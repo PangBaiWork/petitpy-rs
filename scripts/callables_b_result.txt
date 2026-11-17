@@ -1,0 +1,304 @@
+Lane C10b: port generator to Rust — RESULT
+=============================================
+
+Commit: c6f239e (corrected by the main agent at merge time; the
+result file as written recorded the pre-amend hash 5b02a65)
+Branch: lane/callables-b (worktree ~/workspace/petitpy-rs-callables-b)
+Base: master 553d9fc (lib 542 + bin 9)
+Source: ~/workspace/petitpy-orig/src/objects/callables/objgenerator.zig
+        (503 lines, 0 test blocks)
+
+Acceptance (all verified in this worktree)
+------------------------------------------
+- cargo test --release --lib --tests: 569 passed, 0 failed, 1 ignored
+  (baseline 542 + 27 new generator tests; required >= 20 new)
+- cargo test --release --bins: 9 passed
+- cargo build --release: 0 warnings
+- No `unsafe` in this lane's code (grep -rn unsafe over the lane's
+  files returns nothing; the word appears nowhere, not even in a
+  doc comment).
+- Every file < 800 lines (wc -l):
+  src/objects/callables/objgenerator.rs      784  (16 lines headroom —
+       C13 must split this file before adding to it)
+  src/objects/callables/objgenerator_tests.rs    522
+  src/objects/callables/objgenerator_tests_b.rs  363
+  src/objects/callables/mod.rs                13
+  src/objects/value.rs                       721 (lane touched the
+       GeneratorData stub + children() + heap_bytes only)
+  src/objects/containers/tests.rs            275 (fixture only)
+  src/objects/mod.rs                          16 (added `pub mod callables;`)
+- Original repo clean: `git -C ~/workspace/petitpy-orig status
+  --porcelain` is empty.
+
+Files (one commit, "Lane C10b: port generator to Rust")
+------------------------------------------------------
+- src/objects/callables/objgenerator.rs (NEW, 784): gen_wrap_call,
+  gen_resume, gen_resume_and_raise, gen_instance_iternext/send/
+  throw/close/pend_throw, gen_instance_print, gen_wrap_type_data,
+  gen_instance_type_data, gen_instance_locals_dict, the four
+  gen_instance_*_builtin stubs, GenError, RunOutcome, GenRunner,
+  GenResume, exc_is_subclass_named.
+- src/objects/callables/objgenerator_tests.rs (NEW, 522): helpers
+  (compile_fun, wrap_gen, try_wrap_gen, exc_type, exc_value,
+  state_of, script_runner) + 15 tests (wrap, resume, reentrance,
+  pend_throw).
+- src/objects/callables/objgenerator_tests_b.rs (NEW, 363): 12 tests
+  (throw, exceptions + PEP 479, close, print, types, locals dict,
+  stubs). Split off from objgenerator_tests.rs because the single
+  test file hit 848 lines > the 800 cap; helpers are pub(crate)
+  and imported from the first file.
+- src/objects/callables/mod.rs (NEW, 13): `pub mod objgenerator;`
+  + the two test modules. ADDITIVE ONLY — C10a shares this file;
+  the main agent merges the two.
+- src/objects/mod.rs: added `pub mod callables;` (additive).
+- src/objects/value.rs: GeneratorData extended (see Frame decision);
+  children() traces fun + pend_throw + stop_value; heap_bytes for
+  Obj::Generator raised 32 -> 48.
+- src/objects/containers/tests.rs: fixture gained `gen_instance`
+  (real type from gen_instance_type_data, EMPTY locals dict —
+  methods are tested through gen_instance_locals_dict directly).
+  A `gen_wrap` fixture field was added first, then REMOVED again:
+  nothing read it (dead-code warning); the gen_wrap type tests
+  build it fresh via gen_wrap_type_data instead.
+
+FRAME DECISION: (b) C13-side — do NOT embed CodeState in GeneratorData
+----------------------------------------------------------------------
+gen_wrap_call returns (GcRef, CodeState); every resume function
+takes `&mut CodeState` as a parameter; the VM owns the frame and
+associates it with its generator.
+
+Reasons:
+1. value.rs must not depend on runtime::bc — embedding CodeState
+   there would be a `value` <-> `bc` module cycle (value.rs is the
+   bottom of the objects layer; bc.rs already imports value).
+2. The Zig's MpCodeState is exactly C5's CodeState plus `sp` and
+   `old_globals`, which already live outside it in Rust (the value
+   stack and the globals save/restore are the VM's job — see the
+   runner seam below). There is nothing generator-specific left
+   to embed.
+3. The Zig's `n_exc_stack` is decoded but unused (Rust's CodeState
+   has no exception stack; C5 discards it the same way).
+
+GeneratorData was extended instead with two fields:
+  { fun: GcRef, state: GenState, pend_throw: Option<Value>,
+    stop_value: Option<Value> }
+- pend_throw is the Rust spelling of the Zig `pend_exc` tri-state
+  (None == OBJ_NONE, Some(v) == queued throw; Running == pend_exc
+  == OBJ_NULL).
+- stop_value is the Rust spelling of the thread `stop_iteration_arg`
+  (makeStopIteration), stored per-generator so `yield from` reads
+  the right one (None == returned None, the Zig's OBJ_NONE ->
+  OBJ_NULL mapping).
+
+Zig -> Rust mappings pinned in the code:
+- code_state.ip == 0 (already-stopped) -> GenState::Closed. (Rust
+  `ip` is a byte offset; 0 is valid after setup, so it cannot be
+  the marker.)
+- sp == state - 1 (just-started) -> GenState::New. (Rust CodeState
+  has no `sp`.)
+- pend_exc == OBJ_NULL (running) -> GenState::Running.
+- ret_val + VM_RETURN_* -> GenResume.
+- makeStopIteration(v) -> Ok(None) from iternext (C11 convention)
+  with the value stashed in stop_value; send/throw raise
+  GenError::StopIteration(value) on exhaustion instead.
+
+RUNNER SEAM (LOCAL to C10b, defined in objgenerator.rs)
+------------------------------------------------------
+To be unified with C10a's seam by the main agent at merge; C13
+is the consumer.
+
+  pub enum RunOutcome { Normal(Value), Yield(Value), Exception(Value) }
+  // VM_RETURN_* kind + value — yielded/returned/raised value handed
+  // over by the runner, because the value stack lives in the VM,
+  // not in CodeState.
+  pub type GenRunner<'a> = dyn FnMut(&mut CallCtx<'a>, &mut CodeState,
+      Value, Option<Value>) -> RunOutcome + 'a;
+  // args are (ctx, frame, send, throw): send is the value to deliver
+  // as the pending `yield` result, throw is the exception to inject
+  // (None = plain resume). The runner owns the value stack and the
+  // globals save/restore.
+  pub struct GenResume { pub kind: ResumeKind, pub value: Value }
+  pub enum ResumeKind { Normal, Yield, Exception }
+
+gen_wrap_call splits exactly as the brief required: the prelude
+decode -> mp_setup_code_state (C5's, already ported) part is fully
+portable/testable (incl. the B2 polled-sentinel at objgenerator.zig
+:353 — setup errors surface as GenError::Setup), and the execute
+step is the `runner` parameter. Tests drive the full call with a
+scripted stub runner (script_runner in the test file: queued
+RunOutcomes + an (send, throw) log).
+
+Note for the unifier: the test helper script_runner logs into an
+Rc<RefCell<Vec<...>>> (shared &Rc), NOT a &mut Vec. A &mut log
+fights the borrow checker here: the runner's GenRunner<'a>
+lifetime is unified with the CallCtx lifetime at the call site,
+so a mutably-borrowed log cannot be read after a call while ctx
+is still used later in the same test. The Rc<RefCell> log is
+readable at any time.
+
+GenError (C9a DictError shape: exc_name() + message() +
+setup_message(pool) + to_pyerror()):
+- Raised(Value) — exception object straight through; exc_name() = ""
+- StopIteration(Option<Value>)
+- AlreadyExecuting — ValueError "generator already executing"
+- CantSendNonNone — TypeError "can't send non-None value to a
+  just-started generator"
+- IgnoredGeneratorExit — RuntimeError "generator ignored GeneratorExit"
+- GeneratorRaisedStopIteration — RuntimeError "generator raised
+  StopIteration" (PEP 479, checked inside gen_resume,
+  objgenerator.zig:238-242)
+- ArgNumTypesMismatch — TypeError "argument num/types mismatch"
+- Setup(SetupError), PyRaise, OutOfMemory
+
+Verified findings (all probed on the reference binary
+~/workspace/petitpy-orig/zig-out/bin/petitpy, 2026-11-17,
+scripts in /tmp/c10b_p*.py)
+------------------------------------------------------------
+- repr(gen) = `<generator object 'g' at 0x…>`; type(gen).__name__
+  == 'generator'. Rust prints the ARENA INDEX in hex (the Zig
+  prints the raw object pointer, non-deterministic across runs,
+  so no test can pin it; arena index is the Rust id() model, C0).
+  gen_instance_print ignores kind.
+- next yields 1, then StopIteration with args == (42,) and
+  .value == 42 (return value); second next -> StopIteration
+  args (); send on exhausted -> StopIteration args ().
+- close() on exhausted -> None (twice); close() on closed is a
+  no-op (the runner is NOT called — log stays empty).
+- send(5) to just-started -> TypeError "can't send non-None value
+  to a just-started generator"; send(None) works; send(10)
+  delivers 10; close() on suspended -> None; next after close
+  -> StopIteration args ().
+- close() on NEW (never started) runs NEITHER the body NOR its
+  finally, next after -> StopIteration args (). (But close on New
+  is NOT a fast path: it goes through resume and the runner IS
+  called — the log assert pins this.)
+- throw(ValueError("boom")) on suspended / just-started /
+  not-yet-exhausted raises the ValueError; throw(ValueError)
+  (type only) -> ValueError() instance.
+- throw(TypeError, "typed") and throw(TypeError, "typed3", None)
+  -> TypeError "exceptions must derive from BaseException" (the
+  second arg overrides the first as the exception, per
+  objgenerator.zig:286-292).
+- throw(ValueError("v"), None) keeps the instance (second arg None
+  does NOT override).
+- close() when finally yields -> RuntimeError "generator ignored
+  GeneratorExit"; finally raises ValueError -> that ValueError
+  propagates; PEP 479: raise StopIteration("inner") inside ->
+  RuntimeError "generator raised StopIteration"; body raises
+  ValueError -> propagates, next after -> StopIteration args ().
+- throw(ValueError("late")) on TRULY exhausted (next twice) ->
+  bare StopIteration (empty).
+- self-next() inside a running generator -> ValueError "generator
+  already executing".
+- Arg counts — gen.send(), gen.send(1, 2), gen.throw(),
+  gen.close(1), gen.pend_throw(), gen.pend_throw(1, 2) ALL ->
+  TypeError "argument num/types mismatch".
+- throw("x") -> TypeError "exceptions must derive from
+  BaseException"; a LATER throw(123) on the same (now closed)
+  generator -> bare StopIteration (closed fast path, not a second
+  validation); gen.send(v=1) -> arg-mismatch; next(gen, "def")
+  -> "def" (default on exhaustion); iter(gen) is gen -> True.
+- throw(123) and throw(None) on suspended -> TypeError
+  "exceptions must derive from BaseException"; a subsequent bare
+  next() after the throw(None) case raised uncaught StopIteration
+  at top level (rc=1) — i.e. the generator was closed by the
+  failed throw.
+- pend_throw(ValueError("pt")) on new returns None, next next()
+  raises ValueError: pt; close() on new with finally prints
+  nothing from the body.
+- Type flags: gen_wrap 0x0020 (call slot set, print None),
+  gen_instance 0x0080 (print + getiter returning self, call None).
+- Locals dict (full config only, 4 entries): send fixed 2,
+  throw var 2..4, close fixed 1, pend_throw fixed 2; n_args via
+  fun_n_args(min,max) = (min<<8)|max -> sigs 0x0202, 0x0204,
+  0x0101, 0x0202.
+- n_state = S + 1: for `def g(a, b)` the prelude's S is 2 locals
+  and prelude_sig_decode already adds the +1 (DECODE_CODESTATE_SIZE,
+  bc.rs) — the frame has 3 slots, not 4 (an early version of the
+  wrap test asserted 4; the decoded value is 3).
+- StopIteration / GeneratorExit ARE static qstrs (verified in
+  vendor/micropython_embed/genhdr/qstrdefs.generated.h: QDEF0
+  MP_QSTR_GeneratorExit line 40, MP_QSTR_StopIteration line 54) —
+  static_qstr_id works for them.
+
+Brief premises that turned out WRONG (Zig wins)
+------------------------------------------------
+(a) gen_instance_throw's Zig signature is (n_args, args) with NO
+    self_in — args[0] IS self, user args are args[1..]. The Rust
+    API takes `gen` separately + user args after self.
+(b) gen_instance_pend_throw is NOT dropped — the header comment's
+    "Dropped" list is stale; the body exists behind the full-config
+    gate and the full locals dict has 4 entries (nano 3).
+(c) throw(type, value) does NOT instantiate the type — the second
+    arg, if not None, IS the exception passed through; validation
+    ("exceptions must derive from BaseException") happens in the
+    VM inject path (C13), not in gen_instance_throw.
+(d) Test-fixture note (not a brief premise): "MyStop"/"MyExit"
+    are NOT static qstrs — exc_type now falls back to interning
+    non-static names in the runtime pool (RuntimeQstr::from_str,
+    ids start at N_TOTAL), instead of expect()ing a static id.
+
+Subclass checks: no StopIteration/GeneratorExit type objects exist
+yet (C12), so exc_is_subclass_named walks the raised value's
+header-type MRO by type NAME (exact until C12 provides type
+identity; handles a fixture-built subclass with a hand-populated
+mro). gen_instance_close takes the GeneratorExit singleton
+instance as a parameter (C12 creates it, C13 passes it).
+
+DEFERRED to C13 (exact list, with Zig line refs)
+------------------------------------------------
+1. The actual bytecode execution step — mp_execute_bytecode
+   (objgenerator.zig:~366, inside fun_bc_call's call path and
+   gen_resume's step): the runner seam's real implementation.
+   The globals save/restore around the step (globalsGet /
+   globalsSet, objgenerator.zig:~360-366) is the runner's job
+   (it owns the globals), as is applying `send` as the pending
+   `yield` expression's result.
+2. gen_wrap type's call slot (gen_wrap_call_slot, the call slot of
+   mp_type_gen_wrap, objgenerator.zig:~204 mp_obj_new_fun_bc):
+   currently returns PyRaise. C13 wires the code store —
+   FunBcData carries neither bytecode nor def args, which is why
+   gen_wrap_call takes `code: &RawCode, qstr_table, extra_args,
+   empty_tuple` explicitly; C13's Vm supplies them from its code
+   store.
+3. The four gen_instance_*_builtin stubs (objgenerator.zig:282
+   send, :286 throw, :295-314 close, :324-331 pend_throw):
+   arity-checked, then PyRaise. They cannot take a runner through
+   the frozen BuiltinFn signature until C13 grows CallCtx into
+   the Vm (design doc D5).
+4. The GeneratorExit singleton instance (mp_const_GeneratorExit_obj)
+   and the StopIteration / GeneratorExit TYPE objects (C12
+   creates them): gen_instance_close takes the GeneratorExit
+   instance as a parameter; C13 passes it. The PEP 479 check and
+   the close-path GeneratorExit check currently use
+   exc_is_subclass_named (MRO walk by type NAME); C12 must
+   replace it with type-identity checks.
+5. The VM inject-path validation for throw ("exceptions must
+   derive from BaseException", objgenerator.zig:286-292):
+   gen_instance_throw passes args through; the VM validates.
+6. makeStopIteration (objgenerator.zig, StopIteration
+   construction): gen_resume stashes the return value in
+   GeneratorData.stop_value; the VM must read it when raising
+   StopIteration from iternext/send/throw exhaustion (and map
+   GenError::StopIteration(value) to a real StopIteration
+   exception object). Likewise GenError::Raised carries the
+   exception object; the VM must install it as pending_exc
+   (design doc D7; PENDING_STR_ERROR / the C6 convention of
+   dropping raise data at slot boundaries ends here).
+7. NOT deferred (done in this lane, for the record): the
+   already-stopped fast path (StopIteration(None) without calling
+   the runner), the reentrance guard (AlreadyExecuting), the
+   just-started send guard (CantSendNonNone), pend_throw
+   override + return-previous semantics, the close state
+   machine (Yield -> IgnoredGeneratorExit, GeneratorExit /
+   subclass -> None, other exception -> Raised, already-closed
+   -> None), PEP 479 inside gen_resume, the print slot, the
+   getiter-returns-self slot, the locals dict, and the type
+   data for both generator types.
+
+NOTE ON THE COMMIT HASH: the hash above (5b02a65) is the commit
+as first created. Filling it into this file required amending
+that commit, so the branch tip after the amend has a NEW hash
+(see the lane handoff for the final hash). A file cannot contain
+its own commit's hash — same situation as Lane C8a, whose result
+file the main agent corrected at merge time (74d0c36 -> 0ecd2ab).

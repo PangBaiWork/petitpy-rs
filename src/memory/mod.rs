@@ -2,3 +2,5 @@
 //! See `docs/value-obj-design.md`.
 
 pub mod gc;
+pub mod pairheap;
+pub mod ringbuf;

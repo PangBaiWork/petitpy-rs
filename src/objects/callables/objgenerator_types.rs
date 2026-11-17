@@ -80,8 +80,8 @@ pub fn gen_wrap_call_slot(
 /// `mp_type_gen_wrap` (`objgenerator.zig:443-475`): the
 /// generating-function type — flags `0x0020`
 /// (`MP_TYPE_FLAG_BINDS_SELF`), name `generator`, slots attr
-/// (`mp_obj_fun_bc_attr`, C10a's — `TypeData` has no attr slot
-/// yet) and call (`gen_wrap_call`). `dict` is the caller-owned
+/// (`mp_obj_fun_bc_attr`, C10a's — `attr: None` here, the wiring
+/// is C14's) and call (`gen_wrap_call`). `dict` is the caller-owned
 /// locals dict.
 pub fn gen_wrap_type_data(dict: GcRef) -> TypeData {
     TypeData {
@@ -91,7 +91,10 @@ pub fn gen_wrap_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
-namedtuple_fields: None,
+        namedtuple_fields: None,
+        attr: None,
+        make_new: None,
+        bases: None,
         unary_op: None,
         binary_op: None,
         call: Some(gen_wrap_call_slot),
@@ -118,7 +121,10 @@ pub fn gen_instance_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
-namedtuple_fields: None,
+        namedtuple_fields: None,
+        attr: None,
+        make_new: None,
+        bases: None,
         unary_op: None,
         binary_op: None,
         call: None,

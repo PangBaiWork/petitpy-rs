@@ -8,6 +8,7 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::obj::obj_get_type;
+use crate::objects::objtype::lookup::convert_member_lookup;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{GcRef, Obj, Value};
 use crate::runtime::vm::VmState;
@@ -135,9 +136,11 @@ pub fn load_method_maybe_ctx(
             }
         }
     }
-    // The type's attr slot — via the direct fns (no `attr`
-    // field on `TypeData` yet; C12a adds it and C14 subsumes
-    // this whole function).
+    // The type's attr slot — via the direct fns for now
+    // (C12a added the `attr` field to `TypeData`, but the
+    // `gen_wrap` literal still carries `attr: None` and the
+    // module/exception dispatch below is payload-based;
+    // C14 subsumes this whole function).
     if let Some(t) = type_ {
         let attr_fn = if t == state.vm_types.fun_bc || t == state.vm_types.gen_wrap {
             Some(fun_bc_attr as crate::objects::slots::AttrFn)
@@ -169,78 +172,12 @@ pub fn load_method_maybe_ctx(
             let key = Value::Qstr(attr);
             use crate::objects::containers::objdict::dict_get_value;
             if let Ok(member) = dict_get_value(ctx, Value::Heap(dict), key) {
-                return Ok(convert_member_lookup(ctx, state, obj, t, member));
+                let (method, bound) = convert_member_lookup(ctx, Some(obj), t, member);
+                return Ok((Some(method), bound));
             }
         }
     }
     Ok((None, None))
-}
-
-/// `mp_convert_member_lookup` (`runtime.zig:1137-1170`): bind a
-/// locals-dict member to (method, self-or-None). A binds-self
-/// member binds `self` (except a builtin fun on a user
-/// (instance) type, which stays unbound); a staticmethod
-/// unwraps to its fun; a classmethod binds the class (the
-/// type itself when `self` is a type object); anything else is
-/// a plain attribute. `pub(crate)` — `vm_rt_iter`'s
-/// `load_next_method_ctx` uses it.
-pub(crate) fn convert_member_lookup(
-    ctx: &mut CallCtx,
-    state: &mut VmState,
-    self_: Value,
-    type_: GcRef,
-    member: Value,
-) -> (Option<Value>, Option<Value>) {
-    use crate::objects::obj::{FLAG_BINDS_SELF, FLAG_BUILTIN_FUN, FLAG_INSTANCE_TYPE};
-    let _ = state;
-    // Payload-based function check (C12a's `lookup.rs` rule):
-    // `FunBuiltin` / `FunBc` values are allocated with header
-    // `None` (the `fun_builtin_N` type objects do not exist yet),
-    // so the header-type read below cannot see their
-    // `BINDS_SELF` flag. The payload IS the identity: a builtin
-    // function binds `self` unless it was found in an instance
-    // type (where the Zig makes it a staticmethod); a bytecode
-    // function always binds `self`. Without this, a generator's
-    // `throw`/`close`/`send` (all `FunBuiltin`s) load UNBOUND
-    // and the call passes the generator as an arg instead of
-    // `self`.
-    if let Value::Heap(m) = member {
-        if matches!(ctx.arena.get(m), Obj::FunBuiltin(_)) {
-            if let Obj::Type(td) = ctx.arena.get(type_) {
-                if td.flags & FLAG_INSTANCE_TYPE != 0 {
-                    return (Some(member), None);
-                }
-            }
-            return (Some(member), Some(self_));
-        }
-        if matches!(ctx.arena.get(m), Obj::FunBc(_)) {
-            return (Some(member), Some(self_));
-        }
-    }
-    if let Value::Heap(r) = member {
-        let m_type = obj_get_type(ctx.arena, ctx.types, member);
-        if let Some(mt) = m_type {
-            if let Obj::Type(md) = ctx.arena.get(mt) {
-                if md.flags & FLAG_BINDS_SELF != 0 {
-                    if md.flags & FLAG_BUILTIN_FUN != 0 {
-                        if let Obj::Type(td) = ctx.arena.get(type_) {
-                            if td.flags & FLAG_INSTANCE_TYPE != 0 {
-                                return (Some(member), None);
-                            }
-                        }
-                    }
-                    return (Some(member), Some(self_));
-                }
-            }
-            // staticmethod / classmethod (C12a's types — the
-            // `type` objects are recognised by identity with
-            // the VM's stored refs once C12a lands them; until
-            // then no staticmethod/classmethod object exists).
-            let _ = mt;
-            let _ = r;
-        }
-    }
-    (Some(member), None)
 }
 
 /// `mp_load_method` (`runtime.zig:1172-1188`): `load_method_maybe`
@@ -299,12 +236,8 @@ pub fn load_super_method_ctx(
             _ => continue,
         };
         if let Ok(member) = dict_get_value(ctx, Value::Heap(dict), Value::Qstr(attr)) {
-            let (method, self_) = convert_member_lookup(ctx, state, obj, *class, member);
-            if let Some(m) = method {
-                return Ok((m, self_));
-            }
-            // A `None` method means "not a member here" —
-            // keep walking the MRO.
+            let (method, self_) = convert_member_lookup(ctx, Some(obj), *class, member);
+            return Ok((method, self_));
         }
     }
     let name = String::from_utf8_lossy(ctx.pool.qstr_str(attr as u16)).into_owned();

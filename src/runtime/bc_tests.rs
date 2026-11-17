@@ -46,6 +46,9 @@ fn plain_type(arena: &mut GcArena, roots: &RootSet, name: &[u8]) -> GcRef {
             buffer: None,
             print: None,
             namedtuple_fields: None,
+            attr: None,
+            make_new: None,
+            bases: None,
         }),
         roots,
     )
@@ -98,6 +101,15 @@ impl Fixture {
             frozenset: mk(&mut arena, b"frozenset"),
             range: mk(&mut arena, b"range"),
             type_,
+            object: mk(&mut arena, b"object"),
+            super_: mk(&mut arena, b"super"),
+            staticmethod: mk(&mut arena, b"staticmethod"),
+            classmethod: mk(&mut arena, b"classmethod"),
+            boundmeth: mk(&mut arena, b"bound_method"),
+            empty_tuple: mk(&mut arena, b"tuple"),
+            empty_bytes: mk(&mut arena, b"bytes"),
+            native_init_wrapper: mk(&mut arena, b"function"),
+            property: mk(&mut arena, b"property"),
         };
         Fixture {
             arena,

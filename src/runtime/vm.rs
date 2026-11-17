@@ -296,6 +296,15 @@ impl Vm {
             range: GcRef(0),
             dict: GcRef(0),
             type_: GcRef(0),
+            object: GcRef(0),
+            super_: GcRef(0),
+            staticmethod: GcRef(0),
+            classmethod: GcRef(0),
+            boundmeth: GcRef(0),
+            empty_tuple: GcRef(0),
+            empty_bytes: GcRef(0),
+            native_init_wrapper: GcRef(0),
+            property: GcRef(0),
         };
         let (types, vm_types, exc, empty_tuple, ellipsis) = {
             let mut ctx = CallCtx::new(&mut arena, &mut roots, &dummy, &pool, &mut pending_raise);

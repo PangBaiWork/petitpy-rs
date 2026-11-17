@@ -3,7 +3,7 @@
 //! `tests_instance.rs`, type-creation tests in
 //! `tests_typecreate.rs`.
 
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::containers::tests::{empty_dict, Fixture as CFixture};
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::primitives::ops::static_qstr_id;
@@ -35,6 +35,10 @@ pub(crate) struct Fx {
     pub roots: RootSet,
     pub types: BuiltinTypes,
     pub pool: RuntimeQstr,
+    /// C13's `CallCtx` carries the pending-raise slot (5th
+    /// `CallCtx::new` arg); the fixture owns one so `ctx()` can
+    /// hand out a `CallCtx` on demand.
+    pub pending_raise: Option<PendingRaise>,
 }
 
 impl Fx {
@@ -50,13 +54,14 @@ impl Fx {
         // native init wrapper) and the issubclass/isinstance
         // builtins over the fixture's base types, and replaces
         // the fixture's plain `make_type` values with them.
-        let mut ctx = CallCtx::new(&mut arena, &mut roots, &types0, &pool);
+        let mut pending_raise = None;
+        let mut ctx = CallCtx::new(&mut arena, &mut roots, &types0, &pool, &mut pending_raise);
         let rom = super::rom::build_rom(&mut ctx);
-        Fx { arena, roots, types: rom.types, pool }
+        Fx { arena, roots, types: rom.types, pool, pending_raise }
     }
 
     pub(crate) fn ctx(&mut self) -> CallCtx<'_> {
-        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool)
+        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool, &mut self.pending_raise)
     }
 
     /// Run `f` with stub VM seams: the call seam is the

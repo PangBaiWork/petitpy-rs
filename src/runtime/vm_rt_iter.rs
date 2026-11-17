@@ -16,8 +16,9 @@ use crate::runtime::bc::CodeState;
 use crate::runtime::vm::{Vm, VmState};
 use crate::runtime::vm_ops::{exc_from_obj_error, exc_from_pyerror, exc_from_typed, type_error};
 use crate::runtime::vm_rt::{binary_op_ctx, is_true_ctx, pending_exc_or_type_error, unary_op_ctx};
+use crate::objects::objtype::lookup::convert_member_lookup;
 use crate::runtime::vm_rt_name::{
-    convert_member_lookup, delete_global_ctx, delete_name_ctx, load_attr_ctx, load_build_class_ctx,
+    delete_global_ctx, delete_name_ctx, load_attr_ctx, load_build_class_ctx,
     load_global_ctx, load_method_ctx, load_method_maybe_ctx, load_name_ctx, store_attr_ctx,
     store_global_ctx, store_name_ctx,
 };
@@ -171,10 +172,8 @@ fn load_next_method_ctx(
             let dict = d.dict;
             use crate::objects::containers::objdict::dict_get_value;
             if let Ok(member) = dict_get_value(ctx, Value::Heap(dict), Value::Qstr(next_q)) {
-                let (method, self_) = convert_member_lookup(ctx, state, it, t, member);
-                if let Some(m) = method {
-                    return Ok((m, self_));
-                }
+                let (method, self_) = convert_member_lookup(ctx, Some(it), t, member);
+                return Ok((method, self_));
             }
         }
     }

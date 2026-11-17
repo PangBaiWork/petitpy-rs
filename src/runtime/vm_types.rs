@@ -25,6 +25,7 @@ use crate::objects::obj::BuiltinTypes;
 use crate::objects::objtype::objexcept_types::{build_exception_types, ExceptionTypes};
 use crate::objects::objtype::objmodule::module_type_data;
 use crate::objects::objtype::objobject::object_type_data;
+use crate::objects::objtype::rom::{classmethod_type_data, staticmethod_type_data, super_type_data};
 use crate::objects::primitives::objbool::bool_type_data;
 use crate::objects::primitives::objcell::cell_type_data;
 use crate::objects::primitives::objint::{fun_n_args, int_locals_dict, int_type_data};
@@ -32,7 +33,7 @@ use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BuiltinFn, BuiltinKwFn, MethodEntry};
 use crate::objects::strings::objstr_b::{BYTES_METHODS, STR_METHODS};
 use crate::objects::strings::objstr_methods_b::{bytes_type_data, str_type_data};
-use crate::objects::value::{DictData, FunBuiltinData, GcRef, MapData, Obj, TypeData, Value};
+use crate::objects::value::{BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj, TypeData, Value};
 use crate::runtime::vm::VmTypes;
 use crate::runtime::vm_builtins::{ellipsis_print, format_kw_wrapper};
 
@@ -66,6 +67,9 @@ fn plain_type(ctx: &mut CallCtx, name: u32) -> GcRef {
             buffer: None,
             print: None,
             namedtuple_fields: None,
+            attr: None,
+            make_new: None,
+            bases: None,
         }),
     )
 }
@@ -295,6 +299,9 @@ pub(crate) fn build_vm_types(
         buffer: None,
         print: Some(ellipsis_print),
         namedtuple_fields: None,
+        attr: None,
+        make_new: None,
+        bases: None,
     };
     let ellipsis = ctx.alloc(None, Obj::Type(ellipsis_data));
     let ellipsis_singleton = ctx.alloc(Some(ellipsis), Obj::Ellipsis);
@@ -315,6 +322,39 @@ pub(crate) fn build_vm_types(
     let empty_tuple = Value::Heap(crate::objects::containers::objtuple::new_tuple(
         ctx, tuple, &[],
     ));
+    let Value::Heap(empty_tuple_ref) = empty_tuple else {
+        unreachable!("new_tuple always returns a heap value");
+    };
+
+    // C12a's remaining `BuiltinTypes` fields. `super` /
+    // `staticmethod` / `classmethod` use the ROM registry's real
+    // `*_type_data` fns (empty locals dicts — the VM builds no
+    // user classes, and the MRO patch is the ROM's, not the VM's);
+    // `empty_bytes` is the VM-local singleton (header = the VM's
+    // `bytes` type, same shape as `rom.rs`); `native_init_wrapper`
+    // is the fixture pattern (a plain type named `function` — the
+    // VM never calls `instance_make_new`, the only reader of this
+    // field, `typecreate.rs:362`).
+    let super_dict = empty_dict(ctx);
+    let super_ = ctx.alloc(None, Obj::Type(super_type_data(super_dict)));
+    let staticmethod_dict = empty_dict(ctx);
+    let staticmethod = ctx.alloc(
+        None,
+        Obj::Type(staticmethod_type_data(staticmethod_dict)),
+    );
+    let classmethod_dict = empty_dict(ctx);
+    let classmethod = ctx.alloc(
+        None,
+        Obj::Type(classmethod_type_data(classmethod_dict)),
+    );
+    let empty_bytes = ctx.alloc(
+        Some(bytes),
+        Obj::Bytes(BytesData { bytes: Vec::new() }),
+    );
+    let native_init_wrapper = plain_type(
+        ctx,
+        static_qstr_id(b"function").expect("function is a static qstr"),
+    );
 
     let types = BuiltinTypes {
         int,
@@ -331,6 +371,15 @@ pub(crate) fn build_vm_types(
         range,
         dict,
         type_,
+        object,
+        super_,
+        staticmethod,
+        classmethod,
+        boundmeth: bound_meth,
+        empty_tuple: empty_tuple_ref,
+        empty_bytes,
+        native_init_wrapper,
+        property,
     };
     let vm_types = VmTypes {
         fun_bc,

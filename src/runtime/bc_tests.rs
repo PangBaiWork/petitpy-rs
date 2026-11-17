@@ -11,11 +11,9 @@ use crate::compiler::bridge::compile_to_mpy;
 use crate::compiler::mpy::{self, Module, QstrEntry, RawCode};
 use crate::compiler::parser::InputKind;
 use crate::memory::gc::{GcArena, RootSet};
-use crate::objects::value::{CellData, DictData, FunBcData, GcRef, MapData, Obj, Value};
+use crate::objects::value::{DictData, FunBcData, GcRef, MapData, Obj, Value};
 use crate::runtime::bc::*;
 use crate::runtime::qstr::RuntimeQstr;
-
-use crate::runtime::bc::*;
 
 // ── fixture: arena + qstr pool + singletons ──────────────────
 

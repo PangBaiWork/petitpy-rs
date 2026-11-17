@@ -1,0 +1,207 @@
+# Result — petitpy-rs Lane M: .mpy reader + writer
+
+## Headline
+DONE. `src/compiler/mpy.rs` (port of mpy.zig, reader + writer) +
+`src/compiler/mpy_roundtrip.rs` (port of the mpy_roundtrip.zig CLI
+logic), `cargo test --release --lib --tests`: **31 passed, 0 failed**
+(16 A1 tests still green + 10 new mpy tests + 5 new round-trip
+tests). `cargo build --release` from a clean tree: **0 warnings, 0
+errors**. No unsafe, pure Rust std, every .rs file < 800 lines
+(max mpy.rs 756). One commit.
+
+## ⚠️ MERGE NOTE — read before merging this branch
+This branch does NOT compile standalone, and that is NOT a defect in
+this chunk: the worktree was branched at `e4d568f`, whose
+`src/compiler/lexer/` holds the A2 lane's committed submodules
+(chars/peek/string/tables) but NO `lexer/mod.rs` — that file is still
+UNCOMMITTED work in the main worktree (A2 agent, in progress; main
+status at commit time: `M build.rs`, `?? src/compiler/lexer/mod.rs`,
+`?? src/compiler/lexer/tests.rs`). Without it, `pub mod lexer;` in
+`src/compiler/mod.rs` fails with E0583.
+- This branch touches NO lexer file, so the merge is conflict-free on
+  that front. Merge AFTER A2 commits `lexer/mod.rs` (+ its `build.rs`
+  change, which the lexer needs for `STR_UNICODE`), then run
+  `cargo test --release --lib --tests` — it must go to 31 + (A2's
+  lexer tests).
+- How this chunk was verified anyway: the lexer module was excluded
+  with a LOCAL-ONLY temporary comment in `mod.rs`, all checks below
+  were run, and `mod.rs` was restored from backup before commit
+  (final `git diff` contains only the files listed below). The
+  temporary exclusion is NOT in the commit.
+
+## Files ported / created
+| File | Lines | Source |
+|---|---|---|
+| src/compiler/mpy.rs | 756 | mpy.zig (387): read + write + types + 10 tests |
+| src/compiler/mpy_roundtrip.rs | 149 | mpy_roundtrip.zig (96): check() + 5 tests |
+| src/compiler/qstr.rs | 571 (was 576) | QstrEntry moved to mpy.rs (see below) |
+| src/compiler/mod.rs | 11 | + `pub mod mpy; pub mod mpy_roundtrip;` |
+| examples/mpy-roundtrip.rs | 68 | CLI port of mpy_roundtrip.zig (+ optional 2nd arg, see below) |
+| examples/mpy-dump.rs | 123 | canonical .mpy dump tool (reader-agreement check) |
+| scripts/mpy_dump.zig | 117 | Zig dump harness, same format as mpy-dump.rs |
+| scripts/check_mpy_dump.sh | — | runs both dump tools over fixtures, diffs |
+| scripts/check_mpy_write.sh | — | full write check (see below) |
+| scripts/mpy_samples/*.py | 6 | arith, consts, nested, loop, control, complex |
+| scripts/mpy_result.txt | — | this file |
+
+The writer lives in `mpy.zig` itself — the brief's "if mpy.zig has no
+writer" branch did not trigger, so NOTHING was taken from `emit.zig`.
+
+## Verification path established (part of the job)
+- **Producer (original):** `petitpy --emit-mpy F.py` prints the .mpy
+  as base64 (verified on 6 sample programs + all 23 frozen modules
+  are the same format: header `4d 06 00 1f` everywhere).
+- **Consumer oracle (original):** `petitpy-vm file.mpy` runs .mpy
+  files (NOT `petitpy file.mpy` — that parses the bytes as Python
+  source and fails with SyntaxError; `petitpy-vm` is the VM-only
+  binary, "loads .mpy, no compiler", build.zig:821).
+- **Zig reader oracle:** the original's own `zig-out/bin/mpy-roundtrip`
+  (built from mpy_roundtrip.zig) — 23/23 frozen files `OK round-trip`.
+- **Zig-vs-Rust reader agreement:** `scripts/mpy_dump.zig` (Zig
+  harness, built with the same `-M`/`--dep` wiring the original's
+  build.zig uses) + `examples/mpy-dump.rs` print a canonical dump
+  (hex for all byte payloads); `scripts/check_mpy_dump.sh` diffs them.
+
+## Tests (cargo test --release --lib --tests: 31 passed, 0 failed)
+A1 baseline preserved: 11 qstr + 5 grammar_data tests pass unchanged
+(the `to_entry` test was updated mechanically for the owned QstrEntry
+— same assertions, `.to_vec()` on the expected bytes).
+New in mpy.rs (10):
+ 1. qstr_last_static_matches_qstr_module (mirrors the Zig comptime
+    assert in qstr.zig: mpy.QSTR_LAST_STATIC == qstr.QSTR_LAST_STATIC)
+ 2. varint_round_trip_vectors (incl. 0x7f/0x80 boundaries, u64::MAX;
+    300 -> [0x82, 0x2c] pinned)
+ 3. read_rejects_bad_magic (bad magic + bad version)
+ 4. read_rejects_truncated_inputs (empty / header-only / mid-qstr)
+ 5. read_rejects_fun_table_tag (tag 0 and tag 99 -> UnsupportedFeature)
+ 6. minimal_module_round_trips (hand-built smallest module)
+ 7. arch_flags_round_trip (bit 6 -> arch_flags vlen; writer keys off
+    the Option, same as Zig)
+ 8. all_obj_kinds_round_trip (every ObjEntry incl. nested/empty tuple,
+    NUL bytes inside str/bytes)
+ 9. frozen_files_round_trip_byte_identical (23/23)
+ 10. frozen_files_parse_shape (headers, kind, static-id cutoff)
+New in mpy_roundtrip.rs (5) — the Zig CLI's behaviors as tests:
+ 1. first_diff_vectors
+ 2. check_matches_all_frozen_files (23/23 via the check() API)
+ 3. check_returns_read_error (maps to CLI exit 2)
+ 4. mismatch_on_empty_children_header (see "Format edge" below)
+ 5. check_matches_hand_built_module
+Note: `mpy.zig` has NO `test` blocks and `mpy_roundtrip.zig` is a CLI
+with one `pub fn main`, so there were no Zig unit tests to port; the
+CLI behaviors above are the ported cases.
+
+## Acceptance checklist (all hold; commands in scripts/)
+- Read check: Rust reader reads ALL 23 `build-frozen/*.mpy` without
+  error (`cargo test` frozen tests + `scripts/check_mpy_dump.sh`):
+  **23/23 dumps byte-identical between the Zig reader and the Rust
+  reader** (`ALL DUMPS AGREE`), plus the 6 sample .mpy files
+  (29 files total).
+- Round-trip check: Rust read -> Rust write is **byte-identical to
+  the original .mpy bytes for ALL 23 frozen files** (test 9 above)
+  and for all 6 sample .mpy files (`scripts/check_mpy_write.sh`).
+- Write check (`scripts/check_mpy_write.sh`, `WRITE CHECK PASSED`):
+  **5/5 sample programs run under the ORIGINAL binary identically**
+  (`petitpy X.py` vs `petitpy-vm X_rs.mpy`, stdout + stderr + rc
+  compared): arith, consts, nested, loop, control. (complex.py is
+  format-only — see "Original bugs observed" below.)
+- `cargo build --release` from a clean tree: 0 warnings, 0 errors
+  (with the local-only lexer exclusion; see Merge Note).
+- No new `unsafe` (grep: none). Pure Rust std, no external crates.
+- Every .rs file < 800 lines (mpy.rs 756 is the largest).
+
+## QstrEntry migration (anticipated by A1)
+`QstrEntry` moved from `qstr.rs` (borrowed `&[u8]`) to `mpy.rs`
+(owned `Vec<u8>`), matching the Zig original where the type is
+`mpy.QstrEntry` and `qstr.zig` only holds the conversion.
+`qstr.rs` re-exports it (`pub use super::mpy::QstrEntry;`) so the
+`qstr::QstrEntry` path keeps working, and `QstrContext::to_entry`
+now returns the owned form (one small allocation per call; the
+emitter calls it once per qstr). Only `qstr.rs` used the type
+(verified by grep), so nothing else changed.
+
+## runtime/qstr.zig vs compiler/qstr.zig — disagreement checked
+The brief asked to report any disagreement between the two qstr
+implementations. Finding: **no behavioral disagreement — but stale
+comments in runtime/qstr.zig.** Its header comment and the comments
+on lines 212-214 claim N_MAIN = 216 / N_TOTAL = 444, while the
+compiler side has N_MAIN = 385 / N_TOTAL = 613. The code in BOTH
+files parses the SAME generated header
+(`vendor/micropython_embed/genhdr/qstrdefs.generated.h`, 385 QDEF1
+lines — both build.zig `qstrdefs_h` imports point at it), so at
+build time both must compute 385/613. Proved by execution, not just
+reading: a probe binary importing `runtime/qstr.zig` (Zig 0.16
+`-M`/`--dep` wiring, /tmp/qstr_probe.zig) printed
+`runtime N_TOTAL=613`, `qstr_str(500)=modf`,
+`qstr_str(612)={:#b}`. Root cause of the stale comment: the QDEF1
+count grew over time (qstr.rs documents the bumps: 216 -> 227 (JS) ->
+229 -> ... -> 385); the runtime comments were never updated. No
+action needed for the .mpy port (the reader stores raw ids and never
+resolves them); flag for Phase C so the comments get fixed with the
+runtime qstr port.
+
+## Divergences from the Zig original (all deliberate, in code + here)
+- Owned data: Zig returns allocator-owned slices (`gpa.dupe`); Rust
+  stores `Vec<u8>`/`Vec<_>`. No `deinit` — `Drop` frees everything.
+- `RawCode.kind` is `u8`, not Zig's `u2`. The reader reproduces
+  Zig's `@intCast` truncation (`(kind_offset + 2) mod 4`); the writer
+  uses `wrapping_sub` + `debug_assert!` (mirrors Zig Debug panic vs
+  ReleaseFast wrap; only the low 2 bits reach the header either way).
+- `write` is infallible (`Vec<u8>`) where Zig returns
+  `Allocator.Error![]u8` — Rust `Vec` push has no fallible spelling.
+  The reader keeps the fallible shape via `try_reserve` ->
+  `MpyError::OutOfMemory` (same treatment as qstr.rs). On absurd
+  counts (e.g. n_qstr = 2^60) Rust returns OutOfMemory where Zig
+  returns Allocator.Error — same outcome, different spelling.
+- `read_bytes` uses `checked_add` for `len + 1` (qstr/str/bytes):
+  overflow maps to `UnexpectedEof`, which is also what the bounds
+  check would produce — no observable difference on any real input.
+- The `mpy-roundtrip` example accepts an optional 2nd argument
+  (output path for the re-serialized bytes) that the Zig CLI lacks;
+  with one argument its messages/exit codes are exactly the Zig
+  CLI's. It exists so the write check can feed Rust-written .mpy
+  files to `petitpy-vm`.
+
+## Format edge — empty-children header (property of the format)
+A raw-code header with `has_children` set but `n_children == 0`
+parses to an empty children list, and the writer derives
+`has_children` from `children.len() > 0`, so re-serialization drops
+the bit (8 bytes in, 7 out, first diff at offset 6). The Zig writer
+does exactly the same (`writeRawCode`: `has_children =
+rc.children.len > 0`), and the Zig round-trip tool reports MISMATCH
+on those bytes too (verified in check_mpy_write.sh). The compiler
+never emits such a header. Covered by a Rust unit test + the script.
+
+## Original bugs observed (not mine to fix; recorded for the record)
+- Complex constants are broken at RUNTIME in the original: `print(4j)`
+  and `c = 1j` fail with `ValueError: invalid syntax for number`
+  (rc=1); `complex(3, 4)` makes the original binary PANIC
+  (SIGABRT, rc=134, `mp_mirrors.zig:745 fromPtr` null-pointer cast).
+  The .mpy FORMAT handles complex consts fine (complex.py emits a
+  valid 109-byte .mpy; Rust round-trip byte-identical; dump-agree).
+  complex.py is therefore a format-only sample: both the .py run and
+  the Rust-written .mpy run fail identically (rc=1, same message).
+- Error-stream difference between the original's own execution paths:
+  the .py path reports the ValueError on stderr, the .mpy path on
+  stdout. Not a format issue; the write-check script compares
+  combined output for this case and notes the difference.
+- `petitpy file.mpy` does NOT run .mpy files (parses bytes as Python
+  source -> SyntaxError); `petitpy-vm` is the .mpy runner.
+
+## What did NOT port cleanly
+- Nothing in scope failed to port. Two harness-only issues while
+  building the Zig dump tool (the ORIGINAL's own Zig 0.16 API moved
+  since its files were written — `GeneralPurposeAllocator` ->
+  `DebugAllocator`, `std.process.argsAlloc` -> `init.minimal.args`,
+  `std.fs.cwd().readFileAlloc` -> `std.Io.Dir.cwd().readFileAlloc`,
+  `ArrayList.writer` -> `std.Io.Writer.Allocating`); the dump harness
+  was adapted to the 0.16 API following `src/main.zig` /
+  `src/main_vm.zig` as the reference. These are verification-tooling
+  changes only, not port changes.
+
+## Baseline (original, measured this session)
+- `zig-out/bin/mpy-roundtrip` on all 23 frozen files: 23/23 `OK
+  round-trip` (matches the C1 milestone claim).
+- `petitpy --version`: petitpy 0.9.0; `petitpy-vm sample1.mpy`:
+  `hello mpy` / `3`, rc=0.
+- petitpy-orig untouched (read-only; only read + executed).

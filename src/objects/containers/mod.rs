@@ -5,7 +5,9 @@
 //! (set/range/slice/property/attrtuple) fill in the rest.
 
 pub mod map;
+pub mod map_set;
 pub mod objdict;
+pub mod objdict_methods;
 
 #[cfg(test)]
 pub(crate) mod map_tests;

@@ -1,0 +1,213 @@
+Lane C4 result — port memory gc + alloc to Rust
+=================================================
+Executor: Lane C4 subagent, worktree ~/workspace/petitpy-rs-gc,
+branch lane/gc, base master 086c037 (238 lib + 9 bin tests green,
+C0 Value/Obj interface frozen). One commit for this chunk (see git log):
+"Lane C4: port memory gc + alloc to Rust".
+
+Sources (petitpy devel HEAD df7de3a, read-only ~/workspace/petitpy-orig):
+  src/memory/gc.zig    569 lines, 0 test blocks
+  src/memory/alloc.zig  54 lines, 0 test blocks
+  Total                623 lines, 0 test blocks
+
+1:1 mapping
+------------
+gc.zig -> src/memory/gc.rs (662) + src/memory/gc_tests.rs (466, tests
+  split out so both files stay < 800 lines):
+  BYTES_PER_BLOCK = 32 (4 * sizeOf(usize))  -> pub const BYTES_PER_BLOCK
+  MAX_ALLOC = 16 MiB                        -> pub const MAX_ALLOC
+  GC_ALLOC_FLAG_HAS_FINALISER = 1           -> pub const GC_ALLOC_FLAG_HAS_FINALISER
+  Area/atb/ftb/next-fit/allocBlocks         -> NOT ported as such: the Rust arena
+    is a Vec of slots; each slot records its block count (n_blocks),
+    which is the ATB HEAD+TAIL length's Rust form. No area growth
+    (Vec grows), no cursor (free list), no addArea/areaOf.
+  gc_init (auto_collect=1, NPY_GC_STRESS)   -> GcArena::gc_init()
+  gc_lock / gc_unlock / gc_is_locked        -> lock() / unlock() / is_locked()
+    (unlock underflow panics, like Zig's debug usize subtraction)
+  gc_collect (export; lock check)           -> collect() -> usize (freed count)
+  collect() (internal, no lock check)       -> collect_inner() (private)
+  enterPython / leavePython                 -> enter_python() / leave_python()
+  gc_collect_start/end, gc_sweep_all        -> no-op methods of the same names
+  gc_collect_root                           -> NO arena method: it is an empty
+    no-op in gc.zig; its Rust counterpart is RootSet::push (design doc D6)
+  gc_info (+ vendor gc_info_t)              -> info() -> GcInfo
+  gc_alloc / allocMaybe / allocWith         -> alloc() / alloc_with_finaliser()
+  gc_free                                   -> free() (stale frees ignored)
+  gc_realloc / reallocMaybe                 -> realloc() -> Option<GcRef>
+  gc_nbytes                                 -> nbytes() -> usize
+  runFinalisers                             -> pending-finaliser list
+    (take_pending_finalisers); see "Finalisers" below
+  alloc_count / stress_every / allocated_blocks
+                                            -> alloc_count (since last collect,
+    reset in collect_inner) / threshold (stress rule) /
+    stress_alloc_count (monotonic, never reset) / allocated_bytes
+  lock_depth / python_depth / finalising    -> lock_depth / python_depth fields;
+    no `finalising` field (see "Finalisers")
+  collect_wanted                            -> NOT ported: wasm-only, wasm out
+    of scope (native gc_collect() never defers)
+  interp_state / freeAreas                  -> free_areas() (full arena reset)
+  scanRange / dataSegments / collectFrom    -> NOT ported: conservative root
+    scan is impossible in safe Rust; roots are explicit (RootSet).
+    mark_closure() is the worklist marker, following Obj::children()
+    PLUS each header's type_ (see "Header-type tracing" below).
+
+alloc.zig -> src/memory/alloc.rs (180):
+  m_malloc / m_malloc_maybe / m_malloc0     -> malloc() / malloc_maybe() / malloc0()
+    (Vec<u8>, zeroed; None iff n > MAX_ALLOC; malloc(0) is Some)
+  m_realloc / m_realloc_maybe               -> realloc() / realloc_maybe()
+    (Result<Vec<u8>, Vec<u8>>: Err returns the original untouched;
+     growth zero-fills; allow_move=false only shrinks)
+  m_free                                    -> NO counterpart: Rust drops by
+    ownership (documented in alloc.rs)
+  m_malloc_with_finaliser                   -> NO Vec counterpart: the GC-backed
+    version is GcArena::alloc_with_finaliser
+  m_malloc_fail                             -> NOT ported as a function: it sets
+    pyerr.pending_exc (lives in VmState, C13); Rust callers map None to
+    PyError::OutOfMemory.
+
+Acceptance numbers (all pass)
+------------------------------
+- cargo test --release --lib --tests: 267 passed / 0 failed / 1 ignored
+  (baseline 238 kept + 29 new: 20 GC + 9 alloc; the 1 ignored is the
+  stale A3 empty-file expectation).
+- cargo test --release --bins: 9 passed / 0 failed.
+- cargo build --release: 0 warnings. No unsafe in any new file.
+  Every new file < 800 lines (gc.rs 662, gc_tests.rs 466, alloc.rs 180).
+  Pure std, no external crates. Original repo clean (git status empty).
+- Probe examples/gc_probe.rs (`cargo run --release --example gc_probe`):
+    before collect: live=13 mem_alloc=448 mem_free=0
+    collect freed=8 live=5 mem_alloc=160 mem_free=288 total=448
+    info: used=160 free=288 max_free=5 num_1block=5 num_2block=0 max_block=1
+    pending finalisers=1 (slot Some(GcRef(9)))
+    finaliser child alive: true
+    PROBE OK
+  (8 freed = 5 plain floats + 2-object cycle + big 2-block tuple;
+  survivors = 2 rooted floats + dummy type + finaliser tuple + child.)
+
+Key findings (all verified against the original, not guessed)
+-------------------------------------------------------------
+1. THE BRIEF'S PREMISES WERE WRONG IN FOUR PLACES (all checked by grep):
+   - `gc_free_all` does NOT exist — not in gc.zig, not in petitpy src/,
+     not in vendor py/gc.c. The actual function is `freeAreas()`
+     (gc.zig:145), ported as `free_areas()`.
+   - `gc_dump` / `gc_debug` / `gcCollectDebug` do NOT exist in gc.zig.
+     Its only diagnostic is `gc_info`, ported as `info()`.
+   - There is NO `GC_THRESHOLD` / `gc_alloc_amount` mechanism in gc.zig.
+     The vendor threshold rule (py/gc.c:787-788, 880: collect when
+     gc_alloc_amount >= gc_alloc_threshold) was NOT carried into gc.zig.
+     gc.zig's only count-based trigger is the stress rule (NPY_GC_STRESS
+     -> stress_every; allocWith gc.zig:490-493). Rust `threshold` is
+     therefore the STRESS control (collect every N allocations), per the
+     C0 design doc D6 ("原版 alloc_count 规则"). Python-visible
+     gc.threshold() (modgc.zig) is a separate no-op that ignores its
+     argument — the D lane must NOT wire it to this field.
+   - `gc_mem_alloc` / `gc_mem_free` do NOT exist as functions in gc.zig.
+     modgc.zig's mem_alloc/mem_free read gc_info().used / gc_info().free,
+     so Rust mem_alloc()/mem_free() are exactly info().used / info().free
+     (live / free slot block bytes).
+2. `gc.collect()` returns 0 ALWAYS in the original (modgc.zig:
+   "PY_GC_COLLECT_RETVAL=1: collect() returns int(gc_collected). The
+   bumping gc.zig allocator never sets gc_collected; always 0").
+   gc.zig's gc_collect() returns void. The Rust collect() -> usize
+   (freed count) is the frozen C0 API (CPython-like); the D-lane gc
+   module must return 0 from Python gc.collect(), NOT this count.
+3. HEADER-TYPE TRACING — C0 BUG FIXED (grounded in gc.zig): gc.zig's
+   scanRange follows EVERY word of a live allocation, including its
+   first word = the type pointer (MpObjBase.type). The C0 skeleton
+   traced only Obj::children() (payload), so a type reachable only
+   through instance headers could be freed while its instances
+   survived. collect_inner now also marks header.type_. Test
+   `header_type_is_traced` pins it (type + dict survive via the
+   instance header alone). Frozen API untouched.
+4. SKELETON TRIGGER RULE CORRECTED: C0's alloc() collected when
+   `alloc_count >= threshold` (collect-once semantics). The original
+   rule is the stress modulo (`alloc_count % stress_every == 0`,
+   gc.zig:490-493), gated by autoCollect() (lock_depth == 0 and
+   gc_auto_collect_enabled != 0). alloc() now implements the modulo
+   rule; alloc_count keeps its frozen meaning (since last collect).
+   gc.zig's alloc_count is monotonic (never reset by collect); Rust
+   keeps a separate monotonic `stress_alloc_count` for the rule so
+   the phase survives explicit collects. Test `threshold_stress_…`
+   pins the phase across collects.
+5. FINALISERS — MECHANISM CHANGED, OBSERVABLES KEPT: gc.zig's
+   runFinalisers calls __del__ between marking and sweeping, with the
+   GC locked and `finalising` set (blocks allocated by a finaliser are
+   created marked). The Rust arena cannot call __del__ (needs the VM's
+   call machinery, mp_call_function_1_protected). Instead collect()
+   clears the flag first (as gc.zig does), marks the object + its
+   transitive children live for this collection (children intact for
+   __del__), and lists it in `pending_finalisers`; the VM drains the
+   list, runs __del__ through its normal call path, then frees each
+   object. Consequences, all documented in gc.rs: no `finalising`
+   field (allocations during __del__ are ordinary VM-rooted allocs);
+   pending_exc save/restore is the VM hook's job (pending_exc lives
+   in VmState, C13); resurrection becomes possible (gc.zig would still
+   free the object) — unobservable for native types, the only
+   finaliser users. Typeless objects are skipped (gc.zig: "no type
+   yet"), freed by the sweep — test `finaliser_typeless_skipped`.
+   Flag cleared on listing, so a finaliser runs at most once.
+6. realloc DIVERGENCES (documented in code): Rust slots have no
+   neighbouring blocks, so growing in place always succeeds and the
+   ref is always preserved — `allow_move` never triggers a move
+   (gc.zig checks the following blocks are free). `realloc(r, 0)` frees
+   and returns None (gc_realloc rule); `alloc::realloc(buf, 0)` keeps
+   an empty buffer (m_realloc goes through reallocMaybe, 1-block
+   minimum) — the two originals genuinely differ, both ported.
+7. `collect()` LOCKS: the C0 skeleton's collect() ignored lock_depth.
+   It now returns 0 when locked (gc.zig gc_collect: `if (lock_depth
+   != 0) return`), while the internal collect_inner() has no lock
+   check (callers guarantee it, as in gc.zig).
+8. auto_collect_enabled lives on the arena (it is mpstate.zig
+   StateMem.gc_auto_collect_enabled, u16 at offset 568, set to 1 by
+   gc_init, poked by modgc enable/disable/isenabled). When the C15
+   mpstate lane arrives it must NOT duplicate this field — the arena
+   owns it. `GcArena::new()` builds a post-gc_init arena (enabled,
+   threshold -1); `gc_init()` re-applies the init effects (env var).
+9. Block accounting scope (known limitation, C0 design): Rust-heap
+   buffers inside payloads (Vec contents) live outside the arena,
+   unlike the original where every buffer is a GC allocation, so
+   mem_alloc() counts object slots only (block-rounded). The per-slot
+   block math itself is exact (see probe).
+
+Frozen-API compliance
+----------------------
+- No frozen public signature changed: alloc/get/get_mut/collect/
+  mem_alloc/mem_free/len/is_empty/header, alloc_count/threshold/
+  lock_depth fields, RootSet, CallCtx — all intact.
+- Added (all additive): BYTES_PER_BLOCK / MAX_ALLOC /
+  GC_ALLOC_FLAG_HAS_FINALISER / blocks_for / GcInfo / info / nbytes /
+  free / realloc / alloc_with_finaliser / take_pending_finalisers /
+  gc_init / lock / unlock / is_locked / is_auto_collect_enabled /
+  set_auto_collect_enabled / enter_python / leave_python /
+  collect_start / collect_end / sweep_all / free_areas / is_live;
+  internal fields auto_collect_enabled / python_depth /
+  stress_alloc_count / pending_finalisers; Slot.n_blocks.
+- ObjHeader::FLAG_FINALISER now used; FLAG_MARK stays unused (the
+  mark bit lives in the collection's local bitmap, the ATB MARK
+  kind's Rust form).
+
+What is NOT in this chunk
+--------------------------
+- No change to the original repo (read-only; git status clean).
+- No change to any other lane's code or tests (baseline 238 + 9 kept).
+- No extern "C" exports (Phase F). No Value/Obj changes (C0 frozen;
+  only the header-type trace inside collect_inner, no API change).
+- The `gc` Python module itself (modgc.zig) is Phase D, not this lane;
+  notes for it: gc.collect() must return 0 (finding 2 above);
+  gc.threshold() is a no-op (finding 1); mem_alloc/mem_free read
+  info().used/free (finding 1).
+- No end-to-end differential: the VM does not exist yet, so corpus
+  gc tests cannot run; acceptance is unit tests + probe + line-by-line
+  source comparison, as the brief allows. Not claimed otherwise.
+
+Files (this lane)
+-----------------
+src/memory/gc.rs (rewritten, 662 lines, incl. docs + impl),
+src/memory/gc_tests.rs (new, 466 lines, 25 tests: 5 C0 kept + 20 new),
+src/memory/alloc.rs (new, 180 lines, incl. 9 tests),
+src/memory/mod.rs (modified: + `pub mod alloc;`, 1 line),
+examples/gc_probe.rs (new, 89 lines, probe + assertions).
+Scratch only (not committed): /tmp/petitpy_c4_test.log.
+
+Commit: one commit for this chunk (see git log).
+Message: "Lane C4: port memory gc + alloc to Rust".

@@ -4,6 +4,7 @@
 pub mod callables;
 pub mod containers;
 pub mod iters;
+pub mod builtin_types;
 pub mod obj;
 pub mod obj_ops;
 pub mod objtype;

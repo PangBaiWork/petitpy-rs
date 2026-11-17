@@ -205,6 +205,9 @@ impl StrError {
                 Some(crate::objects::obj::ExcType::ZeroDivisionError) => {
                     Some(StrExc::ZeroDivisionError)
                 }
+                Some(crate::objects::obj::ExcType::NotImplementedError) => {
+                    Some(StrExc::NotImplementedError)
+                }
                 None => None,
             },
             StrError::Prim(e) => match e.exc_type() {
@@ -216,6 +219,9 @@ impl StrError {
                 }
                 Some(crate::objects::obj::ExcType::ZeroDivisionError) => {
                     Some(StrExc::ZeroDivisionError)
+                }
+                Some(crate::objects::obj::ExcType::NotImplementedError) => {
+                    Some(StrExc::NotImplementedError)
                 }
                 None => None,
             },
@@ -604,11 +610,13 @@ pub fn new_empty_str() -> Value {
 }
 
 /// The empty bytes object. The original returns the ROM singleton
-/// `mp_const_empty_bytes_obj` (so `b'' is b''`); Rust allocates a
-/// fresh empty `BytesData` per call until a shared ROM object exists
-/// (C12) — identity differs, content does not.
-pub fn new_empty_bytes(ctx: &mut CallCtx, types: &BuiltinTypes) -> Value {
-    new_bytes(ctx, types, &[])
+/// `mp_const_empty_bytes_obj` (so `b'' is b''` and `bytes() is
+/// b''`); Rust returns `types.empty_bytes` (C12a — the singleton
+/// landed). Slicing still allocates fresh (`b'ab'[:0] is b''` is
+/// False on the reference binary), so only this function uses the
+/// singleton — `new_bytes` is untouched.
+pub fn new_empty_bytes(_ctx: &mut CallCtx, types: &BuiltinTypes) -> Value {
+    Value::Heap(types.empty_bytes)
 }
 
 // ── find_subbytes ─────────────────────────────────────────────────────

@@ -103,8 +103,21 @@ Tuple(Vec<Value>) | List(ListData) | Dict(DictData) | Set(SetData)
 | Property(PropertyData) | Super(SuperData) | Iterator(IteratorData)
 | Deque(DequeData) | NamedTuple(NamedTupleData) | AttrTuple(AttrTupleData)
 | Map(MapData) | StrIter(...) // 其余迭代器态按 lane 需要增补
+| Instance(InstanceData) | StaticClassMethod(StaticClassMethodData)
 ```
 
+- **C12a 增补（2026-11-17）：`Instance` 与 `StaticClassMethod`。**
+  `Instance { members: MapData, subobj: Vec<Value> }`（用户类实例，
+  `objtype.zig` 的 `mp_obj_instance_t`；`members` 是原始 map 而非
+  `DictData`，`subobj` 为 0 或 1 个 native-base 对象）。
+  `object()` 的结果也是 `Instance`（空 members、无 subobj）——
+  原版为它分配裸 `MpObjBase`，但所有 members 访问都经过类型的
+  `attr` 槽，而 `mp_type_object` 没有该槽，故空 map 不可达，两者
+  观测等价（已核实：`object().__dict__` 与 `o.x = 1` 均报
+  AttributeError）。`StaticClassMethod { fun: Value }` 是
+  staticmethod / classmethod 共用的 payload，靠 header type 区分。
+  另：namedtuple 实例是**普通 Tuple payload**（header type 为元组
+  子类，C11），不再用 `NamedTuple` 变体承载实例。
 - **变体名与语义冻结**；每个变体的 payload 结构体归属其 lane
   （如 `DictData` 归 C9），lane 可演进 payload 内部字段，但不得
   改名、删变体、改 `Value`/`GcArena` 上的公开访问签名。
@@ -120,8 +133,11 @@ pub struct TypeData {
     pub name: u32,                  // qstr id
     pub flags: u16,                 // 原版 mp_obj_type_t.flags
     pub base: Option<GcRef>,        // 基类（Obj::Type）
+    pub bases: Option<GcRef>,       // C12a：多继承 bases 元组（见下）
     pub mro: Vec<GcRef>,            // C3 线性化（Phase C 不展开 MRO 计算细节，用原版顺序）
     pub dict: GcRef,                // 类型字典（Obj::Dict）
+    pub attr: Option<AttrFn>,       // C12a：属性槽（load-only）
+    pub make_new: Option<MakeNewFn>, // C12a：构造槽
     pub unary_op: Option<UnaryOpFn>,
     pub binary_op: Option<BinaryOpFn>,
     pub call: Option<CallFn>,
@@ -160,13 +176,86 @@ pub struct TypeData {
   `BuiltinKwFn = fn(&mut CallCtx, &[Value], &[(u32, Value)])`
   （位置参数 + 关键字对），由 `FunBuiltinData.kw_func: Option`
   携带（`Some` ⟺ 接受关键字参数），D1 填充。
-- **C10 注（2026-11-17）：`attr` 槽尚未进 `TypeData`。**
-  `TypeData` 仍无 `attr` 字段——补一个字段要改 30 处字面量，
-  且与并行的 C9c lane 共享的 fixture 冲突。三个 attr 函数
-  （`fun_bc_attr` / `bound_meth_attr` / `closure_attr`）已按
-  load-only 约定（`AttrFn = fn(&mut CallCtx, Value, u32) ->
-  PyResult<Option<Value>>`，`slots.rs`）移植并单测，C12 在接
-  `mp_load_method` 时把它们挂进 `TypeData`。
+- **C12a（2026-11-17）：`attr` / `make_new` / `bases` 进 `TypeData`，
+  三个 AttrFn 已接线。**
+  `attr: Option<AttrFn>`（load-only，
+  `AttrFn = fn(&mut CallCtx, Value, u32) -> PyResult<Option<Value>>`）
+  已接 `fun_bc_attr` / `bound_meth_attr` / `closure_attr`
+  （`objfun.zig:482` / `objboundmeth.zig:57` / `objclosure.zig:61`）。
+  注意 `AttrFn` 只管 load——store 路径是独立的自由函数
+  （`instance_store_attr` / `type_store_attr`，返回
+  `PyResult<bool>`：`Ok(true)`=已处理，`Ok(false)`=未处理），
+  因为原版 `attr` 槽的 store 分支用 `dest[0] == NULL` 表示成功，
+  单值模型表达不了。`mp_load_method`（C14，`runtime.zig:1188`）
+  是读 `attr` 槽的那个函数，不在本 lane。
+  `make_new: Option<MakeNewFn>`，
+  `MakeNewFn = fn(&mut CallCtx, GcRef, &[Value], usize) ->
+  PyResult<Value>`（`ctx, type, args, n_kw`；`args` 为
+  `n_args` 个位置参数后跟 `2 * n_kw` 个 `(name, value)` 对，
+  与 `CallFn` 同布局）。`bases: Option<GcRef>`：多继承时存
+  bases 元组本身（此时 `base` 为 None），单继承时 `base` 存父
+  类、`bases` 为 None——`instance_count_native_bases` 要对元组
+  递归求和，`mro` 展平后会把共享父类计一次而算错（`class
+  C(A,B)` 且 A、B 均继承 int 时 layout conflict 应报 2 次）。
+  新增 flags：`FLAG_HAS_SPECIAL_ACCESSORS = 0x0002`、
+  `FLAG_ITER_IS_ITERNEXT = 0x0080`、`FLAG_ITER_IS_CUSTOM =
+  0x0100`、`FLAG_ITER_IS_STREAM = 0x0180`（`mp_mirrors.zig:676-686`）；
+  `TYPE_BASE_FLAGS = 0x021C`。
+  **注意**：`is_exact_type(arena, types.type_, v)`（header 检查）
+  对 fixture 构造的类型对象恒为 False——fixture 用
+  `arena.alloc(None, Obj::Type(..))` 建类型（header 为 None）。
+  “这是不是一个类型对象”要用 payload 检查
+  `is_type_value(arena, v)`（`matches!(arena.get(r),
+  Obj::Type(_))`，`is_subclass` 的 classinfo 检查早已用此形状）；
+  两者在 header 齐全时（ROM）一致。`obj_get_type` 对类型值
+  同样返回 None（fixture）——`type_make_new` 的 1 参数路径对
+  类型值特判为 `types.type_`。
+  **`cached_mro` 的纠正**：Zig 的 `cachedMro`
+  （`objtype.zig:961-966`）只查 locals dict 里的 `__mro__` 且要求
+  它恰为元组，**不**要求父类为元组；Rust 初版多加了
+  `parent_is_tuple` 门，断了“单继承后代继承 MI 祖先的缓存 MRO”
+  这条链，已去掉。
+- **C12a（2026-11-17）：ROM 注册表（`src/objects/objtype/rom.rs`）。**
+  `build_rom(ctx) -> Rom { types, issubclass, isinstance }`：以
+  ctx 的 types 为底，只替换 objtype 所有的字段（`type_`、
+  `object`、`super_`、`staticmethod`、`classmethod`、
+  `boundmeth`、`property`、`empty_tuple`、`native_init_wrapper`、
+  `empty_bytes`），其余内置类型由各自 lane 的 `*_type_data` 构造
+  并传入（C13 负责用 proper header 组装它们）。单例住在
+  `BuiltinTypes`（`empty_tuple`、`empty_bytes`）：tuple 哈希种子
+  是 `empty_tuple` 的 arena index（`hash(()) == id(())`），
+  frozenset 哈希种子是 `frozenset` 类型的 arena index；`new_tuple(0)`
+  与 `new_empty_bytes` 返回单例（`bytes()` 与字面量 `b'' is
+  b''` 成立；切片仍分配新对象，`b'ab'[:0] is b''` 为 False，
+  与原版一致）。`type` 类型自指（header 即自身）；ROM 类型
+  `base` 为 None、`mro = [self, object]`（`__bases__` 为
+  `(object,)` 是无父类规则的产物，已核实）。`issubclass` /
+  `isinstance` 是 `fun_builtin_2` 对象，住在 `Rom` 上（供
+  modbuiltins 安装，Phase D）。
+  **C12b 重叠**：`objobject.zig`（object 类型 + 四个 locals）
+  与 `objexcept.zig` 由 C12b 并行移植，不在本 lane；本 lane 的
+  `object_type_data` 是占位（空 dict + `make_new =
+  instance_make_new`），合流时换成 C12b 的实现并装四个 locals，
+  再复核对象继承路径；`instance_print` 的异常分支要接 C12b 的
+  `mp_obj_is_native_exception_instance`。
+- **C12a（2026-11-17）：`VmSeams`（局部缝合，C13 替换）。**
+  objtype 的逻辑函数以 `&mut VmSeams` 为参数，缝合 VM 尚未提供
+  的五处：`call`（值调用，C10 runner 形状）、`load_maybe`
+  （`mp_load_method_maybe` 的可观测契约）、`unary` / `binary`
+  （`mp_unary_op` / `mp_binary_op`，`Ok(None)` = 未实现）、
+  `subscr`（`mp_obj_subscr`，`SubscrError::{KeyError,
+  Raise(PyError)}`——`__missing__` 的判定需要错误种类，
+  `PyResult` 表达不了）。C13 用真正的 VM 状态机统一 C10a/C10b
+  的两个 runner 与此处缝合，届时删掉它。stub 的已知失真已在
+  `seams.rs` 注明（unary/binary 不能透传真正的槽 raise；
+  stub subscr 永不产生 `KeyError`）。
+- **C12a（2026-11-17）：元组 ADD 用 subclass-fast。**
+  `objtuple.zig:185-189` 的 Add 臂查
+  `is_subclass_fast(rhs_type, tuple)` 而非 exact tuple——
+  namedtuple / 元组子类可拼接（`P(1,2)+(3,)`、`(1,2)+P(1,2)`
+  均为普通 `(1,2,3)`，已核实）；同时要求 rhs 确有 Tuple
+  payload（用户类实例的 items 在 native-base subobj 里，走不到
+  这个槽；Zig 在此处 `fromObj` 是 UB，Rust 返回 PyRaise）。
 - 内置类型（int/str/list/…）的 `TypeData` 由各对象 lane 在
   `GcArena` 里构造并登记；`mp_type_roms.zig` 的静态 ROM 表在 Rust
   里改为启动时构造（无 `extern const`）。

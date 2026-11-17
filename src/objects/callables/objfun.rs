@@ -536,7 +536,7 @@ fn builtin_fun_type_data(dict: GcRef, call: CallFn) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
-namedtuple_fields: None,
+        namedtuple_fields: None,
         unary_op: None,
         binary_op: None,
         call: Some(call),
@@ -544,6 +544,9 @@ namedtuple_fields: None,
         subscr: None,
         buffer: None,
         print: None,
+        attr: None,
+        make_new: None,
+        bases: None,
     }
 }
 
@@ -575,9 +578,9 @@ pub fn fun_builtin_var_type_data(dict: GcRef) -> TypeData {
 /// `mp_type_fun_bc` (`objfun.zig:482-531`): flags
 /// `FLAG_BINDS_SELF`, name `function`, slots print=1, attr=2,
 /// call=3 (`slot_index_*` in the Zig's `MpObjTypeFull`).
-/// `attr` has no `TypeData` field yet (C12 wires it — see the
-/// design doc D5 C10 note); `call` is the null-runner slot
-/// adapter (see `fun_bc_call_slot`).
+/// `attr` is `fun_bc_attr` (wired by C12a — the brief's attr-slot
+/// item); `call` is the null-runner slot adapter (see
+/// `fun_bc_call_slot`).
 pub fn fun_bc_type_data(dict: GcRef) -> TypeData {
     TypeData {
         name: crate::objects::primitives::ops::static_qstr_id(b"function")
@@ -586,7 +589,7 @@ pub fn fun_bc_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
-namedtuple_fields: None,
+        namedtuple_fields: None,
         unary_op: None,
         binary_op: None,
         call: Some(fun_bc_call_slot),
@@ -598,6 +601,9 @@ namedtuple_fields: None,
                 fun_bc_print(ctx, value, kind, sink)
             },
         ),
+        attr: Some(fun_bc_attr),
+        make_new: None,
+        bases: None,
     }
 }
 

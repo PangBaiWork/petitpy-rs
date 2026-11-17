@@ -234,13 +234,15 @@ fn map_hash_of_unhashable_and_unslotted() {
         other => panic!("dict key hash: {other:?}"),
     }
     // A tuple value: the fixture's tuple type now has the
-    // real HASH slot (C9b) — the seed is 0 and the sum wraps
-    // through `wrap_small_int`, so `hash((1,)) == 1`.
+    // real HASH slot (C9b) — the seed is the empty tuple's
+    // arena index (C12a) and the sum wraps through
+    // `wrap_small_int`, so `hash((1,)) == seed + 1`.
     let t = fx.heap_tuple(vec![Value::SmallInt(1)]);
+    let seed = fx.types.empty_tuple.0 as i64;
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
     let h = hash_of(ctx, ctx.types, t).unwrap();
-    assert_eq!(h, 1);
+    assert_eq!(h, (seed + 1) as usize);
 }
 
 #[test]

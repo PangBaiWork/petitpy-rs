@@ -145,8 +145,8 @@ pub fn closure_attr(ctx: &mut CallCtx, self_value: Value, attr: u32) -> PyResult
 
 /// `mp_type_closure`: flags `FLAG_BINDS_SELF` (`0x0020`), name
 /// `closure`, slots attr=1, call=2 (the Zig's `slot_index_*`).
-/// No print slot (see the module docs). `attr` has no `TypeData`
-/// field yet (C12 wires it — design doc D5 C10 note).
+/// No print slot (see the module docs). `attr` is `closure_attr`,
+/// wired by C12a.
 pub fn closure_type_data(dict: GcRef) -> TypeData {
     TypeData {
         name: crate::objects::primitives::ops::static_qstr_id(b"closure")
@@ -155,7 +155,7 @@ pub fn closure_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
-namedtuple_fields: None,
+        namedtuple_fields: None,
         unary_op: None,
         binary_op: None,
         call: Some(closure_call_slot),
@@ -163,5 +163,8 @@ namedtuple_fields: None,
         subscr: None,
         buffer: None,
         print: None,
+        attr: Some(closure_attr),
+        make_new: None,
+        bases: None,
     }
 }

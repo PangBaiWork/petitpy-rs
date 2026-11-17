@@ -40,6 +40,9 @@ pub fn bool_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: Some(bool_print),
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }

@@ -224,7 +224,7 @@ pub fn bound_meth_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
-namedtuple_fields: None,
+        namedtuple_fields: None,
         unary_op: Some(
             |ctx: &mut CallCtx, op: UnaryOp, self_: Value| bound_meth_unary_op(ctx, op, self_),
         ),
@@ -238,5 +238,9 @@ namedtuple_fields: None,
         subscr: None,
         buffer: None,
         print: None,
+        // `bound_meth_attr` (objboundmeth.zig:57), wired by C12a.
+        attr: Some(bound_meth_attr),
+        make_new: None,
+        bases: None,
     }
 }

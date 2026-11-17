@@ -10,7 +10,7 @@ use crate::memory::gc::{CallCtx, GcArena, RootSet};
 use crate::objects::obj::{call_binary, call_unary, SlotOutcome};
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
-use crate::objects::value::{GcRef, Obj, Value};
+use crate::objects::value::{BytesData, GcRef, Obj, Value};
 use crate::pyerr::PyError;
 use crate::runtime::qstr::RuntimeQstr;
 use crate::vendor::mpz::BigInt;
@@ -57,7 +57,22 @@ impl SlotFixture {
         let frozenset = make_type(&mut arena, &roots, b"frozenset");
         let range = make_type(&mut arena, &roots, b"range");
         let dict = make_type(&mut arena, &roots, b"dict");
-        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset, range, dict, type_] {
+        // C12: plain object/super/staticmethod/classmethod/
+        // boundmeth types and the ROM `()` singleton.
+        let object = make_type(&mut arena, &roots, b"object");
+        let super_ = make_type(&mut arena, &roots, b"super");
+        let staticmethod = make_type(&mut arena, &roots, b"staticmethod");
+        let classmethod = make_type(&mut arena, &roots, b"classmethod");
+        let boundmeth = make_type(&mut arena, &roots, b"bound_method");
+        let property = make_type(&mut arena, &roots, b"property");
+        let empty_tuple = arena.alloc(Some(tuple), Obj::Tuple(vec![]), &roots);
+        let empty_bytes = arena.alloc(
+            Some(bytes),
+            Obj::Bytes(BytesData { bytes: Vec::new() }),
+            &roots,
+        );
+        let native_init_wrapper = make_type(&mut arena, &roots, b"function");
+        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset, range, dict, type_, object, super_, staticmethod, classmethod, boundmeth, empty_tuple, empty_bytes, property, native_init_wrapper] {
             roots.push(Value::Heap(t));
         }
         let types = BuiltinTypes {
@@ -75,6 +90,15 @@ impl SlotFixture {
             range,
             dict,
             type_,
+            object,
+            super_,
+            staticmethod,
+            classmethod,
+            boundmeth,
+            empty_tuple,
+            empty_bytes,
+            native_init_wrapper,
+            property,
         };
         SlotFixture { arena, roots, types, pool: RuntimeQstr::new() }
     }

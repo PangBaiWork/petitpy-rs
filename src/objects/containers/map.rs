@@ -79,6 +79,7 @@ use crate::objects::slots::UnaryOp;
 use crate::objects::value::{GcRef, MapData, MapEntry, Obj, Value};
 use crate::pyerr::PyError;
 use crate::qstr_table::qstr_compute_hash;
+use crate::runtime::qstr::RuntimeQstr;
 
 /// Full config: the compact insertion-ordered layout
 /// (`map.zig: pub const compact = build_options.is_full`).
@@ -322,6 +323,123 @@ impl MapData {
             }
         }
         None
+    }
+
+    // ── embedded-map qstr access (C12: instance members) ────────
+
+    /// Find a qstr key in an EMBEDDED map (an instance's members
+    /// map — `mp_map_lookup` on `instance.members`, objtype.zig).
+    /// The probe mirrors `compact_lookup` (map.zig
+    /// `compactLookup`); keys are always qstrs here, so comparison
+    /// is by id only — no `__eq__` call, no rehash risk. Returns
+    /// the entry index, or `None`. (The lookup cache is a pure
+    /// perf hint for dict hot paths; these cold paths skip it.)
+    pub fn find_qstr(&self, pool: &RuntimeQstr, attr: u32) -> Option<usize> {
+        if self.alloc == 0 {
+            return None;
+        }
+        let cap = index_cap(self.alloc);
+        let mask = cap - 1;
+        let mut pos = (pool.qstr_hash(attr as u16) as usize) & mask;
+        loop {
+            let slot = self.index[pos];
+            if slot == 0 {
+                return None;
+            }
+            let i = (slot - 1) as usize;
+            match self.entries[i].key {
+                // Tombstone — step over it.
+                None => {
+                    pos = (pos + 1) & mask;
+                }
+                Some(Value::Qstr(k)) if k == attr => return Some(i),
+                Some(_) => {
+                    pos = (pos + 1) & mask;
+                }
+            }
+        }
+    }
+
+    /// Store `value` under the qstr key `attr` in an embedded map
+    /// (`mp_map_lookup(..., MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)`).
+    /// Returns `true` when the key already existed (the value was
+    /// overwritten), `false` when it was inserted. Growth mirrors
+    /// `compact_rehash` (`new_alloc = max(used+1, (3*used+1)/2)`,
+    /// live entries replayed in place).
+    pub fn store_qstr(&mut self, pool: &RuntimeQstr, attr: u32, value: Value) -> bool {
+        if self.alloc == 0 || self.entries.len() == self.alloc {
+            self.rehash_qstr(pool);
+        }
+        // (Re)probe after the rehash — the table moved.
+        let cap = index_cap(self.alloc);
+        let mask = cap - 1;
+        let mut pos = (pool.qstr_hash(attr as u16) as usize) & mask;
+        loop {
+            let slot = self.index[pos];
+            if slot == 0 {
+                let i = self.entries.len();
+                self.index[pos] = (i + 1) as u32;
+                self.used += 1;
+                self.entries.push(MapEntry {
+                    key: Some(Value::Qstr(attr)),
+                    value,
+                });
+                return false;
+            }
+            let i = (slot - 1) as usize;
+            match self.entries[i].key {
+                None => {
+                    pos = (pos + 1) & mask;
+                }
+                Some(Value::Qstr(k)) if k == attr => {
+                    self.entries[i].value = value;
+                    return true;
+                }
+                Some(_) => {
+                    pos = (pos + 1) & mask;
+                }
+            }
+        }
+    }
+
+    /// Remove the qstr key `attr` from an embedded map
+    /// (`mp_map_lookup(..., MP_MAP_LOOKUP_REMOVE_IF_FOUND)`).
+    /// Returns `true` when the key was present. The entry is
+    /// tombstoned (key `None`); the index slot keeps pointing at
+    /// it, exactly like `compact_lookup`'s remove path.
+    pub fn remove_qstr(&mut self, pool: &RuntimeQstr, attr: u32) -> bool {
+        let Some(i) = self.find_qstr(pool, attr) else {
+            return false;
+        };
+        self.used -= 1;
+        self.entries[i].key = None;
+        self.entries[i].value = Value::None;
+        true
+    }
+
+    /// Rehash an embedded qstr-only map (the `compact_rehash`
+    /// growth rule, replayed through `store_qstr` — no `__eq__`
+    /// can run, so the replay cannot re-enter).
+    fn rehash_qstr(&mut self, pool: &RuntimeQstr) {
+        let new_alloc = (self.used + 1).max((3 * self.used + 1) / 2);
+        let live: Vec<(u32, Value)> = self
+            .entries
+            .iter()
+            .filter_map(|e| match e.key {
+                Some(Value::Qstr(k)) => Some((k, e.value)),
+                _ => None,
+            })
+            .collect();
+        self.alloc = new_alloc;
+        self.entries = Vec::with_capacity(new_alloc);
+        self.index = vec![0u32; index_cap(new_alloc)];
+        self.used = 0;
+        for (k, v) in live {
+            // Fresh table: room for `used` entries in
+            // `new_alloc >= used + 1` slots — every replay inserts.
+            let inserted = self.store_qstr(pool, k, v);
+            debug_assert!(!inserted);
+        }
     }
 }
 

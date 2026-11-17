@@ -1,0 +1,415 @@
+Lane C12a: port objtype (type system core) to Rust — RESULT
+===========================================================
+Branch: lane/objtype-a (base master 994bba3, "Merge lane/callables-a").
+Worktree: ~/workspace/petitpy-rs-objtype-a.
+Original: src/objects/objtype/objtype.zig, 2,214 lines, 0 test blocks.
+Date: 2026-11-17 ~22:05–2026-11-18 ~01:30 CST.
+
+VERDICT
+--------
+- cargo test --release --lib --tests: 764 passed, 0 failed, 1 ignored
+  (baseline 688 + 76 new objtype tests).
+- cargo test --release --bins: 9 passed.
+- cargo build --release: 0 warnings. No `unsafe` anywhere
+  (the word does not appear in any touched file).
+- Every file < 800 lines (largest: lookup.rs 755, typecreate.rs 754,
+  instance.rs 739, tests_typecreate.rs 710, tests_instance.rs 645).
+- Original repo ~/workspace/petitpy-orig: clean.
+
+NEW FILES (src/objects/objtype/)
+--------------------------------
+- mod.rs — module registry + re-exports.
+- errors.rs — ObjTypeError (exc_type/message/to_pyerror) + polled
+  arg_check_num_sig.
+- seams.rs — VmSeams { call, load_maybe, unary, binary, subscr } +
+  SubscrError::{KeyError, Raise(PyError)} + stub builders.
+- subclass.rs — is_exact_type, is_type_value, is_subclass_fast,
+  cast_to_native_base, is_subclass, is_subclass_of_value,
+  issubclass_builtin/isinstance_builtin + issubclass_fun_obj/
+  isinstance_fun_obj.
+- lookup.rs — SlotKind, LookupHit, has_slot, is_native_type,
+  class_lookup, lookup_in, convert_member_lookup, cached_mro,
+  mro_of, mro_tuple, c3_mro, special-accessor scan,
+  type_locals_dict_readonly, instance_dict_readonly,
+  type_bases_tuple, unary/binary op method-name tables.
+- instance.rs — instance_getiter/unary_op/binary_op/subscr/
+  get_call/is_callable/call/get_buffer/load_attr/store_attr/attr
+  (+ slot adapters).
+- instance_print.rs — instance_print + lookup_print_method +
+  print_fallback.
+- typecreate.rs — TYPE_BASE_FLAGS, type_make_new, type_call,
+  super_make_new, super_attr (+ super_attr_impl), super_print,
+  type_print, type_attr, type_store_attr, mp_obj_new_type,
+  new_type_finish, wrap_new, call_set_name_methods, is_fun.
+- instance_create.rs — count_native_bases, new_instance,
+  native_base_init_wrapper (+ wrapper obj), static_class_method_
+  make_new, instance_make_new (+ inner/run_init), load_super_method.
+- rom.rs — Rom registry (build_rom, type/super/staticmethod/
+  classmethod/object type datas).
+- tests.rs, tests_lookup.rs, tests_instance.rs,
+  tests_typecreate.rs, tests_instance_create.rs, tests_set_name.rs,
+  tests_rom.rs — 76 tests.
+
+OTHER FILES TOUCHED (33 modified total)
+---------------------------------------
+- src/objects/value.rs — Obj::Instance + Obj::StaticClassMethod;
+  TypeData gains attr/make_new/bases; wrap_small_int lives here.
+- src/objects/slots.rs — MakeNewFn.
+- src/objects/obj.rs — flags HAS_SPECIAL_ACCESSORS 0x0002 /
+  ITER_IS_ITERNEXT 0x0080 / ITER_IS_CUSTOM 0x0100 /
+  ITER_IS_STREAM 0x0180; ExcType::NotImplementedError;
+  BuiltinTypes gains object/super_/staticmethod/classmethod/
+  boundmeth/empty_tuple/property/native_init_wrapper/empty_bytes.
+- src/memory/gc.rs — GcArena::set_header_type (for the
+  self-referential `type` type).
+- src/objects/containers/map.rs — MapData::find_qstr/store_qstr/
+  remove_qstr/rehash_qstr (embedded-map lookup for instance members).
+- src/objects/callables/objfun.rs, objboundmeth.rs, objclosure.rs —
+  attr slots wired (fun_bc_attr / bound_meth_attr / closure_attr).
+- src/objects/containers/objtuple.rs — tuple ADD subclass-fast;
+  tuple hash seed dynamic (empty tuple's arena index);
+  new_tuple(0) returns the singleton.
+- src/objects/containers/objset.rs — frozenset hash seed dynamic
+  (frozenset type's arena index); FROZENSET_HASH_SEED removed.
+- src/objects/strings/objstr_a.rs — new_empty_bytes returns the
+  singleton.
+- TypeData-literal sweep (attr/make_new/bases: None) across
+  containers/objdict/objlist/objproperty/objrange/objslice/
+  objarray/objattrtuple/objint/objbool/objcell/objstr_methods_b
+  + gc_tests.rs; BuiltinTypes-literal sweep across the 5 fixtures.
+- docs/value-obj-design.md — D4 (new Obj variants) + D5 (TypeData
+  fields, MakeNewFn, Rom registry, seams, ADD fix, C12b overlap).
+
+1:1 Zig -> Rust MAPPING (objtype.zig line refs)
+-----------------------------------------------
+- npy_ty_attr_value_is_special_accessor (:196) /
+  npy_ty_scan_special_accessors_flag (:200) -> lookup.rs
+  attr_value_is_special_accessor / scan_special_accessors_flag.
+- Slot-offset constants (:277-288) -> documented as the TypeData
+  field layout (offset arithmetic NOT reproduced).
+- mp_obj_is_subclass_fast (:409) -> subclass.rs is_subclass_fast.
+- mp_obj_cast_to_native_base (:439) -> subclass.rs
+  cast_to_native_base (type-based: get_type -> equality ->
+  subclass-fast -> subobj[0]; the brief's "exact-type then
+  subobj" shape was wrong, re-read 2026-11-17 ~23:10).
+- mp_obj_instance_is_callable (:454) -> instance.rs
+  instance_is_callable.
+- mp_load_super_method (:463) -> instance_create.rs
+  load_super_method.
+- instanceCallImpl / mp_obj_instance_call (:478/:491) ->
+  instance.rs instance_call.
+- isSubclassImpl / mp_obj_is_subclass (:524/:551) -> subclass.rs
+  is_subclass; mp_builtin_issubclass / mp_builtin_isinstance
+  (:555-569) -> subclass.rs issubclass_builtin / isinstance_builtin
+  + issubclass_fun_obj / isinstance_fun_obj (:577/:581).
+- mp_type_type (:597) -> rom.rs type_type_data + build_rom
+  (self-referential header via set_header_type).
+- mp_type_super (:631) -> rom.rs super_type_data.
+- mp_type_staticmethod (:666) -> rom.rs staticmethod_type_data.
+- mp_type_classmethod (:698) -> rom.rs classmethod_type_data.
+- native_base_init_wrapper_obj (:734) -> instance_create.rs
+  native_base_init_wrapper_obj (FunBuiltinVar, sig (1, 255, kw)).
+- Unary/binary op method-name tables (:747/:772) -> lookup.rs
+  unary_op_method_name / binary_op_method_name (matches, not byte
+  tables; __complex__ IS static so COMPLEX_MAYBE is populated,
+  __sizeof__ is NOT a qstr so SIZEOF -> None).
+- npy_ty_class_lookup (:840) -> lookup.rs class_lookup;
+  lookupIn (:901) -> lookup.rs lookup_in (step 1 fires ONLY for
+  native types — objtype.zig:904).
+- mroOf / c3Mro (:960-1040) -> lookup.rs mro_of / c3_mro /
+  cached_mro / mro_tuple (max_bases=15).
+- mp_obj_instance_getiter (:1050) -> instance.rs instance_getiter.
+- instance_unary_op (:1148) -> instance.rs instance_unary_op.
+- instance_binary_op (:1152) -> instance.rs instance_binary_op.
+- instance_subscr (:1190) -> instance.rs instance_subscr
+  (__missing__ lookup uses slot 0, objtype.zig:1224-1231).
+- mp_obj_instance_get_call (:1248) -> instance.rs instance_get_call.
+- instance_get_buffer (:1261) -> instance.rs instance_get_buffer.
+- mp_obj_instance_load_attr (:1288) -> instance.rs
+  instance_load_attr (incl. __getattr__ fallback + the
+  descriptor-dunder guard + __setattr__/__delattr__ guard).
+- mp_obj_instance_store_attr (:1379) -> instance.rs
+  instance_store_attr.
+- mp_obj_instance_attr (:1459) -> instance.rs instance_attr
+  (load-only; store is the free fn instance_store_attr).
+- type_make_new / type_call (:1503/:1516) -> typecreate.rs
+  type_make_new / type_call.
+- super_print / super_make_new / super_attr (:1529/:1558/:1562)
+  -> typecreate.rs super_print / super_make_new / super_attr.
+- instance_print / type_print (:1638/:1688) -> instance_print.rs
+  instance_print / typecreate.rs type_print. instance_print's
+  fallback __repr__ lookup uses slot 0 (objtype.zig:1650-1659)
+  and its member call is the direct mp_call_function_1
+  (member[0], self) — NOT a bound call.
+- type_attr (:1701) -> typecreate.rs type_attr / type_store_attr.
+- mp_obj_new_type (:2015) -> typecreate.rs mp_obj_new_type /
+  new_type_finish (incl. __new__ wrap when isFun, __set_name__
+  snapshot-then-call, layout-conflict check AFTER the __mro__
+  store).
+- instance_count_native_bases (:2034) -> instance_create.rs
+  count_native_bases.
+- native_base_init_wrapper (:2070) -> instance_create.rs
+  native_base_init_wrapper.
+- mp_obj_new_instance (:2084) -> instance_create.rs new_instance.
+- static_class_method_make_new (:2112) -> instance_create.rs
+  static_class_method_make_new.
+- mp_obj_instance_make_new (:2212) -> instance_create.rs
+  instance_make_new (native-base construction runs ONLY in the
+  blank-instance branch).
+- runtime.zig helpers ported as support: mp_convert_member_lookup
+  (:1137) -> lookup.rs convert_member_lookup (verbatim).
+  mp_load_method (:1188) is NOT this lane's (C14's) — only the
+  attr slot it reads. mp_load_method_maybe / protected /
+  mp_store_attr are NOT ported (their observable contracts live
+  in the seams).
+
+PROBED BEHAVIOURS (reference binary, all confirmed)
+--------------------------------------------------
+- isinstance(True, int) False; issubclass(bool, int) False;
+  isinstance(B(), A) / issubclass(B, A) / issubclass(B, (A, int)) /
+  issubclass(B, B) True; isinstance(1, (int, str)) True;
+  type(1) is int; type(type(1)) is type; type('x').__name__ =
+  'str'; int.__mro__ = (int, object); bool.__bases__ = (object,).
+- C(5).x = 5; c.y = 3 works; hasattr(c, 'x') True;
+  getattr(c, 'z', 9) = 9; D()() -> TypeError "object not
+  callable"; E()() = 7 (__call__); F().m() = 2 via super().m().
+- P(1,2)+(3,) = (1,2,3); (1,2)+P(1,2) = (1,2,1,2) (plain tuples).
+- type('X', (object,), {'a': 1}) works; X().a = 1; X.__name__ =
+  'X'; X.__bases__ = (object,); type(X) is type;
+  isinstance(X(), object) True; X.__mro__ = (X, object).
+- repr(object()) = '<object>' (no print slot -> VM default print,
+  C13's); type(object()) is object; object().__dict__ and o.x = 1
+  both raise AttributeError; o.__init__ is <bound_method>;
+  o.__class__ = <class 'object'>; object.__mro__ = (object,);
+  object.__bases__ = (); object.__dict__ keys =
+  ['__delattr__', '__init__', '__new__', '__setattr__'].
+- hash(()) == id(()) True; hash(frozenset()) == id(frozenset)
+  True FOR THE TYPE (the seed is the frozenset type's address —
+  an instance's id differs; probed 2026-11-18: id(frozenset())
+  is False).
+- repr(C(5)) = '<C object at 7d863e040660>' (address varies; Rust
+  prints the arena index, same divergence class as C10a);
+  __repr__/__str__ dispatch works, str falls back to __repr__;
+  C.__dict__ keys = ['__init__', '__module__', '__qualname__'];
+  repr(type(C)) = "<class 'type'>".
+- issubclass(1, int) -> TypeError "issubclass() arg 1 must be a
+  class"; issubclass(int, 1) -> "issubclass() arg 2 must be a
+  class or a tuple of classes"; type(1,2) / type() -> "type takes
+  1 or 3 arguments".
+- class CI(int): CI(5) = 5, type is CI, isinstance(CI(5), int)
+  True, CI(5)+1 = 6; class CD(dict) item access works;
+  __missing__ works (m['zz'] = 'miss:zz').
+- super(1) / super() -> "issubclass() arg 2 must be a class or a
+  tuple of classes" (polled sig error overwritten by the later
+  raise); super(int, 1) -> "<super: <class 'int'>, 1>";
+  super(int, 1, 2) / super(int, 1, x=1) -> "argument num/types
+  mismatch" (logic succeeds, sig error surfaces).
+- __init__ returning non-None -> "__init__() should return None";
+  __new__ returning a non-instance skips __init__ (N() = 42);
+  object.__new__(cls) inside __new__ works.
+- type() edge cases: type(1, (), {}) -> "can't convert to str
+  implicitly"; type("X", 1, {}) / type("X", (object,), 1) /
+  type("X", (1,), {}) -> bare TypeError; type("X", (int, str),
+  {}) -> "multiple bases have instance lay-out conflict";
+  type("X", (int,), {}) works; staticmethod() /
+  staticmethod(1, 2) / classmethod() -> "argument num/types
+  mismatch"; super(1, 2) -> Arg2 error.
+- int | None exists (UnionType); issubclass(int, int|None) True;
+  list[int] exists (GenericAlias). is_subclass's unionArgs path
+  is live (tested via a stub load_maybe returning a canned
+  __args__ tuple).
+- ROM types: type.__bases__ / super.__bases__ /
+  staticmethod.__bases__ / classmethod.__bases__ all (object,);
+  type.__mro__ = (type, object); super.__mro__ = (super,
+  object); staticmethod.__mro__ = (staticmethod, object);
+  issubclass(type, object) / issubclass(super, object) /
+  issubclass(int, object) True; type(object) / type(type) /
+  type(super) / type(staticmethod) all <class 'type'>.
+- Hash seeds: hash(()) = 22815552; hash((1,2)) = 22815555;
+  hash(((1,2),)) = 45631107 = seed + (seed+3) (the seed
+  double-counts through nesting); hash(frozenset()) = 22810192;
+  hash(frozenset({1,2})) = 22810195.
+- Bytes singleton: b'' is b'' True; bytes() is b'' True;
+  b'ab'[:0] is b'' FALSE (slicing allocates fresh); () is ()
+  True; tuple() is () True; (1,2)*0 is () True.
+
+INTENTIONAL DIVERGENCES (documented, not hidden)
+-------------------------------------------------
+- `object()` is an Instance (empty members, no subobj), not a
+  bare MpObjBase — observationally identical (see D4 note).
+- The `__init__`-via-wrapper tail-skip proof is UNTESTABLE at
+  this layer: a builtin __init__ never receives self (UNBOUND —
+  BINDS_SELF|BUILTIN_FUN -> staticmethod), so it cannot call the
+  wrapper; it needs a real Python __init__ (C13's job). The skip
+  branch is code-reviewed and documented; the corpus will
+  exercise it end to end once the VM runs.
+- instance_binary_op's NotImplemented -> NULL is unrepresentable
+  in Rust (no NotImplemented Value): the member's result is
+  returned as-is; C13's Value-model decision.
+- instance_subscr's __missing__ member call uses the bound pair;
+  a NULL/SENTINEL __missing__ leaves the KeyError standing.
+- The `__set_name__` call ORDER is insertion order in Rust vs
+  map-slot (hash-table) order in the Zig — the order across
+  descriptors is unspecified in both; only the snapshot
+  semantics are pinned.
+- `new_type`'s name extraction: a heap-Str name neither static
+  nor already in the pool reports OutOfMemory (cannot intern
+  without the VM's &mut pool — C13 gap).
+- The wrapper FunBuiltinVar's n_args max is 255 (fun_n_args
+  packs u16; the Zig's 0xffff is unrepresentable).
+- `super()` / `type()` missing args are modelled as None
+  (observed Arg2 error in both cases — the polled model).
+- cast_to_native_base on a subobj-less instance returns None;
+  the Zig reads subobj[0] unconditionally (UB there).
+- A heap-Str class name that is neither static nor in the pool
+  cannot be interned yet (C13 gap, see above).
+- Type hash seeds are arena indices, not the reference binary's
+  link addresses (22815552 / 22810192) — the structure (seed +
+  wrapping sum + tag-wrap) is identical, and hash(()) ==
+  id(()) holds in Rust too now.
+- `new_empty_bytes` returns the singleton, but the .mpy reader's
+  empty-bytes const path is the bridge's job (C13) — literals
+  are const-deduped by the compiler, so `b'' is b''` holds via
+  the const table regardless.
+
+DECISIONS (with Zig line refs)
+------------------------------
+- attr slot (brief §"The attr slot"): TypeData gains
+  attr: Option<AttrFn> (load-only); the three C10a AttrFn fns
+  are wired (fun_bc_attr / bound_meth_attr / closure_attr).
+  AttrFn is load-only — the store path is the free fns
+  instance_store_attr / type_store_attr (-> PyResult<bool>).
+  mp_load_method itself is C14's (runtime.zig:1188), NOT this
+  lane's. (Correction to the C10a report, already in the brief.)
+- ROM registry (brief §"ROM singletons"): Rom { types,
+  issubclass, isinstance } in rom.rs; build_rom(ctx) replaces
+  only the objtype-owned BuiltinTypes fields. Singletons live in
+  BuiltinTypes (empty_tuple, empty_bytes) — the hash seeds read
+  them there. type_ is self-referential (set_header_type);
+  ROM types have base None + mro [self, object].
+- Tuple ADD subclass-fast (brief §"The tuple ADD fix"): the Add
+  arm now checks is_subclass_fast(rhs_type, tuple)
+  (objtuple.zig:185-189) instead of exact-tuple — closes C9c's
+  recorded divergence. A bare Instance rhs is not addable (the
+  Zig's fromObj is UB there; the instance machinery intercepts
+  first in real programs).
+- Hash seeds dynamic: TUPLE_HASH_SEED (const 0) and
+  FROZENSET_HASH_SEED (const 22810192) are REMOVED; tuple_hash
+  seeds from ctx.types.empty_tuple.0, frozenset hash from
+  ctx.types.frozenset.0. C9b/C9c tests updated to seed-relative
+  values (incl. the nested-tuple double-seed,
+  hash(((1,2),)) == 2*seed+3, and the tag-wrap cases).
+- Empty singletons landed: new_tuple(0) -> ctx.types.empty_tuple;
+  new_empty_bytes -> ctx.types.empty_bytes. () is () / tuple()
+  is () / (1,2)*0 is () / bytes() is b'' all hold now.
+- is_type_value (payload check, subclass.rs): "is this a type
+  object" MUST be payload-based, not header-based — the fixture
+  builds types with header None, so is_exact_type(type_) is
+  false for every fixture type. Same check is_subclass already
+  used for classinfo. type_make_new's 1-arg path special-cases
+  type values (-> types.type_).
+- cached_mro correction: the Zig's cachedMro (objtype.zig:961-966)
+  does NOT gate on parent-is-tuple — the Rust first draft did
+  (wrongly), breaking the single-parent-descends-from-MI chain.
+  Removed; the "entry is exactly a tuple" check stays.
+- Seams (VmSeams, seams.rs): the local C13-replacement seam
+  (call / load_maybe / unary / binary / subscr + SubscrError).
+  Stub fidelity limits documented in seams.rs.
+- instance_load_attr returns a single Value (a bound member
+  becomes an allocated BoundMeth; C14's mp_load_method
+  decomposes it back into (fun, self)).
+- load_super_method lives in instance_create.rs (next to
+  super_attr, which it calls), NOT in instance.rs.
+- B.m is the UNBOUND function, C().m is bound (class-lookup
+  convert passes NULL self).
+- A FunBuiltin member on a user type is UNBOUND (BINDS_SELF |
+  BUILTIN_FUN -> staticmethod per convert_member_lookup) — so
+  __init__ test builtins take arity 0, __set_name__ builtins
+  arity 3 ([bound, owner, key]), __new__ builtins arity 1
+  ([type]); a FunBc member DOES bind.
+- property(**{'': 9}) fills getter+setter+deleter all 9 (vendor
+  argcheck looks kw up per slot) — inherited from C9c, unchanged.
+- is_fun: heap obj whose type's NAME == "function"
+  (objtype.zig:349); builtin function types are ALSO named
+  "function" in the Zig (objfun.zig:410,486), so is_fun is TRUE
+  for FunBuiltin values too.
+- empty_dict allocates with header None, so it cannot serve as a
+  class dict (mp_obj_new_type's locals check is a header-type
+  check) — tests use header-typed dicts.
+- NO builtin type has a make_new slot yet (adapters are NOT in
+  this lane's brief — see "NOT DONE" below). type_call_no_make_new
+  pins the fixture's int as make_new-less.
+
+BUGS FOUND BY THE TESTS AND FIXED
+----------------------------------
+- cast_to_native_base was wrong (brief's shape): the Zig is
+  type-based (get_type -> equality -> subclass-fast ->
+  subobj[0]), rewritten to that shape.
+- The class-lookup is_type test expectation was wrong: B.m is the
+  unbound function (Member(m, None)), not bound.
+- instance_print's fallback __repr__ lookup used the wrong slot
+  (Print instead of slot 0) and its member call used call_pair
+  instead of the direct mp_call_function_1(member[0], self).
+- instance_subscr's __missing__ lookup used SlotKind::Subscr
+  instead of slot 0.
+- cached_mro's parent_is_tuple gate (see Decisions).
+- The "base not a type" failures: fixture types have header None
+  (see is_type_value above) — found via temporary eprintln
+  instrumentation, removed before finishing.
+- Fx::new now installs the REAL bound_meth_type_data (the
+  containers fixture's boundmeth is a plain make_type with no
+  call slot — every bound call_pair test failed until fixed).
+- USER_FLAGS (0x021C) does NOT include HAS_SPECIAL_ACCESSORS —
+  the class_c helper ORs it in (mp_obj_new_type's accessor scan
+  would set it).
+- dict_get_value panics on a non-dict value (C8b lesson, re-hit
+  in the typecreate tests via empty_dict's header).
+
+NOT DONE (out of scope for this lane — for C13/C14 or the rebase)
+------------------------------------------------------------------
+- MakeNew adapters into each *_type_data (int/bool/str/bytes/
+  list/tuple/dict/set/range/slice/property/array family):
+  signatures vary (int takes (types, resolver); str takes
+  kwargs; array takes (array_type, bytearray_type)); float/
+  complex have no Rust constructors yet (C18). type_call on a
+  builtin type currently returns CantCreateInstance. C13/C14
+  own this when the VM's type-call path needs it.
+- The __init__-via-wrapper tail-skip branch is untested at this
+  layer (needs a real Python __init__ — C13).
+- The .mpy reader's empty-bytes const path (bridge, C13).
+
+MERGE NOTE (for the main agent)
+-------------------------------
+- Base: 994bba3 (3 merges stale). Master is now c30aa0a
+  (789 tests: C12b 13425ad + C11 c30aa0a landed after this lane
+  branched). REBASE NEEDED: rebase lane/objtype-a onto current
+  master in the worktree, full test in the rebased tree, then
+  git merge --no-ff, full test again (the C9b/C9c/C10a/C11
+  pattern). Expect conflicts in: src/objects/objtype/mod.rs
+  (C12b created its own objtype/mod.rs with 3 modules — UNION
+  the two), src/objects/obj.rs (BuiltinTypes literals — C12b
+  added its fields; C11's namedtuple_fields: None pattern
+  applies to the 12+ TypeData literals this lane added),
+  src/objects/containers/tests.rs (fixture), docs/value-obj-design.md
+  (C12b may have touched D4/D5 too).
+- REBASE TODOs (in rom.rs's module docs too):
+  (1) Replace the local object_type_data stand-in with C12b's
+  object_type_data + install the four object locals
+  (__init__, __new__, __setattr__, __delattr__), then
+  RE-VERIFY the object-inheritance paths (object.__init__ /
+  __new__ / __setattr__ / __delattr__ via the chain).
+  (2) Wire C12b's mp_obj_is_native_exception_instance
+  (objexcept.zig:100) into instance_print's exception branch.
+  (3) Re-verify the C11 namedtuple ADD path end to end (the ADD
+  fix + C11's namedtuple type construction).
+- What C13 consumes: mp_obj_new_type, is_subclass_fast,
+  is_subclass, cast_to_native_base, the Rom registry
+  (build_rom), the attr slot (TypeData.attr), the VmSeams
+  contract (to be replaced by the real Vm), instance_make_new /
+  new_instance / load_super_method, type_call / type_make_new.
+- What C12b owns (do NOT duplicate): objobject.zig,
+  objexcept.zig, objmodule.zig (already merged as 13425ad).
+- What C14 consumes: mp_load_method (reads the attr slot),
+  convert_member_lookup, the type_call slot dispatch.
+- The brief (scripts/objtype_a_brief.md) stays UNTRACKED — do
+  not commit it.

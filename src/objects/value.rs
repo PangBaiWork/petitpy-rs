@@ -16,8 +16,8 @@
 use crate::memory::gc::{GcArena, RootSet};
 use crate::objects::containers::map_set::{set_items, MpSet};
 use crate::objects::slots::{
-    BinaryOpFn, BufferFn, BuiltinFn, BuiltinKwFn, CallFn, GetIterFn, PrintFn, SubscrFn,
-    UnaryOpFn,
+    AttrFn, BinaryOpFn, BufferFn, BuiltinFn, BuiltinKwFn, CallFn, GetIterFn, MakeNewFn,
+    PrintFn, SubscrFn, UnaryOpFn,
 };
 use crate::pyerr::PyResult;
 use crate::vendor::mpz::BigInt;
@@ -233,6 +233,23 @@ pub enum Obj {
     Deque(DequeData),
     AttrTuple(AttrTupleData),
     Map(MapData),
+    /// User-class instance (`mp_obj_instance_t`, objtype.zig).
+    /// `members` is the instance `__dict__` (a `MapData`, not a
+    /// `DictData` — the Zig keeps the raw map); `subobj` holds the
+    /// native-base object(s), 0 or 1 entries (`mp_obj_new_instance`
+    /// asserts fewer than 2 native bases). A bare `object()` result
+    /// is also an `Instance` with an empty map and no subobj: the
+    /// Zig allocates a bare `MpObjBase` for it, but every members
+    /// access goes through the type's `attr` slot, which
+    /// `mp_type_object` does NOT have — so the empty map is
+    /// unreachable and the two are observationally identical
+    /// (probed: `object().__dict__` raises AttributeError,
+    /// `o.x = 1` raises AttributeError). C12 owns.
+    Instance(InstanceData),
+    /// `staticmethod` / `classmethod` wrapper (`MpObjStaticClassMethod`,
+    /// objtype.zig: `newStaticClassMethod`). One payload for both —
+    /// the header type (arena slot `type_`) says which. C12 owns.
+    StaticClassMethod(StaticClassMethodData),
 }
 
 impl Obj {
@@ -265,6 +282,8 @@ impl Obj {
             Obj::Deque(d) => d.items.len() * 8,
             Obj::AttrTuple(a) => a.items.len() * 8,
             Obj::Map(m) => m.alloc * 16 + m.index.len() * 4,
+            Obj::Instance(i) => i.members.alloc * 16 + i.subobj.len() * 8,
+            Obj::StaticClassMethod(_) => 16,
         }
     }
 
@@ -310,9 +329,24 @@ impl Obj {
                 if let Some(b) = t.base {
                     out.push(Value::Heap(b));
                 }
+                if let Some(b) = t.bases {
+                    out.push(Value::Heap(b));
+                }
                 out.push(Value::Heap(t.dict));
                 out
             }
+            Obj::Instance(i) => {
+                let mut out = Vec::with_capacity(i.members.entries.len() * 2 + i.subobj.len());
+                for e in &i.members.entries {
+                    if let Some(k) = e.key {
+                        out.push(k);
+                        out.push(e.value);
+                    }
+                }
+                out.extend(i.subobj.iter().copied());
+                out
+            }
+            Obj::StaticClassMethod(s) => vec![s.fun],
             Obj::Module(m) => vec![Value::Heap(m.dict)],
             Obj::Exception(e) => {
                 let mut out = vec![Value::Heap(e.type_)];
@@ -578,10 +612,27 @@ pub struct TypeData {
     pub flags: u16,
     /// Base class (`Obj::Type` slot), if any.
     pub base: Option<GcRef>,
+    /// Multiple-inheritance bases tuple (`Obj::Tuple` slot), if any.
+    /// Set exactly when the class was created with two or more
+    /// bases (objtype.zig `newTypeImpl`: the parent slot holds the
+    /// bases tuple itself); `base` is `None` then. Single-parent
+    /// classes keep `base` and leave this `None`.
+    pub bases: Option<GcRef>,
     /// C3 linearization (type slots, self first).
     pub mro: Vec<GcRef>,
     /// Type dict (`Obj::Dict` slot).
     pub dict: GcRef,
+    /// Attribute-access slot (`mp_obj_type_t.attr`, C12 adds it —
+    /// C10's `AttrFn`, load-only). `None` where the Zig type has
+    /// no attr slot.
+    pub attr: Option<AttrFn>,
+    /// Constructor slot (`mp_obj_type_t.make_new`, C12 adds it).
+    /// `fn(ctx, type, args, n_kw)` — `args` holds `n_args`
+    /// positionals followed by `2 * n_kw` `(name, value)` keyword
+    /// pairs (the `CallFn` layout). `None` where the Zig type has
+    /// no make_new slot; builtin constructors are wired by their
+    /// owning lanes via thin adapters.
+    pub make_new: Option<MakeNewFn>,
     pub unary_op: Option<UnaryOpFn>,
     pub binary_op: Option<BinaryOpFn>,
     pub call: Option<CallFn>,
@@ -652,6 +703,25 @@ pub struct PropertyData {
 pub struct SuperData {
     pub type_: GcRef,
     pub obj: Value,
+}
+
+/// User-class instance (`mp_obj_instance_t`). C12 owns.
+#[derive(Clone, Debug)]
+pub struct InstanceData {
+    /// Instance `__dict__` (raw map, not a dict object).
+    pub members: MapData,
+    /// Native-base object(s): 0 or 1 entries. `[wrapper]` (the
+    /// `native_base_init_wrapper` builtin) means "not initialised
+    /// yet"; a real object means initialised; empty means the class
+    /// has no native base at all.
+    pub subobj: Vec<Value>,
+}
+
+/// `staticmethod` / `classmethod` wrapper (`MpObjStaticClassMethod`).
+/// C12 owns.
+#[derive(Clone, Debug)]
+pub struct StaticClassMethodData {
+    pub fun: Value,
 }
 
 /// Generic iterator state; specific iterators (enumerate/zip/filter/…)

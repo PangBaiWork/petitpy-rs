@@ -5,10 +5,12 @@
 //! empty-tuple object's address, 22815552 in the reference binary
 //! (`hash((1,2)) == 22815555`, `hash((None,)) == 22815558`,
 //! `hash(('a',)) == 22862084`, `hash((2**62-1, 2**62-1)) ==
-//! 22815550`). Rust seeds with 0 (see the `objtuple.rs` module
-//! docs), so the values asserted here are the seed-0 versions:
-//! `hash(()) == 0`, `hash((1,2)) == 3`, `hash((None,)) == 6`,
-//! `hash(('a',)) == 46532`, `hash((2**62-1, 2**62-1)) == -2`.
+//! 22815550`). Rust seeds with the empty tuple's arena index
+//! (C12a — the singleton landed), so the values asserted here
+//! are the seed-relative versions: `hash(()) == seed`,
+//! `hash((1,2)) == seed + 3`, `hash((None,)) == seed + 6`,
+//! `hash(('a',)) == seed + 46532`,
+//! `hash((2**62-1, 2**62-1)) == seed - 2`.
 //! The *structure* (seed + wrapping sum, `newSmallInt` tag-wrap)
 //! is what is under test.
 //!
@@ -186,28 +188,37 @@ fn tuple_hash_values() {
         let mut c2 = fx.ctx();
         Value::int(&mut c2.arena, Some(int_t), &c2.roots, 1i64 << 62)
     };
+    // Seed = the empty tuple's identity word (C12a — the Zig
+    // uses its address, 22815552 in the reference binary;
+    // `hash(()) == id(())` holds in Rust too now). Hoisted
+    // before the `ctx` borrow below.
+    let seed = fx.types.empty_tuple.0 as i64;
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-    // Seed 0: `hash(()) == 0`, `hash((1,2)) == 3`.
-    assert_eq!(tuple_hash(ctx, &[]).unwrap(), 0);
-    assert_eq!(tuple_hash(ctx, &ints(&[1, 2])).unwrap(), 3);
-    assert_eq!(tuple_hash(ctx, &ints(&[1])).unwrap(), 1);
-    assert_eq!(tuple_hash(ctx, &[Value::None]).unwrap(), 6);
+    assert_eq!(tuple_hash(ctx, &[]).unwrap(), seed);
+    assert_eq!(tuple_hash(ctx, &ints(&[1, 2])).unwrap(), seed + 3);
+    assert_eq!(tuple_hash(ctx, &ints(&[1])).unwrap(), seed + 1);
+    assert_eq!(tuple_hash(ctx, &[Value::None]).unwrap(), seed + 6);
     assert_eq!(
         tuple_hash(ctx, &[Value::Bool(true), Value::Bool(false)]).unwrap(),
-        1
+        seed + 1
     );
-    // `hash(('a',)) == 46532` (qstr hash, no str slot needed —
+    // `hash(('a',)) == seed + 46532` (qstr hash, no str slot needed —
     // `hash_of` fast-paths str/bytes).
-    assert_eq!(tuple_hash(ctx, &[a]).unwrap(), 46532);
-    assert_eq!(tuple_hash(ctx, &[ab]).unwrap(), 28198);
-    // `hash((2**62-1, 2**62-1)) == -2` — the `newSmallInt`
+    assert_eq!(tuple_hash(ctx, &[a]).unwrap(), seed + 46532);
+    assert_eq!(tuple_hash(ctx, &[ab]).unwrap(), seed + 28198);
+    // `hash((2**62-1, 2**62-1)) == seed - 2` — the `newSmallInt`
     // tag-wrap (probe: 22815550 with seed 22815552).
     let big = Value::SmallInt((1i64 << 62) - 1);
-    assert_eq!(tuple_hash(ctx, &[big, big]).unwrap(), -2);
-    assert_eq!(tuple_hash(ctx, &[big]).unwrap(), (1i64 << 62) - 1);
-    // Nested tuples compose: `hash(((1,2),)) == hash((1,2)) == 3`.
-    assert_eq!(tuple_hash(ctx, &[inner]).unwrap(), 3);
+    assert_eq!(tuple_hash(ctx, &[big, big]).unwrap(), seed - 2);
+    assert_eq!(
+        tuple_hash(ctx, &[big]).unwrap(),
+        wrap_small_int(seed + ((1i64 << 62) - 1))
+    );
+    // Nested tuples compose through the slot, so the seed counts
+    // twice: `hash(((1,2),)) == seed + hash((1,2)) == 2*seed + 3`
+    // (reference probe: 45631107 = 22815552 + 22815555).
+    assert_eq!(tuple_hash(ctx, &[inner]).unwrap(), seed + (seed + 3));
     // A heap-int element hashes through its slot; the tuple
     // hash is the seed plus that element hash, wrapped through
     // `newSmallInt`. NOTE: the element hash itself currently
@@ -220,12 +231,12 @@ fn tuple_hash_values() {
     // probed). That is a C7 divergence, NOT this lane's to
     // fix — but it cancels out at the tuple level: the
     // reference's tuple hash is `seed + (-(2**62))`, and
-    // Rust's is `wrap_small_int(0 + 2**62) == -(2**62)`,
-    // the same final value. Recorded for the main agent.
+    // Rust's is `wrap_small_int(seed + (-(2**62)))`, the
+    // same final value. Recorded for the main agent.
     let types = ctx.types;
     let eh =
         crate::objects::containers::map::hash_of(ctx, types, huge).unwrap() as i64;
-    assert_eq!(tuple_hash(ctx, &[huge]).unwrap(), wrap_small_int(eh));
+    assert_eq!(tuple_hash(ctx, &[huge]).unwrap(), wrap_small_int(seed.wrapping_add(eh)));
     assert_eq!(wrap_small_int(eh), -(1i64 << 62));
 }
 
@@ -543,5 +554,7 @@ fn tuple_type_data_slots() {
     f(ctx, t, crate::objects::slots::PrintKind::Repr, &mut s);
     assert_eq!(s, "(1, 2)");
     let h = data.unary_op.unwrap()(ctx, UnaryOp::Hash, t).unwrap();
-    assert_eq!(h, Value::SmallInt(3));
+    // The HASH slot returns the seed-relative value (C12a).
+    let seed = fx.types.empty_tuple.0 as i64;
+    assert_eq!(h, Value::SmallInt(seed + 3));
 }

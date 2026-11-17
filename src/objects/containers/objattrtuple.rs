@@ -130,6 +130,9 @@ pub fn attrtuple_type_data(dict: GcRef) -> TypeData {
         subscr: Some(tuple_subscr),
         buffer: None,
         print: Some(attrtuple_print),
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }

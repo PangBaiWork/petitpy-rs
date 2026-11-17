@@ -604,6 +604,9 @@ pub fn list_type_data(dict: GcRef) -> TypeData {
                 list_print(ctx, value, kind, sink)
             },
         ),
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }

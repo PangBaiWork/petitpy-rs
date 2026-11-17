@@ -77,6 +77,9 @@ fn make_type_with_print(
         subscr: None,
         buffer: None,
         print: Some(print),
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     };
     arena.alloc(None, Obj::Type(data), roots)
@@ -97,6 +100,9 @@ pub(crate) fn make_type(arena: &mut GcArena, roots: &RootSet, name: &[u8]) -> Gc
         subscr: None,
         buffer: None,
         print: None,
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     };
     arena.alloc(None, Obj::Type(data), roots)
@@ -167,9 +173,27 @@ impl Fixture {
             &roots,
         );
         let type_ = make_type(&mut arena, &roots, b"type");
+        // C12: the object/super/staticmethod/classmethod/boundmeth
+        // types and the ROM `()` singleton (plain types here — the
+        // objtype tests overwrite them with the real ROM types).
+        let object = make_type(&mut arena, &roots, b"object");
+        let super_ = make_type(&mut arena, &roots, b"super");
+        let staticmethod = make_type(&mut arena, &roots, b"staticmethod");
+        let classmethod = make_type(&mut arena, &roots, b"classmethod");
+        let boundmeth = make_type(&mut arena, &roots, b"bound_method");
+        let property = make_type(&mut arena, &roots, b"property");
+        let empty_tuple = arena.alloc(Some(tuple), Obj::Tuple(vec![]), &roots);
+        let empty_bytes = arena.alloc(
+            Some(bytes),
+            Obj::Bytes(BytesData { bytes: Vec::new() }),
+            &roots,
+        );
+        let native_init_wrapper = make_type(&mut arena, &roots, b"function");
         for t in [
             int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset,
-            range, array, bytearray, memoryview, dict, type_, gen_instance,
+            range, array, bytearray, memoryview, dict, type_, gen_instance, object, super_,
+            staticmethod, classmethod, boundmeth, property, empty_tuple, empty_bytes,
+            native_init_wrapper,
         ] {
             roots.push(Value::Heap(t));
         }
@@ -188,6 +212,15 @@ impl Fixture {
             range,
             dict,
             type_,
+            object,
+            super_,
+            staticmethod,
+            classmethod,
+            boundmeth,
+            property,
+            empty_tuple,
+            empty_bytes,
+            native_init_wrapper,
         };
         Fixture {
             arena,

@@ -7,7 +7,7 @@
 use std::fmt;
 
 use crate::memory::gc::CallCtx;
-use crate::objects::value::Value;
+use crate::objects::value::{GcRef, Value};
 use crate::pyerr::PyResult;
 
 // ── Method-slot fn types (mirror `mp_obj_type_t` slots) ─────────────
@@ -224,6 +224,14 @@ pub type BinaryOpFn = for<'a> fn(&mut CallCtx<'a>, BinaryOp, Value, Value) -> Py
 /// nothing breaks. Same process as C6's op-parameter amendment.
 pub type CallFn =
     for<'a> fn(&mut CallCtx<'a>, Value, usize, usize, &[Value]) -> PyResult<Value>;
+/// `fn(&mut CallCtx, Value, n_args, n_kw, &[Value]) -> PyResult<Value>` —
+/// make_new slot (`mp_make_new_fun`, vendor `py/obj.h`): construct an
+/// instance of `type` from `args` (positionals followed by `2 * n_kw`
+/// `(name, value)` keyword pairs — the `CallFn` layout). C12 adds it;
+/// builtin constructors are wired by their owning lanes via thin
+/// adapters (their native signatures vary — see each `*_make_new`).
+pub type MakeNewFn =
+    for<'a> fn(&mut CallCtx<'a>, GcRef, &[Value], usize) -> PyResult<Value>;
 /// `fn(&mut CallCtx, Value) -> PyResult<Value>` — getiter slot.
 pub type GetIterFn = for<'a> fn(&mut CallCtx<'a>, Value) -> PyResult<Value>;
 /// Built-in function body (fixed-arity and var-no-kw builtins).

@@ -1,0 +1,159 @@
+# Lane C8a 结果 — port objstr part 1 (Zig 行 1–2080) to Rust
+
+- 工作区：`~/workspace/petitpy-rs-strings`，分支 `lane/strings-a`，基线 master `dda16a5`
+- 原项目：`~/workspace/petitpy-orig`，devel HEAD `df7de3a`（只读，未修改；`git status` 干净）
+- 状态：代码 + 测试全部完成，待主 agent 独立验证后合并（合并顺序：C7 先，C8a 后）
+- Commit: `74d0c36` "Lane C8a: port objstr part 1 to Rust"（11 files, +4046）——注：此 hash 为 amend 前的 HEAD；最终 HEAD hash 见 lane 执行者的最终报告（文件内容含自身 hash，无法在一次提交内自洽；主 agent 合并时可顺手改此行）
+
+## 验收数字
+
+- `cargo test --release --lib --tests`：**349 passed, 0 failed, 1 ignored**（基线 318 + 新增 31）
+- `cargo test --release --bins`：**9 passed**
+- `cargo build --release`：**0 warnings**
+- 无 `unsafe`（`src/objects/strings/` 内只有 2 处 doc 注释提到 unsafe 一词，无 unsafe 代码）
+- 纯 std；每个文件 <800 行；只改了 `src/objects/mod.rs` 一行（`pub mod strings;`），其余全是 `src/objects/strings/` 下的新文件
+- 新增单测 **31 个**（brief 要求 ≥25）：`objstr_tests.rs` 16 个 + `objstr_tests_b.rs` 13 个 + `unicode.rs` 2 个
+
+## 文件（行数）
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `src/objects/strings/mod.rs` | 22 | 模块声明 + C8a/C8b/C8c 分工注释 |
+| `src/objects/strings/unicode.rs` | 204 | `unichar_*`（ASCII 表）+ utf8 walkers + `xdigit_value`；2 个单测 |
+| `src/objects/strings/objstr_a.rs` | 764 | prelude：`StrError`、数据访问、构造器、索引/切片 helpers、`INSTALLED_TYPES`/`PENDING_STR_ERROR` cells |
+| `src/objects/strings/objstr_iters.rs` | 86 | str/bytes 迭代器（从 objstr_a 拆出，因 objstr_a 超 800 行） |
+| `src/objects/strings/objstr_methods_a.rs` | 611 | find 系、startswith/endswith、replace、join、split/rsplit、strip |
+| `src/objects/strings/objstr_methods_b.rs` | 502 | case/is*、zfill、hex/fromhex、print、TypeData、`builtin_method!` + 28 个 `*_builtin` wrapper |
+| `src/objects/strings/objstr_methods_c.rs` | 646 | binary_op、subscr、unary_op、get_buffer、make_new（str/bytes）、`KwArg`/`kw_make_new` |
+| `src/objects/strings/objstr_tests.rs` | 621 | fixture + 构造/binary_op/subscr/unary 测试（16 个） |
+| `src/objects/strings/objstr_tests_b.rs` | 433 | find/replace/join/split/strip/case/hex/print/TypeData/迭代器测试（13 个） |
+| `src/objects/mod.rs` | +1 行 | `pub mod strings;` |
+
+与 brief 计划的划分差异（brief 允许“文件划分可按实际调整”）：方法按逻辑拆成 methods_a/b/c 三个文件 + 迭代器独立成 objstr_iters.rs；测试拆成两个文件（原单文件 1038 行超 cap）。C8b 文件另起名（objstr_b.rs 等），不重名不重叠。
+
+## 1:1 映射（Zig → Rust；行号均为 objstr.zig，另有说明的除外）
+
+### prelude（Zig 1–463）→ `objstr_a.rs` + `unicode.rs`
+
+- excBadImplicitConv / excSubstrNotFound / excValueOutOfRange / excJoinType / excEmptySep / excNonHexDigit / excRsplitNone / excNegLen / excWrongArgs / excBadFormatStr 等异常构造器 → `StrError` enum（`exc_type()` + `message()`；文本逐字对照 `pyerr.zig`）
+- `mp_obj_new_str`（Zig 3155，C8b 范围的定义，本 lane 复用其语义：static-qstr 命中则返回 qstr，否则 fresh copy）→ `new_str`
+- `mp_obj_new_str_of_type`（3169）→ `new_str_of_type`
+- `mp_obj_new_str_via_qstr`（3096）→ `new_str_via_qstr`（动态 interning 延后到 C13：非 static 内容目前建 heap str）
+- `mp_obj_new_bytes`（3100）→ `new_bytes`；`mp_const_empty_bytes_obj` → `new_empty_bytes`（fresh heap 对象，**不是** ROM 单例——`b'' is b''` 差异待 C12）
+- `mp_obj_str_equal`（3276）→ 未单独移植（C6 的 `obj_equal` 已覆盖比较路径；qstr/qstr 的 id 相等语义在 `new_str` 的 static interning 中复用）
+- `str_index_to_ptr`（Zig 942 nano / 961 full；C8a 用 full）→ `str_index_to_ptr`（完整分支：bytes 经 C6 `get_index`；str 经 UTF-8 码点 walk，str 专属报错文本）
+- `mp_obj_slice_indices`（vendor `py/objslice.c:129-187`）→ `slice_indices`；`mp_seq_get_fast_slice_indexes`（vendor `py/sequence.c:48-64`）→ `fast_slice_indexes`；`sliceCount`（Zig 400）→ `slice_count`；`npyStrListFinalizeRsplit`（Zig 305）→ rsplit 的 right-to-left 构建 + flatten（等价于原文的 shift-down）
+- `unicode.zig` 的 `unichar_*` / `utf8_next_char` / `utf8_charlen` / `utf8_ptr_to_index` → `unicode.rs`（`utf8_get_char` 未移植——本范围无调用方）
+- `mp_obj_str_get_data`（3321）/ `get_str` / `get_qstr` → `str_data`（str/bytes 统一读数据；C8b 的 get 系列若需更细语义再对原文）
+
+### 迭代器 → `objstr_iters.rs`
+
+- `str_it_iternext`（464）/ `mp_obj_new_str_iterator`（478）→ `str_iter_next` / `new_str_iterator`
+- `bytes_it_iternext`（487）/ `mp_obj_new_bytes_iterator`（499）→ `bytes_iter_next` / `new_bytes_iterator`
+- 迭代器构造时取显式 `iter_type: Option<GcRef>`（polymorph-iter 类型是 C12 的；getiter 槽接线延后）
+
+### print → `objstr_methods_b.rs`
+
+- `mp_str_print_quoted`（577）→ `str_print_quoted`（引号规则等价形式：含单引号且无双引号时用 `"`；非 ASCII str 段整段 UTF-8 输出，绝不经 Latin-1）
+- `str_print`（621）→ `str_print` 槽（RAW；str + PRINT_STR → raw；其余 `b` 前缀 + quoted；raw 分支经 `from_utf8_lossy`——非 UTF-8 bytes 会退化为 U+FFFD，已知 C6 文本 sink 局限）
+
+### 查找 / 方法 → `objstr_methods_a.rs`
+
+- `find_subbytes`（514）→ `find_subbytes`
+- `strFinderImpl`（724）→ `str_finder`（direction + is_index；str 报码点索引，bytes 报字节偏移）
+- `str_find`（769）/ `str_rfind`（772）/ `str_index`（775）/ `str_rindex`（778）→ 同名方法 fn（`args[0]` = self，`fun_builtin_var` 约定）
+- `str_startswith`（810）/ `str_endswith`（813）→ `str_startendswith` + 同名方法 fn（前缀**不做类型检查**，纯 memcmp；tuple 前缀经 payload 检查）
+- `str_replace`（1306）→ `str_replace` + `replace_pass`（两遍；空 old 先在 index 0 插入、之后每字符后插入；`occ += 1` 与原文循环一致）
+- `str_join`（1469）→ `str_join`（经共享 `iter_items`；元素类型 != self 类型 → JoinType）
+- `strSplitImpl`（1473）/ `mp_obj_str_split`（1536）→ `str_split`（sep=None 走空白切分；sep 给定时 `str_check_arg_type`，空 → EmptySeparator）
+- `strRsplitImpl`（1540）/ `str_rsplit`（1593）→ `str_rsplit`（n_args<3 或 splits<0 时委托 split；sep=None → RsplitNone；**不**类型检查 sep，与 split 不同）
+- `strUniStrip`（1601）→ `str_uni_strip` + `str_strip`/`str_lstrip`/`str_rstrip`（L/R/S walk + first/last-good-char + early break；`ws = " \t\n\r\x0b\x0c"`）
+
+### binary_op / subscr / unary / buffer → `objstr_methods_c.rs`
+
+- `mp_obj_str_binary_op`（934）→ `binary_op_inner` + `str_binary_op` 槽（MODULO → `None`，C8b；MULTIPLY 经 `obj_get_int_maybe`（None → NULL，Err → 专属错）；n<=0 → 空 str Qstr / 空 bytes；rhs 数据：同类型 → data，bytes lhs + buffer 可读 rhs → buffer 数据，否则 CONTAINS 报错 / NULL；ADD 空操作数捷径返回操作数本身；CONTAINS 经 `find_subbytes`；比较经 `seq_cmp_bytes`）
+- `mp_seq_cmp_bytes`（vendor `py/sequence.c:90-130`）→ `seq_cmp_bytes`（EQUAL 且长度不同 → false；LESS/LESS_EQUAL 换位成 MORE/MORE_EQUAL；memcmp + 长度 tiebreak）
+- `npyStrSliceLoad`（407）→ `slice_load_bytes` / `slice_load_str`（见“测试发现的 bug”）
+- `bytesSubscrImpl`（1017）/ `strSubscrImpl`（1045）/ `str_subscr`（1099）→ `subscr_inner` + `str_subscr` / `bytes_subscr` 槽（只读 load；set/del → `None`；切片走 loaders；非切片 bytes/ASCII-str 经 C6 `get_index`——通用报错文本；非 ASCII str 经 `str_index_to_ptr`——str 专属文本；bytes → small-int byte，str → 1-char str 经 `new_str_via_qstr`）
+- `str_unary_op_full`（3624）→ `str_unary_op` 槽（BOOL → 字节长度 != 0，LEN → utf8_charlen，其余 NULL；**bytes 类型无 unary_op 槽**）
+- `mp_obj_str_get_buffer`（2083–2090）→ `str_get_buffer` 槽（仅精确 `MP_BUFFER_READ` 成功；填 data/len/typecode `'B'`）
+- `makeNewDefaultBytes`（1705）→ `make_new_default_bytes`（static-qstr 快路径）
+- `bytesMakeNewStrArg`（1726）→ bytes_make_new 的 str-arg 分支
+- `makeNewCase1`（1823）→ `make_new_case1`（经 C6 `obj_print_helper` PRINT_STR 打印参数）
+- `makeNewDefaultOther`（1837）→ `make_new_default_other`（buffer 经 `buffer_data`；空 → 空 qstr；非 buffer → `BufferProtocol`）
+- `mp_obj_str_make_new`（1860）→ `str_make_new`（0..3 args，TERSE "argument num/types mismatch"；kwargs 见 `kw_make_new`）
+- `bytesMakeNewImpl`（1871）→ `bytes_make_new`（0 args → 空 bytes；arg0 bytes → 原样返回；arg0 str → 需 2–3 args 否则 WrongArgs；n_args>1（非 str）→ WrongArgs；small int → 零填充（负数 → NegLen ValueError 无消息）；buffer → bytes；其余走 iterable 路径）
+- `bytesHexImpl`（1963）/ `mp_obj_bytes_hex`（2007）/ `bytes_hex_as_str`（2011）→ `bytes_hex`（空数据时**无论 type_in 一律返回空 bytes**，已探针确认的 quirk；sep 取首字节，空 sep → NUL）
+- `bytesFromHexImpl`（2015）/ `mp_obj_bytes_fromhex_var`（2076）→ `bytes_fromhex`（空白/sep 只在 pair 起点跳过；`NonHexDigit`；`FromHexSepLen`）
+
+### case / 谓词 / zfill → `objstr_methods_b.rs`
+
+- `strCaseconv`（1126）→ `str_caseconv` + `str_lower`（1139）/ `str_upper`（1142）/ `str_title`（1149）/ `str_capitalize`（1172）
+- `strUniIstype`（1234）→ `str_uni_istype` + `str_predicate!` 宏（`str_isspace`/`isalpha`/`isdigit`/`isupper`/`islower`/`isalnum`；isupper/islower 走 alpha-only 路径）
+- `str_zfill`（1190）→ `str_zfill`（width<=len → self；负 width → self，见“有意分歧”）
+- case/谓词均为**字节级** `unichar_*`（ASCII-only，c<128 guard；非 ASCII 字节在大小写转换中原样通过，在谓词中返回 False）
+
+### 类型 → `objstr_methods_b.rs`
+
+- `mp_type_str`（3647–3683，full）/ `mp_type_bytes`（3708–3736，full）→ `str_type_data(name, dict)` / `bytes_type_data(name, dict)`（flags 0；base None、mro 空——C12 的；getiter `None`——TODO C12 polymorph-iter 类型；str 有 unary_op，bytes 没有）
+- `str_make_new` / `bytes_make_new` 是普通 `(ctx, types, type_, args, kwargs)` fn，由 C12 的 type-call 路径直接调用——冻结的 `TypeData` 上**没有 `make_new` 字段**（全仓 grep 确认无 `make_new` 字段）
+- `*_builtin` wrapper（28 个，宏 `builtin_method!`）：把 `(ctx, types, args)` 方法适配成冻结的 `BuiltinFn`；C10/D1 将其填入 `FunBuiltinData.func`
+- objstr.zig 中**没有 `swapcase`**（全文件 grep 确认，不在方法表里）；`str_count` / `str_partition` / `str_rpartition` / `str_ljust` / `str_rjust` / `str_center` / `str_format` / `str_encode` / `bytes_decode` / `str_splitlines`（2081 行起）是 C8b 范围
+
+## C8b 交界面（prelude 导出清单——C8b 从本 lane import，勿复制）
+
+`objstr_a.rs` 公开：`StrError`、`StrExc`（`exc_type()` / `message()`）、`str_data`、`is_str_value` / `is_bytes_value`、`is_str_type` / `is_bytes_type`、`str_check_arg_type`、`static_qstr_id`、`find_static_qstr`、`new_str`、`new_str_of_type`、`new_str_via_qstr`、`new_bytes`、`new_empty_str`、`new_empty_bytes`、`find_subbytes`、`str_index_to_ptr`、`BoundSlice`、`slice_indices`、`fast_slice_indexes`、`slice_count`、`INSTALLED_TYPES`、`install_builtin_types`、`installed_types()`、`PENDING_STR_ERROR`、`slot_raise`、`take_pending_str_error`、`clear_pending_str_error`、`result_type`、`buffer_data`、`iter_items`、`KwArg`、`kw_make_new`、`seq_cmp_bytes`（methods_c）、`SlotResult`（methods_c）、`str_type_data` / `bytes_type_data`（methods_b）、`str_print_quoted`（methods_b）、`new_str_iterator` / `new_bytes_iterator` / `str_iter_next` / `bytes_iter_next` / `str_charlen`（objstr_iters）。
+
+## 测试（31 个新增；全部期望值均在参考二进制上探针确认，或逐字对照原文）
+
+- 构造：`str_make_new_empty/case1/bytes_arg/arg_count/kwargs`、`bytes_make_new_forms/iterable`（7）
+- binary_op：`binary_op_add/multiply/contains`、`seq_cmp_bytes_cases`、`binary_op_slot_and_pending`（5）
+- subscr：`subscr_index/slice`、`subscr_dispatch_and_pending`、`unary_op_len_bool`（4）
+- find/startswith：`find_family`、`startswith_endswith`（2）
+- replace/join/split/strip：`replace_cases`、`join_cases`、`split_cases`、`strip_cases`（4）
+- case/谓词/zfill：`case_methods`、`zfill_cases`、`predicates`（3）
+- hex/fromhex：`hex_fromhex`（1）
+- print：`print_str_repr`（1）
+- TypeData：`type_data_slots`（1）
+- 迭代器：`str_bytes_iterators`（1）
+- unicode：`unicode.rs` 内 2 个
+- Fixture：手建 plain 类型 + 真实 str/bytes `TypeData`（fresh 空 dict），`install_builtin_types(types)` 后经 C6 `obj_subscr` / `obj_binary_op` / `obj_len_maybe` / `obj_is_true` 分发；int/bool/none 类型带测试专用 print stub（顶替 C7/C12 的真实 print 槽，仅测 make_new 的接线）。`str(123)` / `str(None)` / `str(True)` 经 stub 测通；int/float/list 等的真实 print 槽到位后 make_new_case1 无需改动。
+
+## 测试发现的真 bug（已修复）
+
+- `slice_load_bytes` 慢速路径误用了 `fast_slice_indexes` 的 bounds：`fast_slice_indexes` 对负 step 做 `stop += 1`，`slice_count` 不能看到调整后的 stop。`"abc"[::-1]` 返回了 `"cb"` 而非 `"cba"`。修复：慢速路径改用 `slice_indices` 重新解析（与 `slice_load_str` 已有做法一致）。修复后 `[::-1]` / `[::-2]` / `[3:0:-1]` / bytes `[::-1]` 全部正确。
+- `find_family` 的一个期望值写错：`"abc".find("b", 2)` 我最初按旧探针记录写成 4；重新对参考二进制探针确认是 **-1**（`"abc".find("bc",2)` 也是 -1；`"abc".find("bc",1)`=1，`"abc".find("c",2)`=2）。旧记录有误，以本次新鲜探针为准；实现本身是对的。
+
+## 有意分歧（原文在参考二进制上崩溃 rc=134，Rust 抛 intended error / 返回 self）
+
+- `str(1,2,3,4)` / `str(123,'utf-8')`：Zig 的 void `mp_arg_check_num_sig` 未能阻止执行，`makeNewDefaultOther` 忽略 `mp_get_buffer` 失败，读垃圾指针进 qstr hash → 崩溃。Rust：`str_make_new` 对 4 args 抛 `ArgNumTypesMismatch`；`str(123,'utf-8')` 抛 TypeError "object with buffer protocol required"。
+- `b'ab'.hex(1)`：Zig panic "incorrect alignment"（small int 当指针读）。Rust：`bytes_hex` 对非 str/bytes sep 走 `str_check_arg_type` 报错。
+- `"abc".strip(1)`：`strUniStrip` 在 `str_check_arg_type` 后不查 pending_exc，把 int 当 `MpObjStr` 读 → misaligned-pointer panic。Rust：`str_strip` 抛 TypeError "can't convert to str implicitly"。
+- `"abc".zfill(-1)`：Zig panic "integer does not fit in destination type"（负 isize → usize 的 @intCast）。Rust：`str_zfill` 对负 width 返回 self。
+- `str(1,2,3,4)` 之外的多参路径：`str('a','b','c','d')` 原文正常抛 "argument num/types mismatch"（与 crash 路径不同，`str_make_new` 的 sig check 在该路径生效）；`bytes('a','b','c','d')` / `bytes(1,2)` 原文显式抛 "wrong number of arguments"——两者文本不同，均已探针确认并分别实现（`ArgNumTypesMismatch` vs `WrongArgs`）。
+
+## 设计决策（本 lane 内部；冻结接口未动）
+
+- 方法 fn 取 `(ctx, types, args)`（C6 前例）；槽 fn 只有 `ctx`，经 `INSTALLED_TYPES` thread-local 取 `&BuiltinTypes`（仿 C6 测试 harness 的 `TEST_TYPES` 前例）。C13 扩充 `CallCtx` 后以 `CallCtx` 携带的引用替换该 cell。
+- `PENDING_STR_ERROR: Cell<Option<(StrExc, Option<&'static str>)>>` 是 Zig `pyerr.pending_exc` 全局的替身，待 C13 落地 `VmState.pending_exc`（设计文档 D7）。槽抛专属错时先 `slot_raise(e)` 再返 `PyRaise`；槽返 NULL（原文）时不记任何东西。
+- **已知缺口（C13）**：C6 的 `call_unary` / `call_binary` / `call_subscr` 把每个槽的 `PyRaise` 都折成 `SlotOutcome::NotImplemented`，`obj_subscr` 再抛通用 `ObjError::NotSubscriptable`（"object isn't subscriptable"）——如 `"abc"[5]` 在分发层会表现为 TypeError 而非 IndexError "string index out of range"，直到 C13 让 wrapper 查 pending cell。专属 (type, message) 保存在 cell 里，可经 `take_pending_str_error()` 测到；测试 `subscr_dispatch_and_pending` 同时断言了分发层的通用错和 cell 里的专属错，把该缺口钉死。
+- `BuiltinFn` wrapper 从 installed cell 取 types；VM 如何把 types 线程进方法是 C10/D1 的接口问题，本 lane 不改冻结签名。
+- `KwArg { name: u32, value: Value }` 是最小临时形态（只有关键字名有意义——encoding/errors 的值原文解析后忽略）；运行时调用协议（C10/C13）拥有规范的 kwargs 表示。
+- `buffer_data`：str/bytes 经 `str_data` 读；非 str/bytes 对象的 buffer 没有安全读取器（`BufferInfo` 里的裸指针需 `unsafe` 读，全仓无 `from_raw_parts`）→ 报 `BufferProtocol`（已文档化的 C9 缺口；今天 str/bytes 是仅有的 buffer 提供方，C9 在 array/bytearray 落地时加安全拷贝）。
+- 借用模式（本 lane 3 次踩到）：`str_data` 返回借 arena 的 `&[u8]`，任何分配调用前需先拷到 owned `Vec`，或先抽出借用再分配。
+- `str_print_quoted` 引号规则用等价形式：含单引号且无双引号时用 `"`（Zig 的 early-exit 扫描给出同一结论）。
+- TERSE 纠正：`mp_arg_error_terse_mismatch` = TypeError **"argument num/types mismatch"**（vendor `py/argcheck.c:141`；`terse()` 在 argcheck.zig:34-37 经 `makeTerseExc()` 构建）；`bytesMakeNewImpl` 里的显式 `raiseWrongArgs()` = **"wrong number of arguments"**。两者不同，均已探针确认。
+- `subscr_inner` 由 private 改为 `pub(crate)`（仅供本 lane 测试直接调用；冻结接口无 `subscr_inner`，不影响 C0/C6）。
+
+## 探针记录（参考二进制 `~/workspace/petitpy-orig/zig-out/bin/petitpy`；本次会话新探针）
+
+- `b''.hex()` → `b''`（bytes，非 str）；`b'ab'.hex()` → `'6162'`；`b'ab'.hex(' ')` → `'61 62'`；`b'ab'.hex('')` → `'61\x0062'`；`b'' is b''` → True；`b'ab' * 0 is b''` → True；`'abc' * 0 is ''` → True
+- `b'a' + 'b'` → `b'ab'`（buffer 路径已确认）；`'a' + b'b'` → TypeError unsupported types for __add__（VM 消息，槽返 NULL）；`b'a' in 'b'` → TypeError can't convert to str implicitly；`'a' in b'ab'` → True
+- `str(b'ab','utf-8')` → `'ab'`；`str('a','utf-8')` → `'a'`；`str(encoding='utf-8')` → "argument num/types mismatch"；`str('a', errors='strict')` → `'a'`；`str(object='a')` → `'a'`；`str(object=b'ab')` → `"b'ab'"`；`str(bytearray(b'ab'))` → `"bytearray(b'ab')"`
+- `bytes(b'ab') is b'ab'` → True；`bytes('ab','utf-8')` → `b'ab'`；`bytes('ab')` → "wrong number of arguments"；`bytes(0)` → `b''`；`bytes(-1)` → ValueError（空消息）；`bytes([1,2,3])` → `b'\x01\x02\x03'`；`bytes((1,2))` → `b'\x01\x02'`；`bytes(range(3))` → `b'\x00\x01\x02'`；`bytes({})` → `b''`；`bytes({'a':1})` → TypeError can't convert to int；`bytes(True)` / `bytes(False)` → TypeError object not iterable（bool 在 Zig repr 里不是 small int）；`bytes([True, False])` → `b'\x01\x00'`；`bytes(b'ab','utf-8')` → `b'ab'`；`bytes(bytearray(b'ab'))` → `b'ab'`；`bytes(source=[1,2])` → `b'\x01\x02'`；`bytes(source=5)` → `b'\x00\x00\x00\x00\x00'`
+- `'a' * True` → `'a'`；`'a' * 2.5` → TypeError unsupported types for __mul__；`2 * 'a'` → `'aa'`（反射乘法，VM 分发，C14）；`b'a' * True` → `b'a'`
+- `'' + ''` → `''`；`b'' + b'a'` → `b'a'`；`'abc' in 'xabcx'` → True；`'abc' in 'x'` → False；`b'bc' in b'abc'` → True
+- `'a' < 'b'` True；`'abc' <= 'abc'` True；`'abc' > 'ab'` True；`b'a' == 'a'` → False + stderr Warning；`b'a' < b'b'` True
+- find：`"abc".find("bc",2)`=-1；`"abc".find("b",2)`=-1；`"abc".find("bc",0,3)`=1；`"abc".find("b",5,1)`=-1；`"abc".find("bc",1)`=1；`"abc".find("c",2)`=2
+- 切片：`"abc"[::-1]`='cba'；`"abc"[::-2]`='ca'；`"abc"[3:0:-1]`='cb'；`b"abc"[::-1]`=b'cba'
+- 早期探针（沿用，已在测试中覆盖）：`b'ab'.hex('')`=`'61\x0062'`；`hex('xy')`=`'61x62'`；`bytes.fromhex('a')`/`('zz')`/`('a b')` → ValueError 'non-hex digit'；`str(b'hi')`=`"b'hi'"`；`bytes('hi')` → 'wrong number of arguments'；`bytes([256])` → 'bytes value out of range'；`bytes([1.5])` → "can't convert to int"；`"héllo"[9]` → 'string index out of range'；`"abc"[5]` → 'index out of range'；`"abc"['x']` → 'indices must be integers'；`"héllo"['x']` → 'string indices must be integers'；`"abc"[1:2:0]` → "slice step can't be zero"；`"héllo"[::-1]`='olléh'；`"ab".replace("", "X")`='XaXbX'；`"aaa".replace("aa","b")`='ba'；`",".join([1])` → JoinType 文本；`"a,b,".split(",")`=['a','b','']；`"abc".split("")` → 'empty separator'；`"abc".rsplit(None,1)` → NotImplementedError 'rsplit(None,n)'；`"xxabcxx".strip("x")`='abc'；`"ß".upper()`='ß'；`"é".isalpha()`=False；`"-42".zfill(5)`='-0042'；`zfill('x')` → "can't convert to int"

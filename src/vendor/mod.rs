@@ -11,6 +11,11 @@
 //!   conversions, comparison, hash).
 //! - [`mpz_ops`] — the `mpz_*_inpl` arithmetic / bitwise / shift /
 //!   power / divmod operations.
+//! - [`formatfloat`] — float formatting (`py/formatfloat.c`, Lane
+//!   FMT): `mp_format_float`.
+//! - [`parsenum`] — the `parsenum.c` helpers it needs (Lane FMT):
+//!   `mp_decimal_exp` and `mp_parse_float_internal` (the latter as
+//!   linked in petitpy: the Zig version, see that module).
 //!
 //! Configuration this port targets (petitpy `port/mpconfigport.h`,
 //! full config): `MPZ_DIG_SIZE` is 32 on x86-64, so a digit is a
@@ -22,13 +27,20 @@
 //! `MICROPY_PY_BUILTINS_FLOAT` is 1, so the float conversions are
 //! included.
 
+pub mod formatfloat;
 pub mod mpn;
 pub mod mpz;
 pub mod mpz_ops;
+pub mod parsenum;
 
+pub use formatfloat::{format_float, format_float_into_buf, MP_FLOAT_REPR_PREC};
 pub use mpz::BigInt;
 
+#[cfg(test)]
+mod formatfloat_tests;
 #[cfg(test)]
 mod mpz_tests;
 #[cfg(test)]
 mod probe;
+#[cfg(test)]
+mod probe_fmt;

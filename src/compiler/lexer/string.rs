@@ -12,7 +12,7 @@
 use super::chars::{is_xdigit, xdigit_value};
 use super::{LexError, LexResult, Lexer, Unichar, EOF};
 use super::tables::TokenKind;
-use super::STR_UNICODE;
+use crate::compiler::build_options::STR_UNICODE;
 
 impl Lexer {
     pub(crate) fn get_hex(&mut self, mut num_digits: usize, result: &mut Unichar) -> bool {

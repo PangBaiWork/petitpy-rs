@@ -360,12 +360,45 @@ pub fn rule_act(id: u8) -> u8 {
     RULE_ACT_TABLE[id as usize]
 }
 
+/// The number of argument entries a rule's arg list holds.
+///
+/// For AND/OR rules it is `rule_act(id) & RULE_ACT_ARG_MASK`. For
+/// LIST rules the act's low nibble is the *flavour* (1 = list,
+/// 2 = one_or_more, 3 = list_with_end), not a count: `one_or_more`
+/// takes 1 arg (the item), the other two take 2 (item + separator).
+/// This mirrors vendor parse.c and the `want` computation in
+/// grammar_ext.zig's comptime check — and it is what the parser
+/// actually reads: the LIST branch indexes `rule_arg[i & 1 & n]`,
+/// i.e. `rule_arg[1]` for every separated list.
+///
+/// NOTE (found by the A3 parser port): the A1 version of this
+/// accessor returned `act & mask` entries for every rule, which is
+/// one entry short for the 13 LIST rules with flavour 1 (or_test,
+/// and_test, comparison, expr, xor_expr, and_expr, shift_expr,
+/// arith_expr, term, dotted_as_names, dotted_name, name_list,
+/// with_stmt_list) — the parser would have indexed out of bounds on
+/// their separator. The Zig original returns a raw pointer, so it
+/// never had a length to get wrong; the Rust slice must carry the
+/// right one.
+pub fn rule_arg_count(id: u8) -> usize {
+    let act = rule_act(id);
+    if act & RULE_ACT_KIND_MASK == RULE_ACT_LIST {
+        if act == RULE_ACT_LIST | 2 {
+            1 // one_or_more
+        } else {
+            2 // list / list_with_end: item + separator
+        }
+    } else {
+        (act & RULE_ACT_ARG_MASK) as usize
+    }
+}
+
 /// The argument list of rule `id` (mirrors `getRuleArg`).
 ///
 /// The Zig original returns a raw `[*]const u16` pointer and the
-/// caller reads `rule_act(id) & RULE_ACT_ARG_MASK` entries from it
-/// (vendor parse.c:1098-1099). The Rust version returns exactly
-/// that many entries as a slice, so the bound is checked here.
+/// caller reads `rule_arg_count(id)` entries from it (vendor
+/// parse.c:1098-1099). The Rust version returns exactly that many
+/// entries as a slice, so the bound is checked here.
 ///
 /// NOTE: rule spans are NOT a contiguous partition of the combined
 /// table — by construction (the vendor's RULE_PADDING enum) 35
@@ -376,7 +409,7 @@ pub fn rule_act(id: u8) -> u8 {
 /// the test below asserts exactly that.
 pub fn get_rule_arg(id: u8) -> &'static [u16] {
     let off = rule_arg_offset(id);
-    let count = (rule_act(id) & RULE_ACT_ARG_MASK) as usize;
+    let count = rule_arg_count(id);
     &RULE_ARG_COMBINED_TABLE[off..off + count]
 }
 
@@ -417,9 +450,13 @@ mod tests {
         // every rule's [offset, offset + count) lies inside the
         // combined table. (Spans are not contiguous — see the
         // note on get_rule_arg — so no equality is asserted.)
+        // The count is rule_arg_count, not act & mask: LIST rules
+        // take 2 arg entries (item + separator) except one_or_more
+        // (see the NOTE on rule_arg_count).
         for id in 0..NUM_RULES as u8 {
             let args = get_rule_arg(id);
-            assert_eq!((rule_act(id) & RULE_ACT_ARG_MASK) as usize, args.len());
+            assert_eq!(rule_arg_count(id), args.len());
+            assert!(rule_arg_offset(id) + args.len() <= RULE_ARG_COMBINED_TABLE.len());
         }
         // The last rule's span ends exactly at the table end.
         assert_eq!(
@@ -427,6 +464,29 @@ mod tests {
             rule_arg_offset(RULE_yield_arg_from)
                 + (rule_act(RULE_yield_arg_from) & RULE_ACT_ARG_MASK) as usize
         );
+    }
+
+    #[test]
+    fn list_rule_arg_counts() {
+        // The 13 separated-list rules (flavour 1) carry item +
+        // separator; one_or_more rules carry just the item.
+        for &id in &[
+            RULE_or_test,
+            RULE_and_test,
+            RULE_comparison,
+            RULE_expr,
+            RULE_xor_expr,
+            RULE_and_expr,
+            RULE_shift_expr,
+            RULE_arith_expr,
+            RULE_term,
+        ] {
+            assert_eq!(2, rule_arg_count(id), "rule {id}");
+            assert_eq!(2, get_rule_arg(id).len());
+        }
+        // Separator entries are real table entries, not padding:
+        // or_test's separator is the KW_OR token.
+        assert_eq!(0x102a, get_rule_arg(RULE_or_test)[1]);
     }
 
     #[test]
@@ -439,9 +499,12 @@ mod tests {
         assert_eq!(&[] as &[u16], get_rule_arg(RULE_const_object));
         assert_eq!(&[0x206f, 0x2065], get_rule_arg(RULE_import_from_2));
         assert_eq!(&[0x1021, 0x2086], get_rule_arg(RULE_yield_arg_from));
-        // Overlapping spans are real: rule 1 shares its last entry
-        // with rule 2's first (vendor table construction).
-        assert_eq!(&[0x203f, 0x2043], get_rule_arg(RULE_file_input_2));
+        // file_input_2 is a one_or_more LIST rule: a single arg
+        // entry. (The A1 spot check expected two entries here —
+        // [0x203f, 0x2043] — but 0x2043 is the *next* rule's first
+        // entry; the old count came from reading act & mask as a
+        // length, which is wrong for LIST rules. See rule_arg_count.)
+        assert_eq!(&[0x203f], get_rule_arg(RULE_file_input_2));
         assert_eq!(&[0x2043, 0x2044], get_rule_arg(RULE_decorated));
     }
 }

@@ -1,0 +1,212 @@
+Lane FMT result — port vendor C py/formatfloat.c to Rust
+==========================================================
+
+Worktree ~/workspace/petitpy-rs-fmt, branch lane/fmt, baseline master e68c7e1.
+NOTE — baseline drift: master has since moved to 3fdd2bb (A3 777bc6f +
+Lane M merge). This lane was cut at e68c7e1 and touches only
+src/vendor/* + scripts/*, so the merge should be clean; the main
+agent verifies after merging.
+
+Deliverables
+------------
+- src/vendor/formatfloat.rs (645 lines): mp_format_float and its
+  formatfloat.c helpers.
+- src/vendor/parsenum.rs (213 lines, NEW): the parsenum.c helpers
+  mp_decimal_exp / mp_parse_float_internal + accept_digit, split out
+  of formatfloat.rs to stay under the 800-line cap (mirrors the C
+  file layout: formatfloat.c + parsenum.c).
+- src/vendor/formatfloat_tests.rs (232 lines): 11 unit tests.
+- src/vendor/probe_fmt.rs (82 lines): differential probe test reading
+  scripts/fmt_vectors.txt via include_str!.
+- src/vendor/mod.rs: added `pub mod parsenum;`, re-exports unchanged
+  (format_float, format_float_into_buf, MP_FLOAT_REPR_PREC).
+- scripts/gen_fmt_vectors.py (296 lines) + scripts/fmt_vectors.txt
+  (3,440 cases): deterministic probe battery, seed 20261117.
+- scripts/charharness/: main.c, stubs.c, build_charharness.sh,
+  parsenum_ziglike.c — direct C oracle harnesses (test tooling).
+- scripts/fmt_brief.md, scripts/fmt_result.txt (this file).
+
+1:1 function mapping (C/Zig -> Rust)
+------------------------------------
+formatfloat.c / formatfloat.h -> formatfloat.rs:
+- mp_format_float(f, buf, buf_size, fmt, prec, sign) -> i32
+    -> format_float_into_buf(f: f64, fmt: u8, prec: i32, sign: u8,
+       buf: &mut [u8]) -> i32   (same contract: returns bytes written
+       excl. NUL, incl. sign; NUL-terminates; never writes past
+       buf_size; callers must pass >= MIN_BUF_SIZE 29 bytes; panics
+       on a shorter buffer — the C code asserts, and asserts are
+       dormant in the reference build but kept active here per the
+       brief's rule)
+- format_float(f, fmt, prec, sign) -> String — convenience wrapper
+  (NOT in C; allocates a 1024-byte buffer, calls into_buf). The only
+  new API; everything else is 1:1.
+- mp_format_mantissa -> format_mantissa (private)
+- fp_expval / fp_isless1 / fp_iszero -> same names (private)
+- mp_prepend_zeros -> prepend_zeros (private)
+- MP_FLOAT_REPR_PREC (99, formatfloat.h) -> pub const
+- MIN_BUF_SIZE (29) -> pub const
+- MAX_MANTISSA_DIGITS 19, SAFE_MANTISSA_DIGITS 16, FPMIN_BUF_SIZE 7,
+  FMT_MODE_E/G/F, FMT_E_CASE 0x20 -> private consts
+- MP_FLOAT_EXP_OFFSET 1023 (misc.h) -> private const (used by fp_expval)
+- (u64)(mantissa_f + 0.5) C cast -> c_f64_to_u64 (pub(crate), see
+  Divergence 3; not a C function, reproduces the emitted instruction)
+
+parsenum.c / parsenum.zig -> parsenum.rs:
+- mp_decimal_exp -> decimal_exp (pub(crate))
+- mp_parse_float_internal -> parse_float_internal (pub(crate)),
+  THE ZIG VERSION (see Divergence 1)
+- accept_digit -> accept_digit (private)
+- exactDecimal (parsenum.zig) -> exact_decimal (private)
+- MANTISSA_MAX 0x1999999999999998, MAX_EXACT_POWER_OF_5 22 -> consts
+
+NOT ported (verified compiled out / unrelated):
+- The EXACT retry block in mp_format_float (MICROPY_FLOAT_FORMAT_IMPL
+  is APPROX in the full config; the EXACT branch is dead code).
+- FLOAT (non-double) helper variants (MICROPY_FLOAT_IMPL is DOUBLE).
+- The rest of parsenum.c (integer parsing, mp_parse_float) — unrelated
+  to formatting.
+- formatFloatRepr (Zig, Ryu shortest round-trip) — that is the CALLER's
+  intercept in mpprint.zig for prec==99 + 'g' (repr), not part of
+  formatfloat.c; out of scope for this lane (Phase C/D, mpprint).
+
+Return-value / truncation conventions (verified by probe + unit tests)
+-----------------------------------------------------------------------
+- Return = bytes written excluding NUL, including sign; NUL written.
+- %f with a huge exponent switches to %g when it would not fit
+  (1e300 'f' 6 buf 33 -> "1e+300"; buf 512 holds the 'f' form, 308
+  chars: "1" + 300 zeros + ".000000").
+- max_digits / trail_zeros clamped to the buffer; prec 100 'f' in a
+  33-byte buffer truncates to 31 digits + NUL.
+- prec < 0 defaults to 6; prec 99 = optimal-repr path (prec -> 19,
+  max_exp_zeros 16); unknown fmt byte behaves like 'e' (else branch).
+- inf/nan: case follows fmt bit 0x20 ('F'/'E'/'G'/'X' -> upper);
+  negative NaN sign ignored (C !isnan guard); sign '+'/' ' prepended
+  even for inf/nan; -0.0 keeps its sign.
+
+Verification numbers (all runs by the executor, in this worktree)
+---------------------------------------------------------------
+- cargo test --release --lib --tests: 81 passed, 0 failed
+  (A1 16 + A2 17 + Lane C 36 kept + FMT 12 = 11 unit + 1 probe).
+  Full `cargo test --release` (all targets): same, all green.
+- Differential probe: 3440/3440 cases, 0 failures
+  (2940 binary-oracle + 500 harness-oracle, 0 dropped values).
+  scripts/fmt_vectors.txt SHA-256
+  7b7179636723d7d9c6b012c21df81c7d55e44be119ae65db143fcfd192b22430
+  (re-running scripts/gen_fmt_vectors.py reproduces it byte-identically).
+- Cross-check harness_ziglike vs reference binary on all 2940
+  binary-reachable cases: 2940/2940 agree, 0 disagree.
+- Rust 5f64.powf(k) vs C libm pow(5, k): bit-identical for all
+  k in [-400, 400] (both are the same correctly-rounded libm call
+  on this platform; decimal_exp's pow usage is not a divergence).
+- cargo build: 0 warnings. No unsafe in any lane file
+  (grep over formatfloat.rs, parsenum.rs, formatfloat_tests.rs,
+  probe_fmt.rs, gen_fmt_vectors.py).
+- File sizes: formatfloat.rs 645, parsenum.rs 213,
+  formatfloat_tests.rs 232, probe_fmt.rs 82, mod.rs 46 — all < 800.
+- Original repo ~/workspace/petitpy-orig: git status clean.
+
+Divergences / findings (all verified empirically, not assumed)
+--------------------------------------------------------------
+1. THE BIG ONE — petitpy's mp_parse_float_internal is ZIG, not vendor C
+   (src/frontend/parsenum.zig:328, `export fn mp_parse_float_internal`).
+   The scan loop / accept_digit / exponent bookkeeping are identical
+   to vendor parsenum.c, but the final value comes from libc strtod
+   (correctly rounded) on the scanned text, falling back to
+   mp_decimal_exp only when strtod does not consume the whole text or
+   the text is >= 128 non-'_' chars. Vendor C always uses
+   mp_decimal_exp, which is off by an ulp at times (the Zig comment
+   cites "2.2250738585072014e-308"). The Rust port follows the Zig
+   version via Rust str::parse::<f64> (also correctly rounded, so it
+   agrees with strtod on every decimal string), with the same
+   fallback. A port using only the vendor C parse fails 110/3440
+   probe cases in the last digit; with the Zig semantics it is
+   3440/3440. mp_decimal_exp itself IS algorithm-identical in C and
+   Zig (bit-field add mod 2048, pow(5, k)); only the parse-back differs.
+2. The pure-vendor-C harness (harness_zig) is NOT a valid oracle for
+   petitpy: the binary links the Zig parsenum, so vendor-C and binary
+   disagree in the last digit on 13/3440 high-precision cases
+   (123456789.123456789 'g' 99 / 'f' 100: vendor ...684, binary ...679;
+   DBL_MAX 'g' 99 / 'f' 100: vendor ...3156, binary ...3158).
+   Fix: harness_ziglike (vendor C formatfloat.o + parsenum_ziglike.c,
+   a C reimplementation of the Zig parse-back), cross-checked 2940/2940
+   against the binary on every binary-reachable case. The generator
+   now uses harness_ziglike; harness_zig is kept in
+   build_charharness.sh only as a documented wrong-oracle reference.
+   The 13 vector lines changed accordingly (old SHA e788069b...).
+3. Subnormal UB: mp_decimal_exp shifts the exponent field directly,
+   wrong for subnormals (exp field 0 -> setting it materialises the
+   implicit leading 1); the mantissa then overflows u64 and the C
+   cast (u64)(mantissa_f + 0.5) is UB. The shipped formatfloat.o
+   (both copies in the reference build's .zig-cache) contains
+   vcvttsd2usi -> u64::MAX for out-of-range inputs. A gcc-compiled
+   copy resolves the same UB to mantissa 0 and is NOT a valid oracle.
+   Rust c_f64_to_u64 reproduces vcvttsd2usi exactly (NaN/negative ->
+   u64::MAX, else saturating `as u64`); unit test
+   c_f64_to_u64_vcvttsd2usi pins it. Subnormal outputs verified vs
+   the binary (5e-324 '%.6e' -> "0.955161e-323", '%g' ->
+   "9.55161e-323", '%.17g' -> "4.467440737095516e-323").
+4. Approximate last digits vs CPython — by design, ported exactly
+   (the vendor APPROX algorithm, not CPython's correct rounding).
+   All verified against the reference binary (or harness_ziglike
+   where the binary cannot reach the case):
+   - 1.23456789012345678 'g' 17 -> "...4566" (CPython "...4567")
+   - 1.23456789012345678 'f' 17 -> "...45660" (CPython "...45669")
+   - 1.23456789012345678 'f' 19 -> "...4566000"
+   - sqrt(2) 'g' 17 -> "...952" (CPython "...951")
+   - sqrt(2) 'f' 17 -> "...9520" (CPython "...9515")
+   - DBL_MAX 'g' 17 -> "...3158" (CPython "...3157")
+   - 2.2250738585072014e-308 'g' 17 -> "...2012" (CPython "...2014")
+   - 0.5 'f' 0 -> "0": dichotomic-search tie-break prefers mantissa 0
+     (|0-0.5| == |1-0.5|, 0 % 10 == 0); CPython also "0".
+   - 1e300 'f' 6 buf 512 -> "1" + 300 zeros + ".000000" (308 chars),
+     NOT the exact integer digits 1000000000000000019884624838656...
+   - 1e16 'g' 99 -> "1e+16" (harness_ziglike), not "10000000000000000".
+   Process note: 10 of my hand-written unit-test expectations were
+   initially CPython-based guesses and were wrong; every one was
+   corrected only after checking the binary/harness — none was
+   flipped to match the code unexamined. The probe battery is the
+   guard against this class of mistake.
+5. Config (verified from source, not assumed): MICROPY_FLOAT_IMPL =
+   DOUBLE, MICROPY_FLOAT_FORMAT_IMPL = APPROX
+   (port/mpconfigport.h:209-210); mp_large_float_t = f64,
+   mp_large_float_uint_t = u64, MP_FLOAT_EXP_OFFSET = 1023,
+   MANTISSA_MAX = 0x1999999999999998, MAX_EXACT_POWER_OF_5 = 22.
+   Reference C flags: -std=c99 -DNDEBUG -fno-sanitize=undefined
+   -fno-common -DPETITPY_CONFIG_FULL=1, Debug -O0. -DNDEBUG means
+   the C asserts are dormant in the reference build; the Rust port
+   keeps the equivalent checks active.
+6. Callers (read, not ported): mpprint.zig:36 (extern declaration),
+   :458 (call point, 36-byte buffer, passes buf.len - 3 = 33), :382
+   comment (repr intercepts prec==99 + 'g' + finite and uses
+   formatFloatRepr/Ryu because vendor mp_format_float "gets the last
+   digit wrong (sqrt(2) ends in 952, 5e-324 prints as 1.8e-323)").
+   C callers: mpprint.c mp_print_float (buf[36], passes 33),
+   objfloat.c:113 (repr 'g' 99), objcomplex.c:52,58 (real/imag 'g' 99),
+   objstr.c:1393 (% formatting), :1403 (%%), :1615 (format()).
+
+Harness notes (test tooling, not deliverable code)
+-------------------------------------------------
+- /tmp/charness is a build artifact (rebuilt by
+  scripts/charharness/build_charharness.sh); the script is committed,
+  the binaries are not.
+- The generator's binary oracle runs the reference binary with `%`
+  formats (prec 99 'g' excluded — binary intercepts it for repr).
+- Probe sign encoding: '0' none, '+' plus, 'S' space; harness main.c
+  accepts 'S' (a literal space cannot be an sscanf token).
+- Generator bug fixed during work: bits_of initially used
+  little-endian hex, misread by the probe/harness (e.g. -0.0 became
+  6.3e-322); fixed to big-endian integer hex. It also initially
+  dropped inf/nan on a repr-check bug (compared against the
+  constructor expression instead of repr(v)); fixed, 0 dropped now.
+
+Commit
+------
+Commit: branch lane/fmt, one commit titled "Lane FMT: port formatfloat.c
+to Rust" (see `git log lane/fmt` — the hash is recorded there, not
+here, because amending to write the hash would change the hash).
+Files: src/vendor/mod.rs, src/vendor/formatfloat.rs,
+src/vendor/parsenum.rs, src/vendor/formatfloat_tests.rs,
+src/vendor/probe_fmt.rs, scripts/gen_fmt_vectors.py,
+scripts/fmt_vectors.txt, scripts/fmt_brief.md,
+scripts/fmt_result.txt, scripts/charharness/{main.c, stubs.c,
+build_charharness.sh, parsenum_ziglike.c}

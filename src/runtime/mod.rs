@@ -5,4 +5,8 @@
 //! `crate::compiler`; the two tracks share the static qstr table
 //! (`crate::qstr_table`).
 
+pub mod bc;
 pub mod qstr;
+
+#[cfg(test)]
+mod bc_tests;

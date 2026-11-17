@@ -28,6 +28,11 @@ use crate::runtime::vm_rt::pending_exc_or_type_error;
 /// by a class body (C12a's namespace — the compiler emits
 /// `LOAD_NAME` there too).
 pub fn load_name_ctx(ctx: &mut CallCtx, state: &mut VmState, qst: u32) -> Result<Value, Value> {
+    // `mp_load_name` (`runtime.zig:288-301`): the locals first
+    // (`state.locals`, set by `eval`/`exec` or by a class body),
+    // then the module globals / builtins (`mp_load_global`).
+    // When locals == globals the dict is the same, so the guard
+    // only skips a redundant lookup.
     use crate::objects::containers::objdict::dict_get_value;
     if let Some(l) = state.locals {
         if l != state.globals {
@@ -74,6 +79,10 @@ pub fn store_name_ctx(
     qst: u32,
     value: Value,
 ) -> Result<(), Value> {
+    // `mp_store_name` (`runtime.zig:336-341`): the locals
+    // (`state.locals`, set by `eval`/`exec` or by a class body)
+    // when set, else the module globals — `locals_dict()` is
+    // exactly `locals.unwrap_or(globals)`.
     use crate::objects::containers::objdict::dict_store;
     dict_store(
         ctx,

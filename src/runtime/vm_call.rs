@@ -2,8 +2,9 @@
 //! dispatch calls: `mp_call_function_n_kw` /
 //! `mp_call_method_n_kw` (`runtime.zig:811-886`),
 //! `mp_call_prepare_args_n_kw_var` (`:896-1048`), and the
-//! `next` builtin. Split out of `vm_ops.rs` (which keeps the
-//! exception builders and `make_function` / `make_closure`).
+//! `next` / `__build_class__` builtins. Split out of
+//! `vm_ops.rs` (which keeps the exception builders and
+//! `make_function` / `make_closure`).
 //!
 //! Raise convention: every helper here returns
 //! `Result<Value, Value>` — `Err(exc)` carries the exception
@@ -14,14 +15,19 @@ use crate::compiler::parser::InputKind;
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objfun::{call_fun_builtin, fun_bc_prepare_call};
 use crate::objects::callables::objgenerator::gen_wrap_call;
+use crate::objects::containers::objtuple::new_tuple;
 use crate::objects::obj::obj_get_type;
 use crate::objects::objtype::objexcept::{exception_make_new, is_exception_type, new_exception};
-use crate::objects::value::{GcRef, Obj, Value};
+use crate::objects::objtype::typecreate::type_call;
+use crate::objects::primitives::objcell::cell_set;
+use crate::objects::primitives::ops::static_qstr_id;
+use crate::objects::value::{DictData, GcRef, MapData, Obj, Value};
 use crate::runtime::runner::RunOutcome;
 use crate::runtime::vm::VmState;
 use crate::runtime::vm_gen::{close_generator_ctx, resume_generator_value_ctx};
 use crate::runtime::vm_ops::{exc_from_gen_error, exc_from_pyerror, exc_from_setup, exc_from_typed, type_error};
 use crate::runtime::vm_raise::{execute_frame, make_raise_obj};
+use crate::runtime::vm_rt_name::load_method_maybe_ctx;
 
 // ── Call dispatch ────────────────────────────────────────────────────
 
@@ -74,6 +80,12 @@ pub fn call_function_ctx(
     }
     if fun == state.compile_builtin {
         return crate::runtime::builtinevex::call_compile_ctx(ctx, state, n_args, n_kw, args);
+    }
+    // `__build_class__` is intercepted the same way (C13b: it needs
+    // the VM's frame execution + the locals override — see
+    // `call_build_class_ctx`).
+    if fun == state.build_class_builtin {
+        return call_build_class_ctx(ctx, state, n_args, n_kw, args);
     }
     match fun {
         Value::Heap(r) => match ctx.arena.get(r) {
@@ -325,10 +337,13 @@ fn resume_via_method_ctx(
     }
 }
 
-/// A type call: exception types instantiate via
-/// `exception_make_new`; any other type with a call slot uses
-/// it (C12a's `type_call`); otherwise `TypeError("object not
-/// callable")`.
+/// A type call (C13b): every non-exception type goes through
+/// C12a's `type_call` (`typecreate.rs:183`) — it dispatches on
+/// the type's `make_new` slot and raises `CantCreateInstance`
+/// ("can't create instance") when there is none. Exception
+/// types keep their direct path (`exception_make_new` — their
+/// `make_new` slot is the same fn, but the direct call
+/// preserves the pre-C13b error mapping, pinned by `vm_tests`).
 fn call_type_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -341,15 +356,8 @@ fn call_type_ctx(
         return exception_make_new(ctx, type_, args, n_kw)
             .map_err(|e| exc_from_typed(ctx, state, e));
     }
-    let call = match ctx.arena.get(type_) {
-        Obj::Type(d) => d.call,
-        _ => None,
-    };
-    match call {
-        Some(f) => f(ctx, Value::Heap(type_), n_args, n_kw, args)
-            .map_err(|e| exc_from_pyerror(ctx, state, e)),
-        None => Err(type_error(ctx, state, "object not callable")),
-    }
+    type_call(ctx, Value::Heap(type_), n_args, n_kw, args)
+        .map_err(|e| exc_from_pyerror(ctx, state, e))
 }
 
 /// The fallback for values with no payload dispatch: the value's
@@ -392,6 +400,129 @@ fn call_next_ctx(ctx: &mut CallCtx, state: &mut VmState, n_args: usize, args: &[
             None => Err(new_exception(ctx, state.exc.stop_iteration)),
         },
     }
+}
+
+/// `__build_class__` (`modbuiltins.zig:532-571`) — intercepted
+/// by identity in `call_function_ctx` (like `next`): a bare
+/// `BuiltinFn` cannot run the body (it needs the VM's frame
+/// execution + the locals override), so the stub body is
+/// unreachable through the VM.
+/// Protocol: fresh class-locals dict → save/restore `locals`
+/// around the body call (`mp_locals_set`) → resolve the
+/// metaclass (`type` with no bases, else the type of the first
+/// base) → meta-call `meta(name, tuple(bases), locals)` →
+/// `__class__` cell set → PEP 487 `__init_subclass__` (full
+/// only — we are full config). Keyword args are ignored (the
+/// Zig drops them — `metaclass=` included). A raise anywhere
+/// propagates (the Zig returns the new class with
+/// `pending_exc` set; the Rust returns the `Err`).
+fn call_build_class_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    _n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    // The sig check (`fun_n_args(2, 255)`, the Zig's
+    // `varFun(2, FUN_ARGS_MAX)`) runs before the interception,
+    // but never index blindly on the VM path.
+    let Some(&body) = args.first() else {
+        return Err(type_error(ctx, state, "argument num/types mismatch"));
+    };
+    let Some(&name) = args.get(1) else {
+        return Err(type_error(ctx, state, "argument num/types mismatch"));
+    };
+    // Fresh class-locals dict, rooted across the body call and
+    // the meta-call (it is only reachable from `state.locals`
+    // until the new type stores it). Header is the dict type
+    // (the Zig's `mp_obj_new_dict(0)`) — `mp_obj_new_type`
+    // rejects a locals value whose type is not a dict.
+    let class_dict = ctx.alloc(
+        Some(ctx.types.dict),
+        Obj::Dict(DictData { map: MapData::new() }),
+    );
+    ctx.roots.push(Value::Heap(class_dict));
+    // Unrooting removes exactly the pushed entry (the
+    // `mp_obj_new_type` pattern) — the frame roots around it
+    // are untouched.
+    let unroot = |ctx: &mut CallCtx, r: GcRef| {
+        if let Some(pos) = ctx.roots.extra.iter().rposition(|v| *v == Value::Heap(r)) {
+            ctx.roots.extra.remove(pos);
+        }
+    };
+    let old_locals = state.locals;
+    state.locals = Some(class_dict);
+    let cell = call_function_ctx(ctx, state, body, 0, 0, &[]);
+    state.locals = old_locals;
+    let cell = match cell {
+        Ok(v) => v,
+        Err(e) => {
+            unroot(ctx, class_dict);
+            return Err(e);
+        }
+    };
+    // Resolve the metaclass (`modbuiltins.zig:552-555`).
+    let meta = if n_args == 2 {
+        Value::Heap(ctx.types.type_)
+    } else {
+        match obj_get_type(ctx.arena, ctx.types, args[2]) {
+            Some(t) => Value::Heap(t),
+            None => {
+                unroot(ctx, class_dict);
+                return Err(type_error(ctx, state, "argument num/types mismatch"));
+            }
+        }
+    };
+    let bases = Value::Heap(new_tuple(ctx, ctx.types.tuple, &args[2..n_args]));
+    let meta_args = [name, bases, Value::Heap(class_dict)];
+    let new_class = match call_function_ctx(ctx, state, meta, 3, 0, &meta_args) {
+        Ok(v) => v,
+        Err(e) => {
+            unroot(ctx, class_dict);
+            return Err(e);
+        }
+    };
+    let Value::Heap(new_class_ref) = new_class else {
+        unroot(ctx, class_dict);
+        return Err(type_error(ctx, state, "argument num/types mismatch"));
+    };
+    // The new type holds the class dict now; root the class
+    // across the cell set + `__init_subclass__` (both can
+    // allocate), then unroot the dict (reachable via the class).
+    ctx.roots.push(new_class);
+    unroot(ctx, class_dict);
+    // `__class__` cell (`modbuiltins.zig:566-568`): the body's
+    // return value is the cell, or `None`. A non-cell return
+    // cannot come from compiled code; it is ignored.
+    if let Value::Heap(r) = cell {
+        if let Obj::Cell(_) = ctx.arena.get(r) {
+            cell_set(ctx.arena, r, new_class);
+        }
+    }
+    // PEP 487 (`modbuiltins.zig:574-588`): the first base with
+    // an `__init_subclass__` is called with the new class.
+    // The Zig calls `dest[0]` with one arg and ignores
+    // `dest[1]` — the Rust does the same.
+    let init_subclass_q = static_qstr_id(b"__init_subclass__").unwrap_or(u32::MAX);
+    for base in &args[2..n_args] {
+        let (method, _self_) = match load_method_maybe_ctx(ctx, state, *base, init_subclass_q)
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                unroot(ctx, new_class_ref);
+                return Err(e);
+            }
+        };
+        if let Some(m) = method {
+            if let Err(e) = call_function_ctx(ctx, state, m, 1, 0, &[new_class]) {
+                unroot(ctx, new_class_ref);
+                return Err(e);
+            }
+            break;
+        }
+    }
+    unroot(ctx, new_class_ref);
+    Ok(new_class)
 }
 
 // ── `call_method` ────────────────────────────────────────────────────

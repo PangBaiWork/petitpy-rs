@@ -97,6 +97,8 @@ impl Fixture {
             tuple: mk(&mut arena, b"tuple"),
             list: mk(&mut arena, b"list"),
             dict: mk(&mut arena, b"dict"),
+            array: mk(&mut arena, b"array"),
+            bytearray: mk(&mut arena, b"bytearray"),
             set: mk(&mut arena, b"set"),
             frozenset: mk(&mut arena, b"frozenset"),
             range: mk(&mut arena, b"range"),

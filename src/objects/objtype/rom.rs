@@ -205,8 +205,10 @@ pub fn classmethod_type_data(dict: GcRef) -> TypeData {
 /// identical). This is NOT `instance_make_new` (see the module
 /// docs' rebase note) and NOT C12b's `object_make_new` (that
 /// stub's `PyRaise` tail is pinned by its test — allocation was
-/// C12a's job, and this fn is it).
-fn object_make_new_slot(
+/// C12a's job, and this fn is it). `pub` so the VM's
+/// `build_vm_types` can mirror `build_rom`'s override (C13b —
+/// `mp_obj_new_type` rejects a base without `make_new`).
+pub fn object_make_new_slot(
     ctx: &mut CallCtx,
     type_: GcRef,
     args: &[Value],

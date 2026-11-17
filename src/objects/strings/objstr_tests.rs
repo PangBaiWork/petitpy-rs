@@ -179,6 +179,8 @@ impl Fx {
             frozenset: mk_plain(&mut arena, b"frozenset"),
             range: mk_plain(&mut arena, b"range"),
             dict: mk_plain(&mut arena, b"dict"),
+            array: mk_plain(&mut arena, b"array"),
+            bytearray: mk_plain(&mut arena, b"bytearray"),
             type_,
             object,
             super_,

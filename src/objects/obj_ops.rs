@@ -18,6 +18,7 @@ use crate::objects::obj::{
 use crate::objects::slots::{BinaryOp, BufferInfo, PrintKind, SubscrArg, UnaryOp};
 use crate::objects::value::{Obj, Value};
 use crate::pyerr::{PyError, PyResult};
+use crate::runtime::qstr::RuntimeQstr;
 
 // ── equality ──────────────────────────────────────────────────────────
 
@@ -28,8 +29,13 @@ use crate::pyerr::{PyError, PyResult};
 /// equality alone is not proof); a dynamic id compares by id only
 /// (the dynamic pool dedups by content, and a dynamic id's content
 /// never equals a static id's content, since `from_strn` searches
-/// the static table first).
-fn str_equal(arena: &GcArena, o1: Value, o2: Value) -> bool {
+/// the static table first). Pool-aware (C13b): the mixed
+/// qstr/heap arm used to read the qstr bytes through the
+/// arena-only `qstr_bytes`, which returns `None` for dynamic ids
+/// — so a heap `Str` never equalled a dynamic `Qstr` with the
+/// same bytes and `dict([('k', 9)])['k']` raised `KeyError`.
+/// `pool.qstr_str` resolves both static and dynamic ids.
+fn str_equal(arena: &GcArena, pool: &RuntimeQstr, o1: Value, o2: Value) -> bool {
     match (o1, o2) {
         (Value::Qstr(a), Value::Qstr(b)) => {
             if a == b {
@@ -42,8 +48,8 @@ fn str_equal(arena: &GcArena, o1: Value, o2: Value) -> bool {
             }
         }
         (Value::Qstr(id), Value::Heap(r)) | (Value::Heap(r), Value::Qstr(id)) => {
-            match (qstr_bytes(id), arena.get(r)) {
-                (Some(bytes), Obj::Str(s)) => bytes == s.bytes.as_slice(),
+            match arena.get(r) {
+                Obj::Str(s) => pool.qstr_str(id as u16) == s.bytes.as_slice(),
                 _ => false,
             }
         }
@@ -108,7 +114,7 @@ pub fn obj_equal_not_equal(
     let mut skip_first = false;
     if is_str(ctx.arena, types, o1) {
         if is_str(ctx.arena, types, o2) {
-            return Ok(if str_equal(ctx.arena, o1, o2) {
+            return Ok(if str_equal(ctx.arena, ctx.pool, o1, o2) {
                 local_true
             } else {
                 local_false

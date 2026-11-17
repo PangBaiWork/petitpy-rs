@@ -1,0 +1,127 @@
+Lane C13b: builtin MakeNew adapters + VM type-call wiring
+===========================================================
+Worktree ~/workspace/petitpy-rs-makenew, branch lane/makenew,
+baseline master f6c8378 (C13 merged, lib 938). One commit.
+Brief: scripts/makenew_brief.md (NOT committed).
+
+What landed
+-----------
+- src/objects/objtype/make_new.rs (NEW, 338 lines): 21 `MakeNewFn`
+  adapters, one per builtin type, each filling its `*_type_data`
+  `make_new` slot. Errors map through `ctx.record_typed(e)`
+  (not bare `to_pyerror`), so the VM raises the real exception
+  object. `map`/`filter`/`zip`/`enumerate` adapters also set the
+  iterator's header type to the constructed type (C11's `new_iter`
+  allocates with a `None` header — `type(m)` returned `None`).
+- VM type-call wiring (`src/runtime/vm_call.rs`,
+  `src/runtime/vm_types.rs`, `src/runtime/typecreate.rs`,
+  `src/runtime/vm.rs`, `src/runtime/vm_builtins.rs`):
+  `call_type_ctx` routes type calls to `type_call`; `type_call`'s
+  `CantCreateInstance` becomes a recorded `TypeError("can't
+  create instance")`; `__build_class__` (2,255) with fresh
+  class-locals dict, save/restore of `state.locals`, metaclass
+  resolution, cell setup, PEP 487 `__init_subclass__`;
+  `load_name`/`store_name` read/write `state.locals` first;
+  a real `type` type (`type_type_data`) and `object_make_new_slot`;
+  `map`/`filter`/`zip`/`enumerate` types built and bound as
+  builtins; `BuiltinTypes` gains `array`/`bytearray`.
+- src/runtime/vm_tests_b.rs (NEW, 544 lines): 30 end-to-end VM
+  tests (`makenew_*`), 28 passing, 2 `#[ignore]` (C14-blocked,
+  see below).
+
+Bugs found by the end-to-end tests (all fixed in-lane)
+------------------------------------------------------
+1. `dict([('k', 9)])['k']` raised `KeyError`: a string const
+   inside a tuple loads as a heap `Str`, a bare `'k'` loads as a
+   dynamic `Qstr`, and both `str_equal` implementations compared
+   them with arena-only readers (`str_data` / `qstr_bytes`) that
+   return `None` for dynamic ids. `obj_ops.rs::str_equal` now
+   reads qstr bytes through `pool.qstr_str`; `objstr_b.rs::
+   str_equal` now takes the pool and uses `str_data_pool`.
+   (Same latent bug class in the canonical `mp_obj_str_equal`.)
+2. `list(map(str, [1,2]))` raised `TypeError("object not
+   iterable")`: `collect_iterable` had no arm for C11 iterators.
+   New `IterPlan::Protocol` drains any non-view `Obj::Iterator`
+   through `getiter`/`iternext` with stub seams (call via
+   `call_via_type_slot` — builtins and builtin types work, e.g.
+   `str`; a `FunBc` callee raises, see "Not done"). A
+   `StopIteration` raised by the called function is exhaustion
+   (the recorded raise is drained). `dict`/`set`/`tuple`
+   construction over iterators benefits too.
+3. `list(map(str, …))` then raised a bare `TypeError("None")`:
+   every VM type object had a `None` header, so `obj_get_type`
+   returned `None` for a type value and `call_via_type_slot`
+   could not call `str(1)`. `build_vm_types` now points every
+   type object's header at `type_` (all 37 locals + the 28
+   exception types). `type(str)` now works.
+4. `enumerate`/`filter`/`zip` objects had no type (same
+   `new_iter` `None`-header cause as 1st bullet under
+   "What landed"); fixed in the four adapters.
+5. `objdict_methods.rs` was 810 lines at baseline (already over
+   the 800 cap) and the Protocol arm pushed it to 888. The whole
+   iteration section moved to NEW
+   `src/objects/containers/objdict_collect.rs` (272 lines);
+   `objdict_methods.rs` is now 640 lines and re-exports
+   `collect_iterable`, so all call sites keep their paths.
+
+Results (verified by the lane, full suite, this worktree)
+--------------------------------------------------------
+- `cargo test --release --lib --tests`: 966 passed, 0 failed,
+  3 ignored (baseline 938 -> +28 new, all in vm_tests_b.rs).
+- `cargo test --release --bins`: zigpy-compile 9/9, main target
+  has no unit tests (0). `cargo build --release`: 0 warnings.
+- No `unsafe` in the diff. Pure Rust std only.
+- Every touched file < 800 lines EXCEPT `src/objects/obj.rs`
+  (826): it was already 818 at baseline (pre-existing debt);
+  C13b added 8 lines (the `array`/`bytearray` `BuiltinTypes`
+  fields the adapters need). Not split here — `obj.rs` is the
+  core object module; splitting it is out of this lane's scope.
+
+Ignored tests (both fail if forced to run — genuinely blocked)
+-------------------------------------------------------------
+- `makenew_class_attr_on_class` (`C.x`): `load_method_maybe_ctx`
+  looks `x` up in `type`'s locals dict instead of `C`'s own dict.
+  Its doc says "C14 subsumes this whole function". The instance
+  read (`c.x`) passes and proves the class dict is wired.
+- `makenew_class_member_store` (`c.x = 7`): `store_attr_ctx`
+  (`vm_rt_name.rs`) is a stub that always raises
+  `AttributeError("no attribute '%q'")` (documented C14 gap:
+  instance stores need the `Instance` members map + the `attr`
+  slot). Both live in `vm_rt_name.rs`, which is C14's file —
+  not touched here to avoid colliding with the running C14 lane.
+  (The 3rd ignored test is pre-existing: the parser `#[ignore]`
+  smoke test, passes.)
+
+Not done (out of scope / later lanes)
+-------------------------------------
+- `float`/`complex` make_new (C18): `float(1)` raises recorded
+  `TypeError("can't create instance")` (asserted in
+  `makenew_error_float_call`). The float type's `IntMaybe` slot
+  must return `NotImplemented` (C8b hard requirement) or
+  `"%o" % 3.0` stops raising.
+- `map`/`filter` with a user-function callee (`FunBc`) through
+  `list()`/`dict()`/`set()`/`tuple()`: the `MakeNewFn` signature
+  cannot carry a `VmState`, so `collect_iterable` uses stub
+  seams; a `FunBc` callee raises `PyRaise`. The VM `for` loop
+  path handles it (real runner seams). Needs a VM-seam-aware
+  collect path (C15/D).
+- `array`/`deque` are not builtins (`from array import array`,
+  `ucollections.deque`); adapters are wired but latent.
+- `type(1, (), {})`: only the `TypeError` type is asserted —
+  `type_make_new` maps its `ObjTypeError` through a bare
+  `to_pyerror`, so the "can't convert to str implicitly" message
+  is lost on the VM path (known C12a gap).
+- A class with a Python `__init__` (`C(7)`): `__init__` goes
+  through `with_stub_seams`' `call_via_type_slot`, which raises
+  `PyRaise` for `FunBc` until the VmSeams runner replaces it
+  (C12a-documented).
+
+Reference-binary probes used (petitpy 0.9.0, 2026-11-18)
+---------------------------------------------------------
+`list(1,2)` -> TypeError "object not iterable" (polled sig
+overwritten by getiter); `range()` -> "argument num/types
+mismatch"; `int('x')` -> ValueError "invalid syntax for
+integer"; `int('42',16)` = 66; `int(3.7)` = 3; `dict(a=1)` =
+`{'a':1}`; `array('\x01')` is a `bytearray`; `slice(1,2)
+.indices(5)` = (1,2,1); `type('X',(),{})` builds a class;
+`list(map(str,[1,2]))` = `['1','2']`.

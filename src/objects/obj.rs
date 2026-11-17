@@ -124,6 +124,14 @@ pub struct BuiltinTypes {
     /// with this type; the `dict` builtin reads it from `ctx.types`,
     /// like the int/bool builtins read theirs).
     pub dict: GcRef,
+    /// `array` (C13b: the `array` make_new adapter needs the
+    /// bytearray type — `array_new` picks the bytearray header
+    /// when the typecode is `BYTEARRAY_TYPECODE` (1); probed on
+    /// the reference binary: `array('\x01')` is a `bytearray`).
+    pub array: GcRef,
+    /// `bytearray` (C13b: the `bytearray` make_new adapter needs
+    /// the array type for the shared `array_new` helper).
+    pub bytearray: GcRef,
     /// `type` itself (the class-getitem branch of `mp_obj_subscr`).
     pub type_: GcRef,
     /// `object` (C12: the `isSubclassImpl` short-circuit, `mroOf`'s

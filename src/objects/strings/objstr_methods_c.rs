@@ -509,7 +509,8 @@ fn make_new_default_bytes(
     type_: GcRef,
     arg0: Value,
 ) -> Value {
-    let data = str_data(ctx.arena, arg0).unwrap_or(&[]).to_vec();
+    // Pool-aware (C13b — same `str_data` gap as `str_print`).
+    let data = str_data_pool(ctx.arena, ctx.pool, arg0).unwrap_or_default();
     if let Some(q) = find_static_qstr(&data) {
         return Value::Qstr(q);
     }
@@ -617,7 +618,9 @@ pub fn bytes_make_new(
         if merged.len() < 2 || merged.len() > 3 {
             return Err(StrError::WrongArgs);
         }
-        let data = str_data(ctx.arena, arg0).unwrap_or(&[]).to_vec();
+        // Pool-aware (C13b — same `str_data` gap as
+        // `str_print`): a dynamic qstr source read as empty.
+        let data = str_data_pool(ctx.arena, ctx.pool, arg0).unwrap_or_default();
         return Ok(new_bytes(ctx, types, &data));
     }
     if merged.len() > 1 {

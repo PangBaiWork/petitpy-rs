@@ -346,15 +346,15 @@ fn constructors_and_getters() {
     // `str_equal` does NOT distinguish str from bytes.
     let a = fx.s(b"a");
     let b = fx.b(b"a");
-    assert!(str_equal(&fx.arena, a, b));
+    assert!(str_equal(&fx.arena, &fx.pool, a, b));
     let a = fx.s(b"a");
     let b = fx.s(b"a");
-    assert!(str_equal(&fx.arena, a, b));
+    assert!(str_equal(&fx.arena, &fx.pool, a, b));
     let a = fx.s(b"a");
     let b = fx.s(b"b");
-    assert!(!str_equal(&fx.arena, a, b));
+    assert!(!str_equal(&fx.arena, &fx.pool, a, b));
     let a = fx.s(b"a");
-    assert!(!str_equal(&fx.arena, a, iv(1)));
+    assert!(!str_equal(&fx.arena, &fx.pool, a, iv(1)));
     // `get_qstr` / `get_str` / `get_data`.
     assert_eq!(get_qstr(&fx.arena, &types, Value::Qstr(5)), Some(5));
     let s = fx.s(b"str");

@@ -380,11 +380,12 @@ fn type_make_new_errors() {
 #[test]
 fn type_call_no_make_new() {
     let mut fx = Fx::new();
-    // The fixture's int type has no `make_new` slot (adapters are
-    // the next step) → `can't create instance`.
-    let int = fx.types.int;
+    // The fixture's float type has no `make_new` slot (its
+    // adapter is C18's) → `can't create instance`. (`int`
+    // used to play this role; C13b wired its adapter.)
+    let float = fx.types.float;
     let mut ctx = fx.ctx();
-    assert!(type_call(&mut ctx, Value::Heap(int), 0, 0, &[]).is_err());
+    assert!(type_call(&mut ctx, Value::Heap(float), 0, 0, &[]).is_err());
 }
 
 #[test]

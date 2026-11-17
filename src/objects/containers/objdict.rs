@@ -9,10 +9,12 @@
 //! (`dict_store` / `dict_delete` / `dict_get_value` / `dict_len`).
 //!
 //! The method implementations (`get` / `pop` / `setdefault` /
-//! `popitem` / `update` / `fromkeys` + `collect_iterable`), the dict
-//! views (+ their iterators and slots) and the `BuiltinFn` adapters
-//! live in `objdict_methods.rs` (C9a-split: the 800-line cap) and are
-//! re-exported from this file, so the public paths are unchanged.
+//! `popitem` / `update` / `fromkeys`), the dict views (+ their
+//! iterators and slots) and the `BuiltinFn` adapters live in
+//! `objdict_methods.rs` (C9a-split: the 800-line cap); the
+//! `collect_iterable` machinery lives in `objdict_collect.rs`
+//! (C13b-split: the same cap). Both are re-exported from this
+//! file, so the public paths are unchanged.
 //!
 //! # Errors
 //!
@@ -638,7 +640,7 @@ pub fn dict_type_data(dict: GcRef) -> TypeData {
         buffer: None,
         print: Some(dict_print),
         attr: None,
-        make_new: None,
+        make_new: Some(crate::objects::objtype::make_new::dict_make_new_slot),
         bases: None,
         namedtuple_fields: None,
     }

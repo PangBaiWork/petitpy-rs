@@ -719,7 +719,7 @@ pub fn set_type_data(dict: GcRef) -> TypeData {
         buffer: None,
         print: Some(set_print),
         attr: None,
-        make_new: None,
+        make_new: Some(crate::objects::objtype::make_new::set_make_new_slot),
         bases: None,
         namedtuple_fields: None,
     }
@@ -743,7 +743,10 @@ pub fn frozenset_type_data(dict: GcRef) -> TypeData {
         buffer: None,
         print: Some(set_print),
         attr: None,
-        make_new: None,
+        // The same adapter as `set` (`set_make_new` passes
+        // `type_` through to `alloc_set` — the Zig's
+        // `npy_set_make_new`, `objset.zig:133-151`).
+        make_new: Some(crate::objects::objtype::make_new::set_make_new_slot),
         bases: None,
         namedtuple_fields: None,
     }

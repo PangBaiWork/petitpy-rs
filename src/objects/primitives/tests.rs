@@ -78,6 +78,8 @@ impl Fixture {
         let frozenset = make_type(&mut arena, &roots, b"frozenset");
         let range = make_type(&mut arena, &roots, b"range");
         let dict = make_type(&mut arena, &roots, b"dict");
+        let array = make_type(&mut arena, &roots, b"array");
+        let bytearray = make_type(&mut arena, &roots, b"bytearray");
         let type_ = make_type(&mut arena, &roots, b"type");
         // C12: plain object/super/staticmethod/classmethod/
         // boundmeth types and the ROM `()` singleton.
@@ -94,7 +96,7 @@ impl Fixture {
             &roots,
         );
         let native_init_wrapper = make_type(&mut arena, &roots, b"function");
-        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset, range, dict, type_, object, super_, staticmethod, classmethod, boundmeth, empty_tuple, empty_bytes, property, native_init_wrapper] {
+        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset, range, dict, array, bytearray, type_, object, super_, staticmethod, classmethod, boundmeth, empty_tuple, empty_bytes, property, native_init_wrapper] {
             roots.push(Value::Heap(t));
         }
         let types = BuiltinTypes {
@@ -111,6 +113,8 @@ impl Fixture {
             frozenset,
             range,
             dict,
+            array,
+            bytearray,
             type_,
             object,
             super_,

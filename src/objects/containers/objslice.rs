@@ -394,6 +394,8 @@ pub fn slice_attr(ctx: &mut CallCtx, slice_v: Value, attr: u32) -> Option<Value>
                 name: attr,
                 n_args: fun_n_args(2, 2),
                 func: slice_indices_builtin,
+                // Fixed-arity builtin: no keyword parameters (C10a).
+                kw_func: None,
             }),
         );
         return Some(Value::Heap(ctx.alloc(

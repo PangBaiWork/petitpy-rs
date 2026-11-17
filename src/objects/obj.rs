@@ -57,6 +57,13 @@ use crate::pyerr::{PyError, PyResult};
 pub const FLAG_EQ_NOT_REFLEXIVE: u16 = 0x0004;
 pub const FLAG_EQ_CHECKS_OTHER_TYPE: u16 = 0x0008;
 pub const FLAG_EQ_HAS_NEQ_TEST: u16 = 0x0010;
+/// `MP_TYPE_FLAG_BINDS_SELF` (vendor `py/obj.h:566-577`): the type
+/// binds `self` when its methods are accessed — function and
+/// closure types set it (C10).
+pub const FLAG_BINDS_SELF: u16 = 0x0020;
+/// `MP_TYPE_FLAG_BUILTIN_FUN` (vendor `py/obj.h:566-577`): a
+/// built-in function type (C10).
+pub const FLAG_BUILTIN_FUN: u16 = 0x0040;
 pub const FLAG_INSTANCE_TYPE: u16 = 0x0200;
 /// `MP_TYPE_FLAG_SUBSCR_ALLOWS_STACK_SLICE` (vendor
 /// `py/obj.h:578`): the subscr slot accepts a slice object

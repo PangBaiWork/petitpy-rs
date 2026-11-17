@@ -8,6 +8,7 @@
 //! `str_index_to_ptr`, slice helpers, iterators) lives in
 //! `objstr_a.rs` and is imported by the other C8 files — never copied.
 
+pub mod mpprint;
 pub mod objstr_a;
 pub mod objstr_b;
 pub mod objstr_format;
@@ -19,6 +20,9 @@ pub mod objstr_print;
 pub mod objstr_slice;
 pub mod unicode;
 pub mod vstr;
+
+#[cfg(test)]
+mod mpprint_tests;
 
 #[cfg(test)]
 mod objstr_tests;

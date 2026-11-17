@@ -1,0 +1,214 @@
+Lane C8c result — mpprint.zig (print-output layer) → Rust
+====================================================
+Executor: subagent fa3891d3-28d4-4a3c-b6d2-63a8dd6d0e64
+Worktree: ~/workspace/petitpy-rs-mpprint, branch lane/mpprint
+Base: master 986e3e6 (C8b merge). lib 440 + bin 9 baseline.
+Original: ~/workspace/petitpy-orig, petitpy 0.9.0 (Zig 0.16.0).
+
+ACCEPTANCE
+----------
+cargo test --release --lib --tests:  466 passed, 0 failed, 1 ignored
+  (440 baseline + 26 new C8c tests; the 1 ignored is the pre-existing
+  stale upstream empty-file expectation from A3.)
+cargo test --release --bins:          9 passed, 0 failed.
+cargo build --release:                0 warnings.
+No unsafe in any C8c file (grep-verified; the word "unsafe" appears
+only in a doc comment in mpprint.rs:63).
+All files < 800 lines (max 679). Original repo clean
+(`git status --porcelain` in ~/workspace/petitpy-orig: empty).
+One commit: "Lane C8c: port mpprint.zig to Rust".
+
+FILES
+-----
+New:
+  src/objects/strings/mpprint.rs       679 lines  (mpprint.zig, 511 lines)
+  src/objects/strings/mpprint_tests.rs 467 lines  (26 tests)
+Modified:
+  src/objects/strings/mod.rs           (+ mpprint, mpprint_tests)
+  src/objects/strings/objstr_print.rs  365 → 163 lines (unification,
+                                          see below)
+  scripts/mpprint_result.txt           (this file)
+
+1:1 MAPPING — original → Rust
+-----------------------------
+mpprint.zig (511 lines, 0 test blocks) → src/objects/strings/mpprint.rs:
+  Print (?*const anyopaque, mp_print_t { data, print_strn }) →
+    `Print<'a>` (a `&'a mut dyn PrintSink` handle) + `PrintSink`
+    trait (see design decisions). No raw pointers, no unsafe.
+  pad_spaces[16] / pad_common[23] → `PAD_SPACES` / `PAD_COMMON`
+    (pub(crate), byte-identical; MOVED here from objstr_print.rs —
+    this module is now their single home).
+  emit (npy_pr_emit, :53) → `Print::emit`.
+  mp_print_str (:65) → `mp_print_str` (slice in, length out).
+  mp_print_strn (:71, pad/fill/group state machine) →
+    `mp_print_strn` over the shared `print_strn_core`.
+  mp_print_int (:143) → `mp_print_int` (full port, incl. the
+    32-byte truncation and wrapping negate — see findings).
+  mp_print_mp_int (:228) → `mp_print_mp_int` over the shared
+    `print_mp_int_core`, with the Value→IntValue conversion via
+    C8b's `int_value` (see design decisions).
+  mp_print_float (:443) → `mp_print_float` over the shared
+    `print_float_core`, incl. the `prec == 99` repr dispatch.
+  formatFloatRepr → `format_float_repr` (shortest round-trip
+    digits; Rust `{:e}` supplies the digit string — see findings).
+  MP_FLOAT_REPR_PREC → `MP_FLOAT_REPR_PREC` (99).
+  mp_plat_print / mp_stderr_print (:356-391) → `MP_PLAT_PRINT` /
+    `MP_STDERR_PRINT` (`PrintT` statics, see findings).
+  mp_vprintf / mp_printf → NOT ported (in va_ops.c, per the Zig
+    file header — out of scope, same as the brief).
+  SUPPORT_INT_BASE_PREFIX=0 → omitted (dead, per the Zig header).
+  support_l_format / support_ll_format / long_is_uint_t /
+    int_is_uint_t (:59-62) → NOT ported: comptime `sizeof`
+    comparisons for the va_ops.c `l`/`ll` format support, which is
+    out of scope with mp_printf itself. No `mp_print_*` function
+    reads them.
+
+DIVISION OF LABOUR WITH objstr_print.rs (the C8c unification)
+--------------------------------------------------------------
+C8b's `objstr_print.rs` already held the vendor C cores
+(`print_strn` / `print_mp_int` / `print_float`) in Vstr-bound
+form. This lane moved the three algorithms into `mpprint.rs` ONCE
+as sink-generic cores (`print_strn_core` / `print_mp_int_core` /
+`print_float_core`, over `&mut dyn PrintSink`, returning the
+`c_int` char count the Zig returns) and left thin wrappers in
+`objstr_print.rs` with IDENTICAL signatures (the count is
+discarded there, as C8b's versions did). `PF_FLAG` constants,
+`IntValue`, `int_value`, and `print_float_pct` stay in
+`objstr_print.rs` untouched; `mpprint.rs` re-exports the flags as
+`PF_FLAG_*` so the print layer has one import site. The
+refactor is behaviour-preserving by construction (same code, only
+the sink parameterised) and verified by the full suite: all 440
+baseline tests pass unchanged, including every C8b %-format /
+str.format probe test in tests_d, plus a new test pinning three
+C8b probes through the `Print` API (`c8b_probes_through_print_api`).
+No call sites were rewired (brief item 6): the vsp helpers in
+objstr_print.rs / objstr_format.rs keep calling the Vstr
+wrappers; the `Print`-based exports have no production callers
+yet — C13 wires them into the print machinery.
+
+KEY FINDINGS (verified by the executor, main agent to re-verify)
+---------------------------------------------------------------
+1. BRIEF CORRECTION — `mp_plat_print` is NOT deferred: the brief
+   said the stdout platform function is C13/Phase E's job, but
+   the Zig shows it is a plain `write(1, ...)`
+   (`vendor_stubs.zig:22-24` → `support/output.zig:16-19`, which
+   discards the `write` return; no `\r\n` cooking on this
+   platform). `MP_PLAT_PRINT` is therefore implemented as a plain
+   stdout write, I/O errors ignored, exactly as the C does — and
+   `MP_STDERR_PRINT` as a plain `write(2, ...)` (the Zig comment
+   confirms no flush is needed with `write(2)`). What REMAINS
+   C13/D territory is the full build's `print()`, which goes
+   through `mp_sys_stdout_print` (`sys.stdout`), not this const.
+2. `mp_print_int` TRUNCATES: `INT_BUF_SIZE` is 32
+   (`sizeof(isize) * 4`, vendor `mpprint.c:151`), and both the C
+   loop (`while (b > buf && x != 0)`) and the Zig loop
+   (`if (!(b > 0 and x != 0)) break`) stop when the buffer fills.
+   A base-2 `usize::MAX` prints its LOW 32 bits (`"1" * 32`).
+   Ported verbatim; pinned by `mp_print_int_truncation_base2`.
+   No live Zig caller exists (grep: zero callers outside
+   mpprint.zig) — it is exported for C/mp_printf use.
+3. `formatFloatRepr` digits: Rust's `{:e}` and Zig's Ryu `{e}`
+   both emit THE shortest round-trip digit string, so they agree
+   digit-for-digit (probed with rustc: `2.5→2.5e0`, `0.0→0e0`,
+   `1e16→1e16`, `5e-324→5e-324`, `123456789.0→1.23456789e8`).
+   The exponent is re-emitted normalised (`e±NN`, two digits
+   minimum), so no source spelling can leak through.
+4. The binary's `repr()` IS this branch: probed on the reference
+   binary — repr(2.5)='2.5', repr(1e16)='1e+16',
+   repr(1.5e-5)='1.5e-05', repr(0.1)='0.1', repr(5e-324)='5e-324',
+   repr(1234567.0)='1234567.0', repr(sqrt(2))='1.4142135623730951'
+   (shortest digits …951, NOT the vendor APPROX …952 the Zig
+   comment warns about). The `.0` on 1234567.0 is the
+   `ALWAYS_DECIMAL` framing in `mp_print_float`, not the repr
+   function itself — pinned by the `mp_print_float_repr` test
+   (bare branch gives '1234567', +ALWAYS_DECIMAL gives
+   '1234567.0').
+5. The `prec == 99` branch has NO live Zig caller today: the
+   only `mp_print_float` callers are the vsp format helpers
+   (objstr.zig:1798/1802, spec prec, never 99). The float print
+   slot lives in vendor C (objfloat.c — C18's carve-out), so C18
+   wires the repr path. The branch is ported verbatim anyway.
+6. `mp_print_mp_int`'s non-int conversion: the Zig does
+   `if (!objIsInt(x)) x = smallInt(mp_obj_get_int(x))`. The Rust
+   version goes through C8b's `int_value` (heap big-int first,
+   then the `IntMaybe` slot), which covers both arms; a value
+   with no conversion returns `StrError::Obj
+   (ObjError::IntConversion)` — the Zig's `mp_obj_get_int` raise
+   (`TypeError: can't convert to int`, obj.rs:180). This needs
+   `CallCtx` + `BuiltinTypes`, so the Rust signature gains two
+   parameters over the Zig's — documented in the code.
+
+PROBE RECORDS (reference binary)
+---------------------------------
+repr(2.5) → '2.5'; repr(1e16) → '1e+16'; repr(1.5e-5) → '1.5e-05';
+repr(0.1) → '0.1'; repr(5e-324) → '5e-324';
+repr(1234567.0) → '1234567.0'; repr(sqrt(2)) → '1.4142135623730951'.
+Rust `{:e}` probe (rustc -O): 2.5 → '2.5e0'; 0.0 → '0e0';
+1e16 → '1e16'; 1.5e-5 → '1.5e-5'; 5e-324 → '5e-324';
+123456789.0 → '1.23456789e8'; 100000.0 → '1e5'; 0.1 → '1e-1';
+1e15 → '1e15'; 1234567.0 → '1.234567e6'; 2.0 → '2e0';
+0.0001 → '1e-4'.
+
+NEW TESTS (26, mpprint_tests.rs)
+---------------------------------
+mp_print_str_basic, mp_print_strn_right_pad,
+mp_print_strn_left_adjust, mp_print_strn_center,
+mp_print_strn_zero_fill, mp_print_strn_grouped_comma,
+mp_print_strn_grouped_bump, pad_tables_byte_exact,
+mp_print_int_decimal, mp_print_int_sign_flags, mp_print_int_bases,
+mp_print_int_wrapping_negate, mp_print_int_truncation_base2,
+mp_print_int_pad_after_sign, mp_print_mp_int_small,
+mp_print_mp_int_big, mp_print_mp_int_prefix_prec,
+mp_print_mp_int_non_int, mp_print_float_basic,
+mp_print_float_flags, mp_print_float_repr,
+format_float_repr_direct, print_sink_multi_segment,
+print_sink_vstr, platform_printers_construct,
+c8b_probes_through_print_api.
+
+GAPS FOR LATER LANES
+--------------------
+C13 (VM): wire the `Print`-based `mp_print_*` exports into the
+  print machinery (`obj_print` / `MP_PYTHON_PRINTER`); the
+  `Print`-based exports have no production callers yet.
+C18 (float/complex): wire the float print slot (vendor objfloat.c)
+  to `mp_print_float` with `prec == 99` for repr (see finding 5);
+  replace the `float_of` fixture stub with the real slot.
+D (modules): the full build's `print()` goes through
+  `mp_sys_stdout_print` (`sys.stdout`), not `MP_PLAT_PRINT`.
+Phase F / va_ops.c: `mp_printf` / `mp_vprintf` (variadic, in
+  `va_ops.c`) are out of scope for this lane, per the Zig header.
+
+DESIGN DECISIONS
+----------------
+- `PrintSink` trait (`emit(&mut self, &[u8]) -> Result<(), StrError>`)
+  instead of `&mut dyn fmt::Write`: the print layer emits RAW
+  BYTES (bytes objects, `%c` with `\xff`), which `fmt::Write`
+  (`&str`-only) cannot carry. `Vec<u8>` and `Vstr` implement it;
+  a `PrintT` implements it by calling its fn pointer. The
+  existing `fmt::Write` machinery (`obj_print_helper`, print
+  slots, `VstrSink`) is untouched.
+- The shared cores take `&mut dyn PrintSink` and return the
+  `c_int` char count; Vstr wrappers discard it. A `Vstr` sink
+  still propagates its `StrError` (fixed-buffer / allocation);
+  stdout/stderr sinks ignore I/O errors, as the C does.
+- `PrintT` keeps only the `print_strn: fn(&[u8])` field: both
+  built-in printers have `data = null` in the Zig, so there is
+  nothing to carry. The struct is `Copy`; the two consts are
+  `static`s. A `PrintT` can back a `Print` (via the `PrintSink`
+  impl) by copying the static into a local first.
+- `mp_print_mp_int` takes `ctx` + `types` (finding 6) — a
+  deliberate signature adaptation, not a behaviour change.
+- `format_float_repr` writes into the caller's 33-byte buffer
+  with a NUL terminator, exactly like the Zig (max output ~23
+  bytes); it `debug_assert`s finiteness — the caller
+  (`print_float_core`) checks `is_finite()` first, as the Zig does.
+
+DIVERGENCES FROM THE ORIGINAL (intentional, documented)
+-------------------------------------------------------
+- None in behaviour. Adaptations only: `Print`/`PrintSink`
+  instead of the C `{ data, print_strn }` function-pointer struct
+  (no unsafe); `mp_print_mp_int` gains `ctx`/`types` params
+  (finding 6); `mp_print_str` takes a slice instead of a
+  NUL-terminated pointer (same bytes, same length return);
+  `mp_print_int`'s negative-base `@intCast` panic becomes a
+  `try_into().expect(...)` panic.

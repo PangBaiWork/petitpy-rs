@@ -68,15 +68,14 @@ use std::collections::HashMap;
 use crate::compiler::bridge::compile_to_mpy_named;
 use crate::compiler::mpy::{self, QstrEntry, RawCode};
 use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
-use crate::objects::callables::objfun::new_fun_bc;
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::objtype::objexcept_types::ExceptionTypes;
-use crate::objects::objtype::objmodule::new_module;
 use crate::objects::primitives::objint::fun_n_args;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{DictData, FunBuiltinData, GcRef, MapData, Obj, Value};
 use crate::pyerr::PyResult;
 use crate::runtime::bc::CodeState;
+use crate::runtime::builtinevex::{compile_builtin_fn, eval_builtin_fn, exec_builtin_fn};
 use crate::runtime::qstr::RuntimeQstr;
 use crate::runtime::vm_builtins::{
     build_class_builtin_fn, next_builtin_fn, print_builtin, print_builtin_nokw,
@@ -222,6 +221,19 @@ pub struct VmState {
     /// calls into another module's function — the Zig's
     /// `old_globals`).
     pub globals: GcRef,
+    /// The current locals dict (`mp_state_ctx.thread.dict_locals`,
+    /// `jcb_glue.zig`): set ONLY by `eval`/`exec` (`codeExecute`,
+    /// `builtinevex.zig:64-84`); `None` means "locals ==
+    /// globals" (the module level — the Zig's `dict_locals`
+    /// starts `NULL` and `mp_load_name` falls through to
+    /// globals). Added by C15a: the `VmState` struct change the
+    /// `jcb` brief line ("only accessors, no struct change") did
+    /// not foresee — the eval wiring requires the slot, and the
+    /// alternative (eval with locals == globals only) would be
+    /// knowingly wrong for corpus-tested behavior
+    /// (`builtin_exec.py` exercises distinct locals). Behavior
+    /// is identical when `None`.
+    pub locals: Option<GcRef>,
     /// The builtins globals dict (`mp_load_global`'s fallback).
     pub builtins: GcRef,
     /// The VM-owned empty-tuple singleton (`mp_const_empty_tuple`).
@@ -240,6 +252,16 @@ pub struct VmState {
     /// The `__build_class__` builtin (stub until C12a's
     /// `type_call` — calling it raises a bare TypeError).
     pub build_class_builtin: Value,
+    /// The `eval` builtin (intercepted by GcRef identity in
+    /// `call_function_ctx` — its `func` is a stub, see
+    /// `builtinevex.rs`).
+    pub eval_builtin: Value,
+    /// The `exec` builtin (same interception as `eval`).
+    pub exec_builtin: Value,
+    /// The `compile` builtin (same interception as `eval`;
+    /// raises `NotImplementedError` — there is no `Obj::Code`
+    /// yet, see `builtinevex.rs`).
+    pub compile_builtin: Value,
     /// Loaded modules by name qstr (C15 fills this via imports).
     pub modules: HashMap<u32, GcRef>,
     /// The VM-owned type objects (fun_bc, gen_wrap, …) — kept in
@@ -250,6 +272,35 @@ pub struct VmState {
     /// truncation point for `rebuild_frame_roots` (kept in the
     /// state so the resume path can re-root after a yield).
     pub extra_base: usize,
+}
+
+impl VmState {
+    /// `mp_globals_get` (`jcb_glue.zig`): the current globals
+    /// dict — a plain field read, as the Zig's accessor is a
+    /// plain read of `mp_state_ctx.thread.dict_globals`.
+    pub fn globals_dict(&self) -> GcRef {
+        self.globals
+    }
+
+    /// `mp_globals_set` (`jcb_glue.zig`): replace the current
+    /// globals dict.
+    pub fn set_globals_dict(&mut self, dict: GcRef) {
+        self.globals = dict;
+    }
+
+    /// `mp_locals_get` (`jcb_glue.zig`): the current locals dict
+    /// — `locals` when set, else `globals` (the Zig's
+    /// `dict_locals` is `NULL` at module level; `mp_load_name`
+    /// falls through to globals there).
+    pub fn locals_dict(&self) -> GcRef {
+        self.locals.unwrap_or(self.globals)
+    }
+
+    /// `mp_locals_set` (`jcb_glue.zig`): replace the current
+    /// locals dict (`None` = back to "locals == globals").
+    pub fn set_locals_dict(&mut self, dict: Option<GcRef>) {
+        self.locals = dict;
+    }
 }
 
 /// The VM: the arena + roots + types + pool (the `CallCtx` parts)
@@ -319,6 +370,7 @@ impl Vm {
             state: VmState {
                 code_store: CodeStore::new(),
                 globals: GcRef(0),
+                locals: None,
                 builtins: GcRef(0),
                 empty_tuple,
                 ellipsis,
@@ -327,6 +379,9 @@ impl Vm {
                 exc,
                 next_builtin: Value::None,
                 build_class_builtin: Value::None,
+                eval_builtin: Value::None,
+                exec_builtin: Value::None,
+                compile_builtin: Value::None,
                 modules: HashMap::new(),
                 vm_types,
                 extra_base: 0,
@@ -482,6 +537,36 @@ impl Vm {
         );
         let bc_val = Value::Heap(bc_fun);
         bind("__build_class__", bc_val, &mut pairs);
+        // `eval` / `exec` (1–3 args) and `compile` (3–6 args):
+        // `MpObjFunBuiltinVar` objects (`builtinevex.zig:207-225`,
+        // sigs `(1, 3, false)` / `(1, 3, false)` / `(3, 6,
+        // false)`), intercepted by identity in `call_function_ctx`
+        // — their `func`s are stubs, as `next`'s is.
+        let mk_var = |ctx: &mut CallCtx,
+                      name: &str,
+                      min: u16,
+                      max: u16,
+                      func: crate::objects::slots::BuiltinFn,
+                      pairs: &mut Vec<(Value, Value)>|
+         -> Value {
+            let id = static_qstr_id(name.as_bytes())
+                .unwrap_or_else(|| panic!("builtin name is not a static qstr: {}", name));
+            let f = ctx.alloc(
+                Some(vmt.fun_builtin_var),
+                Obj::FunBuiltin(FunBuiltinData {
+                    name: id,
+                    n_args: fun_n_args(min, max),
+                    func,
+                    kw_func: None,
+                }),
+            );
+            let v = Value::Heap(f);
+            bind(name, v, pairs);
+            v
+        };
+        let eval_val = mk_var(&mut ctx, "eval", 1, 3, eval_builtin_fn, &mut pairs);
+        let exec_val = mk_var(&mut ctx, "exec", 1, 3, exec_builtin_fn, &mut pairs);
+        let compile_val = mk_var(&mut ctx, "compile", 3, 6, compile_builtin_fn, &mut pairs);
 
         let builtins = ctx.alloc(
             None,
@@ -495,8 +580,11 @@ impl Vm {
         state.globals = builtins;
         state.next_builtin = next_val;
         state.build_class_builtin = bc_val;
+        state.eval_builtin = eval_val;
+        state.exec_builtin = exec_val;
+        state.compile_builtin = compile_val;
         // Pin everything live: the types, the singletons, the
-        // builtins dict and the three builtin values.
+        // builtins dict and the builtin values.
         let mut pins: Vec<Value> = Vec::new();
         for r in [
             t.int,
@@ -544,6 +632,9 @@ impl Vm {
         pins.push(print_val);
         pins.push(next_val);
         pins.push(bc_val);
+        pins.push(eval_val);
+        pins.push(exec_val);
+        pins.push(compile_val);
         drop(ctx);
         for v in pins {
             self.pin(v);
@@ -569,67 +660,24 @@ impl Vm {
         self.load_module_from_mpy(&mpy, name)
     }
 
+
     /// Load a module from `.mpy` bytes (the `petitpy-vm` entry
     /// point): read, register, run the module body.
     pub fn load_module_from_mpy(&mut self, data: &[u8], name: &str) -> Result<Value, VmError> {
-        let module = mpy::read(data).map_err(VmError::Mpy)?;
-        // (Intern with `&mut self.pool` BEFORE the split — the
-        // ctx carries the pool shared.)
-        let name_id = self
-            .pool
-            .from_strn(name.as_bytes())
-            .map_err(|_| VmError::OutOfMemory)?;
-        let qstr_table =
-            resolve_qstr_table(&mut self.pool, &module.qstrs).map_err(|_| VmError::OutOfMemory)?;
-        let module_type = self.state.vm_types.module;
-        // Convert the module's const-object table once
-        // (`obj_from_entry`) and pin every value in `roots.extra`
-        // (inserted at `extra_base`, so `rebuild_frame_roots`
-        // keeps them) — `LOAD_CONST_OBJ` must push the SAME
-        // object on every load, as the Zig's `obj_table` does.
-        // Each value is pinned immediately after conversion so a
-        // GC during the next conversion cannot collect it.
-        let const_table: Vec<Value> = {
-            let (mut ctx, state) = self.split();
-            let mut table = Vec::with_capacity(module.objs.len());
-            for entry in &module.objs {
-                let types = ctx.types;
-                let v = crate::runtime::vm_raise::obj_from_entry(
-                    &mut ctx, types, state.ellipsis, entry,
-                )
-                .map_err(|_| VmError::OutOfMemory)?;
-                ctx.roots.extra.insert(state.extra_base, v);
-                state.extra_base += 1;
-                table.push(v);
-            }
-            table
+        let (module_val, code_idx) = self.register_mpy_code(data, name, None, true)?;
+        let module_ref = match module_val {
+            Value::Heap(r) => r,
+            _ => unreachable!("new_module returns a heap module"),
         };
-        let (module_val, code_idx) = {
-            let (mut ctx, state) = self.split();
-            let module_val = new_module(&mut ctx, name_id as u32, module_type);
-            let module_ref = match module_val {
-                Value::Heap(r) => r,
-                _ => unreachable!("new_module returns a heap module"),
-            };
-            let code_idx = state.code_store.register_module(
-                module.rc.clone(),
-                qstr_table,
-                const_table,
-                module_ref,
-            );
-            state.modules.insert(name_id as u32, module_ref);
-            // The module's globals dict is its `dict` — the
-            // frame's globals while the body runs.
-            let globals = match ctx.arena.get(module_ref) {
-                Obj::Module(m) => m.dict,
-                _ => unreachable!("module object"),
-            };
-            // Pin the module object (its dict is traced through it).
-            drop(ctx);
-            self.pin(module_val);
-            self.state.globals = globals;
-            (module_val, code_idx)
+        // The module's globals dict is its `dict` — the frame's
+        // globals while the body runs.
+        let globals = match self.arena.get(module_ref) {
+            Obj::Module(m) => m.dict,
+            _ => unreachable!("module object"),
         };
+        // Pin the module object (its dict is traced through it).
+        self.pin(module_val);
+        self.state.globals = globals;
         // Run the module body as a 0-arg function call.
         let fun = Value::Heap(self.call_module_fun(code_idx, module_val));
         let result = crate::runtime::vm_ops::call_function(self, fun, 0, 0, &[]);
@@ -639,26 +687,12 @@ impl Vm {
         }
     }
 
+
     /// Build the module-body `FunBc` for a registered module code
     /// (context = the module, so its globals are the module dict).
-    fn call_module_fun(&mut self, code_idx: usize, module_val: Value) -> GcRef {
-        let fun_bc_ty = self.state.vm_types.fun_bc;
-        let (mut ctx, _state) = self.split();
-        let module_ref = match module_val {
-            Value::Heap(r) => r,
-            _ => unreachable!("module value"),
-        };
-        let name = static_qstr_id(b"<module>").unwrap_or(0);
-        new_fun_bc(
-            &mut ctx,
-            fun_bc_ty,
-            name,
-            0,
-            code_idx,
-            None,
-            None,
-            Some(module_ref),
-        )
+    pub(crate) fn call_module_fun(&mut self, code_idx: usize, module_val: Value) -> GcRef {
+        let (mut ctx, state) = self.split();
+        Self::call_module_fun_ctx(&mut ctx, state, code_idx, module_val)
     }
 }
 

@@ -17,13 +17,26 @@ use crate::runtime::vm_rt::pending_exc_or_type_error;
 
 // ── load/store name/global ───────────────────────────────────────────
 
-/// `mp_load_name` (`runtime.zig:288-296`): the VM has no
-/// separate locals dict — the frame's locals live in the
-/// `CodeState.state` array (positional, not name-keyed) — so a
-/// name lookup is the globals lookup. (A class body sets a
-/// separate locals namespace; C12a adds that — until then
-/// `LOAD_NAME` is `LOAD_GLOBAL`.)
+/// `mp_load_name` (`runtime.zig:288-296`): when the locals
+/// dict is distinct from the globals dict (`localsNeGlobals`,
+/// `mp_mirrors.zig:275-276` — `dict_locals != dict_globals`),
+/// look the name up in locals FIRST, then fall through to
+/// `mp_load_global` (globals, then builtins). When locals ==
+/// globals (the common case — `VmState.locals` is `None`),
+/// this IS `mp_load_global`. The distinct-locals case is set
+/// only by `eval`/`exec` (`codeExecute` — C15a wires it) and
+/// by a class body (C12a's namespace — the compiler emits
+/// `LOAD_NAME` there too).
 pub fn load_name_ctx(ctx: &mut CallCtx, state: &mut VmState, qst: u32) -> Result<Value, Value> {
+    use crate::objects::containers::objdict::dict_get_value;
+    if let Some(l) = state.locals {
+        if l != state.globals {
+            let key = Value::Qstr(qst);
+            if let Ok(v) = dict_get_value(ctx, Value::Heap(l), key) {
+                return Ok(v);
+            }
+        }
+    }
     load_global_ctx(ctx, state, qst)
 }
 
@@ -50,7 +63,9 @@ pub fn load_global_ctx(ctx: &mut CallCtx, state: &mut VmState, qst: u32) -> Resu
 }
 
 /// `mp_store_name` / `mp_store_global` (`runtime.zig:337-342`):
-/// store into the locals (= globals, see `load_name_ctx`) /
+/// `STORE_NAME` stores into the locals dict unconditionally
+/// (`dict_locals`, which IS the globals dict when
+/// `VmState.locals` is `None`); `STORE_GLOBAL` stores into the
 /// globals dict. A store into a fixed dict raises (the globals
 /// dict is never fixed).
 pub fn store_name_ctx(
@@ -59,7 +74,15 @@ pub fn store_name_ctx(
     qst: u32,
     value: Value,
 ) -> Result<(), Value> {
-    store_global_ctx(ctx, state, qst, value)
+    use crate::objects::containers::objdict::dict_store;
+    dict_store(
+        ctx,
+        Value::Heap(state.locals_dict()),
+        Value::Qstr(qst),
+        value,
+    )
+    .map(|_| ())
+    .map_err(|e| exc_from_typed(ctx, state, e))
 }
 
 pub fn store_global_ctx(
@@ -75,10 +98,11 @@ pub fn store_global_ctx(
 }
 
 /// `mp_delete_name` / `mp_delete_global` (`runtime.zig:343-346`):
-/// delete from the dict; a missing key is silent (the Zig
-/// ignores the delete result).
+/// delete from the locals dict / the globals dict; a missing
+/// key is silent (the Zig ignores the delete result).
 pub fn delete_name_ctx(ctx: &mut CallCtx, state: &mut VmState, qst: u32) {
-    delete_global_ctx(ctx, state, qst)
+    use crate::objects::containers::objdict::dict_delete;
+    let _ = dict_delete(ctx, Value::Heap(state.locals_dict()), Value::Qstr(qst));
 }
 
 pub fn delete_global_ctx(ctx: &mut CallCtx, state: &mut VmState, qst: u32) {

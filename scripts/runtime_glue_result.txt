@@ -1,0 +1,201 @@
+Lane C15a: runtime glue — argcheck/raise/opmethods/runtime_utils
+===============================================================
+Executor: lane/runtime-glue (worktree ~/workspace/petitpy-rs-runtime-glue)
+Base: master 6d0e15f (C14 merged). Result: lib 981 -> 1022 (+41 new),
+bins 9/9, 1 ignored (pre-existing), 0 warnings, no unsafe, every file
+<800 lines, orig clean. One commit.
+
+Modules (all under src/runtime/, all checked against the original
+Zig sources in ~/workspace/petitpy-orig):
+- argcheck.rs (277) + argcheck_tests.rs (307): runtime/argcheck.zig.
+  sig_decode / check_num_sig (pure predicate) / arg_check_num_sig
+  (polled: records the terse raise first-wins + Err(PyRaise)) /
+  ArgSpec + ArgVal + arg_parse_all (kw-array form only — the map
+  form has no Rust caller) / KwPos + kw_pos_parse + kw_make_new.
+  Existing decoded helpers (objtype/errors.rs::arg_check_num_sig,
+  callables/objfun.rs::arg_check_num) NOT rewritten; the grid test
+  cross-checks all three. `kwVar` has NO Rust counterpart — Rust's
+  FunBuiltinData.kw_func already carries the kwargs path.
+  7 new tests (lib 988).
+- raise.rs (135): runtime/raise.zig. raise_type_error_null (bare
+  TypeError), raise_os_error (OSError(errno)), malloc_fail
+  (MemoryError "memory allocation failed"), raise_msg /
+  raise_msg_varg (LITERAL format string — varg formatting deferred),
+  raise_value_error / raise_type_error / raise_not_implemented /
+  raise_type_error_int_conversion ("can't convert to int") /
+  raise_type_arg / raise_bad_compile_mode (ValueError "bad compile
+  mode"). 6 new tests (lib 994).
+- opmethods.rs (195): runtime/opmethods.zig. native_base (flag
+  check FIRST — count_native_bases alone reports 1 for a native
+  type itself — then count>0 -> subobj[0] as-is incl. the sentinel;
+  empty subobj -> self, never index OOB), getitem_op / setitem_op /
+  delitem_op (nativeBase + call_subscr), contains_op (NO nativeBase,
+  call_binary CONTAINS). 3 MethodEntry rows added to DICT_METHODS
+  (__getitem__ 2..2, __setitem__ 3..3, __delitem__ 2..2) using the
+  NEW canonical arg_check_num_sig. dict_contains_builtin exists
+  but has NO table entry (mp_op_contains_obj is unreferenced in
+  the original). 6 new tests (lib 1000).
+- runtime_utils.rs (229): runtime/runtime_utils.zig.
+  call_function_{1,2}_protected (+ pub(crate) sink cores for
+  testability) / mul_ll_overflow / mul_mp_int_t_overflow
+  (-> Option<i64>, shared predicate verbatim from the Zig).
+  3 new tests (lib 1003).
+- builtinevex.rs (304) + vm_eval.rs (394) + vm.rs/vm_call.rs/
+  vm_rt_name.rs wiring: runtime/builtinevex.zig (eval/exec/compile).
+  eval/exec intercepted by GcRef identity in call_function_ctx
+  (the `next` pattern); compile validated then NotImplementedError
+  (see below). 19 new tests (lib 1022).
+
+Verified numbers (cargo test --release --lib --tests AND --bins):
+  lib 1022 passed, 0 failed, 1 ignored; bins 9 passed.
+
+Deviations / decisions (for the main agent to confirm at merge):
+1. VmState.locals: Option<GcRef> ADDED (None = locals == globals),
+   + eval_builtin / exec_builtin / compile_builtin Values on
+   VmState, + globals_dict / set_globals_dict / locals_dict /
+   set_locals_dict accessors (locals_dict() = locals.unwrap_or
+   (globals)). The brief's jcb line said "only accessors, don't
+   touch VmState" — but eval wiring REQUIRES the slot: the
+   alternative (eval with locals==globals only) is knowingly
+   wrong for corpus-tested behavior (builtin_exec.py tests
+   distinct locals). Behavior is identical when None (all 938
+   pre-existing C13/C14 tests still pass). load_name_ctx now
+   tries locals first when Some(l) with l != globals, else
+   globals; store/delete_name_ctx write into
+   locals.unwrap_or(globals). The stale "LOAD_NAME is LOAD_GLOBAL
+   until C12a" comment is updated.
+2. Dispatch-path eval has a READ-ONLY qstr resolve
+   (resolve_qstr_table_readonly, vm_eval.rs): the dispatch loop
+   only has (ctx, state) and CallCtx.pool is a shared & (the C0
+   design — the dispatch loop never mutates the pool). Static
+   entries pass through; New bytes resolve via pool.find_strn; a
+   genuinely-new name fails LOUDLY with OutOfMemory (the
+   interning subsystem's own error — from_strn's only failure),
+   never silently mis-resolving to "" (qstr 0). Vm::eval_exec
+   (which holds &mut pool) interns correctly. Consequences,
+   measured against the corpus tests: eval("1+2"), eval("x")
+   with x an outer variable, exec("def foo(): ...") with foo an
+   outer variable all work; exec("def bar(): ...") where bar
+   never appeared as an identifier fails with MemoryError.
+   The builtinevex tests pin both halves (incl. the three
+   tests that must intern the name in the outer module first:
+   exec_distinct_locals_corpus, exec_stores_into_globals,
+   exec_globals_none_means_current_locals). Closing this gap
+   for dispatch-path eval needs a CallCtx.pool mutability
+   decision — changing it to &'a mut breaks the tree's
+   `let pool = ctx.pool;` + resolve-closure pattern
+   (obj_print_exception takes &mut ctx AND a closure borrowing
+   the pool) and touches the frozen C0 interface; RefCell
+   interior mutability is out (qstr_str returns &[u8] that
+   cannot outlive a RefCell borrow guard, and unsafe is banned).
+3. Raise propagation is the ONLY path in Rust (raise.rs): record
+   pending_raise + return Err(PyRaise); do NOT print + exit(1).
+   The Zig's print+exit exists only because vendor C cannot
+   propagate; the longjmp branch IS propagation; the VM's top
+   level prints uncaught exceptions and exits 1, so the
+   observable outcome for uncaught raises is identical, and
+   try/except can catch them (correct Python semantics).
+4. raise.zig CORRECTION to the brief: the second comptime block
+   exports the nano_mp_raise_* helpers on BOTH arms — mp_raise_msg,
+   mp_raise_msg_varg, mp_raise_ValueError, mp_raise_TypeError,
+   mp_raise_TypeError_int_conversion, mp_raise_NotImplementedError,
+   mp_raise_type_arg ARE live under full (called by vendor MPZ,
+   objint.c, modre.c). All ported.
+5. runtime_utils.zig header-vs-code: the file header claims the
+   C source NEVER writes *res, but the Zig code writes
+   res[0] = x *% y on the non-overflow path in BOTH mul fns —
+   code wins (port returns Some(product) iff !overflow).
+6. opmethods.zig null-slot divergence (documented, not a bug):
+   the Zig's callSubscr/callBinaryOp (mp_mirrors.zig:863-874)
+   PANIC on a null slot; Rust records the generic error instead
+   (ObjError::NotSubscriptable / C14's binop_unsupported) and
+   documents the Zig-panics-there fact. A slot-recorded raise
+   propagates untouched (obj.zig:604-605 rule).
+7. compile() is BLOCKED on the missing Obj::Code: full arg
+   parsing + mode validation are implemented (bad mode ->
+   ValueError "bad compile mode"; non-str filename -> TypeError
+   "can't convert to str implicitly"; the mode check OVERWRITES
+   a pending filename error — compile("1", 5, 5) -> ValueError,
+   probed), then NotImplementedError. A FunBc-as-code interim
+   was REJECTED (it would misrepresent type(c) — 'function' vs
+   'code'). The gap is precise: Obj::Code variant + code type
+   in ROM + codeExecute over code objects (owner C15b / entry
+   work). Probed: compile() WORKS on the reference binary
+   (repr(c) = <>, eval(c) = 3, hash(c) works); type(code)
+   ABORTS the original rc=134 (the code type pointer is null
+   there — Zig panic "cast causes pointer to be null",
+   mp_mirrors.zig:745); compile("1", "f", b"eval") -> ValueError
+   bad mode (bytes mode does NOT match — mode comparison is by
+   qstr id); compile("1", "f", "eval", 0) succeeds (extra args
+   ignored, sig (3,6,false)); a non-str/bytes compile() source
+   aborts the original rc=134 (the Zig passes the NULL
+   str_get_data result to @ptrCast) — Rust raises the TypeError
+   the polled str read records before the abort.
+8. eval/exec non-buffer source: eval(123), eval([1]),
+   eval(None), eval({}), eval(1.5) ALL raise OSError(12,)
+   on the reference binary — stable. Mechanism: getBufferRaise
+   IGNORES the mp_get_buffer failure (_ =, builtinevex.zig:33-35)
+   and evalExecHelperImpl calls npy_zig_eval_exec with the
+   UNINITIALIZED bufinfo; raiseBufferProtocol's TypeError
+   ("object with buffer protocol required", obj.zig:179-182)
+   is recorded then OVERWRITTEN by the bridge's OOM path
+   (zig_compile_bridge.zig:110, mp_raise_OSError_polled
+   (MP_ENOMEM=12)). Rust raises OSError(12) — the OBSERVED
+   behavior, not the overwritten TypeError.
+9. Protected calls have NO dyn FnMut call seam: C14's
+   call_function_1/2 take only &mut CallCtx and return
+   Result<Value, RtError>; testability comes from the sink
+   parameter instead. protected_outcome checks pending AFTER
+   the call whatever it returned (runtime_utils.zig:41-44).
+10. Locals-dict pinning: eval_exec (both versions) pins the
+    locals dict in roots.extra when distinct from globals —
+    it is reachable ONLY through state.locals (not a GC root;
+    the Zig scans thread.dict_locals as a root), and a GC
+    during the body call could otherwise collect it. Same
+    pattern as the module pin.
+11. No stackctrl / nlr_glue / nlr_trampoline / jcb_glue modules
+    (mapping table in src/runtime/mod.rs docs): stackctrl is
+    no-op (STACK_CHECK=0) + GC-bound with no Rust equivalent;
+    nlr_glue is @panic stubs (NOT translated into panic!) +
+    mp_plat_print (already C8c's); the trampoline is setjmp/
+    longjmp (PyError / pending_raise / pending_exc are the
+    mechanism); jcb is the VmState accessors above.
+12. File split (800-line rule): the eval/registration block
+    moved out of vm.rs into vm_eval.rs (vm.rs 758 — 42 lines
+    headroom, watch it; vm_eval.rs 394); the builtinevex tests
+    moved out of runtime_glue_tests.rs into
+    runtime_glue_tests_b.rs (525 / 403). Cross-module methods
+    made pub(crate): register_mpy_code, call_module_fun_ctx,
+    call_module_fun.
+
+Corpus status: builtin_eval.py / builtin_exec.py / builtin_compile.py
+were verified through the Vm tests (the exact corpus cases incl.
+distinct locals, fall-through to globals, NameError, def-in-d,
+syntax errors, bare TypeError, OSError(12), bad mode, terse
+arity). builtin_eval_buffer.py / builtin_exec_buffer.py:
+eval(b"...") and the bytearray source path are covered
+(bytearray via a hand-built Array value through
+call_eval_exec_ctx); the memoryview-source case is NOT covered
+(memoryview is a type call — C13b's make_new adapters).
+compile()-dependent cases in builtin_compile.py (exec(c),
+eval(compile(...)), hash(compile(...)), func.__globals__)
+stay blocked on Obj::Code. No runnable CLI exists yet to run
+the corpus files directly (src/main.rs is still a skeleton —
+Phase E entry work).
+
+Files changed (own files only; brief NOT committed):
+  M src/objects/containers/objdict_methods.rs (3 DICT_METHODS rows)
+  M src/runtime/mod.rs (builtinevex, vm_eval, tests_b + glue map)
+  M src/runtime/vm.rs (locals field + builtin fields + accessors;
+    eval/registration moved to vm_eval.rs)
+  M src/runtime/vm_call.rs (eval/exec/compile interception)
+  M src/runtime/vm_rt_name.rs (locals in load/store/delete_name)
+  A src/runtime/argcheck.rs + argcheck_tests.rs
+  A src/runtime/builtinevex.rs
+  A src/runtime/opmethods.rs
+  A src/runtime/raise.rs
+  A src/runtime/runtime_utils.rs
+  A src/runtime/vm_eval.rs
+  A src/runtime/runtime_glue_tests.rs
+  A src/runtime/runtime_glue_tests_b.rs
+  A scripts/runtime_glue_result.txt (this file)

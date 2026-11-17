@@ -807,4 +807,33 @@ pub static DICT_METHODS: &[crate::objects::slots::MethodEntry] = &[
         max: 3,
         kw_func: None,
     },
+    // The opmethods ROM objects (`objdict.zig:768-770,785-787` —
+    // the last three rows of both the nano and the full locals
+    // dict tables): `__getitem__` / `__setitem__` / `__delitem__`
+    // are `mp_op_getitem_obj` / `mp_op_setitem_obj` /
+    // `mp_op_delitem_obj` (`opmethods.zig:61-73`), 2-/3-/2-arg
+    // `fun_builtin` objects. `__contains__` is NOT in the Zig's
+    // dict table — `mp_op_contains_obj` is unreferenced there —
+    // so it has no entry here either (C15a).
+    crate::objects::slots::MethodEntry {
+        name: "__getitem__",
+        func: crate::runtime::opmethods::dict_getitem_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "__setitem__",
+        func: crate::runtime::opmethods::dict_setitem_builtin,
+        min: 3,
+        max: 3,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "__delitem__",
+        func: crate::runtime::opmethods::dict_delitem_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
 ];

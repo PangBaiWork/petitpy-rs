@@ -21,11 +21,18 @@ use crate::objects::containers::objset_methods::{FROZENSET_METHODS, SET_METHODS}
 use crate::objects::containers::objslice::{slice_type_data, SLICE_METHODS};
 use crate::objects::containers::objtuple::{tuple_type_data, TUPLE_METHODS};
 use crate::objects::containers::objproperty::PROPERTY_METHODS;
+use crate::objects::iters::objenumerate::enumerate_type_data;
+use crate::objects::iters::objfilter::filter_type_data;
+use crate::objects::iters::objmap::map_type_data;
+use crate::objects::iters::objzip::zip_type_data;
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::objtype::objexcept_types::{build_exception_types, ExceptionTypes};
 use crate::objects::objtype::objmodule::module_type_data;
 use crate::objects::objtype::objobject::object_type_data;
-use crate::objects::objtype::rom::{classmethod_type_data, staticmethod_type_data, super_type_data};
+use crate::objects::objtype::rom::{
+    classmethod_type_data, object_make_new_slot, staticmethod_type_data, super_type_data,
+    type_type_data,
+};
 use crate::objects::primitives::objbool::bool_type_data;
 use crate::objects::primitives::objcell::cell_type_data;
 use crate::objects::primitives::objint::{fun_n_args, int_locals_dict, int_type_data};
@@ -161,8 +168,8 @@ fn locals_dict_from_pairs(
 /// singletons. Called once from `Vm::new` (which then pins the
 /// results in `roots.extra`). The type objects are allocated with
 /// a `None` header type (the bootstrap pattern — the `type` type
-/// does not exist yet; C12a's `mp_type_type` replaces the
-/// placeholder below).
+/// does not exist yet) and pointed at `type_` once it exists
+/// (see the fix-up below).
 ///
 /// Order matters: the var builtin type comes first (the method
 /// `FunBuiltin`s take it as their header type); the object type
@@ -180,8 +187,14 @@ pub(crate) fn build_vm_types(
     );
 
     // Object (base of the module type and the exception types).
+    // The `make_new` slot is the ROM's override (C13b mirrors
+    // `build_rom`): `mp_obj_new_type` rejects a base without
+    // `make_new`, so `class C: pass` needs it (its default
+    // parent is `object`).
     let object_dict = crate::objects::objtype::objobject::object_locals_dict(ctx);
-    let object = ctx.alloc(None, Obj::Type(object_type_data(object_dict)));
+    let mut object_data = object_type_data(object_dict);
+    object_data.make_new = Some(object_make_new_slot);
+    let object = ctx.alloc(None, Obj::Type(object_data));
 
     // Primitives.
     let int_dict = int_locals_dict(ctx);
@@ -250,6 +263,19 @@ pub(crate) fn build_vm_types(
     let memoryview_dict = empty_dict(ctx);
     let memoryview = ctx.alloc(None, Obj::Type(memoryview_type_data(memoryview_dict)));
 
+    // `map` / `filter` / `zip` / `enumerate` (C13b): the ROM
+    // types from `objmap` / `objfilter` / `objzip` /
+    // `objenumerate` (flags `0x0080`, make_new + iter slots, no
+    // locals dict); bound as builtins in `Vm::build_builtins`.
+    let map_dict = empty_dict(ctx);
+    let map = ctx.alloc(None, Obj::Type(map_type_data(map_dict)));
+    let filter_dict = empty_dict(ctx);
+    let filter = ctx.alloc(None, Obj::Type(filter_type_data(filter_dict)));
+    let zip_dict = empty_dict(ctx);
+    let zip = ctx.alloc(None, Obj::Type(zip_type_data(zip_dict)));
+    let enumerate_dict = empty_dict(ctx);
+    let enumerate = ctx.alloc(None, Obj::Type(enumerate_type_data(enumerate_dict)));
+
     // Callables.
     let fun_bc_dict = empty_dict(ctx);
     let fun_bc = ctx.alloc(None, Obj::Type(fun_bc_type_data(fun_bc_dict)));
@@ -306,25 +332,26 @@ pub(crate) fn build_vm_types(
     let ellipsis = ctx.alloc(None, Obj::Type(ellipsis_data));
     let ellipsis_singleton = ctx.alloc(Some(ellipsis), Obj::Ellipsis);
 
-    // The `type` placeholder (C12a replaces it with the real
-    // `mp_type_type`, including the `make_new`/`call` slots).
-    // `BuiltinTypes.type_` must be a valid ref; nothing in C13
-    // calls through it (type-call is C12a's).
-    let type_ = plain_type(
-        ctx,
-        static_qstr_id(b"type").expect("type is a static qstr"),
-    );
+    // The real `mp_type_type` (C13b replaces C13's placeholder):
+    // `type_type_data` carries the `make_new` (`type_make_new`)
+    // and `call` (`type_call`) slots, so `type(x)` and
+    // `type(name, bases, dict)` — and `__build_class__`'s
+    // meta-call — go through `type_call`.
+    let type_dict = empty_dict(ctx);
+    let type_ = ctx.alloc(None, Obj::Type(type_type_data(type_dict)));
 
     // Exception types (C12b — built on the object type).
     let exc = build_exception_types(ctx, object);
 
-    // The empty-tuple singleton (`mp_const_empty_tuple`).
-    let empty_tuple = Value::Heap(crate::objects::containers::objtuple::new_tuple(
-        ctx, tuple, &[],
-    ));
-    let Value::Heap(empty_tuple_ref) = empty_tuple else {
-        unreachable!("new_tuple always returns a heap value");
-    };
+    // The empty-tuple singleton (`mp_const_empty_tuple`) —
+    // allocated directly, NOT via `new_tuple`: the bootstrap
+    // `ctx.types` here is still the dummy, whose `empty_tuple`
+    // is `GcRef(0)` — the first dict — so `new_tuple` would
+    // return that dict, and `tuple()` / `type("X", (), {})` /
+    // `class C: pass` (all read the `()` singleton) would see
+    // a dict. Found by C13b's `tuple()` test.
+    let empty_tuple_ref = ctx.alloc(Some(tuple), Obj::Tuple(vec![]));
+    let empty_tuple = Value::Heap(empty_tuple_ref);
 
     // C12a's remaining `BuiltinTypes` fields. `super` /
     // `staticmethod` / `classmethod` use the ROM registry's real
@@ -356,6 +383,28 @@ pub(crate) fn build_vm_types(
         static_qstr_id(b"function").expect("function is a static qstr"),
     );
 
+    // Point every type object's header at `type_` (C13b): a type
+    // is an instance of `type` (the Zig sets `mp_type_type` as
+    // the header at creation; Rust allocates the types first
+    // because `type_` does not exist yet). Without this
+    // `obj_get_type` returns `None` for a type value, so
+    // `call_via_type_slot` could not call `str(1)` from an
+    // iterator seam (`list(map(str, …))` raised a bare
+    // `TypeError("None")`) and `type(str)` had no type. The
+    // exception types are included (their builder allocates
+    // them with a `None` header too).
+    for t in [
+        fun_builtin_var, object, int, bool_, cell, float, complex, none_type, str_, bytes,
+        tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
+        filter, zip, enumerate, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
+        property, ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
+    ] {
+        ctx.arena.set_header_type(t, Some(type_));
+    }
+    for t in exc.all() {
+        ctx.arena.set_header_type(t, Some(type_));
+    }
+
     let types = BuiltinTypes {
         int,
         str_,
@@ -370,6 +419,8 @@ pub(crate) fn build_vm_types(
         frozenset,
         range,
         dict,
+        array,
+        bytearray,
         type_,
         object,
         super_,
@@ -397,6 +448,10 @@ pub(crate) fn build_vm_types(
         memoryview,
         cell,
         property,
+        map,
+        filter,
+        zip,
+        enumerate,
     };
     (types, vm_types, exc, empty_tuple, Value::Heap(ellipsis_singleton))
 }

@@ -13,6 +13,7 @@ pub mod objattrtuple;
 #[cfg(test)]
 pub(crate) mod objattrtuple_tests;
 pub mod objdict;
+pub mod objdict_collect;
 pub mod objdict_methods;
 pub mod objlist;
 pub mod objlist_methods;

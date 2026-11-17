@@ -132,6 +132,8 @@ impl Fixture {
             frozenset: mk(&mut arena, b"frozenset"),
             range: mk(&mut arena, b"range"),
             dict: mk(&mut arena, b"dict"),
+            array: mk(&mut arena, b"array"),
+            bytearray: mk(&mut arena, b"bytearray"),
             type_,
             object,
             super_,

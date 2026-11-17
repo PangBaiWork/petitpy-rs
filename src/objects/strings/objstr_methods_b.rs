@@ -385,7 +385,11 @@ pub fn str_print_quoted(sink: &mut dyn fmt::Write, data: &[u8], is_bytes: bool) 
 /// a known limitation of C6's text-sink design; the quoted path
 /// is always ASCII-safe.)
 pub fn str_print(ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn fmt::Write) {
-    let data = str_data(ctx.arena, value).unwrap_or(&[]);
+    // Pool-aware (C13b): `str_data` returns `None` for dynamic
+    // qstr ids, so `str('x')` printed "" — the module's string
+    // literals live only in the pool (`str_data_pool`'s doc).
+    let data = str_data_pool(ctx.arena, ctx.pool, value).unwrap_or_default();
+    let data = &data[..];
     let is_bytes = is_bytes_value(ctx.arena, value);
     if kind == PrintKind::Raw || (kind == PrintKind::Str && !is_bytes) {
         let _ = sink.write_str(&String::from_utf8_lossy(data));
@@ -403,9 +407,8 @@ pub fn str_print(ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dy
 /// flags `0x0000`, slots make_new/print/unary_op/binary_op/
 /// subscr/iter/buffer/locals_dict. `dict` is the caller-owned
 /// locals dict (C10/D1 fill it — see the module docs); `base`/
-/// `mro` are C12's. There is no `make_new` field on the frozen
-/// `TypeData` — `str_make_new` (`objstr_methods_c.rs`) is called
-/// by C12's type-call path directly.
+/// `mro` are C12's. `make_new` is C13b's `str_make_new_slot`
+/// adapter (`objtype/make_new.rs`).
 pub fn str_type_data(name: u32, dict: GcRef) -> TypeData {
     TypeData {
         name,
@@ -421,7 +424,7 @@ pub fn str_type_data(name: u32, dict: GcRef) -> TypeData {
         buffer: Some(mc::str_get_buffer),
         print: Some(str_print),
         attr: None,
-        make_new: None,
+        make_new: Some(crate::objects::objtype::make_new::str_make_new_slot),
         bases: None,
         namedtuple_fields: None,
     }
@@ -446,7 +449,7 @@ pub fn bytes_type_data(name: u32, dict: GcRef) -> TypeData {
         buffer: Some(mc::str_get_buffer),
         print: Some(str_print),
         attr: None,
-        make_new: None,
+        make_new: Some(crate::objects::objtype::make_new::bytes_make_new_slot),
         bases: None,
         namedtuple_fields: None,
     }

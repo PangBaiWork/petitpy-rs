@@ -11,12 +11,14 @@
 //! (the Zig has none — `zip(…, strict=True)` is a sig error).
 
 use super::iter::{
-    getiter, iternext, new_iter, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams, ZIP_ITER_TAG,
-    NOT_AN_ITERATOR,
+    getiter, iternext, new_iter, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
+    FLAG_ITER_IS_ITERNEXT, ZIP_ITER_TAG, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objtuple::new_tuple;
-use crate::objects::value::{IteratorData, Obj, Value};
+use crate::objects::objtype::make_new::zip_make_new_slot;
+use crate::objects::primitives::ops::static_qstr_id;
+use crate::objects::value::{GcRef, IteratorData, Obj, TypeData, Value};
 
 /// `mp_obj_zip_make_new` (`objzip.zig:19-44`). The sig check is
 /// polled like `map`'s (a later `getiter` failure overwrites
@@ -90,6 +92,33 @@ pub fn zip_iternext(
     let tuple = Value::Heap(new_tuple(ctx, ctx.types.tuple, &items));
     ctx.roots.extra.truncate(mark);
     Ok(Some(tuple))
+}
+
+/// `mp_type_zip` ROM (`objzip.zig:43-55`): flags `0x0080`
+/// (`MP_TYPE_FLAG_ITER_IS_ITERNEXT` — the object is its own
+/// iterator, so `getiter` returns it unchanged, the
+/// `gen_instance` precedent), slots make_new/iter only, no
+/// locals dict. (C13b: the type object itself — the VM binds
+/// it as the `zip` builtin.)
+pub fn zip_type_data(dict: GcRef) -> TypeData {
+    TypeData {
+        name: static_qstr_id(b"zip").expect("zip is a static qstr"),
+        flags: FLAG_ITER_IS_ITERNEXT,
+        base: None,
+        mro: Vec::new(),
+        dict,
+        attr: None,
+        make_new: Some(zip_make_new_slot),
+        bases: None,
+        unary_op: None,
+        binary_op: None,
+        call: None,
+        getiter: Some(|_ctx: &mut CallCtx, self_: Value| Ok(self_)),
+        subscr: None,
+        buffer: None,
+        print: None,
+        namedtuple_fields: None,
+    }
 }
 
 #[cfg(test)]

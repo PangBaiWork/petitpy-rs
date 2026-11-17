@@ -193,7 +193,15 @@ pub fn type_call(
     let make_new = type_data(ctx.arena, t).and_then(|d| d.make_new);
     match make_new {
         Some(f) => f(ctx, t, args, n_kw),
-        None => Err(ObjTypeError::CantCreateInstance.to_pyerror()),
+        // (C13b: record the message — the VM builds the
+        // exception from `pending_raise`; a bare `to_pyerror`
+        // would surface a message-less `TypeError`. No callee
+        // ran here, so nothing in `pending_exc` can be masked.)
+        None => {
+            let e = ObjTypeError::CantCreateInstance;
+            ctx.record_raise("TypeError", e.message());
+            Err(PyError::PyRaise)
+        }
     }
 }
 

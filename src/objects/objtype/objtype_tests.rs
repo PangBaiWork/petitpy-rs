@@ -124,6 +124,10 @@ impl Fx {
         let d = empty_dict(&mut arena, &roots);
         let range = arena.alloc(None, Obj::Type(range_type_data(d)), &roots);
         roots.push(Value::Heap(range));
+        let array = make_type(&mut arena, &roots, b"array");
+        roots.push(Value::Heap(array));
+        let bytearray = make_type(&mut arena, &roots, b"bytearray");
+        roots.push(Value::Heap(bytearray));
         // C12a fields: plain types here (the `object` below is a
         // placeholder — the real ROM type overwrites `types.object`
         // after it is built); the `()` / empty-bytes singletons
@@ -164,6 +168,8 @@ impl Fx {
             set,
             frozenset,
             range,
+            array,
+            bytearray,
             type_,
             object,
             super_,

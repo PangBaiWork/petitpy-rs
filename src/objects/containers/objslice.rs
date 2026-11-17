@@ -451,7 +451,7 @@ pub fn slice_type_data(dict: GcRef) -> TypeData {
         buffer: None,
         print: Some(slice_print),
         attr: None,
-        make_new: None,
+        make_new: Some(crate::objects::objtype::make_new::slice_make_new_slot),
         bases: None,
         namedtuple_fields: None,
     }

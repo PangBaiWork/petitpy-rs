@@ -212,6 +212,8 @@ impl Fixture {
             frozenset,
             range,
             dict,
+            array,
+            bytearray,
             type_,
             object,
             super_,

@@ -689,6 +689,7 @@ fn array_type_data_inner(
     flags: u16,
     dict: GcRef,
     print: bool,
+    make_new: crate::objects::slots::MakeNewFn,
 ) -> TypeData {
     TypeData {
         name: static_qstr_id(name).expect("array type name is a static qstr"),
@@ -732,7 +733,7 @@ fn array_type_data_inner(
             None
         },
         attr: None,
-        make_new: None,
+        make_new: Some(make_new),
         bases: None,
         namedtuple_fields: None,
     }
@@ -744,7 +745,13 @@ fn array_type_data_inner(
 /// locals_dict (the locals dict is C12's — this lane
 /// provides the append/extend adapters).
 pub fn array_type_data(dict: GcRef) -> TypeData {
-    array_type_data_inner(b"array", 0, dict, true)
+    array_type_data_inner(
+        b"array",
+        0,
+        dict,
+        true,
+        crate::objects::objtype::make_new::array_make_new_slot,
+    )
 }
 
 /// `mp_type_bytearray` (`objarray.zig:798-830`): flags
@@ -757,6 +764,7 @@ pub fn bytearray_type_data(dict: GcRef) -> TypeData {
             | crate::objects::obj::FLAG_SUBSCR_ALLOWS_STACK_SLICE,
         dict,
         true,
+        crate::objects::objtype::make_new::bytearray_make_new_slot,
     )
 }
 
@@ -770,5 +778,6 @@ pub fn memoryview_type_data(dict: GcRef) -> TypeData {
             | crate::objects::obj::FLAG_SUBSCR_ALLOWS_STACK_SLICE,
         dict,
         false,
+        crate::objects::objtype::make_new::memoryview_make_new_slot,
     )
 }

@@ -156,9 +156,11 @@ pub(crate) fn next_builtin_fn(_ctx: &mut CallCtx, _args: &[Value]) -> PyResult<V
     Err(PyError::PyRaise)
 }
 
-/// `__build_class__` as a `BuiltinFn` — a stub until C12a's
-/// `type_call` lands (class creation needs runtime type
-/// creation, `mp_obj_new_type`).
+/// `__build_class__` as a `BuiltinFn` — a stub: the VM intercepts
+/// `__build_class__` by GcRef identity in `call_function` (it
+/// needs the VM's frame execution + the locals override, which a
+/// bare `BuiltinFn` cannot carry), so this body is unreachable
+/// through the VM (see `call_build_class_ctx` in `vm_call.rs`).
 pub(crate) fn build_class_builtin_fn(_ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> {
     Err(PyError::PyRaise)
 }

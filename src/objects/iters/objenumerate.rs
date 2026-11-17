@@ -17,12 +17,14 @@
 
 use super::iter::{
     getiter, iternext, new_iter, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
-    ENUMERATE_ITER_TAG, NOT_AN_ITERATOR,
+    ENUMERATE_ITER_TAG, FLAG_ITER_IS_ITERNEXT, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objtuple::new_tuple;
 use crate::objects::obj::obj_get_int;
-use crate::objects::value::{IteratorData, Obj, Value};
+use crate::objects::objtype::make_new::enumerate_make_new_slot;
+use crate::objects::primitives::ops::static_qstr_id;
+use crate::objects::value::{GcRef, IteratorData, Obj, TypeData, Value};
 
 /// `mp_obj_enumerate_make_new` (`objenumerate.zig:19-54`):
 /// the kw-args path. The parse is NOT polled here — the Zig
@@ -132,6 +134,34 @@ pub fn enumerate_iternext(
     }
     ctx.roots.extra.truncate(mark);
     Ok(Some(tuple))
+}
+
+/// `mp_type_enumerate` ROM (`objenumerate.zig:61-73`):
+/// flags `0x0080` (`MP_TYPE_FLAG_ITER_IS_ITERNEXT` — the
+/// object is its own iterator, so `getiter` returns it
+/// unchanged, the `gen_instance` precedent), slots
+/// make_new/iter only, no locals dict. (C13b: the type
+/// object itself — the VM binds it as the `enumerate`
+/// builtin.)
+pub fn enumerate_type_data(dict: GcRef) -> TypeData {
+    TypeData {
+        name: static_qstr_id(b"enumerate").expect("enumerate is a static qstr"),
+        flags: FLAG_ITER_IS_ITERNEXT,
+        base: None,
+        mro: Vec::new(),
+        dict,
+        attr: None,
+        make_new: Some(enumerate_make_new_slot),
+        bases: None,
+        unary_op: None,
+        binary_op: None,
+        call: None,
+        getiter: Some(|_ctx: &mut CallCtx, self_: Value| Ok(self_)),
+        subscr: None,
+        buffer: None,
+        print: None,
+        namedtuple_fields: None,
+    }
 }
 
 #[cfg(test)]

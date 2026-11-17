@@ -624,7 +624,7 @@ pub fn list_type_data(dict: GcRef) -> TypeData {
             },
         ),
         attr: None,
-        make_new: None,
+        make_new: Some(crate::objects::objtype::make_new::list_make_new_slot),
         bases: None,
         namedtuple_fields: None,
     }

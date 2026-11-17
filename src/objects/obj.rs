@@ -93,69 +93,7 @@ pub const BUFFER_WRITE: u32 = 2;
 pub const BUFFER_RW: u32 = BUFFER_READ | BUFFER_WRITE;
 pub const BUFFER_RAISE_IF_UNSUPPORTED: u32 = 4;
 
-/// References to the builtin type objects. `obj.rs` takes them as a
-/// parameter (the C5 explicit-parameter precedent) because the type
-/// objects are built by C12 / the type-ROM bootstrap and do not exist
-/// yet as a global registry; the VM owns one instance and passes it
-/// down. Only the types `obj.zig` names by ROM pointer are here.
-#[derive(Clone, Copy, Debug)]
-pub struct BuiltinTypes {
-    pub int: GcRef,
-    pub str_: GcRef,
-    pub bytes: GcRef,
-    pub bool_: GcRef,
-    pub none_type: GcRef,
-    pub float: GcRef,
-    pub complex: GcRef,
-    pub tuple: GcRef,
-    pub list: GcRef,
-    /// `set` (C9c: the set/frozenset constructor and the in-place
-    /// `update = isExactType(lhs, &mp_type_set)` check read it from
-    /// `ctx.types`, like the int/bool builtins read theirs).
-    pub set: GcRef,
-    /// `frozenset` (C9c: the frozenset hash seed check
-    /// `isExactType(self, &mp_type_frozenset)` and the frozenset
-    /// constructor read it).
-    pub frozenset: GcRef,
-    /// `range` (C9c: `range.__getitem__` on a slice builds a plain
-    /// `range`, as the Zig hardcodes `&mp_type_range`).
-    pub range: GcRef,
-    /// `dict` (C9a: the dict constructor and copy/fromkeys allocate
-    /// with this type; the `dict` builtin reads it from `ctx.types`,
-    /// like the int/bool builtins read theirs).
-    pub dict: GcRef,
-    /// `type` itself (the class-getitem branch of `mp_obj_subscr`).
-    pub type_: GcRef,
-    /// `object` (C12: the `isSubclassImpl` short-circuit, `mroOf`'s
-    /// terminator, `typeBasesTuple`'s default parent, `super_attr`'s
-    /// last-resort lookup).
-    pub object: GcRef,
-    /// `super` (C12: `newSuper` allocates with this header type).
-    pub super_: GcRef,
-    /// `staticmethod` (C12: `convert_member_lookup` unwraps it).
-    pub staticmethod: GcRef,
-    /// `classmethod` (C12: `convert_member_lookup` binds it).
-    pub classmethod: GcRef,
-    /// The bound-method type (C12: the `call_method` seam builds
-    /// bound methods with this header type).
-    pub boundmeth: GcRef,
-    /// The ROM `()` singleton (C12a: the tuple-hash seed is this
-    /// object's arena index, so `hash(()) == id(())`).
-    pub empty_tuple: GcRef,
-    /// The ROM empty-bytes singleton (C12a: `new_empty_bytes`
-    /// returns this; `bytes() is b''` holds. Slicing allocates
-    /// fresh — `b'ab'[:0] is b''` is False on the reference
-    /// binary, so only `new_empty_bytes` uses the singleton).
-    pub empty_bytes: GcRef,
-    /// The `native_base_init_wrapper_obj` singleton (objtype.zig:734):
-    /// the `__init__` wrapper primed into an instance's `subobj[0]`
-    /// while its native base is still uninitialised. C12a's ROM
-    /// builds the real wrapper; other fixtures hold a plain type.
-    pub native_init_wrapper: GcRef,
-    /// `property` (C12: the special-accessor scan tests
-    /// `isExactType(value, property)`).
-    pub property: GcRef,
-}
+pub use crate::objects::builtin_types::BuiltinTypes;
 
 /// The exception type an `ObjError` raises, by name — the type
 /// objects do not exist yet; the VM resolves the name through the

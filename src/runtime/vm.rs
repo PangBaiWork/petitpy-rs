@@ -209,6 +209,15 @@ pub struct VmTypes {
     pub cell: GcRef,
     /// The property type (bound as `property` in builtins).
     pub property: GcRef,
+    /// The `map` type (bound as `map` in builtins, C13b).
+    pub map: GcRef,
+    /// The `filter` type (bound as `filter` in builtins, C13b).
+    pub filter: GcRef,
+    /// The `zip` type (bound as `zip` in builtins, C13b).
+    pub zip: GcRef,
+    /// The `enumerate` type (bound as `enumerate` in builtins,
+    /// C13b).
+    pub enumerate: GcRef,
 }
 
 /// The VM's mutable state (the `Ctx` + `mp_state_ctx` pieces
@@ -222,17 +231,15 @@ pub struct VmState {
     /// `old_globals`).
     pub globals: GcRef,
     /// The current locals dict (`mp_state_ctx.thread.dict_locals`,
-    /// `jcb_glue.zig`): set ONLY by `eval`/`exec` (`codeExecute`,
-    /// `builtinevex.zig:64-84`); `None` means "locals ==
-    /// globals" (the module level — the Zig's `dict_locals`
-    /// starts `NULL` and `mp_load_name` falls through to
-    /// globals). Added by C15a: the `VmState` struct change the
-    /// `jcb` brief line ("only accessors, no struct change") did
-    /// not foresee — the eval wiring requires the slot, and the
-    /// alternative (eval with locals == globals only) would be
-    /// knowingly wrong for corpus-tested behavior
-    /// (`builtin_exec.py` exercises distinct locals). Behavior
-    /// is identical when `None`.
+    /// `jcb_glue.zig`): set by `eval`/`exec` (`codeExecute`,
+    /// `builtinevex.zig:64-84` — C15a) and by a class body
+    /// (`__build_class__` sets it to a fresh dict and restores it
+    /// afterwards — C13b); `None` means "locals == globals" (the
+    /// module level — the Zig's `dict_locals` starts `NULL` and
+    /// `mp_load_name` falls through to globals). `load_name`
+    /// reads it first, `store_name` writes it
+    /// (`runtime.zig:288-301,336-341`). Behavior is identical
+    /// when `None`.
     pub locals: Option<GcRef>,
     /// The builtins globals dict (`mp_load_global`'s fallback).
     pub builtins: GcRef,
@@ -249,8 +256,11 @@ pub struct VmState {
     /// The `next` builtin (intercepted by GcRef identity in
     /// `call_function` — its `func` is a stub, see `vm_ops.rs`).
     pub next_builtin: Value,
-    /// The `__build_class__` builtin (stub until C12a's
-    /// `type_call` — calling it raises a bare TypeError).
+    /// The `__build_class__` builtin — intercepted by GcRef
+    /// identity in `call_function` (it needs the VM's frame
+    /// execution + the locals override, see
+    /// `call_build_class_ctx` in `vm_call.rs`); its `func` is
+    /// a stub, like `next`'s.
     pub build_class_builtin: Value,
     /// The `eval` builtin (intercepted by GcRef identity in
     /// `call_function_ctx` — its `func` is a stub, see
@@ -346,6 +356,8 @@ impl Vm {
             frozenset: GcRef(0),
             range: GcRef(0),
             dict: GcRef(0),
+            array: GcRef(0),
+            bytearray: GcRef(0),
             type_: GcRef(0),
             object: GcRef(0),
             super_: GcRef(0),
@@ -464,6 +476,10 @@ impl Vm {
         bind("bytearray", Value::Heap(vmt.bytearray), &mut pairs);
         bind("memoryview", Value::Heap(vmt.memoryview), &mut pairs);
         bind("slice", Value::Heap(vmt.slice), &mut pairs);
+        bind("map", Value::Heap(vmt.map), &mut pairs);
+        bind("filter", Value::Heap(vmt.filter), &mut pairs);
+        bind("zip", Value::Heap(vmt.zip), &mut pairs);
+        bind("enumerate", Value::Heap(vmt.enumerate), &mut pairs);
         bind("Ellipsis", state.ellipsis, &mut pairs);
         for (name, r) in [
             ("BaseException", state.exc.base_exception),
@@ -524,13 +540,14 @@ impl Vm {
         );
         let next_val = Value::Heap(next_fun);
         bind("next", next_val, &mut pairs);
-        // `__build_class__` (stub until C12a's `type_call`).
+        // `__build_class__` (intercepted by identity in
+        // `call_function` — its `func` is a stub).
         let bc_id = static_qstr_id(b"__build_class__").expect("__build_class__ is a static qstr");
         let bc_fun = ctx.alloc(
             Some(vmt.fun_builtin_var),
             Obj::FunBuiltin(FunBuiltinData {
                 name: bc_id,
-                n_args: fun_n_args(1, 255),
+                n_args: fun_n_args(2, 255),
                 func: build_class_builtin_fn,
                 kw_func: None,
             }),

@@ -395,7 +395,7 @@ pub fn deque_type_data(dict: GcRef, name: u32) -> TypeData {
         mro: Vec::new(),
         dict,
         attr: None,
-        make_new: None,
+        make_new: Some(crate::objects::objtype::make_new::deque_make_new_slot),
         bases: None,
         unary_op: Some(deque_unary_op),
         binary_op: None,

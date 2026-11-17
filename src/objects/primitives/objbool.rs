@@ -41,7 +41,7 @@ pub fn bool_type_data(dict: GcRef) -> TypeData {
         buffer: None,
         print: Some(bool_print),
         attr: None,
-        make_new: None,
+        make_new: Some(crate::objects::objtype::make_new::bool_make_new_slot),
         bases: None,
         namedtuple_fields: None,
     }

@@ -12,11 +12,13 @@
 
 use super::iter::{
     getiter, iternext, new_iter, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams,
-    FILTER_ITER_TAG, NOT_AN_ITERATOR,
+    FILTER_ITER_TAG, FLAG_ITER_IS_ITERNEXT, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
 use crate::objects::obj::obj_is_true;
-use crate::objects::value::{IteratorData, Obj, Value};
+use crate::objects::objtype::make_new::filter_make_new_slot;
+use crate::objects::primitives::ops::static_qstr_id;
+use crate::objects::value::{GcRef, IteratorData, Obj, TypeData, Value};
 
 /// `mp_obj_filter_make_new` (`objfilter.zig:17-36`). The sig
 /// check is polled like `map`'s (a later `getiter` failure
@@ -90,6 +92,33 @@ pub fn filter_iternext(
         if keep {
             return Ok(Some(item));
         }
+    }
+}
+
+/// `mp_type_filter` ROM (`objfilter.zig:56-68`): flags
+/// `0x0080` (`MP_TYPE_FLAG_ITER_IS_ITERNEXT` — the object is
+/// its own iterator, so `getiter` returns it unchanged, the
+/// `gen_instance` precedent), slots make_new/iter only, no
+/// locals dict. (C13b: the type object itself — the VM binds
+/// it as the `filter` builtin.)
+pub fn filter_type_data(dict: GcRef) -> TypeData {
+    TypeData {
+        name: static_qstr_id(b"filter").expect("filter is a static qstr"),
+        flags: FLAG_ITER_IS_ITERNEXT,
+        base: None,
+        mro: Vec::new(),
+        dict,
+        attr: None,
+        make_new: Some(filter_make_new_slot),
+        bases: None,
+        unary_op: None,
+        binary_op: None,
+        call: None,
+        getiter: Some(|_ctx: &mut CallCtx, self_: Value| Ok(self_)),
+        subscr: None,
+        buffer: None,
+        print: None,
+        namedtuple_fields: None,
     }
 }
 

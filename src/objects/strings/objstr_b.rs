@@ -26,8 +26,9 @@ use crate::objects::slots::BuiltinFn;
 use crate::objects::strings::objstr_a::{
     find_static_qstr, is_bytes_value, is_str_value, new_empty_bytes, new_empty_str, new_str,
     new_str_of_type, new_str_via_qstr, slot_raise, static_qstr_id, str_check_arg_type, str_data,
-    str_index_to_ptr, StrError,
+    str_data_pool, str_index_to_ptr, StrError,
 };
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::strings::objstr_methods_c::{bytes_make_new, str_make_new};
 use crate::objects::strings::unicode::{utf8_charlen, utf8_next_char};
 use crate::objects::strings::vstr::Vstr;
@@ -479,11 +480,18 @@ pub fn new_bytes_from_vstr(ctx: &mut CallCtx, types: &BuiltinTypes, vstr: &mut V
 /// then hash-then-memcmp. Note the Zig does NOT distinguish str
 /// from bytes here — `mp_obj_str_equal("a", b"a")` is true. Rust:
 /// compare the byte contents (str or bytes payloads).
-pub fn str_equal(arena: &GcArena, s1: Value, s2: Value) -> bool {
+/// Pool-aware (C13b): `str_data` returns `None` for dynamic
+/// qstr ids, so a heap `Str` never equalled a dynamic `Qstr`
+/// with the same bytes — `dict([('k', 9)])['k']` raised
+/// `KeyError` (`str_data_pool`'s doc).
+pub fn str_equal(arena: &GcArena, pool: &RuntimeQstr, s1: Value, s2: Value) -> bool {
     if let (Value::Qstr(a), Value::Qstr(b)) = (s1, s2) {
         return a == b;
     }
-    match (str_data(arena, s1), str_data(arena, s2)) {
+    match (
+        str_data_pool(arena, pool, s1),
+        str_data_pool(arena, pool, s2),
+    ) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }

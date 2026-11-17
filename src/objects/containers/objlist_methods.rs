@@ -429,8 +429,8 @@ pub fn list_sort_builtin(
     if args.is_empty() {
         return Err(PyError::PyRaise);
     }
-    let (key, reverse) = parse_sort_args(ctx, args, kwargs).map_err(|e| e.to_pyerror())?;
-    list_sort(ctx, args[0], key, reverse).map_err(|e| e.to_pyerror())
+    let (key, reverse) = parse_sort_args(ctx, args, kwargs).map_err(|e| ctx.record_typed(e))?;
+    list_sort(ctx, args[0], key, reverse).map_err(|e| ctx.record_typed(e))
 }
 
 fn arity(args: &[Value], n: usize) -> Result<(), PyError> {
@@ -443,31 +443,31 @@ fn arity(args: &[Value], n: usize) -> Result<(), PyError> {
 /// `list.append` (fun_builtin_2: self, value).
 pub fn list_append_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 2)?;
-    list_append(ctx, args[0], args[1]).map_err(|e| e.to_pyerror())
+    list_append(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.extend` (fun_builtin_2: self, iterable).
 pub fn list_extend_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 2)?;
-    list_extend(ctx, args[0], args[1]).map_err(|e| e.to_pyerror())
+    list_extend(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.clear` (fun_builtin_1: self).
 pub fn list_clear_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 1)?;
-    list_clear(ctx, args[0]).map_err(|e| e.to_pyerror())
+    list_clear(ctx, args[0]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.copy` (fun_builtin_1: self).
 pub fn list_copy_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 1)?;
-    list_copy(ctx, args[0]).map_err(|e| e.to_pyerror())
+    list_copy(ctx, args[0]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.count` (fun_builtin_2: self, value).
 pub fn list_count_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 2)?;
-    list_count(ctx, args[0], args[1]).map_err(|e| e.to_pyerror())
+    list_count(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.index` (fun_builtin_var, sig 2..4: self, value[,
@@ -478,13 +478,13 @@ pub fn list_index_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
     }
     let start = args.get(2).copied();
     let stop = args.get(3).copied();
-    list_index(ctx, args[0], args[1], start, stop).map_err(|e| e.to_pyerror())
+    list_index(ctx, args[0], args[1], start, stop).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.insert` (fun_builtin_3: self, index, value).
 pub fn list_insert_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 3)?;
-    list_insert(ctx, args[0], args[1], args[2]).map_err(|e| e.to_pyerror())
+    list_insert(ctx, args[0], args[1], args[2]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.pop` (fun_builtin_var, sig 1..2: self[, index]).
@@ -493,18 +493,129 @@ pub fn list_pop_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         return Err(PyError::PyRaise);
     }
     let idx = args.get(1).copied();
-    list_pop(ctx, args[0], idx).map_err(|e| e.to_pyerror())
+    list_pop(ctx, args[0], idx).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.remove` (fun_builtin_2: self, value).
 pub fn list_remove_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 2)?;
-    list_remove(ctx, args[0], args[1]).map_err(|e| e.to_pyerror())
+    list_remove(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.reverse` (fun_builtin_1: self).
 pub fn list_reverse_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 1)?;
-    list_reverse(ctx, args[0]).map_err(|e| e.to_pyerror())
+    list_reverse(ctx, args[0]).map_err(|e| ctx.record_typed(e))
 }
+
+/// `list.sort` as a `BuiltinKwFn` adapter (C13): the call
+/// machinery passes keyword pairs as `(name, value)` tuples;
+/// `list_sort_builtin` takes the `KwArg` struct form.
+pub fn list_sort_kw(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+) -> PyResult<Value> {
+    let kws: Vec<KwArg> = kwargs
+        .iter()
+        .map(|(name, value)| KwArg {
+            name: *name,
+            value: *value,
+        })
+        .collect();
+    list_sort_builtin(ctx, args, &kws)
+}
+
+/// `list.sort` as a plain `BuiltinFn` (the no-kw path):
+/// `call_fun_builtin` always routes through `kw_func` when one
+/// is present, so this is only the documented no-kw form — it
+/// sorts with no key/reverse.
+pub fn list_sort_builtin_nokw(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    list_sort_builtin(ctx, args, &[])
+}
+
+/// `list`'s method table (C13, the Zig's `mp_obj_list_methods`
+/// shape): name, body, positional arity counting `self`,
+/// keyword body. Sigs are the ones the adapters already enforce
+/// (see their doc comments); `sort` takes `key=`/`reverse=`
+/// kwargs, the rest take none.
+pub static LIST_METHODS: &[crate::objects::slots::MethodEntry] = &[
+    crate::objects::slots::MethodEntry {
+        name: "append",
+        func: list_append_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "extend",
+        func: list_extend_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "clear",
+        func: list_clear_builtin,
+        min: 1,
+        max: 1,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "copy",
+        func: list_copy_builtin,
+        min: 1,
+        max: 1,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "count",
+        func: list_count_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "index",
+        func: list_index_builtin,
+        min: 2,
+        max: 4,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "insert",
+        func: list_insert_builtin,
+        min: 3,
+        max: 3,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "pop",
+        func: list_pop_builtin,
+        min: 1,
+        max: 2,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "remove",
+        func: list_remove_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "reverse",
+        func: list_reverse_builtin,
+        min: 1,
+        max: 1,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "sort",
+        func: list_sort_builtin_nokw,
+        min: 1,
+        max: 1,
+        kw_func: Some(list_sort_kw),
+    },
+];
 

@@ -245,6 +245,23 @@ pub type BuiltinFn = for<'a> fn(&mut CallCtx<'a>, &[Value]) -> PyResult<Value>;
 /// is never called through `func`.
 pub type BuiltinKwFn =
     for<'a> fn(&mut CallCtx<'a>, &[Value], &[(u32, Value)]) -> PyResult<Value>;
+
+/// One method-table entry (C13): a type's method name, its
+/// `BuiltinFn` body, the positional arity range counting `self`,
+/// and the optional `BuiltinKwFn` for keyword-accepting methods
+/// (`list.sort`'s `key=`/`reverse=`). The VM builds each type's
+/// locals dict from these tables (the Zig's `mp_obj_*_methods`
+/// tables carry the same (name, fn, min, max) shape); the sigs
+/// here are the ones the builtin adapters already enforce (see
+/// their doc comments), so the VM's `call_fun_builtin` sig check
+/// records the terse TypeError before the body runs.
+pub struct MethodEntry {
+    pub name: &'static str,
+    pub func: BuiltinFn,
+    pub min: u16,
+    pub max: u16,
+    pub kw_func: Option<BuiltinKwFn>,
+}
 /// Load-only attribute access (`mp_obj_type_t.attr`, C10).
 /// `Ok(Some(v))` = the attribute was found (Zig: `dest[0] = v`);
 /// `Ok(None)` = not found (Zig: `dest` left `NULL`); `Err` = the slot

@@ -11,7 +11,7 @@
 //! so every test binds the `GcRef`s it needs into locals BEFORE
 //! creating its `CallCtx`.
 
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::containers::objdict::dict_type_data;
 use crate::objects::containers::objlist::list_type_data;
 use crate::objects::containers::objrange::range_type_data;
@@ -47,6 +47,7 @@ pub(crate) struct Fx {
     pub(crate) roots: RootSet,
     pub(crate) types: BuiltinTypes,
     pub(crate) pool: RuntimeQstr,
+    pub(crate) pending_raise: Option<PendingRaise>,
     pub(crate) object: GcRef,
     pub(crate) module_type: GcRef,
     pub(crate) exc: ExceptionTypes,
@@ -174,7 +175,8 @@ impl Fx {
             empty_bytes,
             native_init_wrapper,
         };
-        let mut ctx = CallCtx::new(&mut arena, &mut roots, &types, &pool);
+        let mut pending_raise = None;
+        let mut ctx = CallCtx::new(&mut arena, &mut roots, &types, &pool, &mut pending_raise);
         // `object` with its real locals dict; MRO [self].
         let locals = object_locals_dict(&mut ctx);
         let object = ctx.alloc(Some(type_), Obj::Type(object_type_data(locals)));
@@ -204,6 +206,7 @@ impl Fx {
             roots,
             types,
             pool,
+            pending_raise: None,
             object,
             module_type,
             exc,
@@ -211,7 +214,7 @@ impl Fx {
     }
 
     pub(crate) fn ctx(&mut self) -> CallCtx<'_> {
-        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool)
+        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool, &mut self.pending_raise)
     }
 
     /// Intern a DYNAMIC qstr (not in the static table) — e.g.

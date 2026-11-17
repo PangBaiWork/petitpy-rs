@@ -15,7 +15,7 @@
 //! in for C7/C12's real print slots) so `str(x)` can be tested for
 //! non-str args; everything else about those types is plain.
 
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::obj::*;
 use crate::objects::obj_ops::*;
 use crate::objects::slots::*;
@@ -91,6 +91,7 @@ pub(crate) struct Fx {
     pub(crate) roots: RootSet,
     pub(crate) types: BuiltinTypes,
     pub(crate) pool: RuntimeQstr,
+    pub(crate) pending_raise: Option<PendingRaise>,
 }
 
 impl Fx {
@@ -189,17 +190,17 @@ impl Fx {
             empty_bytes,
             native_init_wrapper,
         };
-        clear_pending_str_error();
         Fx {
             arena,
             roots,
             types,
             pool: RuntimeQstr::new(),
+            pending_raise: None,
         }
     }
 
     pub(crate) fn ctx(&mut self) -> CallCtx<'_> {
-        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool)
+        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool, &mut self.pending_raise)
     }
 
     pub(crate) fn s(&mut self, data: &[u8]) -> Value {
@@ -522,18 +523,21 @@ fn binary_op_slot_and_pending() {
     let b = fx.s(b"cd");
     let r = str_binary_op(&mut fx.ctx(), BinaryOp::Add, a, b).unwrap();
     assert_str(&fx, r, b"abcd");
-    clear_pending_str_error();
+    fx.pending_raise = None;
     let e = str_binary_op(&mut fx.ctx(), BinaryOp::Contains, a, iv(1)).unwrap_err();
     assert_eq!(e, PyError::PyRaise);
     assert_eq!(
-        take_pending_str_error(),
-        Some((StrExc::TypeError, Some("can't convert to str implicitly")))
+        fx.pending_raise.take(),
+        Some(PendingRaise::msg(
+            "TypeError",
+            "can't convert to str implicitly"
+        ))
     );
-    clear_pending_str_error();
+    fx.pending_raise = None;
     let bb = fx.b(b"b");
     let e = str_binary_op(&mut fx.ctx(), BinaryOp::Add, a, bb).unwrap_err();
     assert_eq!(e, PyError::PyRaise);
-    assert_eq!(take_pending_str_error(), None);
+    assert_eq!(fx.pending_raise.take(), None);
     // Through C6's dispatch: obj_binary_op.
     let types = fx.types;
     let r = obj_binary_op(&mut fx.ctx(), &types, BinaryOp::Add, a, b).unwrap();
@@ -643,12 +647,12 @@ fn subscr_dispatch_and_pending() {
     assert_str(&fx, r, b"b");
     // Out of range: the dispatcher raises its generic error, but
     // the specific raise is preserved in the pending cell for C13.
-    clear_pending_str_error();
+    fx.pending_raise = None;
     let e = obj_subscr(&mut fx.ctx(), &types, s, iv(5), SubscrArg::Get).unwrap_err();
     assert_eq!(e, ObjError::NotSubscriptable);
     assert_eq!(
-        take_pending_str_error(),
-        Some((StrExc::IndexError, Some("index out of range")))
+        fx.pending_raise.take(),
+        Some(PendingRaise::msg("IndexError", "index out of range"))
     );
 }
 
@@ -668,10 +672,10 @@ fn unary_op_len_bool() {
     assert!(obj_is_true(&mut fx.ctx(), &types, sa).unwrap());
     assert!(!obj_is_true(&mut fx.ctx(), &types, sb).unwrap());
     // Direct slot: other ops are not implemented.
-    clear_pending_str_error();
+    fx.pending_raise = None;
     let e = str_unary_op(&mut fx.ctx(), UnaryOp::Positive, u).unwrap_err();
     assert_eq!(e, PyError::PyRaise);
-    assert_eq!(take_pending_str_error(), None);
+    assert_eq!(fx.pending_raise.take(), None);
 }
 
 // ── shared helpers for the C8b tests (`objstr_tests_c.rs`,

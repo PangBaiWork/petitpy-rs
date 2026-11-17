@@ -505,7 +505,7 @@ pub fn obj_binary_op(
     rhs: Value,
 ) -> PyResult<Value> {
     match call_binary(ctx, obj_get_type(ctx.arena, types, lhs), op, lhs, rhs)
-        .map_err(ObjError::to_pyerror)?
+        .map_err(|e| ctx.record_typed(e))?
     {
         SlotOutcome::Value(v) => Ok(v),
         SlotOutcome::NotImplemented => Err(PyError::PyRaise),
@@ -521,7 +521,7 @@ pub fn obj_unary_op(
     arg: Value,
 ) -> PyResult<Value> {
     match call_unary(ctx, obj_get_type(ctx.arena, types, arg), op, arg)
-        .map_err(ObjError::to_pyerror)?
+        .map_err(|e| ctx.record_typed(e))?
     {
         SlotOutcome::Value(v) => Ok(v),
         SlotOutcome::NotImplemented => Err(PyError::PyRaise),

@@ -35,9 +35,9 @@ use crate::objects::obj_ops::obj_equal;
 use crate::objects::slots::{BinaryOp, UnaryOp};
 use crate::objects::value::{BoundMethData, GcRef, Obj, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
-use crate::runtime::bc::CodeState;
 
-use super::objfun::{call_fun_builtin, fun_bc_call, load_attr_on_fun, RunOutcome};
+use super::objfun::{call_fun_builtin, fun_bc_call, load_attr_on_fun};
+use crate::runtime::runner::VmRunner;
 
 /// Read a `BoundMethData` out of a heap `Value`. `None` when the
 /// value is not a heap bound method — the Zig's `fromObj` would
@@ -61,8 +61,8 @@ fn bound_meth_data(ctx: &CallCtx, self_value: Value) -> Option<BoundMethData> {
 /// `qstr_table` / `empty_tuple` are resolved by the caller (C13's
 /// dispatcher) for the `FunBc` path; the builtin path needs none
 /// of them. A non-function underlying value returns `PyRaise`.
-pub fn bound_meth_call(
-    ctx: &mut CallCtx,
+pub fn bound_meth_call<'a, 'b>(
+    ctx: &mut CallCtx<'a>,
     self_value: Value,
     code: &RawCode,
     qstr_table: &[u16],
@@ -70,7 +70,7 @@ pub fn bound_meth_call(
     n_args: usize,
     n_kw: usize,
     args: &[Value],
-    runner: &mut dyn FnMut(&mut CallCtx, &mut CodeState) -> RunOutcome,
+    runner: &mut VmRunner<'a, 'b>,
 ) -> PyResult<Value> {
     let data = bound_meth_data(ctx, self_value).ok_or(PyError::PyRaise)?;
     let mut args2: Vec<Value> = Vec::with_capacity(1 + args.len());

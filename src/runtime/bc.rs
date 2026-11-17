@@ -29,12 +29,16 @@
 //! Differences from the C/Zig shape, all deliberate and documented:
 //! - `MpCodeState` is an owned Rust struct (`CodeState`) with only
 //!   the fields `bc.zig` actually uses (`fun_bc`, `ip`, `n_state`,
-//!   `exc_sp_idx`; the state slots themselves). The C `sp` field
-//!   (`&state[0] - 1`) is the VM's value-stack pointer — it is owned
-//!   by the VM (C13), not stored here; `old_globals` is set by the
-//!   C caller (`INIT_CODESTATE` in `objfun.c:217-220`) *after*
-//!   `mp_setup_code_state` returns, so it is not part of this
-//!   struct either.
+//!   `exc_sp_idx`; the state slots themselves), plus — added by
+//!   C13 — the value stack and the exception-handler stack. The C
+//!   `sp` field (`&state[0] - 1`) is the VM's value-stack pointer;
+//!   in Rust the stack lives in the frame itself (`CodeState.stack`)
+//!   so a suspended generator frame is self-contained (the Zig's
+//!   `MpCodeState` is a heap flex object for the same reason).
+//!   `old_globals` is set by the C caller (`INIT_CODESTATE` in
+//!   `objfun.c:217-220`) *after* `mp_setup_code_state` returns, so
+//!   it is not part of this struct either (the VM saves/restores
+//!   globals around `execute` instead).
 //! - `ip` is a byte offset into `RawCode.fun_data`, not a raw
 //!   pointer (the Zig `[*]const Byte`).
 //! - The C `Obj` slots are `Option<Value>` (`None` == `MP_OBJ_NULL`).
@@ -66,18 +70,18 @@
 //! - `decode_uint` uses `wrapping_shl`, matching C unsigned
 //!   wrap for over-long varints (the Zig `<<` on `usize` wraps
 //!   the same way).
-//! - Rooting: allocations inside setup use the caller's `RootSet`
-//!   (as `CallCtx::alloc` does). With the C0 skeleton's threshold
-//!   of `-1` no collection can trigger mid-setup; once C4 lands
-//!   the trigger rule the VM must root the in-progress code state,
-//!   as it roots its value stack.
+//! - Rooting: allocations inside setup use the `CallCtx` (its
+//!   roots), as `CallCtx::alloc` does. The VM must root the
+//!   in-progress code state, as it roots its value stack.
 //!
 //! Tests live in `src/runtime/bc_tests.rs` (split out so both files
 //! stay under the 800-line cap — the Lane RE15 precedent).
 
 use crate::compiler::mpy::RawCode;
-use crate::memory::gc::{GcArena, RootSet};
-use crate::objects::value::{CellData, DictData, GcRef, MapData, MapEntry, Obj, Value};
+use crate::memory::gc::CallCtx;
+use crate::objects::containers::map::{map_lookup, map_set_value, LookupKind, LookupOutcome};
+use crate::objects::containers::objdict::{dict_get_value, DictError};
+use crate::objects::value::{CellData, DictData, GcRef, MapData, Obj, Value};
 use crate::runtime::qstr::RuntimeQstr;
 
 /// Re-exported emit-side encoder — the same algorithm as Zig
@@ -90,16 +94,16 @@ pub use crate::compiler::emit::encoders::encode_uint;
 /// `(8 * 8 + 6) / 7 = 10`).
 pub const MP_ENCODE_UINT_MAX_BYTES: usize = 10;
 
-/// Scope flags (`py/runtime0.h:34-44`); only the three `bc.zig` uses
-/// are defined here.
+/// Scope flags (`py/runtime0.h:34-44`); only the four `bc.zig` uses
+/// are defined here. `GENERATOR` (0x01) is read by the VM's
+/// `MAKE_FUNCTION` (`emitglue.zig: mp_make_function_from_proto_fun`
+/// retypes the function object to `mp_type_gen_wrap` when set) —
+/// the `RawCode` has no `is_generator` field; the bit lives in the
+/// sig prelude.
+pub const MP_SCOPE_FLAG_GENERATOR: usize = 0x01;
 pub const MP_SCOPE_FLAG_VARARGS: usize = 0x04;
 pub const MP_SCOPE_FLAG_VARKEYWORDS: usize = 0x02;
 pub const MP_SCOPE_FLAG_DEFKWARGS: usize = 0x08;
-
-/// `mp_map_lookup` modes (`py/obj.h`): look up only, or insert a
-/// `(key, NULL)` entry when missing.
-pub const MP_MAP_LOOKUP: i32 = 0;
-pub const MP_MAP_LOOKUP_ADD_IF_NOT_FOUND: i32 = 1;
 
 // ── varint decode ──────────────────────────────────────────────────
 
@@ -216,51 +220,6 @@ pub(crate) fn prelude_size_decode(ip: &mut &[u8]) -> PreludeSize {
     PreludeSize { n_info: i, n_cell: c }
 }
 
-// ── map lookup (vendor `mp_map_lookup`, linear scan) ──────────────
-
-/// Look `key` up in a `MapData` entry list. Returns `(index,
-/// is_new)`: `is_new` is true only when `ADD_IF_NOT_FOUND` created
-/// the entry (its value is the `NULL` placeholder until the caller
-/// sets it — the C code's `elem->value == MP_OBJ_NULL` test on a
-/// fresh insert is exactly `is_new`, since a stored value is never
-/// `NULL`). `None` only for a `LOOKUP` miss.
-///
-/// Note: the C map is a hash table; this linear scan has the same
-/// lookup semantics. The real hash-table lookup lives in
-/// `crate::objects::containers::map::map_lookup` (C9a); this scan is
-/// kept because the setup path holds only `&mut GcArena` + `&RootSet`
-/// (no `CallCtx`, so no hashing/equality dispatch) — wiring it to
-/// the real lookup is C13's, when the setup path gains a context.
-/// (C9a: the entry type changed from `(Value, Value)` to
-/// `MapEntry`; the scan skips tombstones via `key == Some(..)`.)
-fn map_lookup(
-    entries: &mut Vec<MapEntry>,
-    key: Value,
-    mode: i32,
-) -> Option<(usize, bool)> {
-    if let Some(pos) = entries.iter().position(|e| e.key == Some(key)) {
-        return Some((pos, false));
-    }
-    if mode == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND {
-        entries.push(MapEntry {
-            key: Some(key),
-            value: Value::None,
-        });
-        Some((entries.len() - 1, true))
-    } else {
-        None
-    }
-}
-
-/// Mutable entry list of a heap `Dict` (panics if the slot does not
-/// hold a dict — a caller-contract violation).
-fn dict_entries_mut(arena: &mut GcArena, dict: GcRef) -> &mut Vec<MapEntry> {
-    match arena.get_mut(dict) {
-        Obj::Dict(d) => &mut d.map.entries,
-        _ => panic!("kwargs dict slot does not hold a Dict"),
-    }
-}
-
 // ── errors ─────────────────────────────────────────────────────────
 
 /// What `mp_setup_code_state_helper` raises, as data. The original
@@ -308,12 +267,35 @@ impl SetupError {
 
 // ── code state ─────────────────────────────────────────────────────
 
+/// One entry of the exception-handler stack (`mp_exc_stack_t`,
+/// `mp_mirrors.zig:133-230`): the handler bytecode offset, the
+/// value-stack depth the handler was pushed at, whether the block
+/// is a `WITH` block (the tag bit the C stores in the low bit of
+/// `val_sp`), and the exception this handler caught (for
+/// `RAISE_LAST` — `excSpScanPrevExc`). The VM (C13) pushes/pops
+/// these as `SETUP_EXCEPT` / `SETUP_FINALLY` / `SETUP_WITH` /
+/// `END_FINALLY` execute.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExcBlock {
+    /// `handler` — byte offset of the handler in `fun_data`.
+    pub handler: usize,
+    /// `val_sp` — value-stack depth (`stack.len()`) at push time.
+    pub val_sp: usize,
+    /// `WITH` flag — the tag bit (`val_sp` low bit in C).
+    pub with_flag: bool,
+    /// `prev_exc` — the exception caught by this handler, if any.
+    pub prev_exc: Option<Value>,
+}
+
 /// Rust form of C `mp_code_state_t` (`mp_mirrors.zig:167`), with
 /// only the fields `bc.zig` uses. `state` is the `n_state` local
 /// slots (`None` == `MP_OBJ_NULL`); `ip` is a byte offset into the
 /// function's `fun_data`, pointing at the first real opcode once
-/// setup returns. `sp` (the VM value-stack pointer) and
-/// `old_globals` live outside this struct — see the module docs.
+/// setup returns. `stack` is the VM value stack (the C `sp`
+/// pointer is `stack.len()`); `exc_stack` is the exception-handler
+/// stack (the C `exc_sp`). Both are empty after setup and are
+/// owned by the frame so a suspended generator is self-contained
+/// (see the module docs). `old_globals` lives outside this struct.
 #[derive(Debug, Clone)]
 pub struct CodeState {
     /// `fun_bc` — the function object (`Obj::FunBc` slot).
@@ -324,8 +306,33 @@ pub struct CodeState {
     pub state: Vec<Option<Value>>,
     /// `n_state` — caller-decoded, cached (see `setup_code_state`).
     pub n_state: usize,
-    /// `exc_sp_idx` — 0 after setup.
+    /// `exc_sp_idx` — mirrors `exc_stack.len()` (maintained by
+    /// `push_exc_block` / `pop_exc_block`); 0 after setup.
     pub exc_sp_idx: usize,
+    /// The value stack (`None` == `MP_OBJ_NULL`).
+    pub stack: Vec<Option<Value>>,
+    /// The exception-handler stack.
+    pub exc_stack: Vec<ExcBlock>,
+}
+
+impl CodeState {
+    /// Push an exception-handler block; `exc_sp_idx` mirrors the
+    /// depth (the Zig's `exc_sp_idx` field).
+    pub fn push_exc_block(&mut self, block: ExcBlock) {
+        self.exc_stack.push(block);
+        self.exc_sp_idx = self.exc_stack.len();
+    }
+
+    /// Pop the top exception-handler block (panics if empty — a
+    /// caller-contract violation, as in the Zig).
+    pub fn pop_exc_block(&mut self) -> ExcBlock {
+        let block = self
+            .exc_stack
+            .pop()
+            .expect("pop_exc_block on an empty exc stack");
+        self.exc_sp_idx = self.exc_stack.len();
+        block
+    }
 }
 
 /// `mp_setup_code_state` (`py/bc.c:322-332`): `code_state->ip` is
@@ -357,8 +364,7 @@ pub fn setup_code_state(
     n_args: usize,
     n_kw: usize,
     args: &[Value],
-    arena: &mut GcArena,
-    roots: &RootSet,
+    ctx: &mut CallCtx,
 ) -> Result<CodeState, SetupError> {
     debug_assert_eq!(
         args.len(),
@@ -371,6 +377,8 @@ pub fn setup_code_state(
         state: vec![None; n_state],
         n_state,
         exc_sp_idx: 0,
+        stack: Vec::new(),
+        exc_stack: Vec::new(),
     };
     setup_code_state_helper(
         &mut cs,
@@ -381,8 +389,7 @@ pub fn setup_code_state(
         n_args,
         n_kw,
         args,
-        arena,
-        roots,
+        ctx,
     )?;
     Ok(cs)
 }
@@ -399,8 +406,7 @@ fn setup_code_state_helper(
     n_args_in: usize,
     n_kw: usize,
     args: &[Value],
-    arena: &mut GcArena,
-    roots: &RootSet,
+    ctx: &mut CallCtx,
 ) -> Result<(), SetupError> {
     let mut n_args = n_args_in;
     // `kwargs = args + n_args` is computed BEFORE the positional
@@ -438,7 +444,7 @@ fn setup_code_state_helper(
         if sig.scope_flags & MP_SCOPE_FLAG_VARARGS == 0 {
             return Err(SetupError::ArgCountMismatch);
         }
-        let tuple = arena.alloc(None, Obj::Tuple(pos_args[sig.n_pos_args..].to_vec()), roots);
+        let tuple = ctx.alloc(None, Obj::Tuple(pos_args[sig.n_pos_args..].to_vec()));
         state[vpk_slot(vpk_idx)] = Some(Value::Heap(tuple));
         vpk_idx -= 1;
         n_args = sig.n_pos_args;
@@ -475,12 +481,11 @@ fn setup_code_state_helper(
     if n_kw != 0 || sig.scope_flags & MP_SCOPE_FLAG_DEFKWARGS != 0 {
         let mut kwargs_dict: Option<GcRef> = None;
         if sig.scope_flags & MP_SCOPE_FLAG_VARKEYWORDS != 0 {
-            let d = arena.alloc(
+            let d = ctx.alloc(
                 None,
                 Obj::Dict(DictData {
                     map: MapData::new(),
                 }),
-                roots,
             );
             state[vpk_slot(vpk_idx)] = Some(Value::Heap(d));
             kwargs_dict = Some(d);
@@ -519,19 +524,24 @@ fn setup_code_state_helper(
             }
             let dict = kwargs_dict.expect("VARKEYWORDS set but no kwargs dict allocated");
             let value = kw_pairs[2 * i + 1];
-            let entries = dict_entries_mut(arena, dict);
-            match map_lookup(entries, wanted_arg_name, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
-                Some((pos, is_new)) => {
-                    if is_new {
-                        entries[pos].value = value;
-                    } else {
-                        // error_multiple (jumped to from goto in C)
-                        return Err(SetupError::MultipleValues {
-                            qstr: wanted_arg_name.as_qstr().unwrap_or(0),
-                        });
-                    }
+            // The real hash-table lookup (C9a's `map_lookup`): the
+            // kwargs keys are qstr immediates, which always hash
+            // and compare by id, so a lookup failure is
+            // unreachable here.
+            let types = ctx.types;
+            match map_lookup(ctx, types, dict, wanted_arg_name, LookupKind::Add)
+                .expect("qstr kwargs key always hashes")
+            {
+                LookupOutcome::Added(pos) => map_set_value(ctx.arena, dict, pos, value),
+                LookupOutcome::Found(_) => {
+                    // error_multiple (jumped to from goto in C)
+                    return Err(SetupError::MultipleValues {
+                        qstr: wanted_arg_name.as_qstr().unwrap_or(0),
+                    });
                 }
-                None => unreachable!("ADD_IF_NOT_FOUND always returns an entry"),
+                LookupOutcome::Removed(_) | LookupOutcome::NotFound => {
+                    unreachable!("ADD always returns Found or Added")
+                }
             }
             i += 1;
         }
@@ -581,16 +591,14 @@ fn setup_code_state_helper(
                 let mut found: Option<Value> = None;
                 if sig.scope_flags & MP_SCOPE_FLAG_DEFKWARGS != 0 {
                     let def_kw_dict_obj = extra_args[sig.n_def_pos_args];
-                    let def_dict = def_kw_dict_obj
-                        .as_heap()
-                        .expect("defkwargs extra arg is not a heap object");
-                    let entries = dict_entries_mut(arena, def_dict);
-                    if let Some((pos, _)) = map_lookup(
-                        entries,
-                        Value::Qstr(u32::from(arg_qstr)),
-                        MP_MAP_LOOKUP,
-                    ) {
-                        found = Some(entries[pos].value);
+                    // The real hash-table lookup (C9a's
+                    // `dict_get_value`): the key is a qstr
+                    // immediate, which always hashes, so only a
+                    // miss (`KeyError`) is reachable here.
+                    match dict_get_value(ctx, def_kw_dict_obj, Value::Qstr(u32::from(arg_qstr))) {
+                        Ok(v) => found = Some(v),
+                        Err(DictError::KeyError(_)) => {}
+                        Err(e) => panic!("defkw lookup on a qstr key failed: {e:?}"),
                     }
                 }
                 match found {
@@ -609,12 +617,11 @@ fn setup_code_state_helper(
             return Err(SetupError::MissingKeywordOnly);
         }
         if sig.scope_flags & MP_SCOPE_FLAG_VARKEYWORDS != 0 {
-            let d = arena.alloc(
+            let d = ctx.alloc(
                 None,
                 Obj::Dict(DictData {
                     map: MapData::new(),
                 }),
-                roots,
             );
             state[vpk_slot(vpk_idx)] = Some(Value::Heap(d));
         }
@@ -631,7 +638,7 @@ fn setup_code_state_helper(
         let local_num = ip2[0] as usize;
         ip2 = &ip2[1..];
         let cell_in = state[n_state - 1 - local_num];
-        let cell = arena.alloc(None, Obj::Cell(CellData { value: cell_in }), roots);
+        let cell = ctx.alloc(None, Obj::Cell(CellData { value: cell_in }));
         state[n_state - 1 - local_num] = Some(Value::Heap(cell));
     }
 

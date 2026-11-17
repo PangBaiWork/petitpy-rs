@@ -13,7 +13,7 @@
 //! thread-local the fixture installs; slots are plain `fn` pointers
 //! and cannot capture anything.
 
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::obj::*;
 use crate::objects::slots::*;
 use crate::objects::value::*;
@@ -63,8 +63,9 @@ pub(crate) fn ctx<'a>(
     roots: &'a mut RootSet,
     types: &'a BuiltinTypes,
     pool: &'a RuntimeQstr,
+    pending_raise: &'a mut Option<PendingRaise>,
 ) -> CallCtx<'a> {
-    CallCtx::new(arena, roots, types, pool)
+    CallCtx::new(arena, roots, types, pool, pending_raise)
 }
 
 pub(crate) struct Fixture {
@@ -72,6 +73,7 @@ pub(crate) struct Fixture {
     pub(crate) roots: RootSet,
     pub(crate) types: BuiltinTypes,
     pub(crate) pool: RuntimeQstr,
+    pub(crate) pending_raise: Option<PendingRaise>,
     dict: GcRef,
 }
 
@@ -147,6 +149,7 @@ impl Fixture {
             roots,
             types,
             pool: RuntimeQstr::new(),
+            pending_raise: None,
             dict,
         }
     }
@@ -374,7 +377,7 @@ fn get_int_small_bool_and_slot() {
     let mut fx = Fixture::new();
     let t = fx.slotted_type("int", 0, Some(int42_slot), None, None, None, None, None);
     let v = fx.value_of(t, Obj::Float(9.9));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(obj_get_int_maybe(&mut ctx, &fx.types, Value::SmallInt(7)).unwrap(), Some(7));
     assert_eq!(obj_get_int_maybe(&mut ctx, &fx.types, Value::Bool(true)).unwrap(), Some(1));
     assert_eq!(obj_get_int_maybe(&mut ctx, &fx.types, Value::Bool(false)).unwrap(), Some(0));
@@ -386,7 +389,7 @@ fn get_int_small_bool_and_slot() {
 fn get_int_no_slot_is_conversion_error() {
     let mut fx = Fixture::new();
     let f = fx.value_of(fx.types.float, Obj::Float(1.5));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(obj_get_int_maybe(&mut ctx, &fx.types, f).unwrap(), None);
     let e = obj_get_int(&mut ctx, &fx.types, f).unwrap_err();
     assert_eq!(e, ObjError::IntConversion);
@@ -403,7 +406,7 @@ fn get_int_bignum_window_and_overflow() {
     // overflow check even though it fits in i64.
     let big70 = fx.bigint(BigInt::from_bytes(true, &[0x40, 0, 0, 0, 0, 0, 0, 0, 0]));
     let big_neg = fx.bigint(BigInt::from_int(i64::MIN));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(obj_get_int(&mut ctx, &fx.types, big62).unwrap(), 1 << 62);
     assert_eq!(obj_get_int(&mut ctx, &fx.types, big70).unwrap_err(), ObjError::Overflow);
     assert_eq!(obj_get_int(&mut ctx, &fx.types, big_neg).unwrap_err(), ObjError::Overflow);
@@ -416,7 +419,7 @@ fn get_int_bignum_window_and_overflow() {
 fn get_int_truncated_and_uint_and_ll() {
     let mut fx = Fixture::new();
     let big70 = fx.bigint(BigInt::from_bytes(true, &[0x40, 0, 0, 0, 0, 0, 0, 0, 0]));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     // Truncation is `mpz_hash`: the low 64 bits of 2^70 are 0.
     assert_eq!(obj_get_int_truncated(&mut ctx, &fx.types, big70).unwrap(), 0);
     assert_eq!(obj_get_int_truncated(&mut ctx, &fx.types, Value::SmallInt(9)).unwrap(), 9);
@@ -436,7 +439,7 @@ fn get_float_small_bool_bignum() {
     let mut fx = Fixture::new();
     let big = fx.bigint(BigInt::from_int(5));
     let f = fx.value_of(fx.types.float, Obj::Float(1.5));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(obj_get_float_maybe(&mut ctx, &fx.types, Value::SmallInt(3)), Some(3.0));
     assert_eq!(obj_get_float_maybe(&mut ctx, &fx.types, Value::Bool(true)), Some(1.0));
     assert_eq!(obj_get_float_maybe(&mut ctx, &fx.types, big), Some(5.0));
@@ -454,7 +457,7 @@ fn get_float_via_slot_and_error() {
             bytes: b"x".to_vec(),
         }),
     );
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(obj_get_float(&mut ctx, &fx.types, v).unwrap(), 2.5);
     let e = obj_get_float(&mut ctx, &fx.types, s).unwrap_err();
     assert_eq!(e, ObjError::FloatConversion);
@@ -476,7 +479,7 @@ fn get_complex_from_float_exact_and_slot() {
             bytes: b"x".to_vec(),
         }),
     );
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     // Any float-convertible value is a complex with imag 0.
     assert_eq!(obj_get_complex(&mut ctx, &fx.types, Value::SmallInt(2)).unwrap(), (2.0, 0.0));
     assert_eq!(obj_get_complex(&mut ctx, &fx.types, c).unwrap(), (3.0, 4.0));
@@ -497,7 +500,7 @@ fn len_bytes_fast_path_and_no_len() {
             bytes: b"abc".to_vec(),
         }),
     );
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(obj_len(&mut ctx, &fx.types, b).unwrap(), Value::SmallInt(3));
     let e = obj_len(&mut ctx, &fx.types, Value::SmallInt(1)).unwrap_err();
     assert_eq!(e, ObjError::NoLen);
@@ -509,7 +512,7 @@ fn len_via_slot() {
     let mut fx = Fixture::new();
     let t = fx.slotted_type("float", 0, Some(len3_slot), None, None, None, None, None);
     let v = fx.value_of(t, Obj::Float(1.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(obj_len(&mut ctx, &fx.types, v).unwrap(), Value::SmallInt(3));
 }
 
@@ -522,7 +525,7 @@ fn is_true_immediates_and_slots() {
     let vl = fx.value_of(tl, Obj::Float(1.0));
     let tl3 = fx.slotted_type("float", 0, Some(len3_slot), None, None, None, None, None);
     let vl3 = fx.value_of(tl3, Obj::Float(1.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert!(obj_is_true(&mut ctx, &fx.types, Value::Bool(true)).unwrap());
     assert!(!obj_is_true(&mut ctx, &fx.types, Value::Bool(false)).unwrap());
     assert!(!obj_is_true(&mut ctx, &fx.types, Value::None).unwrap());

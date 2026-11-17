@@ -372,88 +372,88 @@ pub(crate) fn set_remove(ctx: &mut CallCtx, self_v: Value, item: Value) -> Resul
 
 /// `set.add` (fixed 2 args).
 pub fn set_add_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_add(ctx, first(args), args[1]).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_add(ctx, first(args), args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.clear` (fixed 1 arg).
 pub fn set_clear_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(SetError::to_pyerror)?;
-    set_clear(ctx, first(args)).map_err(SetError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    set_clear(ctx, first(args)).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.copy` (fixed 1 arg).
 pub fn set_copy_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(SetError::to_pyerror)?;
-    set_copy(ctx, first(args)).map_err(SetError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    set_copy(ctx, first(args)).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.discard` (fixed 2 args).
 pub fn set_discard_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_discard(ctx, first(args), args[1]).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_discard(ctx, first(args), args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.difference` (var args, min 1: self + 0+ others).
 pub fn set_difference_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, usize::MAX).map_err(SetError::to_pyerror)?;
-    set_diff_impl(ctx, first(args), &args[1..], false).map_err(SetError::to_pyerror)
+    check_arity(args, 1, usize::MAX).map_err(|e| ctx.record_typed(e))?;
+    set_diff_impl(ctx, first(args), &args[1..], false).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.difference_update` (var args, min 1) → `None`.
 pub fn set_difference_update_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, usize::MAX).map_err(SetError::to_pyerror)?;
-    set_diff_impl(ctx, first(args), &args[1..], true).map_err(SetError::to_pyerror)?;
+    check_arity(args, 1, usize::MAX).map_err(|e| ctx.record_typed(e))?;
+    set_diff_impl(ctx, first(args), &args[1..], true).map_err(|e| ctx.record_typed(e))?;
     Ok(Value::None)
 }
 
 /// `set.intersection` (fixed 2 args).
 pub fn set_intersection_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_intersect_impl(ctx, first(args), args[1], false).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_intersect_impl(ctx, first(args), args[1], false).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.intersection_update` (fixed 2 args) → `None`.
 pub fn set_intersection_update_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_intersect_impl(ctx, first(args), args[1], true).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_intersect_impl(ctx, first(args), args[1], true).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.isdisjoint` (fixed 2 args).
 pub fn set_isdisjoint_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_isdisjoint_impl(ctx, first(args), args[1]).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_isdisjoint_impl(ctx, first(args), args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.issubset` (fixed 2 args).
 pub fn set_issubset_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_issubset_impl(ctx, first(args), args[1], false).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_issubset_impl(ctx, first(args), args[1], false).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.issuperset` (fixed 2 args — args swapped, `setIssuperset`
 /// calls `setIssubsetInternal(other, self)`).
 pub fn set_issuperset_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_issubset_impl(ctx, args[1], first(args), false).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_issubset_impl(ctx, args[1], first(args), false).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.pop` (fixed 1 arg).
 pub fn set_pop_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(SetError::to_pyerror)?;
-    set_pop(ctx, first(args)).map_err(SetError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    set_pop(ctx, first(args)).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.remove` (fixed 2 args).
 pub fn set_remove_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_remove(ctx, first(args), args[1]).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_remove(ctx, first(args), args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.symmetric_difference` (fixed 2 args).
 pub fn set_symmetric_difference_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_symdiff_impl(ctx, first(args), args[1]).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_symdiff_impl(ctx, first(args), args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.symmetric_difference_update` (fixed 2 args) → `None`.
@@ -461,26 +461,26 @@ pub fn set_symmetric_difference_update_builtin(
     ctx: &mut CallCtx,
     args: &[Value],
 ) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_symdiff_update_impl(ctx, first(args), args[1]).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_symdiff_update_impl(ctx, first(args), args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.union` (fixed 2 args).
 pub fn set_union_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
-    set_union_impl(ctx, first(args), args[1]).map_err(SetError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    set_union_impl(ctx, first(args), args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.update` (var args, min 1) → `None`.
 pub fn set_update_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, usize::MAX).map_err(SetError::to_pyerror)?;
-    set_update_impl(ctx, first(args), &args[1..]).map_err(SetError::to_pyerror)
+    check_arity(args, 1, usize::MAX).map_err(|e| ctx.record_typed(e))?;
+    set_update_impl(ctx, first(args), &args[1..]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set.__contains__` (fixed 2 args) — the generic contains op
 /// routes to the CONTAINS binary op (objset.zig `mp_op_contains_obj`).
 pub fn set_contains_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(SetError::to_pyerror)?;
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
     set_binary_op(ctx, BinaryOp::Contains, first(args), args[1])
 }
 

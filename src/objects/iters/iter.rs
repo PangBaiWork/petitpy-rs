@@ -95,7 +95,7 @@
 //!   `collections.deque` list-backed wrapper is petitpy-lib
 //!   (Phase D).
 
-use crate::memory::gc::CallCtx;
+use crate::memory::gc::{CallCtx, TypedRaise};
 use crate::objects::containers::objarray_methods::array_iternext;
 use crate::objects::containers::objdict_methods::dict_view_it_next;
 use crate::objects::containers::objlist::list_iternext;
@@ -222,6 +222,26 @@ impl IterError {
             ),
             IterError::OutOfMemory => String::new(),
             IterError::PyRaise => String::new(),
+        }
+    }
+}
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message). The message needs the qstr pool
+/// (kw-argument names are read out of it).
+impl TypedRaise for IterError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, pool: &RuntimeQstr) -> Option<String> {
+        Some(self.message(pool))
+    }
+    fn raise_signal(&self) -> PyError {
+        match self {
+            IterError::OutOfMemory => PyError::OutOfMemory,
+            _ => PyError::PyRaise,
         }
     }
 }

@@ -6,7 +6,7 @@
 //! resolve to `None` here (the VM's `RuntimeQstr` pool owns them).
 
 use super::*;
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{
     BytesData, DictData, GcRef, MapData, Obj, StrData, TypeData, Value,
@@ -25,6 +25,7 @@ pub(crate) struct Fixture {
     pub(crate) roots: RootSet,
     pub(crate) types: BuiltinTypes,
     pub(crate) pool: RuntimeQstr,
+    pub(crate) pending_raise: Option<PendingRaise>,
 }
 
 pub(crate) fn empty_dict(arena: &mut GcArena, roots: &RootSet) -> GcRef {
@@ -121,11 +122,11 @@ impl Fixture {
             native_init_wrapper,
             property,
         };
-        Fixture { arena, roots, types, pool: RuntimeQstr::new() }
+        Fixture { arena, roots, types, pool: RuntimeQstr::new(), pending_raise: None }
     }
 
     pub(crate) fn call<R>(&mut self, f: impl FnOnce(&mut CallCtx<'_>, &BuiltinTypes) -> R) -> R {
-        let mut ctx = CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool);
+        let mut ctx = CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool, &mut self.pending_raise);
         f(&mut ctx, &self.types)
     }
 

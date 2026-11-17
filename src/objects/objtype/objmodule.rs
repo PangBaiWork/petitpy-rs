@@ -137,7 +137,7 @@ fn dict_lookup(ctx: &mut CallCtx, dict: Value, key: u32) -> PyResult<Option<Valu
     match dict_get_value(ctx, dict, Value::Qstr(key)) {
         Ok(v) => Ok(Some(v)),
         Err(DictError::KeyError(_)) => Ok(None),
-        Err(e) => Err(e.to_pyerror()),
+        Err(e) => Err(ctx.record_typed(e)),
     }
 }
 

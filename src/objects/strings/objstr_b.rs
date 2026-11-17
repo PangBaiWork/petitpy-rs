@@ -668,7 +668,7 @@ pub fn lookup_bytes_method(name: &str) -> Option<BuiltinFn> {
 // ── `BuiltinFn` wrappers (C8a's `builtin_method!` macro is scoped to
 //    `objstr_methods_b.rs`, so these are written out explicitly in
 //    the same shape: empty args → `PyRaise`; types from `ctx.types`;
-//    `StrError` → the pending cell via `slot_raise`).
+//    `StrError` → the `CallCtx` pending raise via `slot_raise`).
 
 /// `str.splitlines` slot wrapper.
 pub fn str_splitlines_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
@@ -676,7 +676,7 @@ pub fn str_splitlines_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Val
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    str_splitlines(ctx, types, args).map_err(slot_raise)
+    str_splitlines(ctx, types, args).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `str.partition` slot wrapper.
@@ -685,7 +685,7 @@ pub fn str_partition_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Valu
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    str_partition(ctx, types, args).map_err(slot_raise)
+    str_partition(ctx, types, args).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `str.rpartition` slot wrapper.
@@ -694,7 +694,7 @@ pub fn str_rpartition_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Val
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    str_rpartition(ctx, types, args).map_err(slot_raise)
+    str_rpartition(ctx, types, args).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `str.count` slot wrapper.
@@ -703,7 +703,7 @@ pub fn str_count_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    str_count(ctx, types, args).map_err(slot_raise)
+    str_count(ctx, types, args).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `str.center` slot wrapper.
@@ -712,7 +712,7 @@ pub fn str_center_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    str_center(ctx, types, args).map_err(slot_raise)
+    str_center(ctx, types, args).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `str.ljust` slot wrapper.
@@ -721,7 +721,7 @@ pub fn str_ljust_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    str_ljust(ctx, types, args).map_err(slot_raise)
+    str_ljust(ctx, types, args).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `str.rjust` slot wrapper.
@@ -730,7 +730,7 @@ pub fn str_rjust_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    str_rjust(ctx, types, args).map_err(slot_raise)
+    str_rjust(ctx, types, args).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `bytes.decode` slot wrapper.
@@ -739,7 +739,7 @@ pub fn bytes_decode_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    bytes_decode(ctx, types, args).map_err(slot_raise)
+    bytes_decode(ctx, types, args).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `str.encode` slot wrapper.
@@ -748,5 +748,5 @@ pub fn str_encode_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    str_encode(ctx, types, args).map_err(slot_raise)
+    str_encode(ctx, types, args).map_err(|e| slot_raise(ctx, e))
 }

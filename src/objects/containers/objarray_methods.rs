@@ -242,11 +242,11 @@ pub fn array_binary_op(
                 return Err(PyError::PyRaise);
             };
             let Some((rhs_bytes, _)) = buffer_bytes(ctx, rhs) else {
-                return Err(ArrayError::Obj(ObjError::BufferProtocol).to_pyerror());
+                return Err(ctx.record_typed(ArrayError::Obj(ObjError::BufferProtocol)));
             };
             let sz = match array_item_size(lhs_tc) {
                 Ok(s) => s,
-                Err(e) => return Err(ArrayError::from(e).to_pyerror()),
+                Err(e) => return Err(ctx.record_typed(ArrayError::from(e))),
             };
             let rhs_len = rhs_bytes.len() / sz;
             let lhs_len = lhs_bytes.len() / sz;
@@ -273,7 +273,7 @@ pub fn array_binary_op(
             if is_view {
                 return Err(PyError::PyRaise);
             }
-            array_extend(ctx, lhs, rhs).map_err(|e| e.to_pyerror())?;
+            array_extend(ctx, lhs, rhs).map_err(|e| ctx.record_typed(e))?;
             Ok(lhs)
         }
         BinaryOp::Contains => {
@@ -360,7 +360,7 @@ pub fn array_subscr(
     };
     let sz = match array_item_size(tc) {
         Ok(s) => s,
-        Err(e) => return Err(ArrayError::from(e).to_pyerror()),
+        Err(e) => return Err(ctx.record_typed(ArrayError::from(e))),
     };
     // A slice index is a heap `Obj::Slice` (C9c's type).
     let slice_data: Option<crate::objects::value::SliceData> = match index {
@@ -374,11 +374,11 @@ pub fn array_subscr(
         let (bound, fast) = match fast_slice_indexes(ctx, types, &slice, len as i64) {
             Ok(v) => v,
             Err(_) => {
-                return Err(ArrayError::SliceStep.to_pyerror());
+                return Err(ctx.record_typed(ArrayError::SliceStep));
             }
         };
         if !fast {
-            return Err(ArrayError::SliceStep.to_pyerror());
+            return Err(ctx.record_typed(ArrayError::SliceStep));
         }
         let start = bound.start.max(0) as usize;
         let stop = bound.stop.max(0) as usize;
@@ -387,7 +387,7 @@ pub fn array_subscr(
             SubscrArg::Get => {
                 if is_view {
                     if start > MEMVIEW_OFFSET_MAX {
-                        return Err(ArrayError::MemviewOffsetOverflow.to_pyerror());
+                        return Err(ctx.record_typed(ArrayError::MemviewOffsetOverflow));
                     }
                     let source = match ctx.arena.get(r) {
                         Obj::Array(a) => a.source,
@@ -433,10 +433,10 @@ pub fn array_subscr(
                     };
                     let src_sz = match array_item_size(src_tc) {
                         Ok(s) => s,
-                        Err(e) => return Err(ArrayError::from(e).to_pyerror()),
+                        Err(e) => return Err(ctx.record_typed(ArrayError::from(e))),
                     };
                     if src_sz != sz {
-                        return Err(ArrayError::SliceCompat.to_pyerror());
+                        return Err(ctx.record_typed(ArrayError::SliceCompat));
                     }
                     let src_len = match array_data(ctx, value) {
                         Some(a) => a.len,
@@ -449,7 +449,7 @@ pub fn array_subscr(
                     (bytes, src_len)
                 } else if matches!(value, Value::Heap(br) if ctx.arena.header(br).type_ == Some(types.bytes)) {
                     if sz != 1 {
-                        return Err(ArrayError::SliceCompat.to_pyerror());
+                        return Err(ctx.record_typed(ArrayError::SliceCompat));
                     }
                     let bytes = match buffer_bytes(ctx, value) {
                         Some((b, _)) => b,
@@ -458,7 +458,7 @@ pub fn array_subscr(
                     let n = bytes.len();
                     (bytes, n)
                 } else {
-                    return Err(ArrayError::SliceRhsRequired.to_pyerror());
+                    return Err(ctx.record_typed(ArrayError::SliceRhsRequired));
                 };
                 let len_adj = src_len as isize - span as isize;
                 // Resolve the destination: an owned array writes
@@ -473,7 +473,7 @@ pub fn array_subscr(
                         return Err(PyError::PyRaise);
                     }
                     if len_adj != 0 {
-                        return Err(ArrayError::SliceCompat.to_pyerror());
+                        return Err(ctx.record_typed(ArrayError::SliceCompat));
                     }
                     let src = match ctx.arena.get(r) {
                         Obj::Array(a) => a.source,
@@ -508,7 +508,7 @@ pub fn array_subscr(
     // `IndexError`, non-int → `TypeError`).
     let idx = match get_index(ctx, types, len, index, false) {
         Ok(i) => i,
-        Err(e) => return Err(ArrayError::from(e).to_pyerror()),
+        Err(e) => return Err(ctx.record_typed(ArrayError::from(e))),
     };
     match arg {
         SubscrArg::Get => Ok(array_get_element(ctx, self_, idx)),
@@ -522,7 +522,7 @@ pub fn array_subscr(
                     return Err(PyError::PyRaise);
                 }
             }
-            array_set_element(ctx, self_, idx, value).map_err(|e| e.to_pyerror())?;
+            array_set_element(ctx, self_, idx, value).map_err(|e| ctx.record_typed(e))?;
             Ok(Value::None)
         }
         SubscrArg::Delete => Err(PyError::PyRaise),
@@ -556,7 +556,7 @@ pub fn array_get_buffer(
     };
     let sz = match array_item_size(tc) {
         Ok(s) => s,
-        Err(e) => return Err(ArrayError::from(e).to_pyerror()),
+        Err(e) => return Err(ctx.record_typed(ArrayError::from(e))),
     };
     if is_view && !is_rw && (flags & BUFFER_WRITE) != 0 {
         return Ok(false);
@@ -644,11 +644,32 @@ fn arity(args: &[Value], n: usize) -> Result<(), PyError> {
 /// `array.append` / `bytearray.append` (fun_builtin_2).
 pub fn array_append_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 2)?;
-    array_append(ctx, args[0], args[1]).map_err(|e| e.to_pyerror())
+    array_append(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `array.extend` / `bytearray.extend` (fun_builtin_2).
 pub fn array_extend_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 2)?;
-    array_extend(ctx, args[0], args[1]).map_err(|e| e.to_pyerror())
+    array_extend(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
 }
+
+/// `array`'s / `bytearray`'s method table (C13, the Zig's
+/// `mp_obj_array_methods` shape): name, body, positional arity
+/// counting `self`. Sigs are the ones the adapters already
+/// enforce (see their doc comments).
+pub static ARRAY_METHODS: &[crate::objects::slots::MethodEntry] = &[
+    crate::objects::slots::MethodEntry {
+        name: "append",
+        func: array_append_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "extend",
+        func: array_extend_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
+];

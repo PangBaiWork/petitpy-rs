@@ -4,6 +4,8 @@
 //! Helpers live in `objgenerator_tests.rs` (same module tree).
 
 use super::objgenerator::*;
+use crate::runtime::runner::RunOutcome;
+use super::objgenerator_types::*;
 use super::objgenerator_tests::{exc_type, exc_value, script_runner, state_of, wrap_gen, GEN_RET_SRC, GEN_SRC};
 use crate::objects::containers::tests::{empty_dict, Fixture};
 use crate::objects::primitives::ops::static_qstr_id;

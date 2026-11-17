@@ -27,7 +27,8 @@
 //! (`fget` is not a named arg); `property(fget=1)` → mismatch.
 
 use super::objdict::ARG_NUM_TYPES_MISMATCH;
-use crate::memory::gc::{CallCtx, GcArena};
+use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::obj::{obj_get_type, ObjError};
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::BuiltinFn;
@@ -74,10 +75,20 @@ impl PropertyError {
         }
     }
 }
-
-impl From<PropertyError> for PyError {
-    fn from(e: PropertyError) -> PyError {
-        e.to_pyerror()
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message).
+impl TypedRaise for PropertyError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.msg().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.to_pyerror()
     }
 }
 
@@ -193,7 +204,7 @@ fn clone_with(ctx: &mut CallCtx, self_v: Value, slot: usize, value: Value) -> Py
 /// the getter replaced. Fixed arity 2 (fun_builtin_2).
 pub fn property_getter_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     if args.len() != 2 {
-        return Err(PropertyError::TypeError(ARG_NUM_TYPES_MISMATCH).to_pyerror());
+        return Err(ctx.record_typed(PropertyError::TypeError(ARG_NUM_TYPES_MISMATCH)));
     }
     clone_with(ctx, args[0], 0, args[1])
 }
@@ -202,7 +213,7 @@ pub fn property_getter_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Va
 /// the setter replaced. Fixed arity 2.
 pub fn property_setter_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     if args.len() != 2 {
-        return Err(PropertyError::TypeError(ARG_NUM_TYPES_MISMATCH).to_pyerror());
+        return Err(ctx.record_typed(PropertyError::TypeError(ARG_NUM_TYPES_MISMATCH)));
     }
     clone_with(ctx, args[0], 1, args[1])
 }
@@ -211,7 +222,7 @@ pub fn property_setter_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Va
 /// the deleter replaced. Fixed arity 2.
 pub fn property_deleter_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     if args.len() != 2 {
-        return Err(PropertyError::TypeError(ARG_NUM_TYPES_MISMATCH).to_pyerror());
+        return Err(ctx.record_typed(PropertyError::TypeError(ARG_NUM_TYPES_MISMATCH)));
     }
     clone_with(ctx, args[0], 2, args[1])
 }

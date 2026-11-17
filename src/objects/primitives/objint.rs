@@ -303,22 +303,40 @@ pub fn int_from_bytes_builtin(ctx: &mut CallCtx<'_>, args: &[Value]) -> PyResult
     let buf = match args[1] {
         Value::Heap(r) => match ctx.arena.get(r) {
             Obj::Bytes(b) => b.bytes.clone(),
-            _ => return Err(PrimError::BufferProtocol.to_pyerror()),
+            _ => return Err(ctx.record_typed(PrimError::BufferProtocol)),
         },
-        _ => return Err(PrimError::BufferProtocol.to_pyerror()),
+        _ => return Err(ctx.record_typed(PrimError::BufferProtocol)),
     };
     let little = matches!(args.get(2), Some(Value::Qstr(id)) if Some(*id) == static_qstr_id(b"little"));
     Ok(int_from_bytes(ctx, cls, &buf, little))
 }
 
+/// `int.to_bytes` as a `FunBuiltin` body (C13 wires the entry —
+/// the C7 doc deferred it here): `to_bytes(length=1,
+/// byteorder='big'[, signed])`, sig 1–4 counting `self`. The
+/// `signed` arg is accepted and ignored — the reference binary
+/// always emits two's-complement bytes (`(-1).to_bytes(1,
+/// "big")` → `b'\xff'`, probed 2026-11-17). Arity is checked by
+/// the VM's `call_fun_builtin` sig check before this runs (which
+/// records the terse TypeError); the guard here is the
+/// direct-call path.
+pub fn int_to_bytes_builtin(ctx: &mut CallCtx<'_>, args: &[Value]) -> PyResult<Value> {
+    if args.is_empty() || args.len() > 4 {
+        ctx.record_raise("TypeError", Some("argument num/types mismatch"));
+        return Err(PyError::PyRaise);
+    }
+    let types = ctx.types;
+    int_to_bytes(ctx, types, args[0], args.get(1).copied(), args.get(2).copied())
+        .map_err(|e| ctx.record_typed(e))
+}
+
 /// `int`'s `locals_dict`: `from_bytes` (classmethod, sig 2-4
-/// counting `cls`). `to_bytes` has NO entry yet — its `FunBuiltin`
-/// body would need the bytes type, which the frozen `BuiltinFn`
-/// signature cannot carry; C13 wires it when `CallCtx` carries the
-/// type registry (the rich `int_to_bytes` below is the
-/// implementation). Both objects are allocated with a `None` header
-/// type — the bootstrap pattern (the dict/builtin-function types do
-/// not exist yet).
+/// counting `cls`) and `to_bytes` (sig 1–4 counting `self`, wired
+/// by C13 — see `int_to_bytes_builtin` above; the `BuiltinFn`
+/// signature carries `CallCtx`, whose `types` supplies the bytes
+/// type). Both objects are allocated with a `None` header type —
+/// the bootstrap pattern (the dict/builtin-function types do not
+/// exist yet).
 pub fn int_locals_dict(ctx: &mut CallCtx<'_>) -> GcRef {
     let from_bytes_id = static_qstr_id(b"from_bytes").expect("MP_QSTR_from_bytes is static");
     let fun = ctx.alloc(
@@ -331,10 +349,26 @@ pub fn int_locals_dict(ctx: &mut CallCtx<'_>) -> GcRef {
             kw_func: None,
         }),
     );
+    // C13: `to_bytes` (sig 1–4 counting `self`; see
+    // `int_to_bytes_builtin` above). The `BuiltinFn` signature
+    // carries `CallCtx`, whose `types` supplies the bytes type.
+    let to_bytes_id = static_qstr_id(b"to_bytes").expect("MP_QSTR_to_bytes is static");
+    let to_bytes_fun = ctx.alloc(
+        None,
+        Obj::FunBuiltin(FunBuiltinData {
+            name: to_bytes_id,
+            n_args: fun_n_args(1, 4),
+            func: int_to_bytes_builtin,
+            kw_func: None,
+        }),
+    );
     ctx.alloc(
         None,
         Obj::Dict(DictData {
-            map: MapData::from_pairs(vec![(Value::Qstr(from_bytes_id), Value::Heap(fun))]),
+            map: MapData::from_pairs(vec![
+                (Value::Qstr(from_bytes_id), Value::Heap(fun)),
+                (Value::Qstr(to_bytes_id), Value::Heap(to_bytes_fun)),
+            ]),
         }),
     )
 }
@@ -504,7 +538,8 @@ pub fn int_unary_op(
 /// `pending_exc`).
 pub fn int_unary_slot(ctx: &mut CallCtx<'_>, op: UnaryOp, v: Value) -> PyResult<Value> {
     let types = ctx.types;
-    prim_to_pyresult(int_unary_op(ctx, types, op, v))
+    let r = int_unary_op(ctx, types, op, v);
+    prim_to_pyresult(ctx, r)
 }
 
 // ── `mp_obj_int_binary_op` (vendor `py/objint_mpz.c`) ───────────────────
@@ -657,7 +692,8 @@ pub fn int_binary_slot(
     rhs: Value,
 ) -> PyResult<Value> {
     let types = ctx.types;
-    prim_to_pyresult(int_binary_op(ctx, types, op, lhs, rhs))
+    let r = int_binary_op(ctx, types, op, lhs, rhs);
+    prim_to_pyresult(ctx, r)
 }
 
 // ── `mp_obj_int_pow3` (vendor `py/objint_mpz.c`) ────────────────────────

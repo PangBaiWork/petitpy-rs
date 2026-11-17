@@ -28,7 +28,8 @@
 
 use super::objdict::ARG_NUM_TYPES_MISMATCH;
 use super::objslice::{slice_indices_polled, SliceError};
-use crate::memory::gc::{CallCtx, GcArena};
+use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::obj::{obj_get_int, ObjError};
 use crate::objects::obj_ops::get_index;
 use crate::objects::primitives::ops::static_qstr_id;
@@ -90,10 +91,20 @@ impl RangeError {
         }
     }
 }
-
-impl From<RangeError> for PyError {
-    fn from(e: RangeError) -> PyError {
-        e.to_pyerror()
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message).
+impl TypedRaise for RangeError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.msg().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.to_pyerror()
     }
 }
 
@@ -278,11 +289,12 @@ pub fn range_subscr(
             }),
         );
         if let Some(e) = pending {
-            return Err(RangeError::from(e).to_pyerror());
+            return Err(ctx.record_typed(RangeError::from(e)));
         }
         return Ok(Value::Heap(new_range));
     }
-    let idx = get_index(ctx, ctx.types, len as usize, index, false).map_err(RangeError::from)?;
+    let idx = get_index(ctx, ctx.types, len as usize, index, false)
+        .map_err(|e| ctx.record_typed(RangeError::from(e)))?;
     Ok(Value::int(
         ctx.arena,
         Some(ctx.types.int),

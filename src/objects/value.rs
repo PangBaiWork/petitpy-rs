@@ -250,6 +250,15 @@ pub enum Obj {
     /// objtype.zig: `newStaticClassMethod`). One payload for both —
     /// the header type (arena slot `type_`) says which. C12 owns.
     StaticClassMethod(StaticClassMethodData),
+    /// The `Ellipsis` singleton (`...` / `Ellipsis`, C13): the
+    /// `.mpy` const table carries an Ellipsis entry and the corpus
+    /// has `builtin_ellipsis.py`, so the value needs a payload —
+    /// a unit variant (no children, no bytes). The VM owns the
+    /// single instance (header type = the VM's ellipsis type,
+    /// name qstr 0 — the reference binary prints
+    /// `type(...)` as `<class ''>` and `repr(...)` as
+    /// `Ellipsis`, probed 2026-11-17).
+    Ellipsis,
 }
 
 impl Obj {
@@ -284,6 +293,7 @@ impl Obj {
             Obj::Map(m) => m.alloc * 16 + m.index.len() * 4,
             Obj::Instance(i) => i.members.alloc * 16 + i.subobj.len() * 8,
             Obj::StaticClassMethod(_) => 16,
+            Obj::Ellipsis => 0,
         }
     }
 

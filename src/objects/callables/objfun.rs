@@ -30,19 +30,21 @@
 //!
 //! The Zig calls `mp_execute_bytecode(code_state, 0)` — a global
 //! VM entry point. Rust has no VM global yet, so the execute step
-//! is a parameter: `runner: &mut dyn FnMut(&mut CallCtx, &mut
-//! CodeState) -> RunOutcome`. The runner returns the outcome; the
-//! *value* travels in the outcome (not in `CodeState.sp[0]` as in
-//! the Zig — the Rust `CodeState` (`bc.rs`) has no value-stack
-//! pointer; the VM manages the stack). `RunOutcome::NeedsVm` is
-//! the seam's "I cannot run this" answer: the `fun_bc_call_slot`
-//! adapter (the `CallFn` registered on the type) passes a null
-//! runner that always answers `NeedsVm`, because the slot has no
-//! `RawCode` / qstr table / empty-tuple singleton to prepare with
-//! — those live in C13's code store. C13's dispatcher calls
-//! `fun_bc_call` directly with the resolved code and the real
-//! runner, or threads the runner into `CallCtx` (design doc D5:
-//! "C13 grows CallCtx into the Vm") and replaces the slot adapter.
+//! is a parameter: `runner: &mut VmRunner` (the unified runner,
+//! `crate::runtime::runner` — C13 unified this lane's 2-argument
+//! seam with C10b's 4-argument one; `fun_bc_call` passes
+//! `send = None`, `throw = None` for a fresh call). The runner
+//! returns the outcome; the *value* travels in the outcome (not
+//! in `CodeState.sp[0]` as in the Zig — the Rust `CodeState`
+//! (`bc.rs`) holds the value stack, and the runner returns the
+//! top value directly). The `fun_bc_call_slot` adapter (the
+//! `CallFn` registered on the type) passes a null runner that
+//! always answers `Exception` (it has no `RawCode` / qstr table /
+//! empty-tuple singleton to prepare with — those live in C13's
+//! code store). C13's dispatcher calls `fun_bc_prepare_call`
+//! directly with the resolved code and the real runner (the slot
+//! cannot capture the code store, so the VM dispatches `FunBc`
+//! before the slot lookup — same observable behaviour).
 //!
 //! ## Deferred to C13 (with Zig refs)
 //!
@@ -73,6 +75,7 @@ use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::obj::{FLAG_BINDS_SELF, FLAG_BUILTIN_FUN};
 use crate::objects::slots::{AttrFn, CallFn, PrintKind};
 use crate::objects::value::{FunBcData, FunBuiltinData, GcRef, Obj, TypeData, Value};
+use crate::runtime::runner::{RunOutcome, VmRunner};
 use crate::pyerr::{PyError, PyResult};
 use crate::qstr_table::Qstr;
 use crate::runtime::bc::{prelude_sig_decode, setup_code_state, CodeState, SetupError};
@@ -229,6 +232,12 @@ pub fn call_fun_builtin(
     let (min, max) = fun_sig_range(data.n_args);
     let takes_kw = data.kw_func.is_some();
     if !arg_check_num(n_args, n_kw, min, max, takes_kw) {
+        // The Zig's `mp_arg_check_num_sig` sets `pending_exc` to
+        // the terse TypeError (vendor `py/argcheck.c:141`) — the
+        // VM records it here instead of returning a bare raise
+        // (C13: the slot-boundary convention is "record, then
+        // return PyRaise").
+        ctx.record_raise("TypeError", Some("argument num/types mismatch"));
         return Err(PyError::PyRaise);
     }
     match data.kw_func {
@@ -315,26 +324,6 @@ pub fn new_fun_bc(
 
 // ── `fun_bc_call`: prepare + runner seam (`objfun.zig:315-380`) ──
 
-/// What the VM runner reports for one `mp_execute_bytecode` step
-/// (`objfun.zig:~366`). The value travels in the outcome: the
-/// Zig reads it from `code_state.sp[0]` (NORMAL) or
-/// `code_state.statePtr()[0]` (EXCEPTION), but the Rust
-/// `CodeState` (`bc.rs`) has no value-stack pointer — the VM
-/// manages the stack, so the runner returns the value directly.
-/// `NeedsVm` is the seam's "I cannot run this" answer (see the
-/// module docs); the real VM runner never returns it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RunOutcome {
-    /// Normal return; the value is the call's result.
-    Normal(Value),
-    /// Exception return; the value is the exception object (the
-    /// Zig sets `pending_exc` to it — dropped at the slot boundary
-    /// until C13, per the C6 convention).
-    Exception(Value),
-    /// The runner cannot execute (no VM wired yet).
-    NeedsVm,
-}
-
 /// `fun_bc_call` up to the `mp_execute_bytecode` line
 /// (`objfun.zig:315-354`): decode the sig prelude (`n_state` from
 /// `S + 1`), build the default-args `extra_args` (positional
@@ -348,8 +337,8 @@ pub enum RunOutcome {
 /// up). The state allocation itself is a `Vec` inside `CodeState`
 /// (see the module docs for the stack-buffer divergence).
 /// Panics when `fun` is not a heap `FunBc` (caller-contract
-/// violation — the Zig's `fromObj` would read garbage; cf.
-/// `dict_entries_mut` in `bc.rs`).
+/// violation — the Zig's `fromObj` would read garbage; cf. the
+/// real hash-table lookup in `bc.rs`).
 pub fn fun_bc_prepare_call(
     ctx: &mut CallCtx,
     fun: GcRef,
@@ -367,8 +356,9 @@ pub fn fun_bc_prepare_call(
     // Sig prelude decode (`MP_BC_PRELUDE_SIG_DECODE_INTO`,
     // `objfun.zig:282-311`): only `n_state` and `n_exc_stack`
     // are read here. `n_exc_stack` sizes the Zig's state buffer
-    // only — the Rust `CodeState` has no exc-stack storage, so
-    // it is decoded and discarded (as C5's setup does).
+    // only — the Rust `CodeState` carries its own exc stack
+    // (empty after setup), so it is decoded and discarded (as
+    // C5's setup does).
     let mut cursor: &[u8] = &code.fun_data;
     let sig = prelude_sig_decode(&mut cursor);
     let _ = sig.n_exc_stack;
@@ -389,8 +379,7 @@ pub fn fun_bc_prepare_call(
         n_args,
         n_kw,
         args,
-        ctx.arena,
-        ctx.roots,
+        ctx,
     )
 }
 
@@ -402,9 +391,11 @@ pub fn fun_bc_prepare_call(
 /// Globals save/restore (`objfun.zig:350, ~368`) is C13's — the
 /// call runs in the caller's globals. `RunOutcome::Exception`
 /// returns `PyRaise` (the exception value is dropped at the slot
-/// boundary until C13 adds `pending_exc`, C6 convention).
-pub fn fun_bc_call(
-    ctx: &mut CallCtx,
+/// boundary until C13 adds `pending_exc`, C6 convention). A fresh
+/// call passes `send = None`, `throw = None` to the runner (the
+/// unified 4-argument shape — see `crate::runtime::runner`).
+pub fn fun_bc_call<'a, 'b>(
+    ctx: &mut CallCtx<'a>,
     self_value: Value,
     code: &RawCode,
     qstr_table: &[u16],
@@ -412,7 +403,7 @@ pub fn fun_bc_call(
     n_args: usize,
     n_kw: usize,
     args: &[Value],
-    runner: &mut dyn FnMut(&mut CallCtx, &mut CodeState) -> RunOutcome,
+    runner: &mut VmRunner<'a, 'b>,
 ) -> PyResult<Value> {
     let fun = match self_value {
         Value::Heap(r) => r,
@@ -420,10 +411,10 @@ pub fn fun_bc_call(
     };
     let mut cs = fun_bc_prepare_call(ctx, fun, code, qstr_table, empty_tuple, n_args, n_kw, args)
         .map_err(|_| PyError::PyRaise)?;
-    match runner(ctx, &mut cs) {
+    match runner(ctx, &mut cs, Value::None, None) {
         RunOutcome::Normal(v) => Ok(v),
         RunOutcome::Exception(_) => Err(PyError::PyRaise),
-        RunOutcome::NeedsVm => Err(PyError::PyRaise),
+        RunOutcome::Yield(_) => Err(PyError::PyRaise),
     }
 }
 

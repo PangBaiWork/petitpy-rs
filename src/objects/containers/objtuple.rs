@@ -64,7 +64,8 @@
 //!   is ()` is `True` and `tuple()` / `x * 0` return the
 //!   singleton, as in the Zig (`mp_const_empty_tuple_obj`).
 
-use crate::memory::gc::CallCtx;
+use crate::memory::gc::{CallCtx, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::containers::map::{hash_of, MapError};
 use crate::objects::containers::objdict::DictError;
 use crate::objects::containers::objdict_methods::collect_iterable;
@@ -150,6 +151,22 @@ impl TupleError {
             TupleError::OutOfMemory => PyError::OutOfMemory,
             _ => PyError::PyRaise,
         }
+    }
+}
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message).
+impl TypedRaise for TupleError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.message().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.clone().to_pyerror()
     }
 }
 
@@ -498,13 +515,13 @@ pub fn tuple_subscr(
                 return match tuple_slice_load(ctx, tuple_type, &items, &slice) {
                     Ok(v) => Ok(v),
                     Err(TupleError::OutOfMemory) => Err(PyError::OutOfMemory),
-                    Err(_) => Err(PyError::PyRaise),
+                    Err(e) => Err(ctx.record_typed(e)),
                 };
             }
             let idx = match get_index(ctx, types, items.len(), index, false) {
                 Ok(i) => i,
                 Err(ObjError::OutOfMemory) => return Err(PyError::OutOfMemory),
-                Err(_) => return Err(PyError::PyRaise),
+                Err(e) => return Err(ctx.record_typed(e)),
             };
             Ok(items[idx])
         }
@@ -636,7 +653,7 @@ pub fn tuple_count_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value>
         return Err(PyError::PyRaise);
     }
     let items = tuple_items(ctx, args[0]).unwrap_or(&[]).to_vec();
-    tuple_count(ctx, &items, args[1]).map_err(|e| e.to_pyerror())
+    tuple_count(ctx, &items, args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `tuple.index` as a `BuiltinFn` adapter (var 2..4 args:
@@ -649,8 +666,29 @@ pub fn tuple_index_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value>
     let items = tuple_items(ctx, args[0]).unwrap_or(&[]).to_vec();
     let start = args.get(2).copied();
     let stop = args.get(3).copied();
-    tuple_index(ctx, &items, args[1], start, stop).map_err(|e| e.to_pyerror())
+    tuple_index(ctx, &items, args[1], start, stop).map_err(|e| ctx.record_typed(e))
 }
+
+/// `tuple`'s method table (C13, the Zig's `mp_obj_tuple_methods`
+/// shape): name, body, positional arity counting `self`. Sigs
+/// are the ones the adapters already enforce (see their doc
+/// comments).
+pub static TUPLE_METHODS: &[crate::objects::slots::MethodEntry] = &[
+    crate::objects::slots::MethodEntry {
+        name: "count",
+        func: tuple_count_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "index",
+        func: tuple_index_builtin,
+        min: 2,
+        max: 4,
+        kw_func: None,
+    },
+];
 
 /// `tuple()` as a `BuiltinFn`-shaped constructor for the
 /// type-call path (C12): `tuple_make_new` with the args as
@@ -660,5 +698,5 @@ pub fn tuple_make_new_builtin(
     args: &[Value],
 ) -> PyResult<Value> {
     let tuple_type = ctx.types.tuple;
-    tuple_make_new(ctx, tuple_type, args, 0).map_err(|e| e.to_pyerror())
+    tuple_make_new(ctx, tuple_type, args, 0).map_err(|e| ctx.record_typed(e))
 }

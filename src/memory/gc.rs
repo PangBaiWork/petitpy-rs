@@ -113,7 +113,7 @@
 
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::value::{GcRef, Obj, ObjHeader, Value};
-use crate::pyerr::PyResult;
+use crate::pyerr::{PyError, PyResult};
 use crate::runtime::qstr::RuntimeQstr;
 
 /// Bytes per GC block (`gc.zig`: `4 * @sizeOf(usize)`, 64-bit).
@@ -158,6 +158,74 @@ impl RootSet {
     }
 }
 
+/// A raise recorded by a slot for the VM (`pending_exc` wiring,
+/// C13). Slots return only the `PyError::PyRaise` signal, so a slot
+/// that raises records the (type, argument) here first; the VM
+/// drains it after the slot returns and builds the exception object
+/// (via C12b's constructors + `ExceptionTypes`). `arg` is the
+/// exception's single argument as a value (e.g. the missing
+/// `KeyError` key); `message` is the message string (used as the
+/// string argument when `arg` is `None`). Exactly one of the two is
+/// set for a real raise; `OutOfMemory` records nothing (it has no
+/// exception object). Replaces C8a's `PENDING_STR_ERROR`
+/// thread-local: same data, now on the context (the C7r/C9a
+/// explicit-parameter precedent — shared state rides on the
+/// context, not on globals).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingRaise {
+    pub exc_name: &'static str,
+    pub arg: Option<Value>,
+    pub message: Option<String>,
+}
+
+impl PendingRaise {
+    /// A raise with a message argument.
+    pub fn msg(exc_name: &'static str, message: &str) -> PendingRaise {
+        PendingRaise {
+            exc_name,
+            arg: None,
+            message: Some(message.to_string()),
+        }
+    }
+
+    /// A raise with a value argument.
+    pub fn value(exc_name: &'static str, arg: Value) -> PendingRaise {
+        PendingRaise {
+            exc_name,
+            arg: Some(arg),
+            message: None,
+        }
+    }
+
+    /// A bare raise (no argument).
+    pub fn bare(exc_name: &'static str) -> PendingRaise {
+        PendingRaise {
+            exc_name,
+            arg: None,
+            message: None,
+        }
+    }
+}
+
+/// A typed error that a slot/builtin can record as the VM's pending
+/// raise (C13). The VM drains the recording after the slot returns
+/// and builds the exception object from it (name + arg/message).
+/// Implemented next to each error type (one small impl per type).
+/// `raise_arg` is the exception's single value argument, if any
+/// (e.g. the missing `KeyError` key); `raise_message` is the
+/// message string otherwise (it takes the qstr pool because some
+/// messages name qstrs — `IterError`). `raise_signal` is the
+/// plain `PyError` the boundary returns (`OutOfMemory` records
+/// nothing; an empty `raise_name` — the `PyRaise` "a slot raised,
+/// data dropped" case — also records nothing, and the VM falls
+/// back to a bare `TypeError`).
+pub trait TypedRaise {
+    fn raise_name(&self) -> &'static str;
+    fn raise_arg(&self) -> Option<Value>;
+    fn raise_message(&self, pool: &RuntimeQstr) -> Option<String>;
+    fn raise_signal(&self) -> PyError;
+}
+
 /// Call context handed to type-slot and built-in functions: the arena
 /// plus the roots they must use for every allocation. The VM builds one
 /// per operation from its own arena + roots; C13 grows this struct
@@ -176,11 +244,18 @@ impl RootSet {
 /// it. No thread-local pool (the C8a draft's `INSTALLED_TYPES` /
 /// `PENDING_STR_ERROR` thread-locals were flagged at review — shared
 /// state rides on the context, not on globals).
+/// `pending_raise` is the C13 growth for the raise path: a slot that
+/// raises records its exception here before returning
+/// `PyError::PyRaise` (see `PendingRaise`); the VM drains it and
+/// builds the exception object into `VmState.pending_exc`. The
+/// first record wins (the Zig's polled-sentinel rule — a later
+/// error does not overwrite an earlier pending one).
 pub struct CallCtx<'a> {
     pub arena: &'a mut GcArena,
     pub roots: &'a mut RootSet,
     pub types: &'a BuiltinTypes,
     pub pool: &'a RuntimeQstr,
+    pub pending_raise: &'a mut Option<PendingRaise>,
 }
 
 impl<'a> CallCtx<'a> {
@@ -189,8 +264,69 @@ impl<'a> CallCtx<'a> {
         roots: &'a mut RootSet,
         types: &'a BuiltinTypes,
         pool: &'a RuntimeQstr,
+        pending_raise: &'a mut Option<PendingRaise>,
     ) -> CallCtx<'a> {
-        CallCtx { arena, roots, types, pool }
+        CallCtx {
+            arena,
+            roots,
+            types,
+            pool,
+            pending_raise,
+        }
+    }
+
+    /// Record a raise with a message argument. First record wins;
+    /// a later record is dropped (the Zig's polled-sentinel rule).
+    pub fn record_raise(&mut self, exc_name: &'static str, message: Option<&str>) {
+        if self.pending_raise.is_none() {
+            *self.pending_raise = Some(PendingRaise {
+                exc_name,
+                arg: None,
+                message: message.map(|m| m.to_string()),
+            });
+        }
+    }
+
+    /// Record a raise with a value argument (e.g. `KeyError(key)`).
+    /// First record wins (see `record_raise`).
+    pub fn record_raise_value(&mut self, exc_name: &'static str, arg: Value) {
+        if self.pending_raise.is_none() {
+            *self.pending_raise = Some(PendingRaise {
+                exc_name,
+                arg: Some(arg),
+                message: None,
+            });
+        }
+    }
+
+    /// Take (and clear) the recorded raise, if any.
+    pub fn take_pending_raise(&mut self) -> Option<PendingRaise> {
+        self.pending_raise.take()
+    }
+
+    /// Whether a raise is recorded.
+    pub fn has_pending_raise(&self) -> bool {
+        self.pending_raise.is_some()
+    }
+
+    /// Record a typed error as the pending raise and return its
+    /// `PyError` signal — the slot/builtin raise path (the
+    /// `slot_raise` pattern, shared by every error type that
+    /// implements `TypedRaise`). `OutOfMemory` and the empty-name
+    /// `PyRaise` case record nothing (see `TypedRaise`).
+    pub fn record_typed<E: TypedRaise>(&mut self, e: E) -> PyError {
+        let sig = e.raise_signal();
+        if sig == PyError::PyRaise {
+            let name = e.raise_name();
+            if !name.is_empty() {
+                let pool = self.pool;
+                match e.raise_arg() {
+                    Some(v) => self.record_raise_value(name, v),
+                    None => self.record_raise(name, e.raise_message(pool).as_deref()),
+                }
+            }
+        }
+        sig
     }
 
     /// Allocate an object, rooted at this context's roots.

@@ -77,7 +77,8 @@ use super::map_set::{set_items, set_lookup_hashed, MpSet, SetSlot};
 use super::objdict::ARG_NUM_TYPES_MISMATCH;
 use super::objdict::DictError;
 use super::objdict_methods::collect_iterable;
-use crate::memory::gc::{CallCtx, GcArena};
+use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::obj::{BuiltinTypes, ObjError};
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::static_qstr_id;
@@ -155,10 +156,24 @@ impl SetError {
         }
     }
 }
-
-impl From<SetError> for PyError {
-    fn from(e: SetError) -> PyError {
-        e.to_pyerror()
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, arg/message). A `KeyError` records its
+/// item as the value argument.
+impl TypedRaise for SetError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        match self {
+            SetError::KeyError(v) => Some(*v),
+            _ => None,
+        }
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.msg().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.clone().to_pyerror()
     }
 }
 
@@ -522,7 +537,8 @@ pub fn set_unary_op(ctx: &mut CallCtx, op: UnaryOp, self_v: Value) -> PyResult<V
                 _ => panic!("set_unary_op on a non-heap value"),
             };
             for item in items {
-                let h = hash_of(ctx, ctx.types, item).map_err(SetError::from)?;
+                let h = hash_of(ctx, ctx.types, item)
+                    .map_err(|e| ctx.record_typed(SetError::from(e)))?;
                 hash = hash.wrapping_add(h as i64);
             }
             // `newSmallInt(hash)` is a raw shift with no window
@@ -556,7 +572,7 @@ pub fn set_binary_op(ctx: &mut CallCtx, op: BinaryOp, lhs: Value, rhs: Value) ->
             if update {
                 return set_update_impl(ctx, lhs, &[rhs])
                     .map(|_| lhs)
-                    .map_err(SetError::to_pyerror);
+                    .map_err(|e| ctx.record_typed(e));
             }
             set_union_impl(ctx, lhs, rhs)
         }
@@ -564,14 +580,14 @@ pub fn set_binary_op(ctx: &mut CallCtx, op: BinaryOp, lhs: Value, rhs: Value) ->
             if update {
                 return set_symdiff_update_impl(ctx, lhs, rhs)
                     .map(|_| lhs)
-                    .map_err(SetError::to_pyerror);
+                    .map_err(|e| ctx.record_typed(e));
             }
             set_symdiff_impl(ctx, lhs, rhs)
         }
         BinaryOp::InplaceAnd => {
             let out = set_intersect_impl(ctx, lhs, rhs, update);
             if update {
-                return out.map(|_| lhs).map_err(SetError::to_pyerror);
+                return out.map(|_| lhs).map_err(|e| ctx.record_typed(e));
             }
             out
         }
@@ -588,15 +604,16 @@ pub fn set_binary_op(ctx: &mut CallCtx, op: BinaryOp, lhs: Value, rhs: Value) ->
             // → `TypeError 'unsupported type for operator'`).
             let r = set_ref_of(ctx.arena, lhs);
             let mut pending: Option<SetError> = None;
-            let found = set_lookup_quirk(ctx, r, rhs, LookupKind::Lookup, &mut pending)?;
+            let found = set_lookup_quirk(ctx, r, rhs, LookupKind::Lookup, &mut pending)
+                .map_err(|e| ctx.record_typed(e))?;
             return match pending {
-                Some(e) => Err(e.to_pyerror()),
+                Some(e) => Err(ctx.record_typed(e)),
                 None => Ok(Value::Bool(found.is_some())),
             };
         }
         _ => return Err(PyError::PyRaise),
     };
-    out.map_err(SetError::to_pyerror)
+    out.map_err(|e| ctx.record_typed(e))
 }
 
 /// `npy_set_print` (objset.zig:109-130): empty → `set()` /

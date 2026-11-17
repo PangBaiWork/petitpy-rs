@@ -458,10 +458,10 @@ pub fn bytes_type_data(name: u32, dict: GcRef) -> TypeData {
 /// `BuiltinFn` shape (`fn(&mut CallCtx, &[Value])`): `types` comes
 /// from the installed-types cell (the VM installs it at startup;
 /// C10/D1 drop these wrappers straight into `FunBuiltinData.func`).
-/// A specific `StrError` is recorded in the pending-error cell
-/// before returning `PyRaise`; an empty `args` (no self —
+/// A specific `StrError` is recorded in the `CallCtx` pending
+/// raise before returning `PyRaise`; an empty `args` (no self —
 /// impossible after the VM's sig check) is plain `PyRaise` with no
-/// pending error.
+/// pending raise.
 macro_rules! builtin_method {
     ($name:ident, $f:path) => {
         pub fn $name(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
@@ -469,7 +469,7 @@ macro_rules! builtin_method {
                 return Err(PyError::PyRaise);
             }
             let types = ctx.types;
-            $f(ctx, types, args).map_err(slot_raise)
+            $f(ctx, types, args).map_err(|e| slot_raise(ctx, e))
         }
     };
 }

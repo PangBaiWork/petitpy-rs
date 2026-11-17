@@ -15,13 +15,15 @@
 //! exception — the exception type plus the TERSE message literal.
 //! Method functions return `StrError` directly. Slot functions
 //! (frozen `PyResult<Value>` signatures) record a specific raise
-//! in the `PENDING_STR_ERROR` cell (`pyerr.pending_exc` stand-in,
-//! see below) before returning `PyError::PyRaise`, and record
-//! nothing when the original returns NULL — so "no pending error"
-//! still means "not implemented" for C6's `call_*` wrappers, until
-//! C13 teaches them to check the pending cell (design doc D7).
+//! in the `CallCtx` pending raise (`PendingRaise`, the
+//! `pyerr.pending_exc` stand-in, see below) before returning
+//! `PyError::PyRaise`, and record nothing when the original
+//! returns NULL — so "no pending raise" still means "not
+//! implemented" for C6's `call_*` wrappers, until C13 teaches
+//! them to check the pending raise (design doc D7).
 
-use crate::memory::gc::{CallCtx, GcArena};
+use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::containers::map_set::set_items;
 use crate::objects::obj::{
     obj_get_int_maybe, obj_get_type, qstr_bytes, BuiltinTypes, ObjError, BUFFER_READ,
@@ -277,6 +279,27 @@ impl StrError {
         }
     }
 }
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, arg/message). A `KeyError` records its key
+/// as the value argument (the old `PENDING_STR_ERROR` cell
+/// dropped it).
+impl TypedRaise for StrError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_type().map(|t| t.name()).unwrap_or("")
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        match self {
+            StrError::KeyError(v) => Some(*v),
+            _ => None,
+        }
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.message().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.to_pyerror()
+    }
+}
 
 impl From<ObjError> for StrError {
     fn from(e: ObjError) -> StrError {
@@ -284,53 +307,31 @@ impl From<ObjError> for StrError {
     }
 }
 
-// ── pending error (thread-local) ────────────────────────────────────────
+// ── pending error (recorded on the `CallCtx`) ──────────────────────
 
-// The pending str/bytes raise, as `(exception type, TERSE message)`.
-//
-// Stand-in for Zig's `pyerr.pending_exc` global until C13 lands
-// `VmState.pending_exc` (design doc D7). C6's `call_*` wrappers
-// collapse every slot `PyRaise` into `NotImplemented`, so a slot
-// that raises a SPECIFIC error (e.g. `IndexError: string index out
-// of range` from `str_subscr`) records it here before returning
-// `PyRaise`; a slot that returns NULL in the original records
-// nothing, so "no pending error" still means "not implemented".
-// C13 must teach the wrappers to check this cell (or the
-// `CallCtx` field that replaces it) before collapsing to
-// `NotImplemented`. Tests read it via `take_pending_str_error`
-// to assert the exact (type, message) a slot raises.
-// (A `///` doc comment on the `thread_local!` block itself is an
-// "unused doc comment" — the docs live on this comment instead.)
-thread_local! {
-    static PENDING_STR_ERROR: std::cell::Cell<Option<(StrExc, Option<&'static str>)>> =
-        const { std::cell::Cell::new(None) };
-}
+// The pending str/bytes raise, recorded on the `CallCtx`
+// (`PendingRaise`, `memory::gc`) — C13's replacement for C8a's
+// `PENDING_STR_ERROR` thread-local cell (same data, now on the
+// context: the C7r/C9a explicit-parameter precedent — shared
+// state rides on the context, not on globals). C6's `call_*`
+// wrappers collapse every slot `PyRaise` into `NotImplemented`,
+// so a slot that raises a SPECIFIC error (e.g. `IndexError:
+// string index out of range` from `str_subscr`) records it via
+// `slot_raise` before returning `PyRaise`; a slot that returns
+// NULL in the original records nothing, so "no pending raise"
+// still means "not implemented". The VM drains the recording
+// after the slot returns and builds the exception object into
+// `VmState.pending_exc`. Tests read it via the fixture's
+// `pending_raise` field to assert the exact (type, message) a
+// slot raises.
 
 /// Record `e` as the pending str/bytes raise and return its plain
-/// `PyError` signal — the slot functions' raise path. (`OutOfMemory`
-/// sets no pending error: it has no exception object.)
-pub(crate) fn slot_raise(e: StrError) -> PyError {
-    let sig = e.to_pyerror();
-    if sig == PyError::PyRaise {
-        PENDING_STR_ERROR.with(|c| {
-            c.set(Some((
-                e.exc_type().unwrap_or(StrExc::TypeError),
-                e.message(),
-            )))
-        });
-    }
-    sig
-}
-
-/// Take (and clear) the pending str/bytes raise, if any.
-pub fn take_pending_str_error() -> Option<(StrExc, Option<&'static str>)> {
-    PENDING_STR_ERROR.with(|c| c.replace(None))
-}
-
-/// Clear the pending str/bytes raise (test fixtures call this before
-/// each slot call so a stale raise cannot leak into the next test).
-pub fn clear_pending_str_error() {
-    PENDING_STR_ERROR.with(|c| c.set(None));
+/// `PyError` signal — the slot functions' raise path. This is the
+/// `TypedRaise` recording shared by every error type (see
+/// `CallCtx::record_typed`); the name is kept so the existing call
+/// sites read the same.
+pub(crate) fn slot_raise(ctx: &mut CallCtx, e: StrError) -> PyError {
+    ctx.record_typed(e)
 }
 
 /// The result type for a method/slot on a value: the header type
@@ -353,6 +354,32 @@ pub fn str_data<'a>(arena: &'a GcArena, v: Value) -> Option<&'a [u8]> {
         Value::Heap(r) => match arena.get(r) {
             Obj::Str(s) => Some(&s.bytes),
             Obj::Bytes(b) => Some(&b.bytes),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Pool-aware `str_data`: resolves a `Qstr` through the
+/// `RuntimeQstr` pool (static AND dynamic ids — `qstr_str`
+/// covers both), heap `Str`/`Bytes` through the arena. The
+/// arena-only `str_data` above returns `None` for dynamic qstr
+/// ids (>= `N_TOTAL`), whose bytes live only in the pool — so
+/// slot fns that run under the VM (which HAVE the pool via
+/// `CallCtx`) must use this one, or string literals from the
+/// module (`"hello"[1]`, `"a" + "b"`, `"%d" % x`) read as
+/// "not implemented" / "isn't subscriptable". Returns an owned
+/// copy (the pool and arena borrows have different lifetimes).
+pub fn str_data_pool(
+    arena: &GcArena,
+    pool: &crate::runtime::qstr::RuntimeQstr,
+    v: Value,
+) -> Option<Vec<u8>> {
+    match v {
+        Value::Qstr(id) => Some(pool.qstr_str(id as u16).to_vec()),
+        Value::Heap(r) => match arena.get(r) {
+            Obj::Str(s) => Some(s.bytes.clone()),
+            Obj::Bytes(b) => Some(b.bytes.clone()),
             _ => None,
         },
         _ => None,

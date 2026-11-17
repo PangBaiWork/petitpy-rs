@@ -53,7 +53,8 @@
 //!   VM call machinery (the reference binary sorts with a key;
 //!   the gap is pinned by a test).
 
-use crate::memory::gc::CallCtx;
+use crate::memory::gc::{CallCtx, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::containers::objlist_methods::list_extend;
 use crate::objects::containers::sequence::{seq_cmp_objs, seq_extract_slice};
 use crate::objects::obj::{obj_get_int_maybe, ObjError};
@@ -166,6 +167,24 @@ impl ListError {
             ListError::OutOfMemory => PyError::OutOfMemory,
             _ => PyError::PyRaise,
         }
+    }
+}
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message). `CompareUnsupported` renders
+/// its dynamic message via `message_string()`.
+impl TypedRaise for ListError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.message_string()
+            .or_else(|| self.message().map(|m| m.to_string()))
+    }
+    fn raise_signal(&self) -> PyError {
+        self.clone().to_pyerror()
     }
 }
 
@@ -314,7 +333,7 @@ pub fn list_binary_op(
             Ok(Value::Heap(new_list(ctx, list_type, &out)))
         }
         BinaryOp::InplaceAdd => {
-            list_extend(ctx, lhs, rhs).map_err(|e| e.to_pyerror())?;
+            list_extend(ctx, lhs, rhs).map_err(|e| ctx.record_typed(e))?;
             Ok(lhs)
         }
         BinaryOp::Multiply => {
@@ -467,20 +486,20 @@ pub fn list_subscr(
                 let items = list_items_vec(ctx, self_);
                 let list_type = types.list;
                 list_slice_load(ctx, list_type, &items, &slice)
-                    .map_err(|e| e.to_pyerror())
+                    .map_err(|e| ctx.record_typed(e))
             }
             SubscrArg::Set(v) => {
-                list_slice_store(ctx, self_, &slice, Some(v)).map_err(|e| e.to_pyerror())
+                list_slice_store(ctx, self_, &slice, Some(v)).map_err(|e| ctx.record_typed(e))
             }
             SubscrArg::Delete => {
-                list_slice_store(ctx, self_, &slice, None).map_err(|e| e.to_pyerror())
+                list_slice_store(ctx, self_, &slice, None).map_err(|e| ctx.record_typed(e))
             }
         };
     }
     match arg {
         SubscrArg::Delete => {
             crate::objects::containers::objlist_methods::list_pop_impl(ctx, self_, Some(index))
-                .map_err(|e| e.to_pyerror())?;
+                .map_err(|e| ctx.record_typed(e))?;
             Ok(Value::None)
         }
         SubscrArg::Get => {
@@ -488,7 +507,7 @@ pub fn list_subscr(
             let idx = match get_index(ctx, types, items.len(), index, false) {
                 Ok(i) => i,
                 Err(ObjError::OutOfMemory) => return Err(PyError::OutOfMemory),
-                Err(_) => return Err(PyError::PyRaise),
+                Err(e) => return Err(ctx.record_typed(e)),
             };
             Ok(items[idx])
         }
@@ -497,7 +516,7 @@ pub fn list_subscr(
             let idx = match get_index(ctx, types, items_len as usize, index, false) {
                 Ok(i) => i,
                 Err(ObjError::OutOfMemory) => return Err(PyError::OutOfMemory),
-                Err(_) => return Err(PyError::PyRaise),
+                Err(e) => return Err(ctx.record_typed(e)),
             };
             let Value::Heap(r) = self_ else {
                 return Err(PyError::PyRaise);
@@ -663,5 +682,5 @@ pub fn list_store(
 /// is C12's.
 pub fn list_make_new_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let list_type = ctx.types.list;
-    list_make_new(ctx, list_type, args, 0).map_err(|e| e.to_pyerror())
+    list_make_new(ctx, list_type, args, 0).map_err(|e| ctx.record_typed(e))
 }

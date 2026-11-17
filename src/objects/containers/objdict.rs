@@ -79,7 +79,8 @@
 //! no guard either (same structure); a Rust stack overflow aborts
 //! the same way, at a different depth.
 
-use crate::memory::gc::{CallCtx, GcArena};
+use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::containers::map::{
     map_lookup, map_of, map_of_mut, map_set_value, map_value, LookupKind, LookupOutcome, MapError,
 };
@@ -142,6 +143,32 @@ impl DictError {
             DictError::OutOfMemory => PyError::OutOfMemory,
             _ => PyError::PyRaise,
         }
+    }
+}
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, arg/message). A `KeyError` records its key
+/// as the value argument.
+impl TypedRaise for DictError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        match self {
+            DictError::KeyError(v) => Some(*v),
+            _ => None,
+        }
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        match self {
+            DictError::TypeError(m) | DictError::ValueError(m) => Some(m.to_string()),
+            DictError::KeyErrorPopitemEmpty => {
+                Some("popitem(): dictionary is empty".to_string())
+            }
+            _ => None,
+        }
+    }
+    fn raise_signal(&self) -> PyError {
+        self.clone().to_pyerror()
     }
 }
 
@@ -466,7 +493,7 @@ fn dict_equal(ctx: &mut CallCtx, lhs: Value, rhs: Value) -> PyResult<bool> {
                 }
             }
             Ok(_) => return Ok(false),
-            Err(e) => return Err(DictError::from(e).to_pyerror()),
+            Err(e) => return Err(ctx.record_typed(DictError::from(e))),
         }
     }
     Ok(true)
@@ -484,21 +511,21 @@ pub fn dict_binary_op(
     match op {
         BinaryOp::Or | BinaryOp::InplaceOr => {
             let target = if op == BinaryOp::Or {
-                dict_copy(ctx, lhs).map_err(DictError::to_pyerror)?
+                dict_copy(ctx, lhs).map_err(|e| ctx.record_typed(e))?
             } else {
                 lhs
             };
             // `d | e` is `d.copy()` + `d.update(e)` (the Zig calls
             // `npy_dt_method_update` with an empty kwargs map).
             let empty = MapData::new();
-            dict_update(ctx, target, Some(rhs), &empty).map_err(DictError::to_pyerror)?;
+            dict_update(ctx, target, Some(rhs), &empty).map_err(|e| ctx.record_typed(e))?;
             Ok(target)
         }
         BinaryOp::Contains => {
             let r = dict_ref_of(ctx.arena, lhs);
             let found = matches!(
                 map_lookup(ctx, ctx.types, r, rhs, LookupKind::Lookup)
-                    .map_err(|e| DictError::from(e).to_pyerror())?,
+                    .map_err(|e| ctx.record_typed(DictError::from(e)))?,
                 LookupOutcome::Found(_)
             );
             Ok(Value::Bool(found))
@@ -521,13 +548,13 @@ pub fn dict_subscr(
     arg: SubscrArg,
 ) -> PyResult<Value> {
     match arg {
-        SubscrArg::Get => dict_get_value(ctx, base, index).map_err(DictError::to_pyerror),
+        SubscrArg::Get => dict_get_value(ctx, base, index).map_err(|e| ctx.record_typed(e)),
         SubscrArg::Set(v) => {
-            dict_store(ctx, base, index, v).map_err(DictError::to_pyerror)?;
+            dict_store(ctx, base, index, v).map_err(|e| ctx.record_typed(e))?;
             Ok(Value::None)
         }
         SubscrArg::Delete => {
-            dict_delete(ctx, base, index).map_err(DictError::to_pyerror)?;
+            dict_delete(ctx, base, index).map_err(|e| ctx.record_typed(e))?;
             Ok(Value::None)
         }
     }

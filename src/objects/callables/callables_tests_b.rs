@@ -11,6 +11,7 @@ use crate::memory::gc::CallCtx;
 use crate::objects::value::{GcRef, Value};
 use crate::pyerr::PyError;
 use crate::runtime::bc::{CodeState, SetupError};
+use crate::runtime::runner::RunOutcome;
 
 // ── `fun_bc_prepare_call` ───────────────────────────────────────
 
@@ -216,10 +217,11 @@ fn fun_bc_call_runner_outcomes() {
     // its value is returned.
     let mut seen: Vec<Option<Value>> = Vec::new();
     {
-        let mut runner = |_ctx: &mut CallCtx, cs: &mut CodeState| {
-            seen = cs.state.clone();
-            RunOutcome::Normal(Value::SmallInt(42))
-        };
+        let mut runner =
+            |_ctx: &mut CallCtx, cs: &mut CodeState, _send: Value, _throw: Option<Value>| {
+                seen = cs.state.clone();
+                RunOutcome::Normal(Value::SmallInt(42))
+            };
         let r = fun_bc_call(
             &mut ctx,
             Value::Heap(fun),
@@ -236,9 +238,10 @@ fn fun_bc_call_runner_outcomes() {
     drop(seen);
     // Exception: the runner's value becomes `PyRaise` (the data
     // is dropped at the boundary until C13 adds pending_exc).
-    let mut runner = |_ctx: &mut CallCtx, _cs: &mut CodeState| {
-        RunOutcome::Exception(Value::None)
-    };
+    let mut runner =
+        |_ctx: &mut CallCtx, _cs: &mut CodeState, _send: Value, _throw: Option<Value>| {
+            RunOutcome::Exception(Value::None)
+        };
     assert_eq!(
         fun_bc_call(
             &mut ctx,
@@ -253,8 +256,12 @@ fn fun_bc_call_runner_outcomes() {
         ),
         Err(PyError::PyRaise)
     );
-    // NeedsVm: the slot has no runner, so the call fails.
-    let mut runner = |_ctx: &mut CallCtx, _cs: &mut CodeState| RunOutcome::NeedsVm;
+    // A runner that cannot run answers Exception (the unified
+    // runner has no `NeedsVm` — C13 dropped it), so the call fails.
+    let mut runner =
+        |_ctx: &mut CallCtx, _cs: &mut CodeState, _send: Value, _throw: Option<Value>| {
+            RunOutcome::Exception(Value::None)
+        };
     assert_eq!(
         fun_bc_call(
             &mut ctx,
@@ -283,10 +290,11 @@ fn fun_bc_call_runner_sees_prepared_state() {
     let mut ctx = cfx.ctx();
     let args = [Value::SmallInt(1)];
     let mut seen: Vec<Option<Value>> = Vec::new();
-    let mut runner = |_ctx: &mut CallCtx, cs: &mut CodeState| {
-        seen = cs.state.clone();
-        RunOutcome::Normal(Value::None)
-    };
+    let mut runner =
+        |_ctx: &mut CallCtx, cs: &mut CodeState, _send: Value, _throw: Option<Value>| {
+            seen = cs.state.clone();
+            RunOutcome::Normal(Value::None)
+        };
     fun_bc_call(&mut ctx, Value::Heap(fun), &code, &table, empty, 1, 0, &args, &mut runner)
         .unwrap();
     drop(runner);

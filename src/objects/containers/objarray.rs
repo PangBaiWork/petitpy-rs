@@ -48,7 +48,8 @@
 //! lane provides the append/extend adapters), `bytes(mv)`
 //! (the `bytes` constructor).
 
-use crate::memory::gc::CallCtx;
+use crate::memory::gc::{CallCtx, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::containers::binary::{
     array_item_size, binary_get_val_array, buffer_bytes, BinaryError,
     ARRAY_TYPECODE_FLAG_RW, BYTEARRAY_TYPECODE, TYPECODE_MASK,
@@ -159,6 +160,22 @@ impl ArrayError {
             ArrayError::OutOfMemory => PyError::OutOfMemory,
             _ => PyError::PyRaise,
         }
+    }
+}
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message).
+impl TypedRaise for ArrayError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.message().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.clone().to_pyerror()
     }
 }
 

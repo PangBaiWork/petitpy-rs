@@ -192,8 +192,13 @@ pub struct TypeData {
   （A2 的 build option）。
 - 浮点：堆对象（REPR_A 下浮点只有堆上一种表示，`obj.zig` 注释）；
   格式化接 Lane FMT 的 `format_float`。
-- `bool` 是 `int` 的子类语义（原版行为）由 C7 lane 在 `TypeData`
-  的 `base`/`mro` 里落地，不在 `Value` 层特判。
+- **`bool` 不是 `int` 的子类（C7 修正，2026-11-17，参考二进制已核实）**：
+  `isinstance(True, int)` 为 False，`issubclass(bool, int)` 为
+  False，`type(True).__bases__` 是 `(<class 'object'>,)`。int/bool/cell
+  的 `TypeData.base` 均为 None，mro 为 [self]。bool→int 只存在于
+  算术委托（槽内把 bool 转成小整数 0/1），不在类型层级里。C7 的
+  `bool_type_data` 已按此落地（base=None）。不要按 CPython 的
+  bool⊂int 假设写代码。
 
 ## 3. 冻结的公开 API（lane 直接用的签名）
 

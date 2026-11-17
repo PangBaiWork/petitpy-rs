@@ -1,0 +1,621 @@
+//! `objtuple.zig` — the `tuple` type (388 lines, 0 test blocks).
+//!
+//! Ported from `src/objects/containers/objtuple.zig`.
+//!
+//! Faithful points:
+//! - print: kind ignored, always `PRINT_REPR` elements, `"(a, b)"`,
+//!   a lone element gets a trailing comma `"(a,)"`.
+//! - `make_new`: sig `(0, 1, false)` — but the Zig sig check is
+//!   **polled-only** (`runtime/argcheck.zig:100`: it sets
+//!   `pending_exc` and returns; `mp_obj_tuple_make_new` never
+//!   polls it). So a too-many-args error survives only if nothing
+//!   later overwrites it: `tuple(1, 2)` → "object not iterable"
+//!   (the `getiter` failure overwrites), `tuple("a", "b")` →
+//!   "argument num/types mismatch" (the `getiter` succeeds), and
+//!   `tuple((1, 2), 99)` → "argument num/types mismatch" (the
+//!   exact-tuple early return leaves the pending error in place).
+//!   The Rust `tuple_make_new` models this with a recorded
+//!   `sig_err` that a later failure overwrites and a later
+//!   success preserves. `n_args == 0` → the ROM empty-tuple
+//!   singleton; exact-tuple arg → returned as-is; else iterate
+//!   with a doubling alloc starting at 4.
+//! - unary HASH: seed + wrapping `+%` sum of element hashes,
+//!   returned through `newSmallInt` (tag, no window check — a
+//!   sum outside the 62-bit window wraps, e.g.
+//!   `hash((2**62-1, 2**62-1))` is `-2` with seed 0). An
+//!   unhashable element propagates the element's hash failure:
+//!   `hash(([],))` → `TypeError("unsupported type for operator")`
+//!   (vendor `mp_unary_op` raises it when the slot returns
+//!   NULL — see the probe notes in `tuple_tests.rs`).
+//! - binary ADD: rhs must be tuple-subclass-compatible (exact
+//!   tuple here — no user subclasses yet) else NULL; MULTIPLY:
+//!   `get_int_maybe` rhs else NULL, `n <= 0` → the empty tuple
+//!   (the ROM singleton in Zig); comparisons via
+//!   `tupleCmpHelper` → `seq_cmp_objs` (the subclass slow path
+//!   is C12's).
+//! - subscr: `value != SENTINEL` → NULL (no set/delete — the
+//!   dispatch raises "object doesn't support item
+//!   assignment/deletion"); a slice loads through
+//!   `fast_slice_indexes`, else `NotImplementedError("only
+//!   slices with step=1 (aka None) are supported")`; otherwise
+//!   `mp_get_index`.
+//! - `count`/`index` delegate to `seq_count_obj` /
+//!   `seq_index_obj`.
+//! - getiter: the polymorph-iter overlay `(tuple, cur)`.
+//!
+//! Divergences (documented, not hidden):
+//! - **Hash seed is 0, not the reference binary's 22815552.**
+//!   The Zig seeds with the ROM empty-tuple object's *address*
+//!   (`@bitCast(objFromPtr(&mp_const_empty_tuple_obj))`) — a
+//!   link artifact of the Zig binary, not a language semantic;
+//!   the address is stable across runs only because the binary
+//!   is non-PIE. The *structure* (seed + wrapping sum of
+//!   element hashes) is ported faithfully, and equal tuples
+//!   still hash equal (Rust has no canonical empty-tuple
+//!   singleton yet — `new_tuple(0)` allocates fresh, like
+//!   C8a's `new_empty_bytes`). When C12 lands the ROM
+//!   singleton, the seed should become the singleton's
+//!   identity word so `hash(()) == id(())` holds in Rust too.
+//!   Reference-binary probe values are recorded in
+//!   `tuple_tests.rs` (`hash((1,2)) == 22815555` there,
+//!   `== 3` here).
+//! - **No ROM empty-tuple singleton yet**: `() is ()` is
+//!   `False` in Rust until C12; `tuple()` and `x * 0` return
+//!   fresh empty tuples (equal, not identical).
+
+use crate::memory::gc::CallCtx;
+use crate::objects::containers::map::{hash_of, MapError};
+use crate::objects::containers::objdict::DictError;
+use crate::objects::containers::objdict_methods::collect_iterable;
+use crate::objects::containers::sequence::{seq_cmp_objs, seq_count_obj, seq_index_obj};
+use crate::objects::obj::{obj_get_int_maybe, ObjError};
+use crate::objects::obj_ops::{get_index, obj_print_helper};
+use crate::objects::slots::{BinaryOp, PrintKind, SubscrArg, UnaryOp};
+use crate::objects::strings::objstr_a::{fast_slice_indexes, StrError};
+use crate::objects::value::{Obj, SliceData, TypeData};
+use crate::objects::value::{GcRef, Value};
+use crate::pyerr::{PyError, PyResult};
+
+/// The tuple-hash seed. The Zig seeds with the ROM empty-tuple
+/// object's address (22815552 in the reference binary) — see
+/// the module docs; Rust uses 0 until C12 lands the singleton.
+pub const TUPLE_HASH_SEED: i64 = 0;
+
+/// `mirrors.newSmallInt(n)`: tag without a window check —
+/// `((n << 1) | 1)` as a word, read back as a small int.
+/// The result always lands in the 62-bit window.
+pub fn wrap_small_int(n: i64) -> i64 {
+    (((n as u64) << 1) | 1) as i64 >> 1
+}
+
+/// Errors from the tuple operations (the C9a `DictError`
+/// shape: `exc_name()` for the VM's pending-exception wiring,
+/// `to_pyerror()` for the slot boundary).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TupleError {
+    /// `NotImplementedError("only slices with step=1 (aka None)
+    /// are supported")` — tuple slice load with `step != 1`.
+    SliceStep,
+    /// `TypeError("argument num/types mismatch")`.
+    ArgNumTypesMismatch,
+    /// `ValueError("object not in sequence")` — `index` miss.
+    NotInSequence,
+    /// `TypeError("unsupported type for operator")` — an
+    /// element's HASH slot answered NULL (vendor `mp_unary_op`
+    /// raises it); e.g. `hash(([],))`.
+    UnsupportedOperator,
+    /// `TypeError("object not iterable")` — `tuple_make_new`
+    /// (via `collect_iterable`) or `tuple.index` on a
+    /// non-iterable first argument.
+    NotIterable,
+    /// A `get_index` failure (non-int index, out-of-range,
+    /// overflow) — the `ObjError` carries the type/message.
+    Obj(ObjError),
+    /// A slot raised while comparing / iterating (data dropped
+    /// at the boundary — the accepted C6/C7r convention).
+    PyRaise,
+    /// An allocation failed.
+    OutOfMemory,
+}
+
+impl TupleError {
+    /// The exception type name (for the VM's `pending_exc` wiring).
+    pub fn exc_name(&self) -> &'static str {
+        match self {
+            TupleError::SliceStep => "NotImplementedError",
+            TupleError::ArgNumTypesMismatch => "TypeError",
+            TupleError::NotInSequence => "ValueError",
+            TupleError::UnsupportedOperator => "TypeError",
+            TupleError::NotIterable => "TypeError",
+            TupleError::Obj(e) => e.exc_type().map(|t| t.name()).unwrap_or(""),
+            TupleError::OutOfMemory => "MemoryError",
+            TupleError::PyRaise => "",
+        }
+    }
+
+    /// The TERSE message literal (`None` for `OutOfMemory` /
+    /// `PyRaise`).
+    pub fn message(&self) -> Option<&'static str> {
+        match self {
+            TupleError::SliceStep => {
+                Some("only slices with step=1 (aka None) are supported")
+            }
+            TupleError::ArgNumTypesMismatch => Some("argument num/types mismatch"),
+            TupleError::NotInSequence => Some("object not in sequence"),
+            TupleError::UnsupportedOperator => Some("unsupported type for operator"),
+            TupleError::NotIterable => Some("object not iterable"),
+            TupleError::Obj(e) => e.message(),
+            TupleError::OutOfMemory | TupleError::PyRaise => None,
+        }
+    }
+
+    /// Convert to the slot-boundary signal (drops the data — the
+    /// accepted C6/C7r convention).
+    pub fn to_pyerror(self) -> PyError {
+        match self {
+            TupleError::OutOfMemory => PyError::OutOfMemory,
+            _ => PyError::PyRaise,
+        }
+    }
+}
+
+impl From<ObjError> for TupleError {
+    fn from(e: ObjError) -> TupleError {
+        match e {
+            ObjError::OutOfMemory => TupleError::OutOfMemory,
+            other => TupleError::Obj(other),
+        }
+    }
+}
+
+impl From<crate::objects::containers::sequence::SeqError> for TupleError {
+    fn from(e: crate::objects::containers::sequence::SeqError) -> TupleError {
+        match e {
+            crate::objects::containers::sequence::SeqError::NotInSequence => {
+                TupleError::NotInSequence
+            }
+            crate::objects::containers::sequence::SeqError::Obj(o) => TupleError::from(o),
+            crate::objects::containers::sequence::SeqError::PyRaise => TupleError::PyRaise,
+            crate::objects::containers::sequence::SeqError::OutOfMemory => {
+                TupleError::OutOfMemory
+            }
+        }
+    }
+}
+
+impl From<DictError> for TupleError {
+    fn from(e: DictError) -> TupleError {
+        match e {
+            DictError::TypeError("object not iterable") => TupleError::NotIterable,
+            DictError::OutOfMemory => TupleError::OutOfMemory,
+            // Any other `DictError` from `collect_iterable` (a
+            // `KeyError`/`ValueError` from a dict-view step, a
+            // swallowed slot raise) carries no message this lane
+            // can reuse — the slot boundary drops it anyway.
+            _ => TupleError::PyRaise,
+        }
+    }
+}
+
+/// The items of a heap tuple, if `value` is one.
+pub fn tuple_items<'a>(ctx: &'a CallCtx<'_>, value: Value) -> Option<&'a [Value]> {
+    let Value::Heap(r) = value else {
+        return None;
+    };
+    match ctx.arena.get(r) {
+        Obj::Tuple(items) => Some(items),
+        _ => None,
+    }
+}
+
+/// Is `value` an *exact* tuple of `tuple_type` (no subclass
+/// check — C12 owns subclasses)?
+pub fn is_exact_tuple(ctx: &CallCtx, tuple_type: GcRef, value: Value) -> bool {
+    let Value::Heap(r) = value else {
+        return false;
+    };
+    match ctx.arena.get(r) {
+        Obj::Tuple(_) => ctx.arena.header(r).type_ == Some(tuple_type),
+        _ => false,
+    }
+}
+
+/// `mp_obj_new_tuple(n, items)`: allocate a tuple holding
+/// `items` (a fresh empty tuple for `n == 0` — no ROM
+/// singleton until C12; see the module docs).
+pub fn new_tuple(ctx: &mut CallCtx, tuple_type: GcRef, items: &[Value]) -> GcRef {
+    ctx.alloc(Some(tuple_type), Obj::Tuple(items.to_vec()))
+}
+
+/// `mp_obj_tuple_make_new` (`objtuple.zig:113-135`): sig
+/// `(0, 1, false)` — polled-only (see the module docs for the
+/// error-ordering model). Extra positional args are *ignored*
+/// when the first arg is an exact tuple or an iterable; a
+/// non-iterable first arg reports "object not iterable"
+/// instead of the arg-count error.
+pub fn tuple_make_new(
+    ctx: &mut CallCtx,
+    tuple_type: GcRef,
+    args: &[Value],
+    n_kw: usize,
+) -> Result<Value, TupleError> {
+    // The polled sig check: record the error, keep going.
+    let sig_err = if n_kw > 0 || args.len() > 1 {
+        Some(TupleError::ArgNumTypesMismatch)
+    } else {
+        None
+    };
+    if args.is_empty() {
+        return match sig_err {
+            Some(e) => Err(e),
+            None => Ok(Value::Heap(new_tuple(ctx, tuple_type, &[]))),
+        };
+    }
+    if is_exact_tuple(ctx, tuple_type, args[0]) {
+        return match sig_err {
+            Some(e) => Err(e),
+            None => Ok(args[0]),
+        };
+    }
+    // `collect_iterable` is C9a's `getiter`/`iternext` loop; a
+    // failure here OVERWRITES the recorded sig error (the Zig's
+    // `mp_getiter` sets `pending_exc` again).
+    let items = collect_iterable(ctx, args[0])?;
+    if let Some(e) = sig_err {
+        return Err(e);
+    }
+    Ok(Value::Heap(new_tuple(ctx, tuple_type, &items)))
+}
+
+/// The tuple HASH slot body (`objtuple.zig:166-175`): the seed
+/// plus the wrapping sum of the element hashes. The element
+/// hash is C9a's `hash_of` — the full vendor `mp_unary_op`
+/// HASH semantics: small int → itself; str/bytes → the qstr
+/// hash; a type whose HASH slot answers NULL → `TypeError
+/// ("unsupported type for operator")` (e.g. `hash(([],))`);
+/// a type with NO unary_op slot at all → the identity word
+/// (so `hash(None) == 6`, `hash(True) == 1` via C7's bool
+/// slot delegating to int). The sum is returned through
+/// `newSmallInt` (tag, no window check — see
+/// `wrap_small_int`).
+pub fn tuple_hash(ctx: &mut CallCtx, items: &[Value]) -> Result<i64, TupleError> {
+    let types = ctx.types;
+    let mut hash: i64 = TUPLE_HASH_SEED;
+    for item in items {
+        match hash_of(ctx, types, *item) {
+            // `hash_of` returns `usize`; the `as i64` cast is
+            // bit-preserving, so a negative small-int hash
+            // round-trips exactly.
+            Ok(h) => hash = hash.wrapping_add(h as i64),
+            Err(MapError::TypeError("unsupported type for operator")) => {
+                return Err(TupleError::UnsupportedOperator);
+            }
+            Err(MapError::OutOfMemory) => return Err(TupleError::OutOfMemory),
+            Err(_) => return Err(TupleError::PyRaise),
+        }
+    }
+    Ok(wrap_small_int(hash))
+}
+
+/// `mp_obj_tuple_unary_op` (`objtuple.zig:161-178`): BOOL, HASH,
+/// LEN — anything else answers NULL.
+pub fn tuple_unary_op(
+    ctx: &mut CallCtx,
+    op: UnaryOp,
+    self_: Value,
+) -> PyResult<Value> {
+    // Clone first: `tuple_hash` needs `&mut ctx`.
+    let items: Vec<Value> = tuple_items(ctx, self_).unwrap_or(&[]).to_vec();
+    let len = items.len();
+    match op {
+        UnaryOp::Bool => Ok(Value::Bool(len != 0)),
+        UnaryOp::Len => Ok(Value::SmallInt(len as i64)),
+        UnaryOp::Hash => match tuple_hash(ctx, &items) {
+            Ok(h) => Ok(Value::SmallInt(h)),
+            Err(TupleError::OutOfMemory) => Err(PyError::OutOfMemory),
+            Err(_) => Err(PyError::PyRaise),
+        },
+        _ => Err(PyError::PyRaise),
+    }
+}
+
+/// `tupleCmpHelper` (`objtuple.zig:146-159`): the rhs must be
+/// an exact tuple here (the subclass slow path is C12's);
+/// otherwise the slot answers NULL.
+fn tuple_cmp(
+    ctx: &mut CallCtx,
+    tuple_type: GcRef,
+    op: BinaryOp,
+    lhs: &[Value],
+    rhs_value: Value,
+) -> Result<bool, TupleError> {
+    if !is_exact_tuple(ctx, tuple_type, rhs_value) {
+        return Err(TupleError::PyRaise);
+    }
+    // Clone first: `seq_cmp_objs` needs `&mut ctx`.
+    let rhs: Vec<Value> = tuple_items(ctx, rhs_value).unwrap_or(&[]).to_vec();
+    Ok(seq_cmp_objs(ctx, op, lhs, &rhs)?)
+}
+
+/// `mp_obj_tuple_binary_op` (`objtuple.zig:180-214`): ADD /
+/// MULTIPLY / comparisons — anything else answers NULL.
+pub fn tuple_binary_op(
+    ctx: &mut CallCtx,
+    op: BinaryOp,
+    lhs: Value,
+    rhs: Value,
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let tuple_type = types.tuple;
+    // Clone first: the arms below allocate (`new_tuple`) and
+    // compare (`seq_cmp_objs`) through `&mut ctx`.
+    let items: Vec<Value> = tuple_items(ctx, lhs).unwrap_or(&[]).to_vec();
+    match op {
+        BinaryOp::Add | BinaryOp::InplaceAdd => {
+            if !is_exact_tuple(ctx, tuple_type, rhs) {
+                return Err(PyError::PyRaise);
+            }
+            let rhs_items = tuple_items(ctx, rhs).unwrap_or(&[]).to_vec();
+            let mut out = Vec::with_capacity(items.len() + rhs_items.len());
+            out.extend_from_slice(&items);
+            out.extend_from_slice(&rhs_items);
+            Ok(Value::Heap(new_tuple(ctx, tuple_type, &out)))
+        }
+        BinaryOp::Multiply | BinaryOp::InplaceMultiply => {
+            let n = match obj_get_int_maybe(ctx, types, rhs) {
+                Ok(Some(n)) => n,
+                _ => return Err(PyError::PyRaise),
+            };
+            if n <= 0 {
+                return Ok(Value::Heap(new_tuple(ctx, tuple_type, &[])));
+            }
+            let out = match crate::objects::containers::sequence::seq_multiply(&items, n)
+            {
+                Some(out) => out,
+                None => return Err(PyError::OutOfMemory),
+            };
+            Ok(Value::Heap(new_tuple(ctx, tuple_type, &out)))
+        }
+        BinaryOp::Equal
+        | BinaryOp::Less
+        | BinaryOp::LessEqual
+        | BinaryOp::More
+        | BinaryOp::MoreEqual => {
+            match tuple_cmp(ctx, tuple_type, op, &items, rhs) {
+                Ok(b) => Ok(Value::Bool(b)),
+                Err(TupleError::OutOfMemory) => Err(PyError::OutOfMemory),
+                Err(_) => Err(PyError::PyRaise),
+            }
+        }
+        _ => Err(PyError::PyRaise),
+    }
+}
+
+/// `tupleSliceLoad` (`objtuple.zig:216-225`): fast slice
+/// indexes else `NotImplementedError("only slices with step=1
+/// (aka None) are supported")`. A `step == 0` failure is
+/// overwritten by that same message (probed:
+/// `(1,2,3)[::0]`); a non-int bound keeps its own error
+/// (`TypeError("can't convert to int")`, probed).
+pub fn tuple_slice_load(
+    ctx: &mut CallCtx,
+    tuple_type: GcRef,
+    items: &[Value],
+    slice: &SliceData,
+) -> Result<Value, TupleError> {
+    let types = ctx.types;
+    let bound = match fast_slice_indexes(ctx, types, slice, items.len() as i64) {
+        Ok((bound, true)) => bound,
+        Ok((_, false)) => return Err(TupleError::SliceStep),
+        Err(StrError::SliceStepZero) => return Err(TupleError::SliceStep),
+        Err(StrError::Obj(o)) => return Err(TupleError::from(o)),
+        Err(_) => return Err(TupleError::PyRaise),
+    };
+    let span = (bound.stop - bound.start).max(0) as usize;
+    let start = bound.start.max(0) as usize;
+    let end = (start + span).min(items.len());
+    Ok(Value::Heap(new_tuple(
+        ctx,
+        tuple_type,
+        &items[start..end],
+    )))
+}
+
+/// `mpObjTupleSubscrImpl` (`objtuple.zig:227-237`): set/delete
+/// → NULL; slice → `tupleSliceLoad`; else `mp_get_index`.
+pub fn tuple_subscr(
+    ctx: &mut CallCtx,
+    self_: Value,
+    index: Value,
+    arg: SubscrArg,
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let tuple_type = types.tuple;
+    match arg {
+        SubscrArg::Set(_) | SubscrArg::Delete => Err(PyError::PyRaise),
+        SubscrArg::Get => {
+            // Clone first: the arms below allocate / resolve
+            // indexes through `&mut ctx`.
+            let items: Vec<Value> = tuple_items(ctx, self_).unwrap_or(&[]).to_vec();
+            // A slice index is a heap `Obj::Slice` (C9c's type).
+            let slice_data: Option<SliceData> = match index {
+                Value::Heap(r) => match ctx.arena.get(r) {
+                    Obj::Slice(s) => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(slice) = slice_data {
+                return match tuple_slice_load(ctx, tuple_type, &items, &slice) {
+                    Ok(v) => Ok(v),
+                    Err(TupleError::OutOfMemory) => Err(PyError::OutOfMemory),
+                    Err(_) => Err(PyError::PyRaise),
+                };
+            }
+            let idx = match get_index(ctx, types, items.len(), index, false) {
+                Ok(i) => i,
+                Err(ObjError::OutOfMemory) => return Err(PyError::OutOfMemory),
+                Err(_) => return Err(PyError::PyRaise),
+            };
+            Ok(items[idx])
+        }
+    }
+}
+
+/// `tuple.count(value)` (`objtuple.zig:246-249`).
+pub fn tuple_count(
+    ctx: &mut CallCtx,
+    items: &[Value],
+    value: Value,
+) -> Result<Value, TupleError> {
+    Ok(Value::SmallInt(seq_count_obj(ctx, items, value)? as i64))
+}
+
+/// `tuple.index(value[, start[, stop]])` (`objtuple.zig:252-255`).
+pub fn tuple_index(
+    ctx: &mut CallCtx,
+    items: &[Value],
+    value: Value,
+    start: Option<Value>,
+    stop: Option<Value>,
+) -> Result<Value, TupleError> {
+    Ok(Value::SmallInt(
+        seq_index_obj(ctx, items, value, start, stop)? as i64,
+    ))
+}
+
+/// `mp_obj_tuple_getiter` (`objtuple.zig:292-294`): the
+/// polymorph-iter overlay `(tuple, cur)`.
+pub fn tuple_getiter(ctx: &mut CallCtx, self_: Value) -> PyResult<Value> {
+    Ok(Value::Heap(ctx.alloc(
+        None,
+        Obj::Iterator(crate::objects::value::IteratorData {
+            source: self_,
+            index: 0,
+            extra: vec![Value::SmallInt(
+                crate::objects::containers::sequence::TUPLE_ITER_TAG,
+            )],
+        }),
+    )))
+}
+
+/// `npy_tup_it_iternext` (`objtuple.zig:297-305`): the next
+/// element, or `None` at exhaustion (C9a's
+/// `dict_view_it_next` convention; C11 formalises it). The
+/// cursor advances in place in the arena slot.
+pub fn tuple_iternext(
+    ctx: &mut CallCtx,
+    iter: Value,
+) -> Result<Option<Value>, TupleError> {
+    let Value::Heap(r) = iter else {
+        return Err(TupleError::PyRaise);
+    };
+    let (source, index) = match ctx.arena.get(r) {
+        Obj::Iterator(d) => (d.source, d.index),
+        _ => return Err(TupleError::PyRaise),
+    };
+    let items: Vec<Value> = tuple_items(ctx, source).unwrap_or(&[]).to_vec();
+    if index < items.len() {
+        if let Obj::Iterator(d) = ctx.arena.get_mut(r) {
+            d.index = index + 1;
+        }
+        Ok(Some(items[index]))
+    } else {
+        Ok(None)
+    }
+}
+
+/// `mp_obj_tuple_print` (`objtuple.zig:100-111`): kind
+/// ignored, always `PRINT_REPR` elements, `"(a, b)"`, a lone
+/// element gets a trailing comma.
+pub fn tuple_print(
+    ctx: &mut CallCtx,
+    value: Value,
+    _kind: PrintKind,
+    sink: &mut dyn std::fmt::Write,
+) {
+    let types = ctx.types;
+    let items: Vec<Value> = tuple_items(ctx, value).unwrap_or(&[]).to_vec();
+    let _ = sink.write_str("(");
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            let _ = sink.write_str(", ");
+        }
+        obj_print_helper(ctx, types, *item, PrintKind::Repr, sink);
+    }
+    if items.len() == 1 {
+        let _ = sink.write_str(",");
+    }
+    let _ = sink.write_str(")");
+}
+
+/// `mp_type_tuple` (`objtuple.zig:340-373`): flags `0x0000`
+/// (no `EQ_CHECKS_OTHER_TYPE` — `(1,2) == [1,2]` skips the
+/// tuple slot in dispatch), slots make_new/print/unary/
+/// binary/subscr/getiter/locals_dict. `make_new` is the
+/// type-call path (C12) and is not a `TypeData` slot.
+pub fn tuple_type_data(dict: GcRef) -> TypeData {
+    TypeData {
+        name: crate::objects::primitives::ops::static_qstr_id(b"tuple")
+            .expect("tuple is a static qstr"),
+        flags: 0,
+        base: None,
+        mro: Vec::new(),
+        dict,
+        unary_op: Some(
+            |ctx: &mut CallCtx, op: UnaryOp, self_: Value| tuple_unary_op(ctx, op, self_),
+        ),
+        binary_op: Some(
+            |ctx: &mut CallCtx, op: BinaryOp, lhs: Value, rhs: Value| {
+                tuple_binary_op(ctx, op, lhs, rhs)
+            },
+        ),
+        call: None,
+        getiter: Some(|ctx: &mut CallCtx, self_: Value| tuple_getiter(ctx, self_)),
+        subscr: Some(
+            |ctx: &mut CallCtx, self_: Value, index: Value, arg: SubscrArg| {
+                tuple_subscr(ctx, self_, index, arg)
+            },
+        ),
+        buffer: None,
+        print: Some(
+            |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn std::fmt::Write| {
+                tuple_print(ctx, value, kind, sink)
+            },
+        ),
+    }
+}
+
+/// `tuple.count` as a `BuiltinFn` adapter (2 fixed args:
+/// self, value) for C12's locals_dict.
+pub fn tuple_count_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    if args.len() != 2 {
+        return Err(PyError::PyRaise);
+    }
+    let items = tuple_items(ctx, args[0]).unwrap_or(&[]).to_vec();
+    tuple_count(ctx, &items, args[1]).map_err(|e| e.to_pyerror())
+}
+
+/// `tuple.index` as a `BuiltinFn` adapter (var 2..4 args:
+/// self, value[, start[, stop]]; the sig is enforced by the
+/// call machinery — C12 — this adapter also guards it).
+pub fn tuple_index_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(PyError::PyRaise);
+    }
+    let items = tuple_items(ctx, args[0]).unwrap_or(&[]).to_vec();
+    let start = args.get(2).copied();
+    let stop = args.get(3).copied();
+    tuple_index(ctx, &items, args[1], start, stop).map_err(|e| e.to_pyerror())
+}
+
+/// `tuple()` as a `BuiltinFn`-shaped constructor for the
+/// type-call path (C12): `tuple_make_new` with the args as
+/// given. `n_kw` is 0 here — the keyword form is C12's.
+pub fn tuple_make_new_builtin(
+    ctx: &mut CallCtx,
+    args: &[Value],
+) -> PyResult<Value> {
+    let tuple_type = ctx.types.tuple;
+    tuple_make_new(ctx, tuple_type, args, 0).map_err(|e| e.to_pyerror())
+}

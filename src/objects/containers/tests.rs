@@ -8,10 +8,12 @@
 //! the arena does not collect them; `mro` is left empty (no test
 //! here needs it).
 
+use super::objarray::{array_type_data, bytearray_type_data, memoryview_type_data};
 use super::objdict::dict_type_data;
+use super::objlist::list_type_data;
+use super::objtuple::tuple_type_data;
 use crate::memory::gc::{CallCtx, GcArena, RootSet};
 use crate::objects::obj::BuiltinTypes;
-use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::slots::PrintKind;
 use crate::objects::primitives::objbool::bool_type_data;
 use crate::objects::primitives::objint::int_type_data;
@@ -20,6 +22,7 @@ use crate::objects::value::{
     BytesData, DictData, GcRef, ListData, MapData, Obj, StrData, TypeData, Value,
 };
 use crate::runtime::qstr::RuntimeQstr;
+use crate::vendor::mpz::BigInt;
 
 pub(crate) fn empty_dict(arena: &mut GcArena, roots: &RootSet) -> GcRef {
     arena.alloc(
@@ -46,32 +49,6 @@ pub(crate) fn str_print_double(
             let _ = write!(sink, "'");
             let _ = sink.write_str(&String::from_utf8_lossy(&s.bytes));
             let _ = write!(sink, "'");
-        }
-    }
-}
-
-/// Test-double `tuple` print (`(a, b)`, 1-tuple `(a,)`). C9b owns
-/// the real tuple print slot; same rationale as `str_print_double`.
-pub(crate) fn tuple_print_double(
-    ctx: &mut CallCtx,
-    v: Value,
-    _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
-) {
-    if let Value::Heap(r) = v {
-        if let Obj::Tuple(items) = ctx.arena.get(r) {
-            let items = items.clone();
-            let _ = write!(sink, "(");
-            for (n, item) in items.iter().enumerate() {
-                if n > 0 {
-                    let _ = write!(sink, ", ");
-                }
-                obj_print_helper(ctx, ctx.types, *item, PrintKind::Repr, sink);
-            }
-            if items.len() == 1 {
-                let _ = write!(sink, ",");
-            }
-            let _ = write!(sink, ")");
         }
     }
 }
@@ -125,6 +102,13 @@ pub(crate) struct Fixture {
     pub(crate) roots: RootSet,
     pub(crate) types: BuiltinTypes,
     pub(crate) pool: RuntimeQstr,
+    /// The three array-family types (C9b). They are fixture
+    /// fields — not `BuiltinTypes` fields — because the
+    /// callers take the header type explicitly, exactly like
+    /// `dict_type_data`'s parameter.
+    pub(crate) array: GcRef,
+    pub(crate) bytearray: GcRef,
+    pub(crate) memoryview: GcRef,
 }
 
 impl Fixture {
@@ -140,13 +124,27 @@ impl Fixture {
         let none_type = make_type(&mut arena, &roots, b"NoneType");
         let float = make_type(&mut arena, &roots, b"float");
         let complex = make_type(&mut arena, &roots, b"complex");
-        let tuple = make_type_with_print(&mut arena, &roots, b"tuple", tuple_print_double);
-        let list = make_type(&mut arena, &roots, b"list");
+        let tuple_dict = empty_dict(&mut arena, &roots);
+        let tuple = arena.alloc(None, Obj::Type(tuple_type_data(tuple_dict)), &roots);
+        let list_dict = empty_dict(&mut arena, &roots);
+        let list = arena.alloc(None, Obj::Type(list_type_data(list_dict)), &roots);
+        let array_dict = empty_dict(&mut arena, &roots);
+        let array = arena.alloc(None, Obj::Type(array_type_data(array_dict)), &roots);
+        let bytearray_dict = empty_dict(&mut arena, &roots);
+        let bytearray =
+            arena.alloc(None, Obj::Type(bytearray_type_data(bytearray_dict)), &roots);
+        let memoryview_dict = empty_dict(&mut arena, &roots);
+        let memoryview = arena.alloc(
+            None,
+            Obj::Type(memoryview_type_data(memoryview_dict)),
+            &roots,
+        );
         let dict_dict = empty_dict(&mut arena, &roots);
         let dict = arena.alloc(None, Obj::Type(dict_type_data(dict_dict)), &roots);
         let type_ = make_type(&mut arena, &roots, b"type");
         for t in [
-            int, str_, bytes, bool_, none_type, float, complex, tuple, list, dict, type_,
+            int, str_, bytes, bool_, none_type, float, complex, tuple, list, array,
+            bytearray, memoryview, dict, type_,
         ] {
             roots.push(Value::Heap(t));
         }
@@ -168,6 +166,9 @@ impl Fixture {
             roots,
             types,
             pool: RuntimeQstr::new(),
+            array,
+            bytearray,
+            memoryview,
         }
     }
 
@@ -187,6 +188,13 @@ impl Fixture {
         let t = self.types.bytes;
         let mut ctx = self.ctx();
         Value::Heap(ctx.alloc(Some(t), Obj::Bytes(BytesData { bytes: bytes.to_vec() })))
+    }
+
+    /// A heap `Int` holding this `BigInt`.
+    pub(crate) fn heap_bigint(&mut self, z: BigInt) -> Value {
+        let t = self.types.int;
+        let mut ctx = self.ctx();
+        Value::Heap(ctx.alloc(Some(t), Obj::Int(z)))
     }
 
     /// A heap `Tuple` of these values.

@@ -238,7 +238,7 @@ impl Obj {
             Obj::List(l) => l.items.len() * 8,
             Obj::Dict(d) => d.map.alloc * 16 + d.map.index.len() * 4,
             Obj::Set(s) => s.items.len() * 8,
-            Obj::Array(a) => a.items.len() * 8,
+            Obj::Array(a) => a.data.len(),
             Obj::Slice(_) => 24,
             Obj::FunBc(_) | Obj::FunBuiltin(_) => 32,
             Obj::BoundMeth(_) | Obj::Cell(_) | Obj::Super(_) => 16,
@@ -272,7 +272,11 @@ impl Obj {
                 out
             }
             Obj::Set(s) => s.items.clone(),
-            Obj::Array(a) => a.items.clone(),
+            Obj::Array(a) => a
+                .source
+                .map(|s| Value::Heap(s))
+                .into_iter()
+                .collect(),
             Obj::Slice(s) => [s.start, s.stop, s.step].into_iter().flatten().collect(),
             Obj::BoundMeth(b) => vec![b.func, b.self_],
             Obj::Closure(c) => {
@@ -402,11 +406,30 @@ pub struct SetData {
     pub items: Vec<Value>,
 }
 
-/// Array object (`array` module type). C9 owns.
+/// Array / bytearray / memoryview object (`objarray.zig`).
+/// C9b owns. The payload is RAW BYTES, not `Value`s — the
+/// Zig's `MpObjArray { base, bits, len, items }` stores a
+/// `*anyopaque` byte buffer; `typecode` is the `MpObjArray`
+/// `bits` low byte (typecode + the `0x80` RW flag for
+/// memoryview), `free` is the `bits` high 56 bits (the spare
+/// count for owned arrays — kept 0, `Vec` manages capacity,
+/// unobservable — and the ELEMENT offset for memoryview:
+/// `arrayGetBuffer` does `buf + free * sz`, subscr does
+/// `index += free`, slice load does `free += start`),
+/// `len` is the element count, `data` the owned element
+/// bytes (the first `len * itemsize` bytes are valid; empty
+/// for views), and `source` the viewed object for a
+/// memoryview (an `Array` or `Bytes` heap object;
+/// views-of-views flatten at construction to the base source
+/// + combined offset, so a view's `source` is never itself a
+/// view).
 #[derive(Clone, Debug)]
 pub struct ArrayData {
     pub typecode: u8,
-    pub items: Vec<Value>,
+    pub free: usize,
+    pub len: usize,
+    pub data: Vec<u8>,
+    pub source: Option<GcRef>,
 }
 
 /// Range object. C9 owns.

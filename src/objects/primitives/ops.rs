@@ -62,6 +62,31 @@ pub enum PrimError {
     NanToInt,
     /// `OverflowError: can't convert inf to int`.
     InfToInt,
+    /// `ValueError: invalid syntax for number` (C18: `float(str)` /
+    /// `complex(str)` parse failures — `parse_num_float` /
+    /// `parse_num_complex` report `ParseNumError::InvalidNumber`).
+    InvalidSyntaxForNumber,
+    /// `TypeError: can't convert to float` (C18: `float(x)` for a
+    /// non-buffer, non-float, non-numeric argument).
+    FloatConversion,
+    /// `TypeError: can't convert to complex` (C18: `complex(x)` for
+    /// a non-string, non-complex, non-numeric argument).
+    ComplexConversion,
+    /// `ValueError: complex values not supported` (C18: the Zig
+    /// `floatOpPrecheck` raise for a negative base to a fractional
+    /// power — vendor `objfloat.c` would delegate to the complex
+    /// op there, but the precheck fires first in petitpy).
+    ComplexNotSupported,
+    /// `TypeError: can't truncate-divide a complex number` (C18:
+    /// vendor `objcomplex.c` `FLOOR_DIVIDE` arm).
+    ComplexFloorDivide,
+    /// `ZeroDivisionError: complex divide by zero` (C18: vendor
+    /// `objcomplex.c` `TRUE_DIVIDE` by `(0, 0)`).
+    ComplexDivideByZero,
+    /// `ZeroDivisionError: 0.0 to a complex power` (C18: vendor
+    /// `objcomplex.c` `POWER` arm, `0 ** z` with `z` not a
+    /// non-negative real).
+    ComplexZeroPower,
     /// `OverflowError: buffer too small`.
     BufferTooSmall,
     /// Bare `ValueError` (no message) — `int.to_bytes` negative length.
@@ -90,17 +115,24 @@ impl PrimError {
             | PrimError::UnsupportedOperator
             | PrimError::Pow3RequiresInts
             | PrimError::BufferProtocol
+            | PrimError::FloatConversion
+            | PrimError::ComplexConversion
+            | PrimError::ComplexFloorDivide
             | PrimError::ArgNumTypesMismatch => Some(ExcType::TypeError),
             PrimError::Pow3ModZero => Some(ExcType::ValueError),
             PrimError::InvalidSyntaxForInt
             | PrimError::NegativeShift
             | PrimError::IntBaseRange
             | PrimError::NanToInt
+            | PrimError::InvalidSyntaxForNumber
+            | PrimError::ComplexNotSupported
             | PrimError::ValueErrorBare => Some(ExcType::ValueError),
             PrimError::OverflowWord | PrimError::InfToInt | PrimError::BufferTooSmall => {
                 Some(ExcType::OverflowError)
             }
-            PrimError::DivideByZero => Some(ExcType::ZeroDivisionError),
+            PrimError::DivideByZero | PrimError::ComplexDivideByZero | PrimError::ComplexZeroPower => {
+                Some(ExcType::ZeroDivisionError)
+            }
             PrimError::OutOfMemory => None,
         }
     }
@@ -117,6 +149,13 @@ impl PrimError {
             PrimError::IntBaseRange => Some("int() arg 2 must be >= 2 and <= 36"),
             PrimError::NanToInt => Some("can't convert NaN to int"),
             PrimError::InfToInt => Some("can't convert inf to int"),
+            PrimError::InvalidSyntaxForNumber => Some("invalid syntax for number"),
+            PrimError::FloatConversion => Some("can't convert to float"),
+            PrimError::ComplexConversion => Some("can't convert to complex"),
+            PrimError::ComplexNotSupported => Some("complex values not supported"),
+            PrimError::ComplexFloorDivide => Some("can't truncate-divide a complex number"),
+            PrimError::ComplexDivideByZero => Some("complex divide by zero"),
+            PrimError::ComplexZeroPower => Some("0.0 to a complex power"),
             PrimError::BufferTooSmall => Some("buffer too small"),
             PrimError::ValueErrorBare => None,
             PrimError::UnsupportedOperator => Some("unsupported type for operator"),

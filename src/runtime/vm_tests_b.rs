@@ -18,9 +18,10 @@
 //!   builtins (`from array import array`,
 //!   `ucollections.deque`) — their `make_new` slots are wired
 //!   but latent until the module lanes bind them.
-//! - `float(...)` / `complex(...)`: C18's adapters (see
-//!   `makenew_error_float_no_make_new`, which pins the
-//!   `type_call` "can't create instance" message instead).
+//! - `float(...)` / `complex(...)`: C18a's adapters (see
+//!   `makenew_float_make_new_landed`, which pins `float(1) == 1.0`
+//!   — the C13b `type_call` "can't create instance" pin is
+//!   retired).
 //! - `len` / `iter`: D1's builtins-module bindings (the
 //!   snippets use indexing / iteration instead).
 
@@ -518,18 +519,21 @@ fn makenew_error_int_bad_str() {
 }
 
 #[test]
-fn makenew_error_float_no_make_new() {
+fn makenew_float_make_new_landed() {
     let mut fx = Fx::new();
-    // `float` has no adapter yet (C18) — the call goes
-    // through `type_call`, whose `CantCreateInstance` message
-    // is recorded (C13b), not a bare `TypeError`.
-    assert_eq!(
-        raised(&mut fx, "x = float(1)\n"),
-        (
-            "TypeError".to_string(),
-            "can't create instance".to_string()
-        )
-    );
+    // C18a: `float` has a `make_new` adapter now — `float(1)`
+    // is `1.0`, not the C13b `type_call` "can't create instance"
+    // (that pin, `makenew_error_float_no_make_new`, is retired
+    // with this test — the `float(1)` raise it pinned no longer
+    // happens).
+    fx.run_ok("x = float(1)\n");
+    match fx.g("x") {
+        Some(Value::Heap(r)) => match fx.vm.arena.get(r) {
+            Obj::Float(f) => assert_eq!(*f, 1.0),
+            other => panic!("float(1) is not a float: {other:?}"),
+        },
+        other => panic!("float(1) global missing: {other:?}"),
+    }
 }
 
 #[test]

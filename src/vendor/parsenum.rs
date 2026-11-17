@@ -547,10 +547,9 @@ pub(crate) fn parse_num_float(s: &[u8], allow_imag: bool) -> Result<DecimalNum, 
 
 /// `mp_parse_num_complex` — vendor `parsenum.h:51-53`:
 /// `mp_parse_num_decimal(..., true, true, lex)`. The `complex(str)`
-/// builtin's entry point (C18 owns the float/complex types; this
-/// is ready for it). No in-tree caller yet — the `.mpy` loader
-/// deliberately calls `parse_num_float` (force_complex=false).
-#[allow(dead_code)]
+/// builtin's entry point — C18a's `complex_make_new` is its
+/// in-tree caller. The `.mpy` loader deliberately calls
+/// `parse_num_float` (force_complex=false).
 pub(crate) fn parse_num_complex(s: &[u8]) -> Result<DecimalNum, ParseNumError> {
     parse_num_decimal(s, true, true)
 }

@@ -51,8 +51,13 @@ impl SlotFixture {
         let str_ = make_type(&mut arena, &roots, b"str");
         let bytes = make_type(&mut arena, &roots, b"bytes");
         let none_type = make_type(&mut arena, &roots, b"NoneType");
-        let float = make_type(&mut arena, &roots, b"float");
-        let complex = make_type(&mut arena, &roots, b"complex");
+    // C18a: the float/complex types carry their vendor slots now
+    // (`float_type_data` / `complex_type_data`) — `heap_float` /
+    // `heap_complex` values print and compute through them.
+    let float_dict = empty_dict(&mut arena, &roots);
+    let float = arena.alloc(None, Obj::Type(float_type_data(float_dict)), &roots);
+    let complex_dict = empty_dict(&mut arena, &roots);
+    let complex = arena.alloc(None, Obj::Type(complex_type_data(complex_dict)), &roots);
         let tuple = make_type(&mut arena, &roots, b"tuple");
         let list = make_type(&mut arena, &roots, b"list");
         let set = make_type(&mut arena, &roots, b"set");
@@ -117,6 +122,11 @@ impl SlotFixture {
     fn heap_float(&mut self, f: f64) -> Value {
         let t = self.types.float;
         Value::Heap(self.arena.alloc(Some(t), Obj::Float(f), &self.roots))
+    }
+
+    fn heap_complex(&mut self, re: f64, im: f64) -> Value {
+        let t = self.types.complex;
+        Value::Heap(self.arena.alloc(Some(t), Obj::Complex { re, im }, &self.roots))
     }
 }
 
@@ -256,8 +266,9 @@ fn dispatch_nothandled_is_not_implemented() {
     // `mp_obj_int_unary_op` returns NULL for it).
     let r = call_unary(&mut ctx, Some(fx.types.int), UnaryOp::Len, Value::SmallInt(5));
     assert!(matches!(r, Ok(SlotOutcome::NotImplemented)));
-    // Float rhs: the original delegates DIRECTLY to the float slot
-    // (C18) — the int slot returns NotHandled.
+    // C18a: a float rhs delegates DIRECTLY to the float op
+    // (vendor `objint_mpz.c:175`) — the int slot returns the
+    // float value now, not `NotImplemented`.
     let r = call_binary(
         &mut ctx,
         Some(fx.types.int),
@@ -265,7 +276,13 @@ fn dispatch_nothandled_is_not_implemented() {
         Value::SmallInt(1),
         fl,
     );
-    assert!(matches!(r, Ok(SlotOutcome::NotImplemented)));
+    match r {
+        Ok(SlotOutcome::Value(Value::Heap(rr))) => match ctx.arena.get(rr) {
+            Obj::Float(f) => assert_eq!(*f, 2.5),
+            other => panic!("expected Float 2.5, got {other:?}"),
+        },
+        _other => panic!("expected float 2.5 (call returned NotImplemented or raised)"),
+    }
     // LEN on bool is NULL in `npy_bool_fn_unary_op` too.
     let r = call_unary(&mut ctx, Some(fx.types.bool_), UnaryOp::Len, Value::Bool(true));
     assert!(matches!(r, Ok(SlotOutcome::NotImplemented)));
@@ -308,6 +325,13 @@ fn dispatch_print_int_and_bool() {
     let mut fx = SlotFixture::new();
     let big = fx.heap_int(pow2(70));
     let fl = fx.heap_float(1.5);
+    let sqrt2 = fx.heap_float(2.0f64.sqrt());
+    let neg_zero = fx.heap_float(-0.0);
+    let inf = fx.heap_float(f64::INFINITY);
+    let nan = fx.heap_float(f64::NAN);
+    let c1 = fx.heap_complex(1.0, 2.0);
+    let c2 = fx.heap_complex(0.0, 2.0);
+    let c3 = fx.heap_complex(1.0, -2.0);
     let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     let mut s = String::new();
     obj_print_helper(&mut ctx, &fx.types, Value::SmallInt(42), PrintKind::Str, &mut s);
@@ -325,10 +349,38 @@ fn dispatch_print_int_and_bool() {
     s.clear();
     obj_print_helper(&mut ctx, &fx.types, Value::Bool(false), PrintKind::Repr, &mut s);
     assert_eq!(s, "False");
-    // No print slot on the plain float type → the `<name>` fallback.
+    // C18a: the float type has a real print slot now
+    // (`mp_print_float`, prec 99 repr) — `1.5` prints as `1.5`,
+    // and the shortest-round-trip repr matches the reference
+    // (`repr(2**0.5)` is `1.4142135623730951`, probed).
     s.clear();
     obj_print_helper(&mut ctx, &fx.types, fl, PrintKind::Str, &mut s);
-    assert_eq!(s, "<float>");
+    assert_eq!(s, "1.5");
+    s.clear();
+    obj_print_helper(&mut ctx, &fx.types, fl, PrintKind::Repr, &mut s);
+    assert_eq!(s, "1.5");
+    s.clear();
+    obj_print_helper(&mut ctx, &fx.types, sqrt2, PrintKind::Repr, &mut s);
+    assert_eq!(s, "1.4142135623730951");
+    s.clear();
+    obj_print_helper(&mut ctx, &fx.types, neg_zero, PrintKind::Str, &mut s);
+    assert_eq!(s, "-0.0");
+    s.clear();
+    obj_print_helper(&mut ctx, &fx.types, inf, PrintKind::Str, &mut s);
+    assert_eq!(s, "inf");
+    s.clear();
+    obj_print_helper(&mut ctx, &fx.types, nan, PrintKind::Str, &mut s);
+    assert_eq!(s, "nan");
+    // Complex prints through its slot too: `(1+2j)`, `2j`.
+    s.clear();
+    obj_print_helper(&mut ctx, &fx.types, c1, PrintKind::Str, &mut s);
+    assert_eq!(s, "(1+2j)");
+    s.clear();
+    obj_print_helper(&mut ctx, &fx.types, c2, PrintKind::Str, &mut s);
+    assert_eq!(s, "2j");
+    s.clear();
+    obj_print_helper(&mut ctx, &fx.types, c3, PrintKind::Str, &mut s);
+    assert_eq!(s, "(1-2j)");
 }
 
 #[test]

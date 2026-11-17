@@ -51,6 +51,8 @@ use crate::objects::iters::objfilter::filter_make_new;
 use crate::objects::iters::objmap::map_make_new;
 use crate::objects::iters::objzip::zip_make_new;
 use crate::objects::primitives::objbool::bool_make_new;
+use crate::objects::primitives::objcomplex::complex_make_new;
+use crate::objects::primitives::objfloat::float_make_new;
 use crate::objects::primitives::objint::int_make_new;
 use crate::objects::primitives::ops::QstrResolver;
 use crate::objects::strings::objstr_methods_c::{bytes_make_new, str_make_new, KwArg};
@@ -267,6 +269,53 @@ pub fn int_make_new_slot(
         }
     };
     int_make_new(ctx, types, resolver, args, n_kw).map_err(|e| ctx.record_typed(e))
+}
+
+/// `float` (`objfloat.rs`): builds the `QstrResolver` from
+/// `ctx.pool` (same shape as `int_make_new_slot`), error mapping
+/// only.
+pub fn float_make_new_slot(
+    ctx: &mut CallCtx,
+    _type_: GcRef,
+    args: &[Value],
+    n_kw: usize,
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let pool = ctx.pool;
+    let resolver: QstrResolver<'_> = &|id| {
+        let Ok(id16) = u16::try_from(id) else {
+            return None;
+        };
+        if (id16 as usize) < pool.total() {
+            Some(pool.qstr_str(id16).to_vec())
+        } else {
+            None
+        }
+    };
+    float_make_new(ctx, types, resolver, args, n_kw).map_err(|e| ctx.record_typed(e))
+}
+
+/// `complex` (`objcomplex.rs`): same resolver shape as
+/// `float_make_new_slot`, error mapping only.
+pub fn complex_make_new_slot(
+    ctx: &mut CallCtx,
+    _type_: GcRef,
+    args: &[Value],
+    n_kw: usize,
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let pool = ctx.pool;
+    let resolver: QstrResolver<'_> = &|id| {
+        let Ok(id16) = u16::try_from(id) else {
+            return None;
+        };
+        if (id16 as usize) < pool.total() {
+            Some(pool.qstr_str(id16).to_vec())
+        } else {
+            None
+        }
+    };
+    complex_make_new(ctx, types, resolver, args, n_kw).map_err(|e| ctx.record_typed(e))
 }
 
 /// `bool` (`objbool.rs:79`): `types` is unused by the

@@ -174,9 +174,24 @@ fn binary_not_handled_boundaries() {
     let mut fx = Fixture::new();
     let n = Value::SmallInt;
     let f = fx.heap_float(1.5);
-    assert_eq!(binary(&mut fx, BinaryOp::Add, n(2), f).unwrap(), PrimOutcome::NotHandled);
+    // C18a: the int slot delegates a float rhs DIRECTLY to the
+    // float op (vendor `objint_mpz.c:175`) — `2 + 1.5` is `3.5`,
+    // no longer `NotHandled`.
+    assert_eq!(
+        as_f64(binary_val(&mut fx, BinaryOp::Add, n(2), f), &fx.arena),
+        Some(3.5)
+    );
     let s = fx.heap_str(b"ab");
+    // The `MULTIPLY` delegation (vendor `objint.c:381`) calls
+    // the rhs type's slot — but THIS fixture builds every type
+    // plain (no slots), so the delegation finds no slot and the
+    // int slot returns `NotHandled` here. The real behavior
+    // (`2 * 'ab' == 'abab'`, `2 * [1] == [1, 1]`) is covered
+    // end to end in `objfloat_tests::int_float_interop`, where
+    // the VM wires the real `str` / `list` / `tuple` slots.
     assert_eq!(binary(&mut fx, BinaryOp::Multiply, n(2), s).unwrap(), PrimOutcome::NotHandled);
+    // `int + str` is still `NotHandled` (extra_cases only
+    // handles `MULTIPLY`).
     assert_eq!(binary(&mut fx, BinaryOp::Add, n(2), s).unwrap(), PrimOutcome::NotHandled);
     let l = fx.heap_list(vec![Value::SmallInt(1)]);
     assert_eq!(binary(&mut fx, BinaryOp::Multiply, n(2), l).unwrap(), PrimOutcome::NotHandled);

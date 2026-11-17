@@ -26,11 +26,14 @@
 //! So int's `base` is `None` and its MRO is `[int]`.
 
 use crate::memory::gc::CallCtx;
-use crate::objects::obj::BuiltinTypes;
+use crate::objects::obj::{call_binary, obj_get_type, BuiltinTypes, SlotOutcome};
+use crate::objects::primitives::objcomplex::complex_binary_op;
+use crate::objects::primitives::objfloat::float_binary_op;
 use crate::objects::primitives::ops::{
-    arg_as_int, int_from_float, is_exact_int, is_float, new_int_from_bigint,
-    new_int_from_bigint_typed, new_int_from_i64, prim_to_pyresult, static_qstr_id,
-    str_bytes_of, PrimError, PrimOutcome, PrimResult, QstrResolver,
+    arg_as_int, int_from_float, is_bytes, is_complex, is_exact_int, is_float, is_list,
+    is_str, is_tuple, new_int_from_bigint, new_int_from_bigint_typed, new_int_from_i64,
+    prim_to_pyresult, static_qstr_id, str_bytes_of, PrimError, PrimOutcome, PrimResult,
+    QstrResolver,
 };
 use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
 use crate::objects::value::{
@@ -129,7 +132,14 @@ pub fn int_make_new(
     n_kw: usize,
 ) -> Result<Value, PrimError> {
     let arg_ok = args.len() <= 2 && n_kw == 0;
-    let r = match args.len() {
+    // C18a: the flat layout is `[pos..., kw_key, kw_val, ...]` —
+    // the branch runs on the POSITIONALS only (`n_pos`). Without
+    // this, `int(x=1)` parsed the KEY (`"x"`) as the value and
+    // raised `InvalidSyntaxForInt` instead of the polled
+    // `ArgNumTypesMismatch` (same latent bug fixed in
+    // `float_make_new` / `complex_make_new` this lane).
+    let n_pos = args.len().saturating_sub(2 * n_kw);
+    let r = match n_pos {
         0 => Ok(Value::SmallInt(0)),
         1 => int_make_new_1(ctx, types, resolver, args[0]),
         _ => int_make_new_2(ctx, types, resolver, args[0], args[1]),
@@ -479,6 +489,49 @@ pub fn int_binary_op(
     };
     if let Value::Bool(b) = rhs {
         return int_binary_op(ctx, types, op, lhs, Value::SmallInt(if b { 1 } else { 0 }));
+    }
+    // C18a — vendor `objint_mpz.c:175-183`: a float / complex rhs
+    // delegates DIRECTLY to the float / complex op with the lhs
+    // converted to `f64` (`mpz_as_float(zlhs)`). No `REVERSE_`
+    // cases exist in either target op, so a reverse op here
+    // returns `NotHandled` from the callee, exactly as the vendor
+    // `NULL`. This also covers the bool lhs (already recursed to
+    // a small int above) and the heap-int lhs.
+    if is_float(ctx.arena, types, rhs) {
+        return float_binary_op(ctx, types, op, lz.as_float(), rhs);
+    }
+    if is_complex(ctx.arena, types, rhs) {
+        return complex_binary_op(ctx, types, op, lz.as_float(), 0.0, rhs);
+    }
+    // C18a — vendor `objint.c:381-394`
+    // (`mp_obj_int_binary_op_extra_cases`): `MULTIPLY` with a
+    // str/bytes/tuple/list rhs delegates to the rhs type with
+    // SWAPPED operands and the PLAIN op (`mp_binary_op(op, rhs,
+    // lhs)` — multiply is commutative for these types). The
+    // generic loop's reverse path CANNOT do this: the str /
+    // tuple / list slots have no `ReverseMultiply` case (vendor
+    // and Zig alike — only the plain `MULTIPLY` case exists), so
+    // without this delegation `2 * 'ab'` was `binopUnsupported`
+    // (a pre-existing gap — the C7 mapping note said "NOT this
+    // lane unless broken", and this lane's interop tests prove
+    // it broken). Only the plain op delegates (the loop retries
+    // `InplaceMultiply` as plain `Multiply`). A delegated raise
+    // travels on `CallCtx.pending_raise` (the C6 convention —
+    // `call_binary` maps it to `NotImplemented`); returning
+    // `NotHandled` with it set lets the runtime loop propagate
+    // it, exactly as a direct slot raise propagates.
+    if op == BinaryOp::Multiply
+        && (is_str(ctx.arena, types, rhs)
+            || is_bytes(ctx.arena, types, rhs)
+            || is_tuple(ctx.arena, types, rhs)
+            || is_list(ctx.arena, types, rhs))
+    {
+        let rhs_type = obj_get_type(ctx.arena, types, rhs);
+        return match call_binary(ctx, rhs_type, BinaryOp::Multiply, rhs, lhs) {
+            Ok(SlotOutcome::Value(v)) => Ok(PrimOutcome::Value(v)),
+            Ok(SlotOutcome::NotImplemented) => Ok(PrimOutcome::NotHandled),
+            Err(_) => Err(PrimError::OutOfMemory),
+        };
     }
     let rz: BigInt = match rhs {
         Value::SmallInt(n) => BigInt::from_int(n),

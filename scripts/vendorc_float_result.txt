@@ -1,0 +1,377 @@
+Lane C18a — vendor C: objint / objint_mpz / objfloat type slots
+===============================================================
+Worktree ~/workspace/petitpy-rs-vendorc-float, branch lane/vendorc-float,
+base master aaded5b (C17 merged). One commit.
+Date: 2026-11-18. Executor: subagent da21f670 (this session).
+
+ACCEPTANCE (verified in-tree, this session)
+------------------------------------------
+- cargo test --release --lib --tests: 1206 passed, 0 failed, 3 ignored
+  (baseline 1168 + 38 new tests, all in the new test files below).
+- cargo test --release --bins: 9 passed, 0 failed.
+- cargo warnings: 0. unsafe: none (grep over the touched files).
+- Every touched file < 800 lines (largest: objfloat_tests.rs 481,
+  objfloat.rs 409, objcomplex.rs 398, test_fx.rs 179).
+- scripts/check_compile_mpy.py: 552/552 PASS (0 rust compile failures,
+  0 byte mismatches) — no frontend regression.
+- Original repo ~/workspace/petitpy-orig: untouched (git status clean).
+- Reference binary: ~/workspace/petitpy-orig/zig-out/bin/petitpy (0.9.0).
+
+NEW / CHANGED FILES
+-------------------
+NEW src/objects/primitives/objfloat.rs (409)
+    float_type_data, new_float, float_hash, float_divmod,
+    float_binary_op, float_binary_slot_rich, float_unary_op,
+    float_make_new, float_print + thin slot adapters.
+NEW src/objects/primitives/objcomplex.rs (398)
+    complex_type_data, new_complex, complex_binary_op,
+    complex_binary_slot_rich, complex_unary_op, complex_make_new,
+    complex_print, complex_attr + thin slot adapters.
+NEW src/objects/primitives/objfloat_tests.rs (481) — 24 tests.
+NEW src/objects/primitives/objcomplex_tests.rs (266) — 14 tests.
+NEW src/objects/primitives/test_fx.rs (179) — shared VM fixture
+    (Fx + slot_ctx + outcome/out_f64/out_f64_pair), extracted from
+    objfloat_tests.rs when it hit 898 lines (over the cap).
+EDIT src/objects/primitives/mod.rs — objfloat / objcomplex /
+    objcomplex_tests / test_fx modules.
+EDIT src/objects/primitives/ops.rs — 7 new PrimError variants
+    (InvalidSyntaxForNumber, FloatConversion, ComplexConversion,
+    ComplexNotSupported, ComplexFloorDivide, ComplexDivideByZero,
+    ComplexZeroPower) with exc_type/message arms.
+EDIT src/objects/objtype/make_new.rs — float_make_new_slot +
+    complex_make_new_slot (QstrResolver closure + record_typed,
+    same shape as int_make_new_slot).
+EDIT src/objects/primitives/objint.rs — float/complex rhs delegation
+    in int_binary_op + extra_cases MULTIPLY delegation + n_pos fix
+    in int_make_new (see below).
+EDIT src/runtime/vm_types.rs — float/complex via float_type_data /
+    complex_type_data (was plain_type, no slots).
+EDIT src/runtime/vm_rt.rs — removed the int-op-float/complex
+    binop_unsupported block; float_precheck_int fract->trunc fix.
+EDIT src/runtime/vm_rt_name.rs — generic TypeData.attr fallback in
+    load_method_maybe_ctx.
+EDIT src/vendor/parsenum.rs — #[allow(dead_code)] removed from
+    parse_num_complex (complex_make_new is its caller).
+EDIT src/objects/primitives/tests_dispatch.rs — fixture float/complex
+    via the real type data; print test asserts real float/complex
+    printing; not-handled test updated (int+float now Value(2.5)).
+EDIT src/objects/primitives/tests_ops.rs — binary_not_handled_boundaries
+    updated (int+float -> Value(3.5); int*str/list/tuple stay
+    NotHandled IN THIS FIXTURE ONLY — it builds every type plain,
+    so the delegation finds no rhs slot; real behavior is covered
+    end to end in objfloat_tests::int_float_interop).
+EDIT src/runtime/vm_tests_b.rs — C13b's pinned
+    makenew_error_float_no_make_new retired, replaced by
+    makenew_float_make_new_landed (float(1) == 1.0).
+
+PER-FUNCTION MAPPING (vendor C -> Rust)
+---------------------------------------
+objint.c (496 lines, vendor/micropython/py/objint.c):
+  mp_obj_new_int_from_float :143  -> ops.rs int_from_float (C7) ALREADY PORTED.
+  mp_obj_int_unary_op       :324  -> objint.rs int_unary_op (C7) ALREADY PORTED.
+  mp_obj_int_binary_op      :329  -> objint.rs int_binary_op (C7) ALREADY PORTED,
+                                     + float/complex rhs delegation ADDED THIS LANE
+                                     (vendor objint_mpz.c:175-183; see below).
+  mp_obj_new_int_from_str_len/ll/ull/uint/int :334-361 -> C7 int_make_new ALREADY.
+  mp_obj_int_binary_op_extra_cases :381-394 -> bool rhs recursion (C7) ALREADY;
+                                     MULTIPLY delegation ADDED THIS LANE
+                                     (int * str/bytes/tuple/list -> call_binary
+                                     with SWAPPED operands, plain op).
+  mp_obj_int_print / mp_obj_int_formatted / mp_int_format_size -> C7 ALREADY.
+  int_from_bytes / int_to_bytes -> C7 ALREADY.
+  mp_obj_new_int / from_ll / from_ull / from_uint / from_str_len,
+  get_truncated / get_checked -> C7 ALREADY.
+
+objint_mpz.c (473 lines, vendor/micropython/py/objint_mpz.c):
+  mp_obj_int_new_mpz :77, mp_obj_int_from_bytes_impl :109,
+  mp_obj_int_to_bytes_impl, mp_obj_int_sign, get_truncated/get_checked/
+  uint_checked, as_float_impl, new_int*, formatted_impl -> Lane C (BigInt)
+  + C7 ALREADY PORTED (mapping only, no second mpz — brief requirement).
+  mp_obj_int_unary_op :142 -> objint.rs int_unary_op (C7) ALREADY.
+  mp_obj_int_binary_op :175-183 -> objint.rs int_binary_op (C7) ALREADY,
+    + float rhs -> mp_obj_float_binary_op / complex rhs ->
+    mp_obj_complex_binary_op delegation ADDED THIS LANE.
+  mp_obj_int_pow3 :356 -> int_pow3 (C7) ALREADY.
+
+objfloat.c (339 lines, vendor/micropython/py/objfloat.c):
+  float_print :118-122 -> objfloat.rs float_print (mp_print_float 'g',
+    PF_FLAG_ALWAYS_DECIMAL, prec MP_FLOAT_REPR_PREC=99) NEW.
+  float_make_new :123-141 -> objfloat.rs float_make_new NEW
+    (sig (0,1,false); buffer -> parse_num_float(buf, false); float ->
+    itself; else mp_obj_get_float -> TypeError "can't convert to float").
+  float_unary_op :143-161 -> objfloat.rs float_unary_op NEW
+    (BOOL/HASH/POSITIVE/NEGATIVE/ABS; IntMaybe/FloatMaybe/ComplexMaybe/
+    Len/Sizeof -> NotHandled).
+  float_binary_op slot :163-172 -> objfloat.rs float_binary_slot_rich NEW
+    (exact-complex rhs FIRST, then mp_obj_float_binary_op).
+  mp_obj_new_float :184 -> objfloat.rs new_float NEW.
+  mp_obj_float_divmod :201-233 -> objfloat.rs float_divmod NEW
+    (fmod + sign fix; floordiv via floor(div) + 0.5 rounding fix).
+  mp_obj_float_binary_op :235-339 -> objfloat.rs float_binary_op NEW
+    (ADD/SUB/MUL; FLOOR_DIVIDE/TRUE_DIVIDE/MODULO zero divisor ->
+    ZeroDivisionError; MODULO sign-of-divisor fix + copysign(0.0, rhs);
+    POWER with the Zig precheck raises inside; DIVMOD tuple;
+    comparisons -> bool; default -> NotHandled).
+  float type :175, flags EQ_NOT_REFLEXIVE | EQ_CHECKS_OTHER_TYPE
+    -> objfloat.rs float_type_data (flags 0x000C) NEW, wired in
+    vm_types.rs (was plain_type, no slots).
+
+objcomplex.c (vendor/micropython/py/objcomplex.c):
+  *** SCOPE NOTE: objcomplex.c is NOT in the brief's file list, but
+  it IS required by hard requirements 2 and 4 (complex binary_op +
+  make_new + print + unary + attr). Ported in full this lane. ***
+  complex_print :50-68 -> objcomplex.rs complex_print NEW
+    (real != 0 -> "(" + float(real,'g',0) + float(imag,'g',SHOW_SIGN)
+    + "j)", else float(imag,'g',0) + "j").
+  complex_make_new :71-107 -> objcomplex.rs complex_make_new NEW
+    (sig (0,2,false); str -> parse_num_complex; complex -> itself;
+    else get_complex; 2-arg vendor quirk verbatim — see below).
+  complex_unary_op :109-125 -> objcomplex.rs complex_unary_op NEW
+    (BOOL / HASH = float_hash(re) ^ float_hash(im) wrapped /
+    POSITIVE / NEGATIVE / ABS -> float sqrt(re^2+im^2)).
+  complex_binary_op slot :127-131 -> objcomplex.rs complex_binary_slot_rich NEW.
+  complex_attr :133-144 -> objcomplex.rs complex_attr NEW
+    (.real / .imag via static qstrs, load-only).
+  complex type :144 -> objcomplex.rs complex_type_data (flags 0x000C) NEW,
+    wired in vm_types.rs.
+  mp_obj_complex_binary_op :166-239 -> objcomplex.rs complex_binary_op NEW
+    (ADD/SUB/MUL; FLOOR_DIVIDE -> TypeError "can't truncate-divide a
+    complex number"; TRUE_DIVIDE 3 branches; POWER via exp/log/atan2/
+    cos/sin with abs1==0 -> rhs_imag==0 && rhs_real>=0 -> (rhs_real==0)
+    else ZeroDivisionError "0.0 to a complex power"; EQUAL -> bool).
+
+HARD REQUIREMENTS — ALL FIVE MET
+---------------------------------
+1. Float IntMaybe returns NotImplemented: float_unary_op returns
+   PrimOutcome::NotHandled for IntMaybe (and FloatMaybe/ComplexMaybe/
+   Len/Sizeof). Probed: "%o" % 3.0 -> TypeError "can't convert to int",
+   "%x" % 3.0 -> same, "%d" % 3.0 -> 3 (format_arg_as_int truncates).
+2. float/complex binary_op accepts a non-float lhs, no REVERSE_ cases:
+   int_binary_op delegates float/complex rhs to float_binary_op /
+   complex_binary_op (vendor objint_mpz.c:175); the float/complex
+   slots take a plain f64/complex lhs — the generic loop's reverse
+   path is never used (the vendor float slot has no REVERSE_ cases).
+   Probed: 1+2.5=3.5, 2.5+1=3.5, True+2.5=3.5, 2**70+2.5=1.18...e21.
+3. C14 case list (scripts/runtime_result.txt:199-205), all probed on
+   the reference binary and asserted end to end in
+   objfloat_tests.rs (c14_list_*): 1+2.5, 2.5+1, 1+2j -> ValueError
+   "invalid syntax for number" (the literal fails at LOAD — the
+   compiler writes FLOAT const "1j"/"2j", the loader calls
+   parse_num_float(allow_imag=false)), 2j+1 -> same, 1/0.0 and
+   1.0/0 -> ZeroDivisionError "divide by zero", 0.0**-1 -> same,
+   (-8.0)**0.5 -> ValueError "complex values not supported",
+   "%o" % 3.0 -> TypeError, 2.0**-1 -> 0.5.
+4. float/complex make_new: float(1)=1.0, float("3.5")=3.5, float()=0.0,
+   complex(3,4) works (see the divergence note — the reference
+   ABORTS on it). complex(str) uses C17's parse_num_complex
+   (its #[allow(dead_code)] removed).
+5. float(str) -> parse_num_float(s, false): float(' 3.5 ')=3.5,
+   float('')/float('abc')/float('0x10') -> ValueError "invalid
+   syntax for number", float('1_0')=10.0, float('1e5')=100000.0.
+
+DIVERGENCES FROM THE REFERENCE (deliberate, recorded)
+-----------------------------------------------------
+D1. COMPLEX IS IMPLEMENTED, THE REFERENCE ABORTS ON IT.
+    objcomplex.c is NOT compiled by build.zig; full_stubs.zig provides
+    @panic stubs for mp_obj_new_complex / mp_obj_complex_binary_op /
+    mp_obj_complex_get / mp_type_complex. Probed 2026-11-18: complex(3,4),
+    complex(1), complex(), complex('1+2j'), complex(1,2)+complex(3,4),
+    complex(1,2,3) ALL abort the reference binary rc=134 (stack trace
+    0x145db64). This lane implements complex properly from the vendor C
+    code (the Zig's "F4 target"), following the precedent of C9b/C11
+    abort-divergences. Rust returns the value; the reference aborts.
+    The complex literal load failure is NOT a divergence: print(1j) and
+    print(3+4j) raise ValueError "invalid syntax for number" on the
+    reference AND in Rust (loader calls parse_num_float(allow_imag=false)).
+D2. HEAP-INT NEGATIVE-BASE POWER: (-(2**70)) ** 0.5 ABORTS on the
+    reference (rc=134) but raises ValueError "complex values not
+    supported" in Rust. Cause: the Zig floatOpPrecheck fires only on
+    the small-int-lhs and float-lhs paths (runtime.zig:705/732); a
+    heap-int lhs goes through the generic loop -> int slot -> vendor
+    float op -> POWER arm delegates to the stubbed complex op -> abort.
+    (-(2**62)) ** 0.5 is SMALL_INT_MIN, so the precheck fires and the
+    reference raises ValueError there. Rust applies the precheck
+    uniformly inside float_binary_op, so the heap-int case raises the
+    same ValueError instead of aborting. Probed: (2**70)**0.5 =
+    34359738368.0, (-(2**70))**2 = exact int 1393796574908163946345982392040522594123776,
+    (-(2**70))**-1 = -8.470329472543003e-22, (-(2**70))/0.0 ->
+    ZeroDivisionError.
+D3. Float raises follow the Zig floatOpPrecheck semantics, not vendor
+    C's (vendor C raises by longjmp, uncatchable; the Zig raises
+    catchably first). Probed catchable: try: 1/0.0 except ZeroDivisionError
+    prints "caught"; try: (-8.0)**0.5 except ValueError prints "caught-ve".
+    POWER precheck (implemented inside float_binary_op, Rust propagates
+    catchably everywhere): lhs==0 && rhs<0 -> ZeroDivisionError with NO
+    isinf exclusion (0.0**-inf raises); lhs<0 && rhs != trunc(rhs) ->
+    ValueError, where NaN counts ((-8.0)**nan raises, since
+    nan != trunc(nan)) and inf does NOT count ((-8.0)**inf = inf).
+    MICROPY_PY_MATH_POW_FIX_NAN defaults 0 and the port does not
+    override it; Rust powf already gives 1.0**nan = 1.0 and nan**0.0 = 1.0
+    (IEEE), so no POW_FIX_NAN branch is needed.
+    Probed inf/nan power: 0.0**-inf -> ZeroDivisionError,
+    (-8.0)**nan -> ValueError, 1.0**nan = 1.0, nan**0.0 = 1.0,
+    2.0**nan = nan, nan**2.0 = nan, (-8.0)**inf = inf, 2.0**inf = inf,
+    0.5**inf = 0.0, (-1.0)**inf = 1.0, 0.0**nan = nan.
+
+REAL BUGS FOUND AND FIXED IN-LANE
+---------------------------------
+B1. kwargs flat-layout bug (make_new fns): make_new receives the FLAT
+    layout [pos..., kw_key, kw_val, ...]. float(x=1) parsed the KEY
+    "x" as the value -> ValueError "invalid syntax for number" instead
+    of the polled TypeError. Fix: branch on n_pos =
+    args.len().saturating_sub(2 * n_kw) in float_make_new,
+    complex_make_new, AND int_make_new (identical latent bug in C7's
+    code — int(x=1) raised ValueError "invalid syntax for integer").
+    bool_make_new is unaffected (its branch doesn't parse the key).
+    str_make_new_slot uses split_kwargs (correct already). Tests:
+    float_make_new_errors, int_and_complex_kwargs_raise_mismatch.
+B2. int * str/bytes/tuple/list was binopUnsupported (pre-existing gap,
+    proven NOT a regression of this lane: the int delegation checks
+    float/complex only, and the removed vm_rt block matched Float/
+    Complex rhs only). Vendor objint.c:381-394 extra_cases delegates
+    MULTIPLY with SWAPPED operands and the PLAIN op via call_binary.
+    The generic loop's reverse path CANNOT do it: no ReverseMultiply
+    case exists in the str/tuple/list slots (vendor or Zig). Only plain
+    Multiply delegates (inplace retries as plain). A delegated raise
+    travels on CallCtx.pending_raise (C6 convention — call_binary maps
+    it to NotImplemented); returning NotHandled with it set lets the
+    runtime loop propagate it. Tests: int_float_interop
+    (2*'ab'='abab', 2*[1]=[1,1], 2*(1,)=(1,1)).
+B3. float_precheck_int in vm_rt.rs used rhs_f.fract() != 0.0 — wrong
+    for inf (fract(inf) is NaN != 0, so (-8) ** inf would raise
+    ValueError; the reference returns inf, probed). Changed to
+    rhs_f != rhs_f.trunc() (the Zig's test, runtime.zig:493).
+    Behaviorally identical at its only call site (integer rhs always
+    has fract 0); the fix aligns the helper with the Zig for future
+    float-rhs callers.
+B4. load_method_maybe_ctx attr fallback (vm_rt_name.rs): the VM's
+    LOAD_ATTR path hardcoded attr fns for fun_bc/gen_wrap/bound_meth/
+    closure + module/exception by payload and NEVER consulted
+    TypeData.attr generically, so complex .real/.imag did not load.
+    Added a generic fallback (only when the hardcoded dispatch found
+    nothing, so no attr fn runs twice). The Zig's mp_load_method_maybe
+    consults the type's attr slot for every type.
+
+OTHER GROUNDED DECISIONS
+------------------------
+- mp_float_hash is the SIMPLE version (obj.h:1169-1171,
+  HIGH_QUALITY_HASH OFF, port/mpconfigport.h:35): (mp_int_t)val,
+  C truncation toward zero; nan/inf/|f| >= 2^63 -> i64::MIN
+  (x86-64 cvttsd2si behavior — Rust's saturating `as` would give
+  i64::MAX for large positives, so the range check is load-bearing),
+  then wrap_small_int. Probed: hash(2.5)=2, hash(0.5)=0, hash(1.5)=1,
+  hash(-2.5)=-2, hash(2.0**62)=-4611686018427387904 (after wrap;
+  the RAW float_hash(2^62) is +4611686018427387904 — the negative
+  value is only after wrap_small_int), hash(1e30)=0, hash(inf)=0,
+  hash(nan)=0, hash(123456789.987)=123456789.
+  Complex hash = wrap_small_int(float_hash(re) ^ float_hash(im)).
+- Vendor float divmod (objfloat.c:201-233) ported verbatim; divmod is
+  NOT a VM builtin yet (D1) — the DIVMOD op is tested slot-level
+  (float_divmod_tuple); end-to-end uses // and % for the zero-divisor
+  raise. abs() and repr() are likewise not VM builtins yet (D1) —
+  end-to-end tests use str() instead of repr() and slot-level calls
+  for abs/divmod (float_abs_slot_level, complex_abs_slot_level).
+- Complex make_new 2-arg quirk (vendor objcomplex.c, port verbatim —
+  differs from CPython): arg0 complex -> (re0, im0) else
+  (get_float(arg0), 0); arg1 complex -> real -= im1; imag += re1
+  else imag += get_float(arg1). So
+  complex(complex(1,2), complex(3,4)) = (-3, 5). Asserted in
+  complex_make_new_two_arg_quirk.
+- Print slots: vendor float_print calls mp_print_float(print, val,
+  'g', PF_FLAG_ALWAYS_DECIMAL, '\0', -1, MP_FLOAT_REPR_PREC);
+  Rust mp_print_float is at src/objects/strings/mpprint.rs:621,
+  MP_FLOAT_REPR_PREC = 99 (mpprint.rs:413), PF_FLAG_ALWAYS_DECIMAL
+  re-exported from mpprint.rs:55 (lives in objstr_print.rs, 0x100),
+  PF_SHOW_SIGN (objstr_print.rs:34, 0x002). Print::new(sink) wraps a
+  PrintSink (mpprint.rs:90-109). The print slot signature is
+  PrintFn(ctx, value, PrintKind, &mut dyn fmt::Write) — a local
+  WriteSink adapter (fmt::Write -> PrintSink, errors ignored) lives
+  in each of objfloat.rs and objcomplex.rs (4 lines each, no shared
+  helper). The rich-result-then-bind pattern (bind the rich result
+  to a local first — prim_to_pyresult(ctx, rich(ctx, ...)) does NOT
+  compile, E0499) is used in the thin slot adapters.
+- % formatting: %d/%i/%u use format_arg_as_int (objstr_format.rs:108
+  — float -> int_from_float truncation, so "%d" % 3.0 = 3);
+  %o/%x/%X go through mp_print_mp_int -> int_value ->
+  obj_get_int_maybe -> IntMaybe slot -> NotHandled -> "can't convert
+  to int".
+- TypeData wiring: float/complex were plain_type (no slots) in
+  vm_types.rs:207 — now float_type_data(dict) / complex_type_data(dict)
+  (vendor float/complex types have NO locals_dict methods table).
+- Existing helpers reused: obj.rs obj_get_float_maybe / obj_get_float /
+  obj_get_complex_maybe / obj_get_complex, call_unary/call_binary
+  (pub(crate)); ops.rs int_from_float (NaN -> ValueError NanToInt,
+  Inf -> OverflowError InfToInt, exact truncation via BigInt::from_float),
+  arg_as_int, is_float/is_complex, prim_to_pyresult, PrimError;
+  vendor/parsenum.rs parse_num_float(s, allow_imag) /
+  parse_num_complex(s); DecimalNum { Float(f64), Complex{re,im} }
+  (only two variants — parse_num_float("42") returns Float(42.0));
+  hash_of/hash_via_slot (map.rs:528+) routes float hashing through
+  the unary Hash slot. obj_get_float_maybe does NOT handle str/bytes
+  buffers (see limitations).
+
+PROBE SUMMARY (reference binary, 2026-11-18, each abort case in its
+own script — aborts lose buffered stdout)
+---------------------------------------------------------------
+Float edges: repr(2**0.5)='1.4142135623730951', repr(0.1)='0.1',
+  5.5%2.0=1.5, -5.5%2.0=0.5, 5.5//2.0=2.0, -5.5//2.0=-3.0,
+  divmod(5.5,2.0)=(2.0,1.5), 2.0**0.5=1.4142135623730951,
+  (-2.0)**2.0=4.0, 0.0**0.0=1.0, bool(0.0)=False, hash(2.5)=2,
+  1<2.5=True, float('inf')=inf, float('nan')=nan, float(' 3.5 ')=3.5,
+  float('')/float('abc') -> ValueError, float(2**70)=1.1805916207174113e+21,
+  int(3.7)=3, 0.0/0.0 -> ZeroDivisionError, 1e308*10.0=inf,
+  float(True)=1.0, float(False)=0.0, float(None) -> TypeError
+  "can't convert to float", float(b'3.5')=3.5, float([1]) -> TypeError,
+  int(2.5)=2, int(float('inf')) -> OverflowError "can't convert inf
+  to int", int(float('nan')) -> ValueError "can't convert NaN to int",
+  2*'ab'='abab', 1.0//2=0.0, 7.5%2=1.5, -7.5%2=0.5, 7.5//2=3.0,
+  -7.5//2=-4.0, 2.5**2=6.25, 2**2.5=5.656854249492381,
+  0.0**2.0=0.0, 0.0**-2.0 -> ZeroDivisionError, 1e308+1e308=inf,
+  5.0/2.0=2.5, 5/2.0=2.5, (-8)**inf=inf, (-8.0)**inf=inf,
+  0.0**nan=nan, 2.0**inf=inf, 0.5**inf=0.0, (-1.0)**inf=1.0,
+  1==1.0=True, 2**70==2.0**70=True, divmod(-5.5,2.0)=(-3.0,0.5),
+  divmod(5.5,-2.0)=(-3.0,-0.5), 5.5%-2.0=-0.5, -5.5%-2.0=-1.5,
+  repr(inf)='inf', repr(-inf)='-inf', repr(nan)='nan',
+  float('1e5')=100000.0, float('0x10') -> ValueError,
+  float('1_0')=10.0, 2.5*'ab' -> TypeError "unsupported types for
+  __mul__: 'float', 'str'", [1,2.5]='[1, 2.5]', 3.0+2j -> ValueError
+  (literal load failure), 2.5**2.5=9.882117688026186,
+  0.5**0.5=0.7071067811865476, 10.0%3.0=1.0, -10.0%3.0=2.0,
+  10.0%-3.0=-2.0, -10.0%-3.0=-1.0, -0.0==0.0=True, repr(-0.0)='-0.0',
+  repr(1e16)='1e+16', repr(1e-5)='1e-05', repr(123456789.0)='123456789.0'.
+Complex (vendor C semantics; the reference aborts on all of these):
+  complex(3,4)=(3+4j), complex(1)=(1+0j), complex()=0j,
+  complex('1+2j')=(1+2j), complex(3,4)+complex(1,2)=(4+6j),
+  (3+4j).real=3.0, .imag=4.0, abs(3+4j)=5.0, (1+2j)*(3+4j)=(-5+10j),
+  (1+2j)/(1+1j)=(1.5+0.5j), (1+2j)**2=(-3+4j), (1+2j)//(3+4j) ->
+  TypeError "can't truncate-divide a complex number", (1+2j)/(0j) ->
+  ZeroDivisionError "complex divide by zero", (0j)**(-1j) ->
+  ZeroDivisionError "0.0 to a complex power", str(1+2j)='(1+2j)',
+  str(2j)='2j', str(1-2j)='(1-2j)'.
+
+NOT DONE / HANDOVER
+-------------------
+- modio.c + objstringio.c + builtinhelp.c + warning.c = Lane C18b
+  (running in parallel, worktree ~/workspace/petitpy-rs-vendorc-io).
+- D1 (module lanes): bind float/complex as builtins is already done
+  via vm_types.rs; divmod/abs/repr/len/iter as VM builtins are D1's
+  scope (tests here use str() / slot-level calls instead).
+- Phase E: Obj::Code (compile() backend) — unchanged, still blocked.
+
+KNOWN LIMITATIONS
+-----------------
+- bytearray -> float raises TypeError "can't convert to float":
+  tree-wide str_bytes_of limitation (it accepts str/bytes only),
+  shared with int() — float(b'3.5') works, float(bytearray(b'3.5'))
+  does not. Not fixed here (it would change int() too).
+- float_precheck_int's Power branch is unreachable for non-integer
+  rhs at its only call site (vm_rt.rs binary_op_ctx); the B3 fix
+  aligns it with the Zig for future float-rhs callers.
+- In tests_ops.rs the Fixture builds every type plain (no slots), so
+  the int*str/list/tuple MULTIPLY delegation returns NotHandled
+  there; real behavior is covered end to end in
+  objfloat_tests::int_float_interop.
+- parse_num_complex has no in-tree caller other than complex_make_new
+  (that is its caller now — the #[allow(dead_code)] is removed).
+- vendor/parsenum.rs keeps one is_space copy (vendor/ must not depend
+  on objects/, pinned by a 256-byte agreement test — C17 debt, kept).

@@ -14,6 +14,19 @@
 //!
 //! Internal pipeline (matches bridge.zig's comment): lexer → parser
 //! → compile → mpy.write.
+//!
+//! `debug_mode` is a parameter of the original pipeline
+//! (`lexerNewFromStr(..., debug_mode)`): it turns the `__debug__` name
+//! into a `KW_TRUE` literal when true, `KW_FALSE` when false
+//! (lexer.zig:1023, 1139-1140). The two original entry points disagree:
+//! `main.zig` (zigpy-compile) passes `true`, `bridge.zig` (this seam,
+//! used by `petitpy --emit-mpy` and the `petitpy` binary) passes
+//! `false` — so the original's own two compilers emit different
+//! bytecode for `__debug__` (verified: `petitpy` prints `False`,
+//! oracle `zigpy-compile` emits `True`; corpus file `lexer.py` is the
+//! only one affected). The default is `false`, keeping this seam's
+//! behaviour; `compile_to_mpy_named_debug` exposes the flag for the
+//! zigpy-compile CLI, which must match main.zig.
 
 use crate::compiler::compile::driver;
 use crate::compiler::compile::CompileError;
@@ -36,18 +49,30 @@ pub fn compile_to_mpy(source: &str, kind: InputKind) -> Result<Vec<u8>, CompileE
 }
 
 /// Like `compile_to_mpy`, but the emitted module records `source_name`
-/// as its source file (qstr index 0).
+/// as its source file (qstr index 0). Lexer `debug_mode` is `false`,
+/// matching bridge.zig.
 pub fn compile_to_mpy_named(
     source: &str,
     kind: InputKind,
     source_name: &str,
+) -> Result<Vec<u8>, CompileError> {
+    compile_to_mpy_named_debug(source, kind, source_name, false)
+}
+
+/// Like `compile_to_mpy_named`, but with an explicit lexer `debug_mode`
+/// (see the module docs: main.zig passes `true`, bridge.zig `false`).
+pub fn compile_to_mpy_named_debug(
+    source: &str,
+    kind: InputKind,
+    source_name: &str,
+    debug_mode: bool,
 ) -> Result<Vec<u8>, CompileError> {
     let mut qctx = crate::compiler::qstr::QstrContext::new();
     // The source name is interned first so it lands at qstr index 0,
     // exactly as the Zig bridge seeds it via `qstr_from_strn`.
     let source_file_qstr = qctx.from_strn(source_name.as_bytes()).unwrap_or(0);
 
-    let mut lex = match Lexer::new_from_str(source_file_qstr, source.as_bytes(), false) {
+    let mut lex = match Lexer::new_from_str(source_file_qstr, source.as_bytes(), debug_mode) {
         Ok(lex) => lex,
         Err(LexError::UnicodeNameEscape) => return Err(CompileError::SyntaxError),
         Err(LexError::OutOfMemory) => return Err(CompileError::OutOfMemory),

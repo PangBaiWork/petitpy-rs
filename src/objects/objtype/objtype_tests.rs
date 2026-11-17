@@ -35,7 +35,7 @@ use crate::objects::primitives::objint::int_type_data;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{PrintFn, PrintKind};
 use crate::objects::strings::objstr_methods_b::str_type_data;
-use crate::objects::value::{DictData, GcRef, MapData, Obj, StrData, TypeData, Value};
+use crate::objects::value::{BytesData, DictData, GcRef, MapData, Obj, StrData, TypeData, Value};
 use crate::runtime::qstr::RuntimeQstr;
 
 pub(crate) fn q(name: &[u8]) -> u32 {
@@ -68,7 +68,10 @@ impl Fx {
                 base: None,
                 mro: Vec::new(),
                 dict: type_dict,
-namedtuple_fields: None,
+                attr: None,
+                make_new: None,
+                bases: None,
+                namedtuple_fields: None,
                 unary_op: None,
                 binary_op: None,
                 call: None,
@@ -120,7 +123,33 @@ namedtuple_fields: None,
         let d = empty_dict(&mut arena, &roots);
         let range = arena.alloc(None, Obj::Type(range_type_data(d)), &roots);
         roots.push(Value::Heap(range));
-        let types = BuiltinTypes {
+        // C12a fields: plain types here (the `object` below is a
+        // placeholder — the real ROM type overwrites `types.object`
+        // after it is built); the `()` / empty-bytes singletons
+        // are plain heap values (the containers fixture's pattern).
+        let object = make_type(&mut arena, &roots, b"object");
+        roots.push(Value::Heap(object));
+        let super_ = make_type(&mut arena, &roots, b"super");
+        roots.push(Value::Heap(super_));
+        let staticmethod = make_type(&mut arena, &roots, b"staticmethod");
+        roots.push(Value::Heap(staticmethod));
+        let classmethod = make_type(&mut arena, &roots, b"classmethod");
+        roots.push(Value::Heap(classmethod));
+        let boundmeth = make_type(&mut arena, &roots, b"bound_method");
+        roots.push(Value::Heap(boundmeth));
+        let property = make_type(&mut arena, &roots, b"property");
+        roots.push(Value::Heap(property));
+        let empty_tuple = arena.alloc(Some(tuple), Obj::Tuple(vec![]), &roots);
+        roots.push(Value::Heap(empty_tuple));
+        let empty_bytes = arena.alloc(
+            Some(bytes),
+            Obj::Bytes(BytesData { bytes: Vec::new() }),
+            &roots,
+        );
+        roots.push(Value::Heap(empty_bytes));
+        let native_init_wrapper = make_type(&mut arena, &roots, b"function");
+        roots.push(Value::Heap(native_init_wrapper));
+        let mut types = BuiltinTypes {
             int,
             str_,
             bytes,
@@ -135,6 +164,15 @@ namedtuple_fields: None,
             frozenset,
             range,
             type_,
+            object,
+            super_,
+            staticmethod,
+            classmethod,
+            boundmeth,
+            property,
+            empty_tuple,
+            empty_bytes,
+            native_init_wrapper,
         };
         let mut ctx = CallCtx::new(&mut arena, &mut roots, &types, &pool);
         // `object` with its real locals dict; MRO [self].
@@ -157,6 +195,10 @@ namedtuple_fields: None,
             td.mro = vec![module_type, object];
         }
         drop(ctx);
+        // The real ROM `object` overwrites the placeholder in
+        // `types` (see above) so `types.object` and `fx.object`
+        // are the same object.
+        types.object = object;
         Fx {
             arena,
             roots,
@@ -205,7 +247,10 @@ namedtuple_fields: None,
             base: Some(object),
             mro: vec![object],
             dict,
-namedtuple_fields: None,
+            attr: None,
+            make_new: None,
+            bases: None,
+            namedtuple_fields: None,
             unary_op: None,
             binary_op: None,
             call: None,

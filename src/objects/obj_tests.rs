@@ -48,6 +48,9 @@ fn plain_type_data(name: u32, flags: u16, dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: None,
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }
@@ -96,21 +99,47 @@ impl Fixture {
                 &roots,
             )
         };
+        // C12: plain object/super/staticmethod/classmethod/
+        // boundmeth types and the ROM `()` singleton.
+        let object = mk(&mut arena, b"object");
+        let super_ = mk(&mut arena, b"super");
+        let staticmethod = mk(&mut arena, b"staticmethod");
+        let classmethod = mk(&mut arena, b"classmethod");
+        let boundmeth = mk(&mut arena, b"bound_method");
+        let property = mk(&mut arena, b"property");
+        let tuple = mk(&mut arena, b"tuple");
+        let bytes = mk(&mut arena, b"bytes");
+        let empty_tuple = arena.alloc(Some(tuple), Obj::Tuple(vec![]), &roots);
+        let empty_bytes = arena.alloc(
+            Some(bytes),
+            Obj::Bytes(BytesData { bytes: Vec::new() }),
+            &roots,
+        );
+        let native_init_wrapper = mk(&mut arena, b"function");
         let types = BuiltinTypes {
             int: mk(&mut arena, b"int"),
             str_: mk(&mut arena, b"str"),
-            bytes: mk(&mut arena, b"bytes"),
+            bytes,
             bool_: mk(&mut arena, b"bool"),
             none_type: mk(&mut arena, b"NoneType"),
             float: mk(&mut arena, b"float"),
             complex: mk(&mut arena, b"complex"),
-            tuple: mk(&mut arena, b"tuple"),
+            tuple,
             list: mk(&mut arena, b"list"),
             set: mk(&mut arena, b"set"),
             frozenset: mk(&mut arena, b"frozenset"),
             range: mk(&mut arena, b"range"),
             dict: mk(&mut arena, b"dict"),
             type_,
+            object,
+            super_,
+            staticmethod,
+            classmethod,
+            boundmeth,
+            property,
+            empty_tuple,
+            empty_bytes,
+            native_init_wrapper,
         };
         TEST_TYPES.with(|c| c.set(Some(types)));
         Fixture {

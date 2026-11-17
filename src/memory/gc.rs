@@ -447,6 +447,15 @@ impl GcArena {
         self.slots[r.0 as usize].header
     }
 
+    /// Set a slot's header type after allocation. Needed for
+    /// self-referential type objects: `mp_type_type`'s header type
+    /// is itself (objtype.zig `mp_type_type`), so the Rom registry
+    /// allocates it first and then points its header at itself.
+    /// C12 adds it.
+    pub fn set_header_type(&mut self, r: GcRef, type_: Option<GcRef>) {
+        self.slots[r.0 as usize].header.type_ = type_;
+    }
+
     /// Bytes held by live objects, block-rounded (`gc.zig`
     /// `gc_info().used`; `modgc.zig`'s `gc.mem_alloc()`).
     pub fn mem_alloc(&self) -> usize {

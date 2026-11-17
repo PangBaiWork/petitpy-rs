@@ -52,6 +52,9 @@ pub(crate) fn make_type(arena: &mut GcArena, roots: &RootSet, name: &[u8]) -> Gc
         subscr: None,
         buffer: None,
         print: None,
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     };
     arena.alloc(None, Obj::Type(data), roots)
@@ -75,7 +78,22 @@ impl Fixture {
         let range = make_type(&mut arena, &roots, b"range");
         let dict = make_type(&mut arena, &roots, b"dict");
         let type_ = make_type(&mut arena, &roots, b"type");
-        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset, range, dict, type_] {
+        // C12: plain object/super/staticmethod/classmethod/
+        // boundmeth types and the ROM `()` singleton.
+        let object = make_type(&mut arena, &roots, b"object");
+        let super_ = make_type(&mut arena, &roots, b"super");
+        let staticmethod = make_type(&mut arena, &roots, b"staticmethod");
+        let classmethod = make_type(&mut arena, &roots, b"classmethod");
+        let boundmeth = make_type(&mut arena, &roots, b"bound_method");
+        let property = make_type(&mut arena, &roots, b"property");
+        let empty_tuple = arena.alloc(Some(tuple), Obj::Tuple(vec![]), &roots);
+        let empty_bytes = arena.alloc(
+            Some(bytes),
+            Obj::Bytes(BytesData { bytes: Vec::new() }),
+            &roots,
+        );
+        let native_init_wrapper = make_type(&mut arena, &roots, b"function");
+        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset, range, dict, type_, object, super_, staticmethod, classmethod, boundmeth, empty_tuple, empty_bytes, property, native_init_wrapper] {
             roots.push(Value::Heap(t));
         }
         let types = BuiltinTypes {
@@ -93,6 +111,15 @@ impl Fixture {
             range,
             dict,
             type_,
+            object,
+            super_,
+            staticmethod,
+            classmethod,
+            boundmeth,
+            empty_tuple,
+            empty_bytes,
+            native_init_wrapper,
+            property,
         };
         Fixture { arena, roots, types, pool: RuntimeQstr::new() }
     }

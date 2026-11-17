@@ -420,6 +420,9 @@ pub fn str_type_data(name: u32, dict: GcRef) -> TypeData {
         subscr: Some(mc::str_subscr),
         buffer: Some(mc::str_get_buffer),
         print: Some(str_print),
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }
@@ -442,6 +445,9 @@ pub fn bytes_type_data(name: u32, dict: GcRef) -> TypeData {
         subscr: Some(mc::bytes_subscr),
         buffer: Some(mc::str_get_buffer),
         print: Some(str_print),
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }

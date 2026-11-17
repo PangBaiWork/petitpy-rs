@@ -93,10 +93,14 @@ use crate::objects::containers::objset_methods::{
 /// reference binary (`nm`: `0x15c0e50` = 22810192), which the Zig
 /// uses as the hash seed (`@intFromPtr(&mp_type_frozenset)`,
 /// objset.zig `npy_set_unary_op` HASH branch). Element hashes
-/// wrapping-add onto it. The Zig's value is address-dependent; the
-/// Rust port hardcodes the reference binary's address so the
-/// observable hashes agree (`hash(frozenset({1,2}))` = 22810195).
-pub const FROZENSET_HASH_SEED: i64 = 22810192;
+/// wrapping-add onto it. The Zig's value is address-dependent;
+/// the Rust port seeds with the frozenset *type's* arena index
+/// instead (C12a — `ctx.types.frozenset.0`), so
+/// `hash(frozenset())` equals the frozenset type's id, as in the
+/// reference (`hash(frozenset()) == id(frozenset)` for the type).
+/// NOTE: the seed is NOT the address of the reference binary's
+/// type object, so the absolute hash values differ from the
+/// reference binary's (the structure is identical).
 
 /// Errors from set/frozenset operations, mirroring `DictError`
 /// (C9a): the exception type name + message travel in the enum;
@@ -505,7 +509,11 @@ pub fn set_unary_op(ctx: &mut CallCtx, op: UnaryOp, self_v: Value) -> PyResult<V
             // pending and contributes 0, but the pending raise wins
             // over the returned value — so returning the error
             // immediately is observably identical.
-            let mut hash: i64 = FROZENSET_HASH_SEED;
+            // The seed is the frozenset type's identity word
+            // (C12a — the Zig uses `@intFromPtr(&mp_type_frozenset)`,
+            // 22810192 in the reference binary; `hash(frozenset())`
+            // equals the frozenset *type's* id, not an instance's).
+            let mut hash: i64 = ctx.types.frozenset.0 as i64;
             let items = match self_v {
                 Value::Heap(r) => match ctx.arena.get(r) {
                     Obj::Set(s) => set_items(&s.table),
@@ -693,6 +701,9 @@ pub fn set_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: Some(set_print),
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }
@@ -714,6 +725,9 @@ pub fn frozenset_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: Some(set_print),
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }

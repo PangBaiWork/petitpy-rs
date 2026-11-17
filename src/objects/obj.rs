@@ -57,6 +57,20 @@ use crate::pyerr::{PyError, PyResult};
 pub const FLAG_EQ_NOT_REFLEXIVE: u16 = 0x0004;
 pub const FLAG_EQ_CHECKS_OTHER_TYPE: u16 = 0x0008;
 pub const FLAG_EQ_HAS_NEQ_TEST: u16 = 0x0010;
+/// `MP_TYPE_FLAG_HAS_SPECIAL_ACCESSORS` (vendor `py/obj.h:565-578`,
+/// `mp_mirrors.zig:676`): the type's locals contain a property,
+/// a descriptor, or `__setattr__`/`__delattr__` — instance
+/// attribute access goes through the descriptor dispatch. C12 adds it.
+pub const FLAG_HAS_SPECIAL_ACCESSORS: u16 = 0x0002;
+/// `MP_TYPE_FLAG_ITER_IS_ITERNEXT` (vendor `py/obj.h:565-578`,
+/// `mp_mirrors.zig:683`): the type's iter slot IS the `iternext`
+/// function itself (polymorph iterators). C12 adds it.
+pub const FLAG_ITER_IS_ITERNEXT: u16 = 0x0080;
+/// `MP_TYPE_FLAG_ITER_IS_CUSTOM` (`mp_mirrors.zig:684`). C12 adds it.
+pub const FLAG_ITER_IS_CUSTOM: u16 = 0x0100;
+/// `MP_TYPE_FLAG_ITER_IS_STREAM` = ITERNEXT | CUSTOM
+/// (`mp_mirrors.zig:685`). C12 adds it.
+pub const FLAG_ITER_IS_STREAM: u16 = 0x0180;
 /// `MP_TYPE_FLAG_BINDS_SELF` (vendor `py/obj.h:566-577`): the type
 /// binds `self` when its methods are accessed — function and
 /// closure types set it (C10).
@@ -111,6 +125,35 @@ pub struct BuiltinTypes {
     pub dict: GcRef,
     /// `type` itself (the class-getitem branch of `mp_obj_subscr`).
     pub type_: GcRef,
+    /// `object` (C12: the `isSubclassImpl` short-circuit, `mroOf`'s
+    /// terminator, `typeBasesTuple`'s default parent, `super_attr`'s
+    /// last-resort lookup).
+    pub object: GcRef,
+    /// `super` (C12: `newSuper` allocates with this header type).
+    pub super_: GcRef,
+    /// `staticmethod` (C12: `convert_member_lookup` unwraps it).
+    pub staticmethod: GcRef,
+    /// `classmethod` (C12: `convert_member_lookup` binds it).
+    pub classmethod: GcRef,
+    /// The bound-method type (C12: the `call_method` seam builds
+    /// bound methods with this header type).
+    pub boundmeth: GcRef,
+    /// The ROM `()` singleton (C12a: the tuple-hash seed is this
+    /// object's arena index, so `hash(()) == id(())`).
+    pub empty_tuple: GcRef,
+    /// The ROM empty-bytes singleton (C12a: `new_empty_bytes`
+    /// returns this; `bytes() is b''` holds. Slicing allocates
+    /// fresh — `b'ab'[:0] is b''` is False on the reference
+    /// binary, so only `new_empty_bytes` uses the singleton).
+    pub empty_bytes: GcRef,
+    /// The `native_base_init_wrapper_obj` singleton (objtype.zig:734):
+    /// the `__init__` wrapper primed into an instance's `subobj[0]`
+    /// while its native base is still uninitialised. C12a's ROM
+    /// builds the real wrapper; other fixtures hold a plain type.
+    pub native_init_wrapper: GcRef,
+    /// `property` (C12: the special-accessor scan tests
+    /// `isExactType(value, property)`).
+    pub property: GcRef,
 }
 
 /// The exception type an `ObjError` raises, by name — the type
@@ -126,6 +169,10 @@ pub enum ExcType {
     IndexError,
     OverflowError,
     ZeroDivisionError,
+    /// `NotImplementedError` added by C12 (objtype's `raiseMI`:
+    /// "multiple inheritance not supported" — verified on the
+    /// reference binary).
+    NotImplementedError,
 }
 
 impl ExcType {
@@ -136,6 +183,7 @@ impl ExcType {
             ExcType::IndexError => "IndexError",
             ExcType::OverflowError => "OverflowError",
             ExcType::ZeroDivisionError => "ZeroDivisionError",
+            ExcType::NotImplementedError => "NotImplementedError",
         }
     }
 }

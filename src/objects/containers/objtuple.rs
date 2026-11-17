@@ -46,42 +46,37 @@
 //! - getiter: the polymorph-iter overlay `(tuple, cur)`.
 //!
 //! Divergences (documented, not hidden):
-//! - **Hash seed is 0, not the reference binary's 22815552.**
-//!   The Zig seeds with the ROM empty-tuple object's *address*
+//! - **Hash seed is the empty tuple's arena index, not the
+//!   reference binary's 22815552.** The Zig seeds with the ROM
+//!   empty-tuple object's *address*
 //!   (`@bitCast(objFromPtr(&mp_const_empty_tuple_obj))`) — a
 //!   link artifact of the Zig binary, not a language semantic;
 //!   the address is stable across runs only because the binary
 //!   is non-PIE. The *structure* (seed + wrapping sum of
-//!   element hashes) is ported faithfully, and equal tuples
-//!   still hash equal (Rust has no canonical empty-tuple
-//!   singleton yet — `new_tuple(0)` allocates fresh, like
-//!   C8a's `new_empty_bytes`). When C12 lands the ROM
-//!   singleton, the seed should become the singleton's
-//!   identity word so `hash(()) == id(())` holds in Rust too.
+//!   element hashes) is ported faithfully, and `hash(()) ==
+//!   id(())` holds in Rust too now that the singleton has
+//!   landed (C12a): the seed is `ctx.types.empty_tuple.0`.
 //!   Reference-binary probe values are recorded in
 //!   `tuple_tests.rs` (`hash((1,2)) == 22815555` there,
-//!   `== 3` here).
-//! - **No ROM empty-tuple singleton yet**: `() is ()` is
-//!   `False` in Rust until C12; `tuple()` and `x * 0` return
-//!   fresh empty tuples (equal, not identical).
+//!   `== seed + 3` here).
+//! - **The ROM empty-tuple singleton landed (C12a)**:
+//!   `new_tuple(0)` returns `ctx.types.empty_tuple`, so `()
+//!   is ()` is `True` and `tuple()` / `x * 0` return the
+//!   singleton, as in the Zig (`mp_const_empty_tuple_obj`).
 
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::map::{hash_of, MapError};
 use crate::objects::containers::objdict::DictError;
 use crate::objects::containers::objdict_methods::collect_iterable;
 use crate::objects::containers::sequence::{seq_cmp_objs, seq_count_obj, seq_index_obj};
-use crate::objects::obj::{obj_get_int_maybe, ObjError};
+use crate::objects::obj::{obj_get_int_maybe, obj_get_type, ObjError};
+use crate::objects::objtype::subclass::is_subclass_fast;
 use crate::objects::obj_ops::{get_index, obj_print_helper};
 use crate::objects::slots::{BinaryOp, GetIterFn, PrintKind, SubscrArg, UnaryOp};
 use crate::objects::strings::objstr_a::{fast_slice_indexes, StrError};
 use crate::objects::value::{Obj, SliceData, TypeData};
 use crate::objects::value::{GcRef, Value};
 use crate::pyerr::{PyError, PyResult};
-
-/// The tuple-hash seed. The Zig seeds with the ROM empty-tuple
-/// object's address (22815552 in the reference binary) — see
-/// the module docs; Rust uses 0 until C12 lands the singleton.
-pub const TUPLE_HASH_SEED: i64 = 0;
 
 /// `mirrors.newSmallInt(n)` — re-exported from `crate::objects::value`
 /// (single definition; the tuple hash and the int hash both use it).
@@ -226,9 +221,14 @@ pub fn is_exact_tuple(ctx: &CallCtx, tuple_type: GcRef, value: Value) -> bool {
 }
 
 /// `mp_obj_new_tuple(n, items)`: allocate a tuple holding
-/// `items` (a fresh empty tuple for `n == 0` — no ROM
-/// singleton until C12; see the module docs).
+/// `items`. For `n == 0` the Zig returns the ROM singleton
+/// (`mp_const_empty_tuple_obj`); Rust returns
+/// `ctx.types.empty_tuple` (C12a — the singleton landed, see
+/// the module docs), so `() is ()` holds.
 pub fn new_tuple(ctx: &mut CallCtx, tuple_type: GcRef, items: &[Value]) -> GcRef {
+    if items.is_empty() {
+        return ctx.types.empty_tuple;
+    }
     ctx.alloc(Some(tuple_type), Obj::Tuple(items.to_vec()))
 }
 
@@ -285,7 +285,10 @@ pub fn tuple_make_new(
 /// `wrap_small_int`).
 pub fn tuple_hash(ctx: &mut CallCtx, items: &[Value]) -> Result<i64, TupleError> {
     let types = ctx.types;
-    let mut hash: i64 = TUPLE_HASH_SEED;
+    // The seed is the empty tuple's identity word (C12a — the
+    // ROM singleton; the Zig uses its address, 22815552 in the
+    // reference binary). `hash(()) == id(())` holds.
+    let mut hash: i64 = ctx.types.empty_tuple.0 as i64;
     for item in items {
         match hash_of(ctx, types, *item) {
             // `hash_of` returns `usize`; the `as i64` cast is
@@ -381,10 +384,27 @@ pub fn tuple_binary_op(
     let items: Vec<Value> = tuple_items(ctx, lhs).unwrap_or(&[]).to_vec();
     match op {
         BinaryOp::Add | BinaryOp::InplaceAdd => {
-            if !is_exact_tuple(ctx, tuple_type, rhs) {
+            // `objtuple.zig:185-189` — the rhs must be
+            // tuple-subclass-compatible
+            // (`mp_obj_is_subclass_fast(rhs_type, tuple)`), not
+            // an exact tuple (C12a closes C9c's recorded
+            // divergence: a namedtuple / tuple-subclass value
+            // concatenates). The rhs must also actually carry a
+            // tuple payload — a user-class instance's items live
+            // in its native-base subobj and never reach this
+            // slot (the instance machinery intercepts first),
+            // so a bare `Instance` payload is not addable here
+            // (the Zig reads it through `fromObj`, which is UB
+            // for an instance).
+            let rhs_ok = obj_get_type(ctx.arena, types, rhs)
+                .map(|t| is_subclass_fast(ctx.arena, Value::Heap(t), Value::Heap(tuple_type)))
+                .unwrap_or(false);
+            let Some(rhs_items) = tuple_items(ctx, rhs).map(|s| s.to_vec()) else {
+                return Err(PyError::PyRaise);
+            };
+            if !rhs_ok {
                 return Err(PyError::PyRaise);
             }
-            let rhs_items = tuple_items(ctx, rhs).unwrap_or(&[]).to_vec();
             let mut out = Vec::with_capacity(items.len() + rhs_items.len());
             out.extend_from_slice(&items);
             out.extend_from_slice(&rhs_items);
@@ -602,6 +622,9 @@ pub fn tuple_type_data(dict: GcRef) -> TypeData {
                 tuple_print(ctx, value, kind, sink)
             },
         ),
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }

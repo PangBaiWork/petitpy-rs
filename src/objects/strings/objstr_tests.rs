@@ -43,6 +43,9 @@ fn plain_type_data(name: u32, flags: u16, dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: None,
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }
@@ -145,6 +148,22 @@ impl Fx {
         if let Obj::Type(d) = arena.get_mut(float) {
             d.print = Some(float_print_stub);
         }
+        // C12: plain object/super/staticmethod/classmethod/
+        // boundmeth types and the ROM `()` singleton.
+        let object = mk_plain(&mut arena, b"object");
+        let super_ = mk_plain(&mut arena, b"super");
+        let staticmethod = mk_plain(&mut arena, b"staticmethod");
+        let classmethod = mk_plain(&mut arena, b"classmethod");
+        let boundmeth = mk_plain(&mut arena, b"bound_method");
+        let property = mk_plain(&mut arena, b"property");
+        let tuple = mk_plain(&mut arena, b"tuple");
+        let empty_tuple = arena.alloc(Some(tuple), Obj::Tuple(vec![]), &roots);
+        let empty_bytes = arena.alloc(
+            Some(bytes_),
+            Obj::Bytes(BytesData { bytes: Vec::new() }),
+            &roots,
+        );
+        let native_init_wrapper = mk_plain(&mut arena, b"function");
         let types = BuiltinTypes {
             int,
             str_: str_,
@@ -153,13 +172,22 @@ impl Fx {
             none_type,
             float,
             complex: mk_plain(&mut arena, b"complex"),
-            tuple: mk_plain(&mut arena, b"tuple"),
+            tuple,
             list: mk_plain(&mut arena, b"list"),
             set: mk_plain(&mut arena, b"set"),
             frozenset: mk_plain(&mut arena, b"frozenset"),
             range: mk_plain(&mut arena, b"range"),
             dict: mk_plain(&mut arena, b"dict"),
             type_,
+            object,
+            super_,
+            staticmethod,
+            classmethod,
+            boundmeth,
+            property,
+            empty_tuple,
+            empty_bytes,
+            native_init_wrapper,
         };
         clear_pending_str_error();
         Fx {

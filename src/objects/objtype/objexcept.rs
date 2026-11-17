@@ -38,11 +38,12 @@
 //!   unknown errno / 3 args fall back to the tuple form.
 //! - `PRINT_EXC_SUBCLASS` (0x80) is set only by vendor
 //!   `objtype.c:271` when printing a *user-subclass* exception's
-//!   inner native exception (skips the type-name prefix). Rust has
-//!   no `Instance` payload yet, so no caller can set it —
-//!   `exception_print` always takes the `!is_subclass` branch and
-//!   the flag is documented, not plumbed (C12a/C13's instance
-//!   print path will need it).
+//!   inner native exception (skips the type-name prefix). The Rust
+//!   spelling is the `is_subclass` parameter of
+//!   `exception_print_inner`, set only by `instance_print`'s
+//!   exception-subclass branch (wired at the C12a merge — the
+//!   `Instance` payload exists now); the print slot itself
+//!   always takes the `!is_subclass` branch.
 //!
 //! Config gates (full config — the only config this port targets):
 //! - `MICROPY_PY_ERRNO = 1` (default on, `build.zig:96,122`) → the
@@ -86,7 +87,7 @@
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::{PrintFn, PrintKind};
+use crate::objects::slots::{MakeNewFn, PrintKind};
 use crate::objects::value::{ExceptionData, GcRef, Obj, StrData, TraceFrame, Value};
 use crate::pyerr::{PyError, PyResult};
 
@@ -165,6 +166,21 @@ pub fn exception_make_new(
             cause: None,
         }),
     )))
+}
+
+/// `mp_obj_exception_make_new` as a `MakeNewFn` slot (the
+/// exception types' `make_new` — every ROM exception type built
+/// by `exc_type_data` carries this). The `ExcError` maps to
+/// `PyError` via `ExcError::to_pyerror` (the slot-boundary
+/// convention: the raise message is dropped until C13 adds
+/// `pending_exc`, as with every other slot).
+pub fn exception_make_new_slot(
+    ctx: &mut CallCtx,
+    type_: GcRef,
+    args: &[Value],
+    n_kw: usize,
+) -> PyResult<Value> {
+    exception_make_new(ctx, type_, args, n_kw).map_err(ExcError::to_pyerror)
 }
 
 /// `mp_obj_new_exception` (`objexcept.zig:416`): no-arg exception.
@@ -402,11 +418,28 @@ fn is_oserror_type(ctx: &CallCtx, exc: Value) -> bool {
 }
 
 /// `mp_obj_exception_print` (`objexcept.zig:184`): the exception
-/// type's print slot. `PRINT_EXC_SUBCLASS` is always clear here
-/// (see the module docs). `Json`/`Raw` fall through to the tuple
+/// type's print slot. `Json`/`Raw` fall through to the tuple
 /// form exactly as the Zig's `k` dispatch does (only `Str`/`Exc`
 /// take the args form; only `Repr`/`Exc` print the type name).
+/// `is_subclass` is the Zig's `PRINT_EXC_SUBCLASS` flag
+/// (`objexcept.zig:192-195`): set only by `instance_print`'s
+/// exception-subclass branch (objtype.zig:1659-1672), which has
+/// already printed the subclass name — the inner print then
+/// omits its own type name. The print slot itself always calls
+/// with `false`.
 pub fn exception_print(ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+    exception_print_inner(ctx, value, kind, false, sink);
+}
+
+/// The `mp_obj_exception_print` body with the `PRINT_EXC_SUBCLASS`
+/// flag spelled out (see `exception_print`).
+pub fn exception_print_inner(
+    ctx: &mut CallCtx,
+    value: Value,
+    kind: PrintKind,
+    is_subclass: bool,
+    sink: &mut dyn std::fmt::Write,
+) {
     let (args, type_name): (Vec<Value>, String) = match value {
         Value::Heap(r) => match ctx.arena.get(r) {
             Obj::Exception(e) => {
@@ -424,7 +457,7 @@ pub fn exception_print(ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &
         _ => return,
     };
     let types = ctx.types;
-    if kind == PrintKind::Repr || kind == PrintKind::Exc {
+    if !is_subclass && (kind == PrintKind::Repr || kind == PrintKind::Exc) {
         let _ = sink.write_str(&type_name);
     }
     if kind == PrintKind::Exc {
@@ -558,16 +591,16 @@ pub fn exception_match(arena: &GcArena, exc: Value, exc_type: Value) -> bool {
 
 /// `is_exception` (`objexcept.zig:87`): a TYPE is an exception
 /// type iff its make_new slot IS `mp_obj_exception_make_new`.
-/// `TypeData` has no make_new slot (D5 — make_new is the type-call
-/// path, wired by C12), so the Rust spelling is: the type's print
-/// slot is `exception_print` (bare fn items compare with
-/// `fn_addr_eq`, C9c precedent — every exception type built by
-/// this lane sets it, and C12a's `mp_obj_new_type` inherits the
-/// parent's slots for exception subclasses).
+/// `TypeData` gained the make_new slot with C12a, so the Rust
+/// spelling is now the faithful one: the type's make_new fn item
+/// is `exception_make_new` (bare fn items compare with
+/// `fn_addr_eq`, C9c precedent). (Before C12a, this was spelled
+/// as a print-slot identity — `exception_print` — because there
+/// was no make_new field to compare.)
 pub fn is_exception_type_obj(arena: &GcArena, type_: GcRef) -> bool {
     match arena.get(type_) {
-        Obj::Type(td) => match td.print {
-            Some(f) => std::ptr::fn_addr_eq(f, exception_print as PrintFn),
+        Obj::Type(td) => match td.make_new {
+            Some(f) => std::ptr::fn_addr_eq(f, exception_make_new_slot as MakeNewFn),
             None => false,
         },
         _ => false,

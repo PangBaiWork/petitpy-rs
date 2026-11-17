@@ -714,6 +714,9 @@ fn array_type_data_inner(
         } else {
             None
         },
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     }
 }

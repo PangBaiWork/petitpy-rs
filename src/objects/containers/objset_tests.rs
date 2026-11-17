@@ -7,7 +7,7 @@
 //! quirk (`s.add([2])` raises but the element stays in the set).
 
 use super::map_set::set_items;
-use super::objset::{set_make_new, set_new, set_print, set_unary_op, FROZENSET_HASH_SEED, SetError};
+use super::objset::{set_make_new, set_new, set_print, set_unary_op, SetError};
 use super::objset_methods::{
     set_add, set_add_builtin, set_clear_builtin, set_copy_builtin, set_discard,
     set_discard_builtin, set_pop, set_pop_builtin, set_remove, set_remove_builtin,
@@ -79,6 +79,9 @@ pub(crate) fn quirk_value(fx: &mut Fixture) -> Value {
         subscr: None,
         buffer: None,
         print: None,
+        attr: None,
+        make_new: None,
+        bases: None,
         namedtuple_fields: None,
     };
     let t = fx.arena.alloc(None, Obj::Type(data), &fx.roots);
@@ -444,19 +447,21 @@ fn set_copy_preserves_header_type() {
 
 #[test]
 fn frozenset_hash_seed_and_sum() {
-    // Seed = address of `mp_type_frozenset` in the reference binary
-    // (`nm`: 0x15c0e50 = 22810192); element hashes wrapping-add.
-    assert_eq!(FROZENSET_HASH_SEED, 22810192);
+    // Seed = the frozenset type's identity word (C12a — the Zig
+    // uses the type's address, 22810192 in the reference binary;
+    // element hashes wrapping-add). `hash(frozenset())` equals
+    // the frozenset *type's* id.
     let mut fx = Fixture::new();
+    let seed = fx.types.frozenset.0 as i64;
     let empty = mk_frozenset(&mut fx, &[]);
     let two = mk_frozenset(&mut fx, &[Value::SmallInt(1), Value::SmallInt(2)]);
     let five = mk_frozenset(&mut fx, &[Value::SmallInt(5)]);
     let neg = mk_frozenset(&mut fx, &[Value::SmallInt(-1)]);
     let mut ctx = fx.ctx();
-    assert_eq!(is(set_unary_op(&mut ctx, UnaryOp::Hash, empty).expect("hash()")), 22810192);
-    assert_eq!(is(set_unary_op(&mut ctx, UnaryOp::Hash, two).expect("hash({1,2})")), 22810195);
-    assert_eq!(is(set_unary_op(&mut ctx, UnaryOp::Hash, five).expect("hash({5})")), 22810197);
-    assert_eq!(is(set_unary_op(&mut ctx, UnaryOp::Hash, neg).expect("hash({-1})")), 22810191);
+    assert_eq!(is(set_unary_op(&mut ctx, UnaryOp::Hash, empty).expect("hash()")), seed);
+    assert_eq!(is(set_unary_op(&mut ctx, UnaryOp::Hash, two).expect("hash({1,2})")), seed + 3);
+    assert_eq!(is(set_unary_op(&mut ctx, UnaryOp::Hash, five).expect("hash({5})")), seed + 5);
+    assert_eq!(is(set_unary_op(&mut ctx, UnaryOp::Hash, neg).expect("hash({-1})")), seed - 1);
 }
 
 #[test]

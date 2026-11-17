@@ -1,0 +1,142 @@
+Lane C2 result — port reader + pairheap + ringbuf to Rust
+=========================================================
+Executor: Lane C2 subagent, worktree ~/workspace/petitpy-rs-misc,
+branch lane/misc, base master c365309 (203 tests green, C0 Value/Obj
+interface frozen). One commit for this chunk (see git log):
+"Lane C2: port reader + pairheap + ringbuf to Rust".
+
+Sources (petitpy devel HEAD df7de3a, read-only ~/workspace/petitpy-orig):
+  src/frontend/reader.zig    83 lines, 0 test blocks
+  src/memory/pairheap.zig   140 lines, 0 test blocks
+  src/memory/ringbuf.zig    103 lines, 0 test blocks
+  Total                     326 lines, 0 test blocks
+
+1:1 mapping
+------------
+reader.zig -> src/frontend/reader.rs (181) + src/frontend/mod.rs (3):
+  ReaderMem / Reader extern structs -> struct Reader<'a> { buf: Cow<'a, [u8]>, pos: usize }
+  MP_READER_EOF ((mp_uint_t)-1)     -> pub const MP_READER_EOF: usize = usize::MAX
+  mp_reader_mem_readbyte            -> read_byte() -> Option<u8> (+ read_byte_raw() -> usize, the
+                                     sentinel form, for consumers that need the C return type)
+  mp_reader_mem_close               -> close(self), consuming (Drop does the same)
+  mp_reader_new_mem                 -> new_mem(&[u8]) (free_len == 0, borrowed) /
+                                     new_mem_owned(Vec<u8>) (free_len > 0, owned)
+  mp_reader_try_read_rom            -> try_read_rom(&mut self, len) -> Option<&[u8]>
+  (lib.rs gains `pub mod frontend;`.)
+
+ringbuf.zig -> src/memory/ringbuf.rs (314):
+  ringbuf_t { buf, size, iget, iput } -> struct RingBuf { buf: Vec<u8>, size: u16, iget: u16, iput: u16 }
+  ringbuf_alloc                     -> RingBuf::new(size)
+  static init {buf_array, sizeof}   -> RingBuf::with_buf(Vec<u8>)
+  rb_free / rb_avail (ringbuf.h)    -> pub fn free() / avail() (made pub: they are public
+                                     static inlines in ringbuf.h; the Zig file keeps them private)
+  memcpy_get/put_internal           -> private fn memcpy_get_internal / memcpy_put_internal
+  ringbuf_peek16 / get16 / put16    -> peek16() / get16() / put16() -> i32 (C return codes kept)
+  ringbuf_get_bytes / put_bytes     -> get_bytes(&mut [u8]) / put_bytes(&[u8]) -> i32 (0/-1/-2 kept)
+
+pairheap.zig -> src/memory/pairheap.rs (552):
+  mp_pairheap_t* (nullable)         -> Option<NodeId>; NodeId = arena slot index
+  Node { type, child, child_last, next } -> HeapNode<T> { payload, child, child_last, next: Next }
+  next LSB tag (pairheap.c:29-35)   -> enum Next { None, Sibling(NodeId), Parent(NodeId) }
+  lt fn-ptr (C int, nonzero=true)   -> &dyn Fn(&T, &T) -> bool, passed to every call (as in C)
+  mp_pairheap_meld                  -> PairHeap::meld(lt, Option<NodeId>, Option<NodeId>)
+  mp_pairheap_pairing               -> PairHeap::pairing(lt, Option<NodeId>)
+  mp_pairheap_delete                -> PairHeap::delete(lt, Option<NodeId>, NodeId)
+  mp_pairheap_new (returns NULL)    -> None as the empty heap
+  mp_pairheap_init_node             -> folded into insert() (links start empty)
+  (src/memory/mod.rs gains `pub mod pairheap; pub mod ringbuf;`.)
+
+Pairheap representation — caller evidence (as the brief required)
+-----------------------------------------------------------------
+- In petitpy there are NO callers: main.zig:105 and main_vm.zig:101
+  only `_ = @import("memory/pairheap.zig")` to force-link the exports;
+  no Zig code calls mp_pairheap_*. build.zig does not compile
+  vendor/micropython_embed/py/pairheap.c (nor modasyncio.c /
+  machine_timer.c, its vendor callers), so the Zig exports are the
+  only implementation in the binary and nothing in the binary calls
+  them.
+- In vendor MicroPython the heap backs extmod/modasyncio.c (task
+  queue) and extmod/machine_timer.c (timer heap): the node is
+  INTRUSIVE — mp_pairheap_t is embedded FIRST in the task/timer
+  struct, so the node pointer IS the object pointer (pairheap.h
+  header comment).
+- Safe Rust cannot do intrusive pointers without unsafe, so the port
+  uses an index arena (the brief's first option). The `base`/`type`
+  field of mp_pairheap_t is never read or written by
+  meld/pairing/delete (verified against both the C and the Zig
+  sources), so it has no Rust counterpart — the payload T carries
+  whatever the caller needs.
+- Panic policy (documented in code, not hidden): C segfaults and Zig
+  panics on a malformed heap (dangling next, sibling chain with no
+  parent tag, unknown node id). The Rust port panics with a message
+  naming the violated invariant instead. A well-formed heap — built
+  only by insert/meld/pairing/delete — never hits these.
+
+Divergences / corrections found while porting
+---------------------------------------------
+- READER: Zig redefines the ROM notion vs vendor C, and the Rust port
+  follows ZIG (the port target — it is what the running binary does):
+  C says ROM ⟺ free_len == MP_READER_IS_ROM ((size_t)-1) and C's
+  try_read_rom has NO bounds check; Zig says ROM ⟺ free_len == 0,
+  try_read_rom returns None when free_len > 0 OR fewer than len
+  bytes remain, and close frees beg iff free_len > 0 (no IS_ROM
+  exclusion). MP_READER_IS_ROM is never passed anywhere in petitpy
+  (grep: zero uses in src/); the only live caller,
+  persistentcode.zig:465, passes free_len = 0. (persistentcode.zig:314
+  comments on the same "non-ROM" reading.)
+- READER: the lexer does NOT use mp_reader_t — lexer.zig:193 has its
+  own pure-Zig slice Reader. The Rust reader's live consumer is the
+  persistentcode .mpy loader (Phase C/D).
+- RINGBUF: get16 advances iget with wrapping_add (C uint16_t wrap).
+  Zig's `r.iget += 2` would panic in a debug build when size ==
+  u16::MAX and iget == size - 1 (the C value there is also wrong
+  vs the mathematical (iget+2)%size — a latent C corner); the port
+  follows C's wrap. Unreachable from any petitpy caller (no callers
+  in src/ at all).
+- RINGBUF: the single-byte ringbuf_get / ringbuf_peek / ringbuf_put
+  static inlines of ringbuf.h are NOT ported — they are not in
+  ringbuf.zig (the port target) and no Zig caller uses them. If a
+  later lane needs them, that is a separate decision.
+- PAIRHEAP: Zig's pairing loop checks the tag on the advancing
+  `child` POINTER itself (not on child->next) — a single-child list
+  still runs one loop iteration and returns the child; the Rust
+  `advance` helper preserves this (test delete_root_with_one_child
+  pins it).
+- No @cImport in any of the three Zig files. No extern "C" exports
+  added (per brief; C-ABI export is Phase F).
+
+Tests (Zig side has 0 test blocks, so all tests are semantic, per brief)
+-------------------------------------------------------------------------
+- cargo test --release --lib --tests: 226 passed / 0 failed / 1 ignored
+  (baseline 203 kept + 23 new: reader 7, ringbuf 7, pairheap 9).
+  The 1 ignored is the stale A3 empty-file expectation.
+- cargo build --release: 0 warnings. No unsafe in any new file
+  (the word appears only in doc comments). Every new file < 800 lines
+  (largest: pairheap.rs 552). Pure std, no external crates.
+  Original repo clean (git status empty).
+- Reader tests: sequential read + sticky EOF, raw EOF sentinel,
+  try_read_rom slices + advances, too-long request returns None
+  without advancing, zero-len on empty buffer, owned reader never
+  exposes ROM but still reads, close after read.
+- Ringbuf tests: put/get16 roundtrip + empty, put16 needs 2 free
+  slots, iget/iput wraparound (pinned indices), get/put_bytes
+  roundtrip + 0/-1/-2 codes, bytes wraparound (DEFGHI across the
+  boundary), capacity is size-1, with_buf takeover.
+- Pairheap tests (deterministic xorshift64, seed 20261117, the
+  project's probe convention): meld ordering + empty cases,
+  delete-root-with-one-child, delete-min of 200 random values yields
+  exactly the sorted input, 100 inserts + 30 arbitrary non-root
+  deletes then drain yields exactly the sorted remainder, delete of
+  a node not in the heap leaves the heap unchanged, meld of two
+  50-node heaps drains sorted, reversed comparator yields a max
+  heap, empty-heap ops, take() reuses slots.
+
+What is NOT in this chunk
+--------------------------
+- No extern "C" exports (Phase F). No Value/Obj work (C0 interface
+  already frozen; these three files do not depend on it).
+- No change to the original repo (read-only; git status clean).
+- No change to any other lane's code or tests (baseline 203 kept intact).
+
+Commit: one commit for this chunk (see git log).
+Message: "Lane C2: port reader + pairheap + ringbuf to Rust".

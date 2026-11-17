@@ -37,43 +37,18 @@
 
 use crate::pyerr::{PyError, PyResult};
 
-// ── Vendor constants ──────────────────────────────────────────────────────
+// ── Shared static table ─────────────────────────────────────────────────
 //
-// N_STATIC and N_MAIN come from the QDEF0/QDEF1 partition in
-// vendor/qstrdefs.generated.h. They are asserted at compile time below
-// against the build.rs-generated counts — a vendor regen that changes
-// either count will fail the build with a clear message.
-
-/// A qstr id.
-pub type Qstr = u16;
-
-/// Number of QDEF0 entries — the "static" pool (compile-time, unsorted).
-/// Ids 0..N_STATIC-1.
-pub const N_STATIC: u16 = 228;
-
-/// Number of QDEF1 entries — the "main" pool (compile-time, sorted).
-/// Ids N_STATIC..N_STATIC+N_MAIN-1.
-///
-/// ADR-006 J1 — bumped from 216 to 227 (+11) to absorb the qstrs the
-/// `_petitpy_js` module shadow declares (`_petitpy_js`,
-/// `_bridge_present`, `_get_global`, `_get_attr`, `_set_attr`, `_call`,
-/// `_release`, `_create_string`, `_create_int`, `_to_string`, `_to_int`).
-/// J5a — bumped from 227 to 229 (+2) for `_create_callback` +
-/// `_set_dispatcher` (Python callback marshaling).
-/// These land in the QDEF1 table whether or not -Dfeature-js is on
-/// because the qstr scanner reads the shadow .c unconditionally; the
-/// runtime gating only affects whether the module object itself is
-/// linked, not the qstr table.
-/// ADR 019 — 357 (+1) for `__del__` (finalisers, memory/gc.zig).
-/// 358 (+1) for `os_path` (`os.path` via os.__getattr__, modules/modos.zig).
-/// 359 (+1) for `gcd` (math.gcd, modules/modmath.zig).
-/// 362 (+3) for `__cause__`, `__context__`, `__suppress_context__` (PEP 3134).
-/// 366 (+4) for `lseek`, `SEEK_SET`, `SEEK_CUR`, `SEEK_END` (modules/modos.zig).
-/// 367 (+1) for `_json` (modules/modjson.zig).
-pub const N_MAIN: u16 = 385;
-
-/// Total compile-time qstr count. Dynamic pool ids start here.
-pub const N_TOTAL: u16 = N_STATIC + N_MAIN;
+// The static pool, the `Qstr` id type and the djb2 hash live in
+// `crate::qstr_table` (generated at build time by `build.rs` from
+// `vendor/qstrdefs.generated.h`) and are shared with the runtime
+// track (`crate::runtime::qstr`). Re-exported here so existing
+// `compiler::qstr::*` paths keep working unchanged. N_STATIC and
+// N_MAIN are asserted at compile time below against the
+// build.rs-generated counts — a vendor regen that changes either
+// count will fail the build with a clear message.
+pub use crate::qstr_table::{qstr_compute_hash, Qstr, N_MAIN, N_STATIC, N_TOTAL};
+pub(crate) use crate::qstr_table::{GEN_N_MAIN, GEN_N_STATIC, QSTR_HASHES, QSTR_LENGTHS, QSTR_STRINGS};
 
 /// Boundary used by .mpy persistentcode encoding (vendor
 /// persistentcode.c:48 `#define QSTR_LAST_STATIC MP_QSTR_zip`). Qstrs
@@ -84,13 +59,6 @@ pub const N_TOTAL: u16 = N_STATIC + N_MAIN;
 /// against genhdr/qstrdefs.generated.h line 168 / QDEF0 #166).
 pub const QSTR_LAST_STATIC: u16 = 165;
 
-// ── Static-pool data (build-time generated) ───────────────────────────────
-//
-// Layout (mirrors the Zig StaticStrings/Hashes/Lengths):
-//   ids 0..N_STATIC-1        -> QDEF0 entries, in file order
-//   ids N_STATIC..N_TOTAL-1  -> QDEF1 entries, in file order
-include!(concat!(env!("OUT_DIR"), "/qstr_table.rs"));
-
 // Compile-time consistency check: keep these constants in lockstep with
 // the generated table (mirrors the Zig `comptime` fingerprint block).
 const _: () = assert!(GEN_N_STATIC == N_STATIC as usize, "N_STATIC drift");
@@ -98,25 +66,6 @@ const _: () = assert!(GEN_N_MAIN == N_MAIN as usize, "N_MAIN drift");
 const _: () = assert!(QSTR_STRINGS.len() == N_TOTAL as usize);
 const _: () = assert!(QSTR_HASHES.len() == N_TOTAL as usize);
 const _: () = assert!(QSTR_LENGTHS.len() == N_TOTAL as usize);
-
-// ── Hash function ─────────────────────────────────────────────────────────
-//
-// djb2 — must match vendor qstr.c:64-76 byte-for-byte so that
-// vendor-precomputed hashes in QSTR_HASHES line up with runtime hashes
-// for the same string. Result is masked to 16 bits and bumped to 1 if
-// it would otherwise be 0 (vendor uses 0 as "hash not computed").
-
-pub fn qstr_compute_hash(data: &[u8]) -> u16 {
-    let mut hash: u32 = 5381;
-    for &b in data {
-        hash = (hash.wrapping_shl(5).wrapping_add(hash)) ^ b as u32; // hash*33 ^ byte
-    }
-    hash &= 0xffff;
-    if hash == 0 {
-        hash = 1;
-    }
-    hash as u16
-}
 
 // ── Dynamic pool: QstrContext ─────────────────────────────────────────────
 //

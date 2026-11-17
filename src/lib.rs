@@ -6,3 +6,4 @@
 
 pub mod compiler;
 pub mod pyerr;
+pub mod vendor;

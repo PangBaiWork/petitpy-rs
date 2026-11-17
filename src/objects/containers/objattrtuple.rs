@@ -10,16 +10,16 @@
 //! The type NAME is `tuple` (`MP_QSTR_tuple`), flags 0. Slots: print
 //! (custom), unary_op / binary_op / subscr / getiter = the TUPLE's
 //! slots, attr (custom field lookup). The tuple slots are C9b's —
-//! C9b has merged into master, but this worktree is on the stale
-//! base 613b242 (pre-C9b) where the tuple type has no slots yet, so
-//! the four delegating slots are `None` here with a TODO for the
-//! rebase: wire `tuple_unary_op` / `tuple_binary_op` /
-//! `tuple_subscr` / `tuple_getiter` from C9b's `objtuple.rs` at
-//! merge time. NO make_new, NO locals dict.
+//! wired at the rebase (`tuple_unary_op` / `tuple_binary_op` /
+//! `tuple_subscr` / `tuple_getiter` from `objtuple.rs`); they
+//! operate on the attrtuple directly because `tuple_items` covers
+//! the AttrTuple payload (the Zig's shared layout). NO make_new,
+//! NO locals dict.
 //!
 //! The print helper is exported for C11's namedtuple repr:
 //! `mp_obj_attrtuple_print_helper` is used by modcollections.c.
 
+use super::objtuple::{tuple_binary_op, tuple_getiter, tuple_subscr, tuple_unary_op};
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::static_qstr_id;
@@ -120,15 +120,14 @@ pub fn attrtuple_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
-        // TODO(C9b rebase): tuple_unary_op (this worktree predates C9b).
-        unary_op: None,
-        // TODO(C9b rebase): tuple_binary_op.
-        binary_op: None,
+        // The tuple's slots (objattrtuple.zig:105-109): an attrtuple
+        // IS a tuple object, so the tuple slots operate on it
+        // directly (`tuple_items` covers the AttrTuple payload).
+        unary_op: Some(tuple_unary_op),
+        binary_op: Some(tuple_binary_op),
         call: None,
-        // TODO(C9b rebase): tuple_getiter.
-        getiter: None,
-        // TODO(C9b rebase): tuple_subscr.
-        subscr: None,
+        getiter: Some(tuple_getiter),
+        subscr: Some(tuple_subscr),
         buffer: None,
         print: Some(attrtuple_print),
     }

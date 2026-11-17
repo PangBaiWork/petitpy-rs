@@ -8,9 +8,10 @@ use super::objattrtuple::{
     attrtuple_attr, attrtuple_new, attrtuple_print, attrtuple_print_helper,
     attrtuple_type_data,
 };
+use super::objtuple::{tuple_binary_op, tuple_getiter, tuple_subscr, tuple_unary_op};
 use super::tests::{empty_dict, Fixture};
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::PrintKind;
+use crate::objects::slots::{BinaryOp, PrintKind, SubscrArg, UnaryOp};
 use crate::objects::value::{GcRef, Obj, Value};
 
 /// Allocate a real `attrtuple` type in the fixture (rooted, the
@@ -164,12 +165,47 @@ fn attrtuple_type_data_shape() {
     );
     assert_eq!(data.flags, 0x0000);
     assert!(data.print.is_some());
-    // The tuple slots are C9b's — `None` with a TODO until the
-    // rebase (this worktree predates C9b); no make_new, no locals.
-    assert!(data.unary_op.is_none());
-    assert!(data.binary_op.is_none());
+    // The tuple slots are C9b's — wired at the rebase (this worktree
+    // predated C9b); no make_new, no locals.
+    assert!(data.unary_op.is_some());
+    assert!(data.binary_op.is_some());
     assert!(data.call.is_none());
-    assert!(data.getiter.is_none());
-    assert!(data.subscr.is_none());
+    assert!(data.getiter.is_some());
+    assert!(data.subscr.is_some());
     assert!(data.buffer.is_none());
+}
+
+/// The four tuple slots delegate (rebase wiring): LEN / subscr /
+/// getiter / equality go through the tuple's slots, because in the
+/// Zig an attrtuple IS a tuple object (`objattrtuple.zig:3`).
+#[test]
+fn attrtuple_tuple_slots_delegate() {
+    let mut fx = Fixture::new();
+    let a = mk_fields(&mut fx);
+    let mut ctx = fx.ctx();
+    assert_eq!(
+        tuple_unary_op(&mut ctx, UnaryOp::Len, a),
+        Ok(Value::SmallInt(2))
+    );
+    assert_eq!(
+        tuple_subscr(&mut ctx, a, Value::SmallInt(0), SubscrArg::Get),
+        Ok(Value::SmallInt(1))
+    );
+    assert_eq!(
+        tuple_subscr(&mut ctx, a, Value::SmallInt(-1), SubscrArg::Get),
+        Ok(Value::SmallInt(2))
+    );
+    assert_eq!(
+        tuple_binary_op(&mut ctx, BinaryOp::Equal, a, a),
+        Ok(Value::Bool(true))
+    );
+    let it = tuple_getiter(&mut ctx, a).expect("getiter");
+    // The iterator overlays the attrtuple itself (source == a).
+    match it {
+        Value::Heap(r) => match ctx.arena.get(r) {
+            Obj::Iterator(i) => assert_eq!(i.source, a),
+            _ => panic!("getiter did not return an iterator"),
+        },
+        _ => panic!("getiter did not return a heap value"),
+    }
 }

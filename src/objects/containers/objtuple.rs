@@ -31,8 +31,10 @@
 //!   tuple here — no user subclasses yet) else NULL; MULTIPLY:
 //!   `get_int_maybe` rhs else NULL, `n <= 0` → the empty tuple
 //!   (the ROM singleton in Zig); comparisons via
-//!   `tupleCmpHelper` → `seq_cmp_objs` (the subclass slow path
-//!   is C12's).
+//!   `tupleCmpHelper` → `seq_cmp_objs`: direct when the rhs
+//!   type's iter slot IS the tuple getiter (covers attrtuples —
+//!   objattrtuple.zig:109); the subclass slow path
+//!   (cast-to-native-base) is C12's.
 //! - subscr: `value != SENTINEL` → NULL (no set/delete — the
 //!   dispatch raises "object doesn't support item
 //!   assignment/deletion"); a slice loads through
@@ -70,7 +72,7 @@ use crate::objects::containers::objdict_methods::collect_iterable;
 use crate::objects::containers::sequence::{seq_cmp_objs, seq_count_obj, seq_index_obj};
 use crate::objects::obj::{obj_get_int_maybe, ObjError};
 use crate::objects::obj_ops::{get_index, obj_print_helper};
-use crate::objects::slots::{BinaryOp, PrintKind, SubscrArg, UnaryOp};
+use crate::objects::slots::{BinaryOp, GetIterFn, PrintKind, SubscrArg, UnaryOp};
 use crate::objects::strings::objstr_a::{fast_slice_indexes, StrError};
 use crate::objects::value::{Obj, SliceData, TypeData};
 use crate::objects::value::{GcRef, Value};
@@ -201,6 +203,12 @@ pub fn tuple_items<'a>(ctx: &'a CallCtx<'_>, value: Value) -> Option<&'a [Value]
     };
     match ctx.arena.get(r) {
         Obj::Tuple(items) => Some(items),
+        // An attrtuple IS a tuple in the Zig (`objattrtuple.zig:3`:
+        // "a regular `mp_obj_tuple_t` whose flex `items[]`...") —
+        // the tuple slots operate on the shared layout, so the
+        // items accessor covers both payloads. (Wired at the C9c
+        // rebase for `attrtuple_type_data`.)
+        Obj::AttrTuple(a) => Some(&a.items),
         _ => None,
     }
 }
@@ -316,22 +324,46 @@ pub fn tuple_unary_op(
     }
 }
 
-/// `tupleCmpHelper` (`objtuple.zig:146-159`): the rhs must be
-/// an exact tuple here (the subclass slow path is C12's);
-/// otherwise the slot answers NULL.
+/// `tupleCmpHelper` (`objtuple.zig:146-159`): the rhs is compared
+/// directly when its type's iter slot IS the tuple's getiter
+/// (that covers attrtuples — their iter slot is
+/// `mp_obj_tuple_getiter`, objattrtuple.zig:109); otherwise the
+/// slow path for user subclasses (C12's cast-to-native-base)
+/// applies, and the slot answers NULL for now.
 fn tuple_cmp(
     ctx: &mut CallCtx,
-    tuple_type: GcRef,
     op: BinaryOp,
     lhs: &[Value],
     rhs_value: Value,
 ) -> Result<bool, TupleError> {
-    if !is_exact_tuple(ctx, tuple_type, rhs_value) {
+    if !rhs_has_tuple_getiter(ctx, rhs_value) {
         return Err(TupleError::PyRaise);
     }
     // Clone first: `seq_cmp_objs` needs `&mut ctx`.
     let rhs: Vec<Value> = tuple_items(ctx, rhs_value).unwrap_or(&[]).to_vec();
     Ok(seq_cmp_objs(ctx, op, lhs, &rhs)?)
+}
+
+/// Does `value`'s type use the tuple's getiter slot?
+/// (`tupleCmpHelper`'s `typeIterSlot(another_type) !=
+/// getiter_zig_ptr` test, objtuple.zig:152-153.)
+fn rhs_has_tuple_getiter(ctx: &CallCtx, value: Value) -> bool {
+    let Value::Heap(r) = value else {
+        return false;
+    };
+    let Some(t) = ctx.arena.header(r).type_ else {
+        return false;
+    };
+    match ctx.arena.get(t) {
+        // `fn_addr_eq` (not `==`): fn-pointer `==` is linted as
+        // unreliable, and the stored slot must be the bare
+        // `tuple_getiter` item (`tuple_type_data` registers it
+        // unwrapped — a closure wrapper would compare unequal).
+        Obj::Type(td) => td
+            .getiter
+            .is_some_and(|f| std::ptr::fn_addr_eq(f, tuple_getiter as GetIterFn)),
+        _ => false,
+    }
 }
 
 /// `mp_obj_tuple_binary_op` (`objtuple.zig:180-214`): ADD /
@@ -378,7 +410,7 @@ pub fn tuple_binary_op(
         | BinaryOp::LessEqual
         | BinaryOp::More
         | BinaryOp::MoreEqual => {
-            match tuple_cmp(ctx, tuple_type, op, &items, rhs) {
+            match tuple_cmp(ctx, op, &items, rhs) {
                 Ok(b) => Ok(Value::Bool(b)),
                 Err(TupleError::OutOfMemory) => Err(PyError::OutOfMemory),
                 Err(_) => Err(PyError::PyRaise),
@@ -559,21 +591,11 @@ pub fn tuple_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
-        unary_op: Some(
-            |ctx: &mut CallCtx, op: UnaryOp, self_: Value| tuple_unary_op(ctx, op, self_),
-        ),
-        binary_op: Some(
-            |ctx: &mut CallCtx, op: BinaryOp, lhs: Value, rhs: Value| {
-                tuple_binary_op(ctx, op, lhs, rhs)
-            },
-        ),
+        unary_op: Some(tuple_unary_op),
+        binary_op: Some(tuple_binary_op),
         call: None,
-        getiter: Some(|ctx: &mut CallCtx, self_: Value| tuple_getiter(ctx, self_)),
-        subscr: Some(
-            |ctx: &mut CallCtx, self_: Value, index: Value, arg: SubscrArg| {
-                tuple_subscr(ctx, self_, index, arg)
-            },
-        ),
+        getiter: Some(tuple_getiter),
+        subscr: Some(tuple_subscr),
         buffer: None,
         print: Some(
             |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn std::fmt::Write| {

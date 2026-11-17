@@ -250,6 +250,52 @@ data test pins the current (None) shape, update it at the rebase.
   rebase (as C9b's merge did); the attrtuple TODO (§9) must be
   resolved in the rebase, and the test counts re-verified there.
 
+REBASE + INTEGRATION (main agent, 2026-11-17 ~21:35)
+---------------------------------------------------
+Rebased onto master 553d9fc (fae97e1). Conflicts (all resolved
+keep-both, verified by the test run below):
+  * containers/mod.rs: C9b's objlist/objtuple/sequence + C9c's
+    objattrtuple/objproperty/objrange/objset/objslice (sorted).
+  * objdict_methods.rs: C9c's Set arm (`set_items(&s.table)`)
+    + C9b's Array arm (ArrayBytes plan).
+  * value.rs (heap_bytes + children): Set from C9c (table shape),
+    Array from C9b (data/source shape — C9c's `a.items` was the
+    stale pre-C9b stub).
+  * containers/tests.rs fixture: real slotted tuple/list from C9b
+    (C9c's `tuple_print_double` construction was stale — the
+    double was retired by C9b) + real set/frozenset/range from C9c;
+    array/bytearray/memoryview fixture fields kept.
+
+Attrtuple slots wired (§9 TODO resolved): `attrtuple_type_data`
+now carries `tuple_unary_op` / `tuple_binary_op` / `tuple_subscr` /
+`tuple_getiter`; `tuple_items` covers the AttrTuple payload (the
+Zig's shared layout, objattrtuple.zig:3); new test
+`attrtuple_tuple_slots_delegate` pins LEN / subscr[0,-1] /
+getiter-source / equality. The shape test now asserts the four
+slots are Some.
+
+`tuple_cmp` FIX (found by the rebase wiring): C9b's exact-tuple
+check was WRONG for attrtuples — the Zig's `tupleCmpHelper`
+(objtuple.zig:152-153) compares directly when the rhs type's
+iter slot IS the tuple getiter, no exact-type check. Implemented
+as `rhs_has_tuple_getiter` (`fn_addr_eq`, not `==` — the linted
+fn-pointer comparison); `tuple_type_data` now registers the bare
+fn items (C9b's closure wrappers compare unequal — that is why
+the first attempt broke `tuple_binary_compare`). Verified on the
+reference binary: `P(1,2)==P(1,2)`, `P(1,2)==(1,2)`,
+`(1,2)==P(1,2)` all True; C9b's `tuple_binary_compare` green.
+
+ADD divergence RECORDED (not fixed — needs C12): the Zig's ADD
+uses `mp_obj_is_subclass_fast` (namedtuple IS a tuple subclass:
+`issubclass(P, tuple)` True, `a+(3,)` and `(1,2)+a` both work);
+Rust still requires an exact tuple. C12's subclass machinery
+must relax it.
+
+Final rebased counts: cargo test --release --lib --tests
+663 passed (542 master + 120 C9c + 1 new delegation test),
+0 failed, 1 ignored; bins 9; cargo build --release 0 warnings;
+no unsafe in the lane's files.
+
 SPLIT (800-line cap)
 --------------------
 objset.rs 717, objset_methods.rs 534, objset_tests.rs 481,

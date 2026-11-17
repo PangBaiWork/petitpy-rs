@@ -1,0 +1,222 @@
+Lane C5 result — port runtime bc to Rust
+========================================
+Executor: Lane C5 subagent, worktree ~/workspace/petitpy-rs-bc,
+branch lane/bc, base master 7faf3d5 (C0 + Lane C1 merged,
+215 tests green).
+
+Sources (petitpy devel HEAD df7de3a, read-only ~/workspace/petitpy-orig):
+  src/runtime/bc.zig  461 lines, 0 test blocks
+  imports: std, mp_mirrors.zig, pyerr.zig
+  Cross-checked against vendor py/bc.c (mp_setup_code_state_helper
+  :127-320, mp_setup_code_state :322-332), py/bc.h (prelude macros),
+  py/runtime0.h (scope flags), py/argcheck.c (terse mismatch),
+  py/objfun.c (DECODE_CODESTATE_SIZE / INIT_CODESTATE / extra_args),
+  py/objtuple.c (empty-tuple singleton).
+
+1:1 mapping
+------------
+bc.zig -> src/runtime/bc.rs (643 lines) + src/runtime/bc_tests.rs (571)
+  MP_ENCODE_UINT_MAX_BYTES / MP_SCOPE_FLAG_* / MP_MAP_LOOKUP*
+                                      -> constants, same values
+  mp_encode_uint                      -> REUSED, not copied:
+                                           pub use of
+                                           compiler::emit::encoders::encode_uint
+                                           (see §2)
+  mp_decode_uint                      -> decode_uint(&mut &[u8]) -> usize
+  mp_decode_uint_value                -> decode_uint_value(&[u8]) -> usize
+  mp_decode_uint_skip                 -> decode_uint_skip(&[u8]) -> &[u8]
+  preludeSigDecode                    -> prelude_sig_decode (pub(crate))
+  preludeSizeDecode                   -> prelude_size_decode (pub(crate))
+  decodeUint / decodeUintSkip         -> the decode_* fns above
+  mp_setup_code_state                 -> setup_code_state (pub)
+  mp_setup_code_state_helper          -> setup_code_state_helper (private)
+  setTypeError / mp_arg_error_terse_mismatch_polled /
+  mp_obj_new_exception_msg_varg raises -> SetupError enum + message()
+  MpCodeState (mirror)                -> CodeState (see §3)
+  mp_map_lookup (MpMap)               -> map_lookup (linear scan, see §4)
+  src/runtime/mod.rs                  -> + `pub mod bc;`
+                                           + `#[cfg(test)] mod bc_tests;`
+
+Tests were split out of bc.rs into bc_tests.rs so both files stay
+under the 800-line cap (the Lane RE15 precedent:
+src/vendor/re15_tests.rs, declared `#[cfg(test)]` in mod.rs).
+
+2. Encode reuse — emit side vs runtime side (brief: compare first)
+---------------------------------------------------------------------
+IDENTICAL algorithm, verified by hand and by test. Zig
+`mp_encode_uint`: fills a 10-byte buffer from the end with plain
+`val & 0x7f` chunks, then copies out setting `| 0x80` on every byte
+but the last. Emit `encode_uint` (Phase B, `emit/encoders.rs`):
+fills from the end setting `| 0x80` while filling, leaving the
+least-significant chunk clear. Same bytes for every input,
+including 0 (one `0x00` byte) and `usize::MAX` (10 bytes).
+`DUMMY_DATA_SIZE` (emit consts.rs) == `MP_ENCODE_UINT_MAX_BYTES`
+== 10. Therefore the runtime module **re-exports** the emit
+encoder (`pub use crate::compiler::emit::encoders::encode_uint`)
+and defines no second encoder. Decode is new here; the cross-check
+test encodes with the emit encoder and decodes with the runtime
+decoder for 10 boundary values (0, 1, 127, 128, 300, 16383,
+16384, 2^28, 2^56, usize::MAX) against hand-computed byte
+vectors — same value, same bytes.
+Difference in API shape only: Zig takes a C allocator callback;
+Rust takes `&mut [u8]` and returns the written slice (the emit
+port's shape, kept as-is).
+
+3. MpCodeState — Rust shape
+----------------------------
+```rust
+pub struct CodeState {
+    pub fun: GcRef,                  // fun_bc (Obj::FunBc slot)
+    pub ip: usize,                   // byte offset into RawCode.fun_data
+    pub state: Vec<Option<Value>>,   // n_state slots; None == MP_OBJ_NULL
+    pub n_state: usize,              // caller-decoded, cached
+    pub exc_sp_idx: usize,           // 0 after setup
+}
+```
+Only the fields bc.zig uses. NOT stored, by design (see bc.rs
+module docs): C `sp` (`&state[0] - 1`) — the VM's value-stack
+pointer, owned by the VM lane (C13); `old_globals` — set by the C
+caller (`INIT_CODESTATE`, objfun.c:217-220) *after*
+`mp_setup_code_state` returns.
+The three `mp_obj_fun_bc_t` pieces the helper reads are passed
+explicitly, because the frozen `FunBcData` (value-obj-design D4)
+holds only a code-store index: `code: &RawCode` (fun_data =
+prelude + source info + cells + bytecode), `qstr_table: &[u16]`
+(the module's resolved qstr table, as the C loader builds it
+from the .mpy qstr section), `extra_args: &[Value]` (creation
+order: n_def_pos_args positional defaults, then the defkwargs
+dict iff DEFKWARGS — `mp_obj_new_fun_bc`, objfun.c:414-440).
+`n_state` is a caller parameter, as in C (the caller decodes it
+from the sig prelude, `DECODE_CODESTATE_SIZE`; the helper
+decodes S again only to discard it).
+`empty_tuple: Value` is a parameter: the original stores the
+`mp_const_empty_tuple` singleton for the empty-`*args` case
+(objtuple.c:241-243), and the reference binary proves the
+identity is observable (`def f(*a): return a is ()` → True);
+a fresh empty tuple per call would break it. The VM owns the
+singleton and passes it in.
+Raises become `Result<CodeState, SetupError>`: the exception
+object lives in `VmState.pending_exc` (D7) which does not exist
+yet, so the error carries exactly the data the original formats
+into its TypeError (arg index / qstr id); `SetupError::message`
+renders the TERSE strings.
+
+4. Decisions / equivalences worth recording
+--------------------------------------------
+- `map_lookup` is a linear scan over `DictData.map.entries`
+  (the C map is a hash table; same lookup semantics — C9 owns
+  the payload and may replace it). It returns `(index, is_new)`:
+  `is_new` is exactly the C test `elem->value == MP_OBJ_NULL`
+  on a fresh `ADD_IF_NOT_FOUND` insert, because a stored value
+  is never NULL (the placeholder is `Value::None` and is set by
+  the caller immediately). This matters: a stored Python `None`
+  must NOT look like a fresh entry (dict-path duplicate kwargs
+  with a `None` value still raise).
+- `kwargs = args + n_args` is computed BEFORE the positional
+  check reassigns `n_args` (bc.c/bc.zig order); the Rust code
+  splits `args` up front (`pos_args`, `kw_pairs`) to keep that
+  order explicit.
+- The defaults-fill loop and the mandatory-positional check
+  reproduce the C pointer arithmetic exactly, including the
+  `*d++ == NULL` post-increment: the reported number is
+  `n_state - d` AFTER the increment, i.e. the 0-based arg index
+  (verified on the binary: f(a, b=2) called as f(b=3) → #0;
+  f(a, b, c=3) called as f(c=4) → #1).
+- `decode_uint` uses `wrapping_shl`, matching C unsigned wrap
+  for over-long varints (Zig `<<` on usize wraps the same way).
+- Truncated bytecode panics (slice indexing), mirroring the Zig
+  port's index-out-of-bounds panic on the same malformed input.
+- Rooting: allocations inside setup use the caller's `RootSet`.
+  With the C0 skeleton's threshold of -1 no collection can
+  trigger mid-setup; once C4 lands the trigger rule the VM must
+  root the in-progress code state, as it roots its value stack.
+- `prelude_sig_decode` / `prelude_size_decode` (+ their structs)
+  are `pub(crate)`: the VM lane needs the sig decode itself to
+  size the code state (`DECODE_CODESTATE_SIZE`), and the tests
+  pin the decode vectors.
+
+Acceptance numbers
+------------------
+- cargo test --release --lib --tests: 234 passed / 0 failed /
+  1 ignored (baseline 215 kept + 19 new bc tests; the 1 ignored
+  is the stale A3 empty-file expectation).
+- cargo build --release: 0 warnings.
+- No unsafe in any new file (grep: 0).
+- Every file < 800 lines: bc.rs 643, bc_tests.rs 571, mod.rs 12.
+- Pure std, no external crates. Original repo clean
+  (`git status` empty).
+
+New tests (19, in src/runtime/bc_tests.rs)
+-------------------------------------------
+Varint / prelude (4):
+- varint_encode_decode_vectors: 10 boundary values (0, 1, 127,
+  128, 300, 16383, 16384, 2^28, 2^56, usize::MAX) — emit encode
+  vs hand-computed bytes, runtime decode roundtrip, skip/value
+  variants. 10-byte max asserted.
+- varint_skip_steps_past_one_value: skip over concatenated
+  varints, decode after skip.
+- prelude_sig_decode_vectors: hand-computed from bc.h
+  (0x00 -> n_state 1; 0x03 -> A=3; [0x80,0x30] -> n_state 49).
+- prelude_size_decode_vectors: hand-computed from bc.h
+  (0x00 -> 0/0; 0x02 -> I=1; 0x01 -> C=1; [0x81,0x03] ->
+  I=64, C=3).
+  (One of my own hand-computed expectations was wrong here and
+  the test caught it: I first wrote [0x81,0x01] -> (64,3), but
+  0x81 & 0x7e == 0, so I == 0; the correct vector is
+  [0x81,0x03]. The implementation matched the C macro all along.)
+Setup (15), each compiling a real function with the Phase B
+compiler and checking slots/ip/errors; `ip` is checked against
+an independently measured offset (prelude + n_info + n_cell):
+- setup_positional_only, setup_positional_defaults (f(1)->(1,2);
+  f()->ArgCountMismatch; f(1,2,3)->ArgCountMismatch),
+  setup_varargs (f(1,2,3)->args=(2,3); f(1)->args IS the
+  empty-tuple singleton), setup_kwargs_full_combo
+  (f(1,3,4,k=5,z=6)->(1,3,(4,),5,{'z':6})),
+  setup_kwarg_overrides_default (f(1,b=20)->(1,20)),
+  setup_missing_positional_via_kw (#0 and #1),
+  setup_unexpected_keyword, setup_multiple_values_positional,
+  setup_missing_keyword_only, setup_missing_kwonly_with_defkwargs
+  (missing 'k', m=5 filled), setup_missing_second_kwonly
+  (missing 'm'), setup_kwonly_default_from_defkwargs (k=7),
+  setup_duplicate_kwarg_in_dict (dict-path multiple values),
+  setup_empty_varargs_and_kwargs (f(1)->((), {})),
+  setup_closure_cell (x wrapped in Cell{value: 42}, n_cell==1
+  asserted as its own premise).
+
+Reference-binary oracle (all run 2026-11-17 on
+~/workspace/petitpy-orig/zig-out/bin/petitpy, file mode)
+-------------------------------------------------------
+t1  f(a); f(1,2)              -> TypeError: argument num/types mismatch
+t2  f(a,b=2); f()            -> TypeError: argument num/types mismatch
+t3  f(a,b=2); f(b=3)         -> TypeError: function missing required positional argument #0
+t4  f(a,b,c=3); f(c=4)       -> TypeError: function missing required positional argument #1
+t5  f(a); f(a=1,z=2)         -> TypeError: unexpected keyword argument
+t6  f(a,b); f(1,a=2)         -> TypeError: function got multiple values for argument 'a'
+t7  f(a,*,k); f(1)           -> TypeError: function missing keyword-only argument
+t8  f(a,*,k,m=5); f(1)       -> TypeError: function missing required keyword argument 'k'
+t9  f(a,*,k,m); f(1,k=2)     -> TypeError: function missing required keyword argument 'm'
+t10 f(*a): return a is ()    -> True (empty-tuple singleton identity)
+t11 f(a,*args); f(1,2,3)     -> (2, 3)
+t12 f(a,b=2,*args,k=9,**kw); f(1,3,4,k=5,z=6) -> (1, 3, (4,), 5, {'z': 6})
+t13 f(a,b=2); f(1)           -> (1, 2)
+t14 f(a,**kw); f(a=1,a=2)    -> TypeError: function got multiple values for argument 'a'
+t15 str(TypeError) via f()   -> 'argument num/types mismatch' (TERSE confirmed)
+t16 f(**kw); f(z=1,z=2)      -> TypeError: function got multiple values for argument 'z'
+t17 f(a,*args,**kw); f(1)    -> ((), {})
+t18 f(a,b); f(1,**{"b":2})   -> 1
+t19 f(a,b=10); f(1,**{"b":20}) -> (1, 20)
+All 19 messages/behaviours are asserted by the Rust tests above
+(via SetupError variants + message()).
+
+What is NOT in this chunk
+--------------------------
+- No VM (C13), no `sp`/`old_globals` in CodeState (see §3).
+- No hash-table map (linear scan; C9 may replace it).
+- No `mp_const_empty_tuple` singleton of its own — the VM owns
+  it and passes it in (see §3).
+- No change to the original repo (read-only; git status clean).
+- No change to A1/A2/A3/B/C0/C1/M/C/FMT/RE15 code or tests
+  (baseline 215 kept intact).
+
+Commit: one commit for this chunk (see git log).
+Message: "Lane C5: port runtime bc to Rust".

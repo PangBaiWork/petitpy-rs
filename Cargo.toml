@@ -1,0 +1,14 @@
+[package]
+name = "petitpy-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of petitpy (Abilian, Zig + MicroPython 0.9.0) — native make build (full config), checked line-by-line against the original"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]

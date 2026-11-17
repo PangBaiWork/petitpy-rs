@@ -155,6 +155,7 @@ pub fn closure_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
+namedtuple_fields: None,
         unary_op: None,
         binary_op: None,
         call: Some(closure_call_slot),

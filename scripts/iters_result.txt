@@ -1,0 +1,382 @@
+Lane C11: port iterators to Rust — result
+=========================================
+
+Verdict
+-------
+- Baseline (master 55d0104): lib 663 passed + 1 ignored; bins 9.
+- This lane: lib 704 passed + 1 ignored (663 + 41 new); bins 9.
+- 0 warnings, no `unsafe`, every file < 800 lines (largest new:
+  objdeque.rs 728, objnamedtuple.rs 674). `~/workspace/petitpy-orig`
+  untouched (git status clean).
+- One commit on branch lane/iters: "Lane C11: port iterators to Rust".
+
+Source map (Zig -> Rust, 1:1)
+------------------------------
+~/workspace/petitpy-orig/src/objects/iters/ (9 files, 1,236 lines, 0 test blocks)
+  -> ~/workspace/petitpy-rs-iters/src/objects/iters/ (new module, entry in src/objects/mod.rs):
+  - objpolyiter.zig 54   -> iter.rs (tags, getiter, iternext dispatch; the
+                          polymorph-iterator type itself is the generic
+                          Obj::Iterator with the ITER_IS_ITERNEXT flag)
+  - objmap.zig 100       -> objmap.rs
+  - objfilter.zig 85     -> objfilter.rs
+  - objenumerate.zig 90  -> objenumerate.rs
+  - objzip.zig 101       -> objzip.rs
+  - objreversed.zig 87   -> objreversed.rs
+  - objgetitemiter.zig 101-> objgetitemiter.rs
+  - objnamedtuple.zig 252-> objnamedtuple.rs
+  - objdeque.zig 366     -> objdeque.rs
+  - (shared)             -> tests.rs (test support: token_bytes, heap_str,
+                          collect_all, PanicSeams)
+- src/objects/value.rs: TypeData gains `namedtuple_fields: Option<Vec<u32>>`
+  (decision (a) — fields live in the type struct, as in the Zig);
+  DequeData stub replaced by the faithful ring; the C0 `Obj::NamedTuple`
+  variant + `NamedTupleData` are RETIRED (namedtuple instances are plain
+  Obj::Tuple with header type = the namedtuple class, as in the Zig).
+  19 TypeData literals gained a mechanical `namedtuple_fields: None,`
+  line (only that line, verified by git diff).
+- BuiltinTypes: NO new fields (map/filter/zip/enumerate/reversed/deque
+  make_new take `type_` as a parameter where needed, like dict_make_new;
+  namedtuple needs only types.tuple). New types are fixture fields
+  (C9b array precedent).
+
+Iterator tags (extra[0] = SmallInt(tag), existing convention)
+-------------------------------------------------------------
+LIST=100, TUPLE=101, ARRAY=102 (existing); new: MAP=110, FILTER=111,
+ENUMERATE=112, ZIP=113, REVERSED=114, GETITEM=115, DEQUE_ITER=116.
+Dict views keep kind in `index` (extra empty); dict view iterators
+keep kind 0/1/2 in extra[0].
+
+Layouts (IteratorData source/index/extra)
+-------------------------------------------
+- map: source=fun, extra=[110, it1, ...]
+- filter: source=fun-or-None, extra=[111, iter]
+- enumerate: source=iter, extra=[112, cur: Value] (cur is a Value::int —
+  heap Int out of the 62-bit window, per the C9c precedent)
+- zip: source=None, extra=[113, it1, ...]
+- reversed: source=seq, index=cur_index, extra=[114]
+- getitemiter: source=obj, index=next index, extra=[115]
+- deque-it: source=deque, index=cur (ring position), extra=[116];
+  reads the deque payload live each step (matches the
+  appendleft-between-next probe)
+
+Dispatch collision (len==2 extra): a range iterator stores [stop, step]
+with no tag, and map-1/filter/zip-1/enumerate also have two extra
+entries; a range's stop can numerically equal a tag (range(110,115)).
+Resolution by shape: extra[1] is an Obj::Iterator -> map-1/filter/zip-1
+(dispatch by tag); otherwise extra[1] is an int -> range (source is
+Obj::Range) or enumerate (extra[0]==112, source is the sub-iterator).
+Dict views (extra empty) -> "object not an iterator" from iternext.
+
+Seams (local, C13 consumes — same pattern as C10's local runner seam)
+----------------------------------------------------------------------
+- CallOutcome { Value(Value), Stop, Raise } — outcome of a VM call made
+  on behalf of iterator machinery. Stop = callee raised StopIteration
+  or IndexError; Raise = anything else. map/filter treat both Stop and
+  Raise as Err(PyRaise) (the Zig propagates a func raise as an error,
+  never as end-of-iteration); only the getitem iterator treats Stop as
+  end-of-iteration.
+- IterSeams<'a> { call, getitem }: `call` calls a function value (map
+  func, filter predicate, reversed's `__reversed__` method with the
+  object passed as its first argument — the bound call); `getitem` calls
+  obj.__getitem__(index) with Stop/Index classification. The getitem
+  seam is a separate closure because the bound `__getitem__` method
+  value cannot be produced without C12's method lookup; its contract is
+  exactly the Zig's mp_call_method_n_kw([__getitem__ method, obj, index])
+  + excIsStopOrIndex classification, packaged as one operation.
+- InternFn<'a> = &'a mut dyn FnMut(&[u8]) -> PyResult<u32> — the
+  interning seam: qstr_from_strn needs &mut RuntimeQstr, but CallCtx.pool
+  is a shared &. The named-tuple factory (and make_new, for heap-Str kw
+  keys) takes the interning closure as a parameter; the VM (which owns
+  the pool mutably) supplies it. In tests the fixture pre-interns the
+  names and the seam is a find_strn lookup over the (shared) pool,
+  panicking on a miss (test bug).
+- getiter(ctx, value) -> PyResult<Value> (local, iters module):
+  (1) Obj::Iterator -> as-is; (2) type flags & 0x0080 -> as-is;
+  (3) type.getiter Some -> call it (Err(PyRaise) falls through per the
+  C6 convention); (4) type.subscr Some -> build a getitem iterator (the
+  Zig loads `__getitem__` as a method; the Rust interim routes through
+  the subscr slot — see divergences); (5) else "object not iterable".
+- iternext(ctx, it, seams) -> PyResult<Option<Value>>: Ok(Some(v)) =
+  next item, Ok(None) = StopIteration, Err(PyRaise) = the iterator
+  raised. Dispatches on the IteratorData tag. Non-Iterator values ->
+  PyRaise "object not an iterator" (user iterators with `__next__`
+  are C12's method machinery — documented gap).
+
+Probed behaviours (all on ~/workspace/petitpy-orig/zig-out/bin/petitpy)
+------------------------------------------------------------------------
+- Deque: `from collections import deque` is a PURE PYTHON list-backed
+  wrapper (petitpy-lib/collections/__init__.py); the NATIVE Zig deque is
+  `ucollections.deque` (modcollections.zig IS the ucollections module).
+  All native-deque probes use `import ucollections; deque =
+  ucollections.deque` (ucollections.deque is collections.deque -> False).
+  deque([1,2],2)->[1,2]; deque([1,2,3],2)->[2,3] (maxlen eviction);
+  deque([],2,0)/([],2,1)->[]; deque([1,2],-1)->ValueError EMPTY message;
+  deque([1,2],0)->[] (maxlen 0 stays empty even after append);
+  deque(5)->"object not iterable"; deque([1],'x')->"can't convert to int";
+  deque([1],maxlen=1)->mismatch (no kwargs); deque()/deque([])/
+  deque([1,2])->mismatch (sig min 2). Methods: append/appendleft/pop/
+  popleft/extend ONLY (clear/count/rotate/remove/index/extendleft all
+  False); 99 in d -> True (VM iteration fallback); pop/popleft empty ->
+  IndexError('empty'); overflow flag (3rd arg 1): append/appendleft ->
+  IndexError('full'); eviction without flag: append evicts left
+  ([1,2]+3->[2,3]), appendleft evicts right; iterator: next after
+  appendleft returns the element at the stale cur ([1,2,3], next->1,
+  appendleft(0), next->2, rest=[3] — cur walks to live i_put, not
+  re-synced to i_get); del d[0] -> "object doesn't support item
+  deletion"; d[1:3] -> "indices must be integers"; d[-100]/d[100] ->
+  IndexError "index out of range"; repr/str -> `<deque>`; d == deque ->
+  False; type(iter(d)) -> `<class 'iterator'>`; extend(5) -> "object not
+  iterable"; deque([], 2**70) -> OverflowError "overflow converting long
+  int to machine word"; deque([], 2**62) -> ABORTS rc=134 (Zig integer
+  overflow panic at objdeque.zig:96, o.alloc * @sizeOf(Obj) overflow).
+- map: list(map(str,[1,2]))->['1','2']; map(f,[1,2],[10,20,30]) stops
+  at shortest -> [11,22]; map(str) (0 iters) -> mismatch; map(None,[1,2])
+  -> "object not callable" (at first next, not construction); func
+  raising -> ValueError propagates; map(str,[1],5) raises "object not
+  iterable" AT CONSTRUCTION.
+- filter: filter(None,[0,1,0,2,"","a"])->[1,2,'a']; pred works; 1 arg /
+  3 args -> mismatch; non-iterable -> "object not iterable";
+  filter(str,5) raises at construction.
+- enumerate: [('a','b'),5]->[(5,'a'),(6,'b')]; start -1 -> [(-1,'a')];
+  start 2**70 -> OverflowError "overflow converting long int to machine
+  word"; kw start=/iterable= work; bad kw / 3 positional -> mismatch;
+  float start -> "can't convert to int"; enumerate(['a'],1,start=2) ->
+  mismatch (duplicate); enumerate(['a'],start=1,iterable=['b']) ->
+  mismatch.
+- zip: zip([1,2],[3])->[(1,3)]; zip()->[]; zip([1,2])->[(1,),(2,)];
+  3 iters stops at shortest; kw strict -> mismatch; non-iterable ->
+  "object not iterable"; zip([1],5) raises at construction.
+- reversed: list/tuple/range/str/empty work; reversed(iter([1])) ->
+  "object has no len"; reversed(5) -> "object has no len";
+  reversed({'a':1}) -> KeyError(0) (len=1 then subscr(dict,0) — the Zig
+  does NOT check for a sequence type; faithful port reproduces this via
+  generic len+subscr); custom `__reversed__` -> delegation works ([9,8]);
+  `__reversed__` returning 5 -> "object not iterable" (the returned
+  value is used as-is, getiter fails later); reversed({1,2}) ->
+  "object isn't subscriptable" (with apostrophe — obj.zig:172);
+  namedtuple(b'T',[b'x']) -> "can't convert to str implicitly" (bytes
+  names rejected).
+- getitemiter: GetOnly class (__getitem__ IndexError at 3) -> [0,10,20];
+  StopIteration at 2 -> [0,1]; ValueError at 1 -> propagates; KeyError
+  at 1 -> propagates (NOT a stop — only StopIteration/IndexError
+  convert); iter(iter([1])) is iter([1]) -> False (fresh overlay each
+  time); next(iter([])) -> bare StopIteration.
+- namedtuple: P(1) -> "function takes 2 positional arguments but 1 were
+  given"; P(1,2,3) -> "...but 3 were given"; P(x=1,x=2) -> "function got
+  multiple values for argument 'x'"; P(z=1) -> count error (count check
+  fires FIRST — total 1 != 2); P(x=1,z=2)/P(z=1,y=2)/P(1,z=2) ->
+  "unexpected keyword argument 'z'" (count matches, then kw check);
+  P._fields/_make/_asdict/_replace -> AttributeError "no attribute..."
+  (NOT exposed); P.count/P.index -> AttributeError "no attribute..."
+  (no tuple methods via attr); repr P(x=1, y=2); P+tuple -> (1,2,3)
+  plain tuple; P*2 -> (1,2,1,2); 2*P -> TypeError "unsupported types
+  for __mul__: 'int', 'P'"; P<P -> True; hash(P(1,2)) -> 22815555 (=
+  ROM seed 22815552 + 3, same as tuple (1,2)); P(1,2).x=5 and
+  del P(1,2).x -> AttributeError "no attribute 'x'" (NOT "can't set
+  attribute" — the VM's setattr path never reaches the slot's store
+  branch with that message; the slot itself raises "can't set attribute"
+  per the Zig — record as C12/C13 note, port the slot as written);
+  fields as tuple works; fields as generator -> "expected tuple/list";
+  fields None / 5 -> "expected tuple/list"; field names NOT validated
+  ('a-b', '1x', '' all accepted, printed as-is); duplicate field names
+  allowed (R(['a','a']), .a -> first match, 1); S([]) -> S();
+  namedtuple(123,['x']) and namedtuple('T',[1,2]) -> "can't convert to
+  str implicitly"; 1 arg / 3 args -> mismatch; P.__bases__ ->
+  (<class 'tuple'>,); P.__name__ -> 'P'; print(P) -> `<class 'P'>`;
+  bool(P(1,2)) True, empty namedtuple False; list(P(1,2)) -> [1,2];
+  namedtuple('T',['x'],defaults=[1]) -> mismatch;
+  namedtuple('T','a b\tc') -> fields a,b,c;
+  namedtuple('T',' a ') -> field a.
+- type(iter(...)) -> `<class 'iterator'>` for str, bytes, list, tuple,
+  range, dict, set, and iter-of-iter alike; list(iter('héllo')) ->
+  ['h','é','l','l','o'] (UTF-8 chars); list(iter(b'ab')) -> [97, 98].
+
+Intentional divergences (original aborts or is undefined; Rust raises/returns)
+------------------------------------------------------------------------------
+- deque([], 2**62): original ABORTS rc=134 (objdeque.zig:96 overflow);
+  Rust returns OutOfMemory (try_reserve_exact failure).
+- getitemiter method load is LAZY (at each next step through the getitem
+  seam); the Zig loads `__getitem__` EAGERLY at getiter time and stores
+  the bound method. C13 may hoist the load into getiter once method
+  lookup exists.
+- str iteration goes through the getitem fallback (subscr slot), not the
+  Zig's dedicated str iterator (objstr.zig:3662); observably identical
+  (same values, same 'iterator' type name) except the construction path.
+- enumerate counter out of the 62-bit window: the Zig's `newSmallInt`
+  is a raw shift with no window check (address-dependent garbage);
+  Rust keeps the true value as a heap Int.
+- deque make_new/extend use `collect_iterable` (the C9 tuple/dict
+  pattern), NOT the streaming mp_iternext loop: (1) an infinite iterable
+  with the overflow flag would hang here where the Zig raises "full"
+  after maxlen+1 appends; (2) C11 iterators (map/filter/...) are not
+  `collect_iterable` shapes — deque(map(...), n) reports "object not
+  iterable", the same limitation tuple/dict already have; the general
+  protocol is C13's.
+- reversed(dict) KeyError payload dropped at the slot boundary (C6
+  convention); the test asserts the raise, not the payload.
+- ADD still diverges: the Zig uses subclass-fast (namedtuple IS a tuple
+  subclass, a+(3,) works), Rust requires an exact tuple — C12 must
+  relax it (already recorded by C9c).
+
+Brief corrections (the brief's premises were wrong; the code follows the original)
+----------------------------------------------------------------------------------
+- The brief's deque method list (extendleft/rotate/clear/count/index/
+  remove) is WRONG for the native deque — only append/appendleft/extend/
+  pop/popleft exist (locals dict, objdeque.zig).
+- `collections.deque` vs `ucollections.deque` (see probes): the native
+  deque is ucollections.deque; collections.deque is a pure-Python wrapper.
+- The brief's "MapData" premise for set backing was already corrected by
+  C9c (mp_set_t, map.zig:46).
+
+Zig facts pinned in code
+-------------------------
+- objpolyiter.zig: polymorph iterator type stores `iternext` fn-ptr at
+  offset 8; flags 0x0080 (MP_TYPE_FLAG_ITER_IS_ITERNEXT), name `iterator`,
+  no make_new.
+- objmap.zig: MpObjMap { base, n_iters, fun, iters[] flex }; sig
+  (2<<17)|(0xffff<<1)|0 = min 2, max MAX, no kw; make_new calls
+  mp_getiter on each positional arg; iternext pulls one item from EACH
+  sub-iterator (StopIteration on any -> stop), then
+  mp_call_function_n_kw(fun, n, 0, nextses).
+- objfilter.zig: MpObjFilter { base, fun, iter }; sig exactly 2, no kw;
+  iternext loops pulling until predicate passes; fun == OBJ_NONE ->
+  truthiness filter (no call); else mp_call_function_n_kw(fun, 1, 0, &next)
+  + mp_obj_is_true.
+- objenumerate.zig: MpObjEnumerate { base, iter, cur: isize }; kw-args
+  path via mp_arg_parse_all_kw_array (allowed: `iterable` required-obj,
+  `start` int default 0); iternext yields (newSmallInt(cur), next) tuple,
+  cur += 1.
+- objzip.zig: MpObjZip { base, n_iters, iters[] flex }; sig (0, MAX, no
+  kw); make_new calls mp_getiter on each positional arg; iternext:
+  n_iters==0 -> StopIteration immediately; else builds a fresh tuple,
+  pulls from each iterator (any StopIteration -> free tuple, return stop).
+  NO `strict` support.
+- objreversed.zig: MpObjReversed { base, seq, cur_index: usize }; sig
+  exactly 1, no kw; make_new FIRST tries mp_load_method_maybe(args[0],
+  __reversed__) — if found, returns mp_call_method_n_kw(0, 0, &dest)
+  directly (the __reversed__ result, NOT wrapped); else cur_index =
+  mp_obj_get_int(mp_obj_len(args[0])); iternext: cur==0 -> stop; else
+  cur-=1, mp_obj_subscr(seq, newSmallInt(cur), SENTINEL).
+- objgetitemiter.zig: MpObjGetitemIterFull { base, args[3] } (args[0]=
+  method, args[1]=self, args[2]=index small-int); iternext calls
+  mp_call_method_n_kw(1, 0, args); if pending_exc set: StopIteration/
+  IndexError (exc type ptr == &mp_type_StopIteration or
+  &mp_type_IndexError) -> OBJ_STOP_ITERATION, else re-raise; on success
+  index += 1. Type mp_type_it, name `iterator`, flags 0x0080, no make_new.
+- objnamedtuple.zig: factory mp_namedtuple_obj is a 2-arg builtin
+  (FunBuiltin_2); new_namedtuple_type_2(name, fields): name via
+  mp_obj_str_get_qstr; if fields is qstr/str -> split on whitespace
+  (mp_obj_str_split); mp_obj_get_array for the fields (requires
+  tuple/list — else TypeError "expected tuple/list"); newNamedtupleType
+  allocates NamedtupleType (MpObjType + slots[8] + n_fields + qstr
+  fields[] flex); type header flags = FLAG_EQ_CHECKS_OTHER_TYPE (0x0008,
+  mp_mirrors.zig:678), name = given name, slot indices make_new=1,
+  print=2, unary=3, binary=4, attr=5, subscr=6, iter=7, parent=8 (slot 8
+  = &mp_type_tuple); slots = namedtuple_make_new, namedtuple_print,
+  tuple_unary_op, tuple_binary_op, namedtuple_attr, tuple_subscr,
+  tuple_getiter, parent. namedtuple_make_new (objnamedtuple.zig:163):
+  requires n_args + n_kw == num_fields else TypeError "function takes %d
+  positional arguments but %d were given"; positional fill, remaining
+  slots zeroed (OBJ_NULL), then kw fill by name; unknown kw ->
+  "unexpected keyword argument '%q'"; duplicate -> "function got multiple
+  values for argument '%q'". Instance is a PLAIN TUPLE with
+  tuple.base.type = type_in. namedtuple_print: prints %q (type name) +
+  mp_obj_attrtuple_print_helper(print, fields, tuple). namedtuple_attr:
+  load -> findField (first match wins) -> items[id]; store/delete ->
+  AttributeError "can't set attribute". ASDICT branch DEAD
+  (MICROPY_PY_COLLECTIONS_NAMEDTUPLE__ASDICT=0) — _asdict/_make/_replace/
+  _fields are NOT in this file.
+- objdeque.zig: ring buffer, alloc = maxlen+1; len = (i_put - i_get) mod
+  alloc; MpObjDeque { base, alloc, i_get, i_put, items, flags };
+  FLAG_CHECK_OVERFLOW = 1; make_new sig makeFunSig(2,3,false) = min 2,
+  max 3, no kw (iterable, maxlen, flags); order: maxlen via
+  mp_obj_get_int(args[1]), negative -> ValueError (bare,
+  mp_obj_new_exception — no message); alloc ring; flags =
+  mp_obj_get_int(args[2]) if n_args>2; then dequeExtendImpl (getiter +
+  iternext loop + append). unary: BOOL = i_get!=i_put, LEN = dequeLen.
+  append: new_i_put wraps at alloc; overflow flag + new_i_put==i_get ->
+  IndexError "full"; write, advance i_put; if i_get==new_i_put, advance
+  i_get (evict left). appendleft: new_i_get wraps; overflow flag +
+  new_i_get==i_put -> "full"; write at new_i_get (i_get=new_i_get FIRST,
+  then write); if i_put==new_i_get, move i_put back (evict right:
+  i_put==0 -> alloc-1 else i_put-=1). extend: getiter + append loop.
+  pop/popleft: empty (i_get==i_put) -> IndexError "empty"; popped slot
+  set to OBJ_NULL. subscr: value==OBJ_NULL (delete) -> NULL ("object
+  doesn't support item deletion" from the generic path); else
+  mp_get_index(type, len, index, false) (slice -> TypeError "indices must
+  be integers"; OOB -> IndexError "index out of range"); load ->
+  items[(i_get+offset) % alloc]; store -> items[...] = value. Deque
+  iterator MpObjDequeIt { base, iternext fn-ptr, deque, cur }: cur starts
+  at deque.i_get; next: cur != i_put -> items[cur], cur+=1 (wrap at
+  alloc); else stop. NOTE: cur is NOT re-synced to i_get after creation
+  (mutation between next() calls shows through via the live i_put/items).
+  Locals dict has ONLY 5 methods: append, appendleft, extend, pop,
+  popleft. Type flags 0x0000 (ITER_IS_GETITER = 0, i.e. getiter slot);
+  print slot = 0 -> `<deque>` via C6 fallback.
+
+Sig-error model (polled, C9b precedent)
+----------------------------------------
+map/filter/zip/deque sig checks are POLLED: record the sig error,
+proceed, a later error (getiter/extend) overwrites it, return the sig
+error at the end if nothing overwrote it. map(str)/map()/filter 1-or-3
+args/zip kwargs/deque 0-1 args or 4+ args or kwargs -> mismatch;
+map(str,[1],5)/filter(str,5)/zip([1],5)/deque(5) -> "object not
+iterable" (construction-time getiter/extend error wins).
+- map/zip getiter ONLY the positionals (the Zig loops args[0..n_args]);
+  keyword pairs are never getiter'd (a kw key is a qstr — getiter'ing it
+  would spuriously fail in the fixture, where str has no getiter slot).
+- deque reads maxlen/flags only from real positional slots (n_pos =
+  args.len() - 2*n_kw); with < 2 positionals the Zig's args[1] read lands
+  on a kw key/past the end — unobservable, the sig error is raised.
+- enumerate parse is NOT polled (the Zig returns NULL as soon as the
+  parse sets pending_exc) — a bad start fails before getiter.
+
+Reversed `__reversed__` lookup (interim)
+------------------------------------------
+Reads the operand type's dict for a `"__reversed__"` entry (id via
+ctx.pool.find_strn(b"__reversed__"); 0 -> skip). Instance-dict lookup
+is C12's. Bound call passes the object as the method's first argument
+through the call seam. Sig-error interaction: method found + call
+success + sig_err -> mismatch (result discarded); call failure -> that
+error wins.
+Reversed iternext calls the subscr slot DIRECTLY (not via call_subscr,
+which erases raise-vs-not-implemented): slot None ->
+ObjError::NotSubscriptable ("object isn't subscriptable"); slot
+Err(PyRaise) -> PyRaise (e.g. dict KeyError, payload dropped per C6).
+Cursor decremented BEFORE the subscript (the Zig's order — a raising
+subscript leaves the iterator advanced).
+
+Known gaps (fixture limitations, NOT fake-done)
+------------------------------------------------
+- The fixture's plain str type carries no LEN/subscr/getiter slots (the
+  production str type, C8a, does), so three reference-probed behaviours
+  are NOT exercised in Rust tests: filter(None, [..., "", ...]) dropping
+  "", reversed('ab') -> ['b','a'], and getiter(str) via the subscr
+  fallback. The fallback logic IS tested via a custom type with a
+  subscr slot (tuple_subscr) — see getitem_iter_via_getiter_fallback.
+- End-to-end str iteration through the real subscr slot is NOT testable
+  in this lane (kind erasure at the slot boundary — the subscr slot
+  returns bare PyRaise, so the Stop/Index distinction is unobservable;
+  the logic is stub-tested; C13's VM integration covers the live path).
+- No attr/method-load helper exists in Rust yet (C12 owns it).
+- namedtuple class mro is [] in the fixture (C12 computes real MROs);
+  `issubclass(P, tuple)` reads base/mro in C12. P.__bases__ == (tuple,)
+  pins base.
+- `deque([], 2**62)` abort divergence and the collect_iterable limits
+  are documented above.
+
+Merge note for C13 (and C12)
+-----------------------------
+- C13 consumes: `iternext` dispatch + the call/getitem/intern seams +
+  the namedtuple type shape (namedtuple_fields on TypeData, flags 0x0008,
+  base=tuple, tuple slots) + the getitemiter lazy-load divergence +
+  the ADD subclass-fast divergence (still owed to C12).
+- C13 owns: replacing PENDING_STR_ERROR with VmState.pending_exc;
+  wiring bc.rs local map_lookup; the Print-based mp_print_* exports;
+  to_bytes FunBuiltin; str.format kwargs pass-through; `__format__`/
+  nativeBase; unifying the two C10 lanes' local runner seams.
+- C12 owns: attr slot + method lookup (load_method), the getiter-slot
+  str iterator (replacing the getitem fallback for str), real MROs,
+  relaxing ADD for namedtuple (subclass-fast), ROM singletons
+  (TUPLE_HASH_SEED should become the ROM empty-tuple singleton's
+  identity word when it lands).

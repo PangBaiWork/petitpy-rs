@@ -406,5 +406,6 @@ pub fn range_type_data(dict: GcRef) -> TypeData {
         subscr: Some(range_subscr),
         buffer: None,
         print: Some(range_print),
+        namedtuple_fields: None,
     }
 }

@@ -260,5 +260,6 @@ pub fn property_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: None,
+        namedtuple_fields: None,
     }
 }

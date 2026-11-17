@@ -224,6 +224,7 @@ pub fn bound_meth_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
+namedtuple_fields: None,
         unary_op: Some(
             |ctx: &mut CallCtx, op: UnaryOp, self_: Value| bound_meth_unary_op(ctx, op, self_),
         ),

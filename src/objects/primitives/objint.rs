@@ -268,6 +268,7 @@ pub fn int_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: Some(int_print),
+        namedtuple_fields: None,
     }
 }
 

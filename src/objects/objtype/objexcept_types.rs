@@ -77,6 +77,7 @@ pub fn exc_type_data(name: u32, base: Option<GcRef>, mro: Vec<GcRef>, dict: GcRe
         base,
         mro,
         dict,
+namedtuple_fields: None,
         unary_op: None,
         binary_op: None,
         call: None,

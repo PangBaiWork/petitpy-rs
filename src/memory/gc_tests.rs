@@ -338,6 +338,9 @@ fn header_type_is_traced() {
             binary_op: None,
             call: None,
             getiter: None,
+            subscr: None,
+            buffer: None,
+            print: None,
         }),
         &roots,
     );

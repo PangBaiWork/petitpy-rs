@@ -1,0 +1,248 @@
+Lane RE15 result — port of the re1.5 regex engine to Rust
+=========================================================
+Worktree ~/workspace/petitpy-rs-re15, branch lane/re15, base master e68c7e1.
+Status: DONE, awaiting main-agent verification. NOT merged.
+
+Source (patched, NOT vanilla vendor)
+------------------------------------
+Port target is petitpy's `port/re1.5-patched/` (5 files), the version
+actually compiled by `make build`:
+  - `port/Makefile:103-110` copies vanilla `vendor/micropython/lib/re1.5/*`
+    into the embed package, then overlays it with `port/re1.5-patched/*`.
+  - `build.zig:747` comment confirms only the embed copy is compiled
+    (the engine files are `#include`d by the embed `modre.c`).
+  - `diff -q` between the two trees confirms they differ.
+Patch core (2026-07-20): Jmp/Split/RSplit jump offsets int8 -> int16
+little-endian (every jump instruction is now 3 bytes: opcode + lo + hi);
+NON_ANCHORED_PREFIX 5 -> 7. `charclass.c` is identical to vanilla.
+
+1:1 mapping (patched C -> Rust)
+--------------------------------
+re1.5.h (156) -> src/vendor/re15.rs (opcodes, constants, types)
+  enum Inst.opcode      -> pub const CHAR/ANY/CLASS/CLASS_NOT/
+                           NAMED_CLASS/BOL/EOL/JMP/SPLIT/RSPLIT/
+                           SAVE/MATCH (values unchanged)
+  NON_ANCHORED_PREFIX 7 -> pub const NON_ANCHORED_PREFIX: usize = 7
+  RE15_CLASS_NAMED_CLASS_INDICATOR 0
+                        -> pub const CLASS_NAMED_CLASS_INDICATOR: u8 = 0
+  struct re_prog        -> pub struct ByteProg { bytelen, len, sub,
+                           insts: Vec<u8> } (bytelen == insts.len()
+                           by construction)
+  struct re_sub         -> pub struct Sub { start/end: Option<usize> }
+                           (matched iff start is Some, mirroring
+                           modre.c's NULL check on the start pointer)
+  struct re_subject     -> pub struct Subject<'a> { bytes, begin_line,
+                           begin, end } + Subject::whole()
+  (declarations only, no .c file in this tree -> NOT ported, see below)
+
+compilecode.c (239) -> src/vendor/re15_compile.rs
+  _compilecode          -> fn compile_code (recursive; term/start/
+                           alt_label; byte_at returns 0 past the end
+                           for the C NUL-terminator peeks)
+  re1_5_compilecode     -> fn compile_into (writes the 7-byte
+                           non-anchored prefix + Save 0 / Save 1 /
+                           Match framing; check_trailing=true for
+                           compilecode, false for sizecode)
+  re1_5_sizecode        -> pub fn sizecode (None = C's -1)
+  re1_5_compilecode     -> pub fn compilecode (in re15.rs)
+  INSERT_CODE / REL(at,to)=to-at-3 / EMIT / EMIT_CHECKED (i8, Save
+  slots + class counts) / EMIT_JMP_CHECKED (i16 LE)
+                        -> fn insert_code / fn rel / fn emit_checked /
+                           fn emit_jmp_checked (in re15.rs, shared)
+
+charclass.c (41) -> src/vendor/re15_match.rs
+  _re1_5_classmatch     -> fn class_match (count byte read as SIGNED
+                           char; ranges compare as signed chars)
+  _re1_5_namedclassmatch-> fn named_class_match (off = (pc>>5)&1;
+                           lowercase=positive, uppercase=negated;
+                           d=[0-9], s=space or \t..\r, w=[A-Za-z0-9_])
+
+recursiveloop.c (87) -> src/vendor/re15_match.rs
+  _read_jmp_off         -> fn read_jmp_off (lo=u8, hi=i8 sign-extended)
+  _recursiveloop        -> pub(crate) fn recursiveloop (index-based;
+                           Split tries fall-through first, RSplit
+                           tries the jump target first; Save restores
+                           the old value on backtrack and skips
+                           (continues, no recursion) when the slot is
+                           >= nsubp; Bol checks sp != begin_line; Eol
+                           checks sp != end; unknown opcode -> panic!)
+  re1_5_recursiveloopprog -> pub fn recursiveloopprog (whole &[u8])
+                           + pub fn recursiveloopprog_subject (full
+                           Subject; the brief's &[u8] form cannot
+                           express begin_line != begin, which modre.c
+                           needs for pos/endpos — see boundary below)
+
+dumpcode.c (65) -> src/vendor/re15.rs, pub fn dumpcode -> String
+  (jump targets printed as pc + off + 2; `class %d` count; pair bytes
+  via %02x on a signed char, sign-extended, e.g. 0x80 -> ffffff80;
+  final line `Bytes: %d, insts: %d`)
+
+modre.c boundary (the caller; modre.c itself is NOT ported — Phase D)
+-----------------------------------------------------------------------
+modre.c uses exactly four entry points, all mirrored above:
+sizecode / compilecode / recursiveloopprog / dumpcode. The probe
+battery (src/vendor/re15_probe.rs) replicates modre.c's loops, so the
+engine is exercised the way Phase D's modre port will use it:
+  - re_split: stop at the first empty match; NotImplementedError when
+    sub > 0; maxsplit via `maxsplit > 0 && --maxsplit == 0`.
+  - re_sub_helper: pre-match text + replacement per match; replacement
+    loop ported literally — `\1`..`\9`, `\g<n>`, `\\`, wrapping u32
+    group number (C: unsigned int), invalid group -> IndexError,
+    no-match -> return the subject unchanged.
+  - re_exec_helper pos/endpos clamping: pos clamped to [0, len],
+    endpos clamped to [pos, len] (against the already-clamped pos).
+  - caps array is (sub+1)*2 pointers, zero-initialised; group 0 is
+    the whole match.
+  - re1_5_fatal(x) is `#define`d to `assert(!x)` (modre.c:506) -> Rust
+    `panic!`.
+  - re1_5_stack_chk() is `mp_cstack_check()` (modre.c:42) -> NO Rust
+    equivalent; the matcher recurses without a stack check (see the
+    (a*)* finding below).
+
+NOT ported (declaration-only in re1.5.h, no .c file in this tree)
+------------------------------------------------------------------
+backtrack / pikevm / thompsonvm / recursiveprog — declared in
+re1.5.h, no implementation anywhere in petitpy or the vendored
+MicroPython; modre.c never calls them. Also NOT ported: modre.c
+itself (Phase D), and `petitpy-lib/re.py` (a pure-Python shim over
+`ure` — see the oracle finding below; it is a separate layer).
+
+Oracle findings (verified empirically on the reference binary)
+--------------------------------------------------------------
+- The binary's `import re` is NOT the engine: `petitpy-lib/re.py`
+  rewrites patterns before handing them to the engine — brace
+  expansion ({n}/{n,m}/{n,} -> explicit repetition), IGNORECASE
+  widening ([aA] per letter), `fullmatch` = compile `(?:pat)$` then
+  `.match`, plus a `findall` method. It even "repairs" unbalanced
+  parens: `re.compile("(")` succeeds because its brace pass turns
+  `"("` into `"()"`. ORACLE FOR THIS LANE IS `import ure` DIRECTLY.
+- `ure` module surface in the binary: compile/match/search/sub only.
+  No module-level split (only a method on compiled patterns), no
+  fullmatch, no findall, no DEBUG (MICROPY_PY_RE_DEBUG is off, so
+  dumpcode is NOT compiled into the binary — no binary oracle exists
+  for dump output; dumps were verified against a standalone gcc build
+  of the patched C sources, /tmp/re15_c_harness/).
+- Patched int16 confirmed in the running binary: long alternation
+  "x"*150 + "|y" compiles and matches (vanilla int8 would fail at
+  offset ~150 > 127).
+- `ure.compile("(")` -> ValueError "error in regex" (NOT "regex too
+  complex": modre.c raises that from sizecode only when
+  MICROPY_ERROR_REPORTING >= NORMAL, which this build does not set).
+- Limits verified on the binary (patched int16): class count 127 OK /
+  128 ERR; groups 63 OK / 64 ERR; "(" + "a"*16000 + ")?" OK /
+  "(" + "a"*17000 + ")?" ERR (offset ~34000 > 32767); "b"*5000+"|a" OK.
+  The vanilla `.exp` expectations in `re_limit.py` (all 7 Error) do
+  NOT hold under the patch — 5 of the 7 now compile.
+- `(a*)*` vs "aaa" ABORTS the reference binary (rc=134, SIGABRT):
+  `mp_cstack_check` fires; stderr shows >10000 `recursiveloop`
+  frames (Split at recursiveloop.c:62, Save at :78). Upstream
+  `re_stack_overflow.py` expects RuntimeError, but this Debug build
+  hard-aborts instead. The Rust port has no stack check and overflows
+  the thread stack the same way — `(a*)*`-style nested-quantifier
+  cases are EXCLUDED from the unit tests and the probe battery.
+- startpos/endpos semantics verified via `ure` compiled methods
+  (matches re_start_end_pos.py): `^o` with pos=1 -> None (Bol anchors
+  to begin_line=0, not begin); `o$` with endpos=2 on "dog" -> match,
+  endpos=3 -> None; negative pos clamps to 0; endpos < startpos ->
+  endpos = startpos; match("dog", 5) -> None.
+- Empty pattern matches empty and non-empty; `a*` on "" matches;
+  `a+` on "" does not; bytes patterns/subjects work.
+- sizecode quirk (verified on the C harness): `sizecode("a)")`
+  returns a size (14) while `compilecode("a)")` fails — sizecode's
+  dummy starts at 5 + NON_ANCHORED_PREFIX = 12 and never checks the
+  trailing `)`. modre.c raises "error in regex" either way.
+- Upstream tests mined for the battery:
+  vendor/micropython/tests/extmod/re*.py — re1.py, re_debug.py
+  (+.exp, vanilla dump format, NOT valid for the patched engine),
+  re_error.py, re_group.py, re_groups.py, re_limit.py (+.exp, vanilla
+  limits, NOT valid under the patch), re_namedclass.py, re_span.py,
+  re_split.py, re_split_empty.py (+.exp), re_split_notimpl.py (+.exp,
+  expects NotImplementedError), re_stack_overflow.py (+.exp, expects
+  RuntimeError — does NOT hold, binary aborts), re_start_end_pos.py,
+  re_sub.py, re_sub_unmatched.py.
+
+Deliberate deviations from the C (all documented in code too)
+-------------------------------------------------------------
+- re1_5_fatal -> panic!; re1_5_stack_chk -> no equivalent (above).
+- ByteProg::bytelen is kept equal to insts.len() by construction
+  (the C updates it incrementally; same invariant).
+- Errors: C returns NULL / -1 / 1; Rust returns CompileError (kinds
+  name the exact C failure site: TrailingBackslash,
+  UnterminatedClass, UnmatchedParen, UnexpectedCloseParen,
+  NothingToRepeat, OffsetOverflow, SlotOverflow) and None from
+  sizecode.
+- NUL byte in a pattern truncates it (C string semantics — the
+  `while` condition includes `pat[i] != 0`).
+- Negative class-count byte is treated as 0 in class_match (the C
+  would spin forever on `while (cnt--)` with a negative count;
+  unreachable from compilecode since cnt <= 127).
+- File layout: the port was first written as one 900-line re15.rs,
+  over the 800-line cap, so it was split into re15.rs (436, public
+  API/types/shared helpers/sizecode/compilecode/recursiveloopprog/
+  dumpcode) + re15_compile.rs (278) + re15_match.rs (215). The two
+  halves are child modules of re15.rs declared with
+  `#[path = "..."]` (a child module of a non-mod.rs file resolves to
+  a directory named after it, not to a sibling file).
+
+Divergences: ure (this port) vs CPython `re` (bytes)
+----------------------------------------------------
+Recorded by scripts/gen_re15_vectors.py (CPython is a cross-check
+only; the vectors keep ure's answers). 20 divergences in the final
+battery (302 cases):
+- `{n,m}` quantifiers: ure treats `{` as a literal byte
+  (a{2} on "aa" -> NOMATCH; a{2} on "a{2}" -> MATCH 0 4); CPython
+  treats them as quantifiers. (3 cases)
+- `[]` / `[^]]`: ure treats `]` as closing the class immediately
+  (empty class / empty negated class); CPython treats `[]]` as a
+  class containing `]`. (2 cases)
+- `.` matches `\n` in ure; CPython bytes `.` does not. (2 cases)
+- NUL in a pattern truncates it (C string semantics); CPython treats
+  `\x00` as a literal byte. (3 cases)
+- split stops at the first empty match and returns the remainder as
+  one piece (modre.c break); CPython splits on empty matches. (4 cases)
+- split with capture groups -> NotImplementedError (modre.c); CPython
+  includes the groups. (1 case)
+- sub `\0` -> group-0 backref (whole match); CPython -> NUL byte.
+  (1 case)
+- sub invalid group `\2` / `\9` / huge number -> IndexError;
+  CPython -> re.error. (3 cases; the huge number wraps u32 —
+  1999...9 mod 2^32 = 4294967295 >= 2 groups.)
+- sub trailing `\` -> backslash dropped; CPython -> re.error. (1 case)
+
+Tests
+-----
+- cargo test --release --lib --tests: 85 passed, 0 failed.
+  Baseline kept: A1 16 (qstr 11 + grammar_data 5), A2 17 (lexer),
+  Lane C 36 (mpn 11 + mpz_tests 14 + mpz_ops 10 + probe 1).
+  This lane: 16 (15 unit tests in src/vendor/re15_tests.rs + 1 probe
+  battery in src/vendor/re15_probe.rs).
+- Probe battery: scripts/re15_vectors.txt, 302 cases, 0 failures.
+  Per-op: compileerr 21, dump 52, match 116, matchpos 16, search 51,
+  split 21, sub 25. Generator scripts/gen_re15_vectors.py,
+  deterministic (seed 20261117; two re-runs byte-identical; the
+  brace-quantifier addition changed exactly +5 lines).
+- Unit tests cover every opcode, classes/named classes, anchors,
+  greedy/lazy quantifiers, alternation, groups, group-count boundary
+  (63 OK / 64 SlotOverflow), class-count boundary (127 OK / 128
+  SlotOverflow), jump-offset boundary (16000 OK / 17000
+  OffsetOverflow), empty pattern/subject, invalid patterns with exact
+  error kinds, sizecode/prog fields, exact dumpcode output
+  (hand-computed from the patched C, cross-checked on the C harness),
+  NUL truncation.
+- 0 warnings (clean rebuild), no unsafe in the lane's files, all
+  files < 800 lines (re15.rs 436, re15_compile.rs 278,
+  re15_match.rs 215, re15_tests.rs 386, re15_probe.rs 376),
+  original repos clean (petitpy-orig git status empty).
+
+Files (this lane)
+-----------------
+src/vendor/re15.rs, src/vendor/re15_compile.rs,
+src/vendor/re15_match.rs, src/vendor/re15_tests.rs,
+src/vendor/re15_probe.rs, src/vendor/mod.rs (wiring only),
+scripts/gen_re15_vectors.py, scripts/re15_vectors.txt,
+scripts/re15_result.txt (this file).
+Scratch only (not committed): /tmp/re15_c_harness/ (gcc build of the
+patched C sources + main.c driver used as the dump/sizecode oracle).
+
+Commit: one commit on branch lane/re15 (this file is written before
+the commit; see git log for the hash).

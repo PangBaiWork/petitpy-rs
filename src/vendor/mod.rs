@@ -11,6 +11,9 @@
 //!   conversions, comparison, hash).
 //! - [`mpz_ops`] — the `mpz_*_inpl` arithmetic / bitwise / shift /
 //!   power / divmod operations.
+//! - [`re15`] — the re1.5 regex engine (Lane RE15), ported from
+//!   petitpy's patched copy `port/re1.5-patched/` (int16 jump
+//!   offsets), not the vanilla vendor `lib/re1.5/`.
 //!
 //! Configuration this port targets (petitpy `port/mpconfigport.h`,
 //! full config): `MPZ_DIG_SIZE` is 32 on x86-64, so a digit is a
@@ -25,6 +28,7 @@
 pub mod mpn;
 pub mod mpz;
 pub mod mpz_ops;
+pub mod re15;
 
 pub use mpz::BigInt;
 
@@ -32,3 +36,7 @@ pub use mpz::BigInt;
 mod mpz_tests;
 #[cfg(test)]
 mod probe;
+#[cfg(test)]
+mod re15_probe;
+#[cfg(test)]
+mod re15_tests;

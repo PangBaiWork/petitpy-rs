@@ -289,3 +289,33 @@ fn emit_common_round_trips_use_qstr_stays_stable_across_the_compiler() {
     // module scope (<module>); first qstr should be that id.
     assert!(!module.qstrs.is_empty());
 }
+
+#[test]
+fn emitglue_raw_code_kind_and_generator_flag() {
+    // `mp_emit_glue_new_raw_code` / `mp_emit_glue_assign_bytecode`
+    // (`emitglue.zig:59-87`) have no standalone Rust form: the
+    // compile driver builds each scope's `RawCode` directly with
+    // `kind = MP_CODE_BYTECODE` (driver.rs) and fills `children`
+    // in `assemble_raw_code`, while the generator bit lives in
+    // the prelude's scope flags (there is no `is_generator` field
+    // on `RawCode` — bc.rs:101). This test pins that mapping:
+    // a module defining a generator and a plain function has two
+    // child raw codes, both BYTECODE, exactly one with the
+    // generator prelude flag set.
+    use crate::compiler::mpy::MP_CODE_BYTECODE;
+    use crate::runtime::bc::{prelude_sig_decode, MP_SCOPE_FLAG_GENERATOR};
+
+    let module = compile_src("def g():\n    yield 1\ndef f():\n    return 1\n");
+    assert_eq!(module.rc.kind, MP_CODE_BYTECODE);
+    assert_eq!(module.rc.children.len(), 2);
+    let mut gen_flags = 0;
+    for child in &module.rc.children {
+        assert_eq!(child.kind, MP_CODE_BYTECODE);
+        let mut cursor: &[u8] = &child.fun_data;
+        let sig = prelude_sig_decode(&mut cursor);
+        if sig.scope_flags & MP_SCOPE_FLAG_GENERATOR != 0 {
+            gen_flags += 1;
+        }
+    }
+    assert_eq!(gen_flags, 1, "exactly one child is a generator");
+}

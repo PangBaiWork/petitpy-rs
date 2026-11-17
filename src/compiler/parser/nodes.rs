@@ -46,6 +46,14 @@ pub(crate) fn make_node_const_object(
 ///     `00`) and zero-with-underscores (`0_0`) remain valid.
 ///   * Any character bigint.parse_literal can't consume (`123z`,
 ///     `1abc`, `0xq`). Underscore separators are allowed.
+///
+/// NOTE (C17): the validity check here is `bigint::parse_literal`
+/// — the Zig `bigint.zig` `parseLiteral`, NOT `mp_parse_num_integer`
+/// (the canonical `vendor::parsenum::parse_num_integer`, used by
+/// `int()` and the `.mpy` loader). The two agree on literal text
+/// (no sign, no whitespace — the lexer hands us the bare token);
+/// the leading-zero rule is the parser-level rule from
+/// `parser.zig:983-993`, which `parseInt` alone would miss.
 pub(crate) fn validate_int_literal(buf: &[u8]) -> ParseResult<()> {
     if buf.len() >= 2 && buf[0] == b'0' {
         let c2 = buf[1] | 0x20;
@@ -74,6 +82,12 @@ pub(crate) fn validate_int_literal(buf: &[u8]) -> ParseResult<()> {
 /// overflow, on a bad digit (including `_` — Zig's parseInt rejects
 /// underscores, so `1_000` falls through to a const_object here just
 /// as in the original), or on a non-UTF8 / empty digit run.
+///
+/// NOTE (C17): this is deliberately the stdlib `parseInt` mirror
+/// from `parser.zig:1001`, NOT `mp_parse_num_integer` (canonical:
+/// `vendor::parsenum::parse_num_integer`). Only the parser's
+/// 30-bit `SMALL_INT` leaf gate uses it; literal values go through
+/// `bigint::parse_literal` / `expr_const`.
 fn parse_int_base0(buf: &[u8]) -> Option<isize> {
     let s = std::str::from_utf8(buf).ok()?;
     let (digits, radix): (&str, u32) = if s.len() >= 2 && s.as_bytes()[0] == b'0' {

@@ -39,6 +39,7 @@ pub mod argcheck;
 pub mod bc;
 pub mod builtinevex;
 pub mod builtinimport;
+pub mod code_store;
 pub mod compile_bridge;
 pub mod frozen_modules;
 pub mod import_search;
@@ -93,5 +94,7 @@ mod runtime_tests_b;
 
 #[cfg(test)]
 mod runtime_tests_c;
+#[cfg(test)]
+mod vm_raise_tests;
 #[cfg(test)]
 mod vm_tests_b;

@@ -18,7 +18,7 @@ use crate::objects::objtype::objexcept::{
 use crate::objects::primitives::objint::parse_int_text;
 use crate::objects::primitives::ops::new_int_from_bigint;
 use crate::objects::value::{BytesData, Obj, StrData, Value};
-use crate::pyerr::PyResult;
+use crate::pyerr::{PyError, PyResult};
 use crate::runtime::bc::{decode_uint, prelude_sig_decode, prelude_size_decode, CodeState};
 use crate::runtime::runner::RunOutcome;
 use crate::runtime::vm::VmState;
@@ -26,8 +26,11 @@ use crate::runtime::vm::VmState;
 /// Convert one `.mpy` const-table entry to a `Value` (the Zig
 /// loader's `mpy` → `Obj` mapping, `mpy.zig` + `py/persistentcode.c`).
 /// `Int` text is decimal; `Float`/`Complex` text parses with
-/// `str::parse` (the FMT finding: the Zig uses libc `strtod`,
-/// correctly rounded — Rust `str::parse` matches). A `Tuple`
+/// `mp_parse_num_float` (`vendor::parsenum::parse_num_float` —
+/// the FMT finding applies: the Zig uses libc `strtod`, correctly
+/// rounded — Rust `str::parse` matches — but the entry point is
+/// the full decimal parser, so `"1e+"` / `"1j"` raise `ValueError`
+/// instead of silently becoming `0.0`). A `Tuple`
 /// converts recursively. `Ellipsis` is the VM's singleton
 /// (passed in — the ctx cannot reach `VmState`).
 pub fn obj_from_entry(
@@ -60,16 +63,46 @@ pub fn obj_from_entry(
             Ok(new_int_from_bigint(ctx.arena, types, ctx.roots, &z))
         }
         ObjEntry::Float(text) => {
+            // The Zig loader's `load_obj` calls `mp_parse_num_float`
+            // (`allow_imag = false`) here — NOT a plain `str::parse`:
+            // `"1e+"` / `"1_0.5"` / `"1j"` are ValueError / 10.5 /
+            // ValueError respectively (probed on the reference binary
+            // via hand-built .mpy files, C17), while `str::parse`
+            // would give 0.0 for all three.
             let s = String::from_utf8_lossy(text);
-            let f: f64 = s.parse().unwrap_or(0.0);
+            let f = match crate::vendor::parsenum::parse_num_float(s.as_bytes(), false) {
+                Ok(crate::vendor::parsenum::DecimalNum::Float(f)) => f,
+                Ok(crate::vendor::parsenum::DecimalNum::Complex { .. }) => {
+                    unreachable!("parse_num_float with allow_imag=false never returns Complex")
+                }
+                Err(e) => {
+                    ctx.record_raise("ValueError", Some(e.message()));
+                    return Err(PyError::PyRaise);
+                }
+            };
             Ok(Value::Heap(ctx.alloc(Some(types.float), Obj::Float(f))))
         }
         ObjEntry::Complex(text) => {
-            // Text form is `(re+imj)` / `(re-imj)` / `Nj` — parse
-            // the real/imag parts (the compiler only emits what
-            // `str::parse::<f64>` accepts for each part).
+            // Same loader path with `allow_imag = true`
+            // (`persistentcode.zig: load_obj`). The text is the
+            // vendor `PRINT_REPR` of the complex (`"(1+2j)"` when
+            // real != 0, `"2j"` otherwise — `objcomplex.c:
+            // complex_print`), and the parenthesised form does NOT
+            // parse: the reference binary raises `ValueError("invalid
+            // syntax for number")` for it (probed, C17). Only a bare
+            // `"Nj"` text loads. (The petitpy compiler never emits a
+            // COMPLEX entry — `1j` / `3+4j` become FLOAT `"1j"` /
+            // `"4j"` consts — so this arm is reachable only from
+            // foreign .mpy files.)
             let s = String::from_utf8_lossy(text);
-            let (re, im) = parse_complex_text(&s);
+            let (re, im) = match crate::vendor::parsenum::parse_num_float(s.as_bytes(), true) {
+                Ok(crate::vendor::parsenum::DecimalNum::Float(f)) => (f, 0.0),
+                Ok(crate::vendor::parsenum::DecimalNum::Complex { re, im }) => (re, im),
+                Err(e) => {
+                    ctx.record_raise("ValueError", Some(e.message()));
+                    return Err(PyError::PyRaise);
+                }
+            };
             Ok(Value::Heap(ctx.alloc(Some(types.complex), Obj::Complex { re, im })))
         }
         ObjEntry::Tuple(items) => {
@@ -81,33 +114,6 @@ pub fn obj_from_entry(
                 ctx, types.tuple, &values,
             )))
         }
-    }
-}
-
-/// Parse a complex const-table text (`(re+imj)`, `(re-imj)`,
-/// `Nj`, `re`, …) into its parts. The compiler emits the
-/// CPython `repr` form; the split is on the last `+`/`-` that is
-/// not the leading sign and is followed by a `j`-suffixed part.
-fn parse_complex_text(s: &str) -> (f64, f64) {
-    let t = s.trim().trim_start_matches('(').trim_end_matches(')');
-    if let Some(stripped) = t.strip_suffix('j') {
-        // Pure imaginary (`Nj`) or `re±imj`.
-        let mut split = None;
-        for (i, c) in stripped.char_indices().skip(1) {
-            if c == '+' || c == '-' {
-                split = Some(i);
-            }
-        }
-        match split {
-            Some(i) => {
-                let re: f64 = stripped[..i].parse().unwrap_or(0.0);
-                let im: f64 = stripped[i..].parse().unwrap_or(0.0);
-                (re, im)
-            }
-            None => (0.0, stripped.parse().unwrap_or(0.0)),
-        }
-    } else {
-        (t.parse().unwrap_or(0.0), 0.0)
     }
 }
 

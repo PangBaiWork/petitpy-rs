@@ -5,10 +5,20 @@
 //! petitpy's ZIG implementations (`src/frontend/parsenum.zig`), not
 //! the vendor C ones (see `parse_float_internal`).
 //!
-//! Only what `formatfloat.rs` needs is ported: `mp_decimal_exp`,
-//! `mp_parse_float_internal`, and the scan helpers they use. The
-//! rest of `parsenum.c` (integer parsing, `mp_parse_float`) is
-//! unrelated to formatting and is not ported here.
+//! Since Lane C17 this module is also the canonical home of the
+//! remaining `parsenum` entry points: `mp_parse_num_base`
+//! (`src/frontend/parsenumbase.zig`), `mp_parse_num_integer`,
+//! `mp_parse_num_float` / `mp_parse_num_decimal` /
+//! `mp_parse_num_complex` (`src/frontend/parsenum.zig`). The
+//! `int()` builtin (`objects::primitives::objint`) and the `.mpy`
+//! const loader (`runtime::vm_raise::obj_from_entry`) both call
+//! these; the parser's own integer helpers
+//! (`compiler::parser::nodes::validate_int_literal` /
+//! `parse_int_base0`) are NOT these entry points — they mirror the
+//! Zig parser's `validateIntLiteral` / `std.fmt.parseInt` shapes
+//! (see those docs), and stay where they are.
+
+use crate::vendor::mpz::BigInt;
 
 /// `MANTISSA_MAX` (`parsenum.c`): retain precision while not
 /// overflowing the `u64` mantissa.
@@ -94,7 +104,23 @@ fn accept_digit(mantissa: u64, dig: u32, exp_extra: &mut i32, in_state: i32) -> 
 /// rounding). The scanned text here contains only digits, `.`,
 /// `e`/`E` with an optional sign, and `_` — all handled identically
 /// by both parsers.
+///
+/// Thin wrapper over [`parse_float_internal_with_len`]: the Zig
+/// returns a NULL pointer for a dangling exponent (`"1e+"`), which
+/// the formatter never produces — the wrapper maps it to `0.0`,
+/// exactly as the FMT port did.
 pub(crate) fn parse_float_internal(s: &[u8]) -> f64 {
+    parse_float_internal_with_len(s).map(|(_, v)| v).unwrap_or(0.0)
+}
+
+/// `mp_parse_float_internal` with the consumed length kept
+/// (`parsenum.zig:328-360`): returns `(consumed, value)` — the
+/// Zig's `[*c]const u8` return is the pointer just past the scan,
+/// i.e. `consumed` bytes — or `None` when the scan ends on a
+/// dangling exponent (`"1e+"`, `"1e-"`: the Zig returns NULL there).
+/// `mp_parse_num_decimal` needs the length; `parse_float_internal`
+/// (the formatter's entry) only needs the value.
+pub(crate) fn parse_float_internal_with_len(s: &[u8]) -> Option<(usize, f64)> {
     // parse_dec_in_t: 0 = INTG, 1 = FRAC, 2 = EXP.
     let mut in_state: i32 = 0;
     let mut exp_neg = false;
@@ -151,8 +177,9 @@ pub(crate) fn parse_float_internal(s: &[u8]) -> f64 {
                 }
             }
             if idx == top {
-                // C returns NULL; unreachable from mp_format_float.
-                return 0.0;
+                // Zig returns NULL (dangling exponent); unreachable
+                // from mp_format_float.
+                return None;
             }
         } else if dig == b'_' {
             continue;
@@ -175,10 +202,8 @@ pub(crate) fn parse_float_internal(s: &[u8]) -> f64 {
     // back to mp_decimal_exp for what strtod does not take whole
     // (or text too long for the 128-byte buffer).
     let scanned = &s[..idx];
-    if let Some(v) = exact_decimal(scanned) {
-        return v;
-    }
-    decimal_exp(mantissa as f64, exp_val)
+    let v = exact_decimal(scanned).unwrap_or_else(|| decimal_exp(mantissa as f64, exp_val));
+    Some((idx, v))
 }
 
 /// `exactDecimal` (`parsenum.zig`): correctly-rounded parse of
@@ -211,3 +236,322 @@ fn exact_decimal(text: &[u8]) -> Option<f64> {
     let s = core::str::from_utf8(&stripped).ok()?;
     s.parse::<f64>().ok()
 }
+
+// ── Integer entry points (Lane C17) ──────────────────────────────────
+
+/// ASCII whitespace per `unichar_isspace` (vendor `py/unicode.c:119-121`):
+/// `c < 128 && FL_SPACE` — exactly `0x09..=0x0d` and `0x20`.
+/// The canonical predicate is `objects::strings::unicode::unichar_isspace`
+/// (C16); this one-line copy keeps `vendor/` free of `objects/`
+/// imports — `parsenum_tests` asserts the two agree on all 256
+/// byte values, so they cannot drift silently. `pub(crate)` only
+/// for that agreement test.
+pub(crate) fn is_space(b: u8) -> bool {
+    matches!(b, 0x09..=0x0d | 0x20)
+}
+
+/// `mp_parse_num_base` (`src/frontend/parsenumbase.zig:17-52`, the
+/// Zig port of `py/parsenumbase.c`): strip an optional `0x` / `0o` /
+/// `0b` prefix (case-insensitive) and settle `*base`; returns the
+/// prefix length to skip. Base 0 with a leading `0` and no prefix
+/// letter becomes base 1 (provokes `ValueError` unless every digit
+/// is zero — the Zig's `mp_obj_new_int_from_str_len` re-parse then
+/// sees a digit `>= base` and stops immediately); base 0 with no
+/// prefix becomes 10. A prefix letter only counts when it matches
+/// the requested base.
+///
+/// The `goto no_prefix` shape is preserved: the `len <= 1` and
+/// `c != '0'` paths fall through to the `*base == 0 → 10` tail,
+/// while the `c == '0'` path skips the tail (`break :done`).
+pub(crate) fn parse_num_base(s: &[u8], base: &mut i32) -> usize {
+    if s.len() <= 1 {
+        if *base == 0 {
+            *base = 10;
+        }
+        return 0;
+    }
+    if s[0] == b'0' {
+        let c = s[1] | 0x20;
+        let b = *base;
+        if c == b'x' && (b == 0 || b == 16) {
+            *base = 16;
+            2
+        } else if c == b'o' && (b == 0 || b == 8) {
+            *base = 8;
+            2
+        } else if c == b'b' && (b == 0 || b == 2) {
+            *base = 2;
+            2
+        } else {
+            if b == 0 {
+                *base = 1;
+            }
+            0
+        }
+    } else {
+        if *base == 0 {
+            *base = 10;
+        }
+        0
+    }
+}
+
+/// `mp_parse_num_integer` failure (`parsenum.zig:130-138`):
+/// `BadBase` is `ValueError("int() arg 2 must be >= 2 and <= 36")`,
+/// `InvalidSyntax` is `ValueError("invalid syntax for integer")`.
+/// (With a non-null `lex` the Zig converts the latter to a
+/// `SyntaxError` + traceback — the lexer never calls this entry,
+/// so the Rust form carries the `ValueError` shape only; see
+/// `parse_num_integer`.) The message literals live on
+/// `PrimError::message` (`objects::primitives::ops`) — the
+/// `objint::parse_int_text` wrapper maps these variants there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseNumIntError {
+    BadBase,
+    InvalidSyntax,
+}
+
+/// `mp_parse_num_integer` (`parsenum.zig:212-270`, `mpParseNumIntegerImpl`):
+/// the exact integer denoted by `s` in `base` (0 = auto-detect).
+/// Skips leading whitespace and an optional sign, strips the base
+/// prefix via [`parse_num_base`], then accumulates digits; `_` is
+/// skipped ANYWHERE (including leading/trailing/doubled —
+/// `int("_")` is 0: the `_` advances past `str_val_start`, so the
+/// no-digits check does not fire); a digit `>= base` ends the digit
+/// run without error; trailing whitespace is skipped and anything
+/// else left is `InvalidSyntax`.
+///
+/// The Zig accumulates into an `isize` with a per-step overflow
+/// check and re-parses via `mp_obj_new_int_from_str_len` (mpz) on
+/// overflow; accumulating straight into a `BigInt` gives the
+/// identical value (the C7 `parse_int_text` justification, moved
+/// here unchanged with the function).
+pub(crate) fn parse_num_integer(s: &[u8], base_in: i32) -> Result<BigInt, ParseNumIntError> {
+    let mut base = base_in;
+    if (base != 0 && base < 2) || base > 36 {
+        return Err(ParseNumIntError::BadBase);
+    }
+    let top = s.len();
+    let mut i = 0;
+    while i < top && is_space(s[i]) {
+        i += 1;
+    }
+    let mut neg = false;
+    if i < top {
+        if s[i] == b'+' {
+            i += 1;
+        } else if s[i] == b'-' {
+            i += 1;
+            neg = true;
+        }
+    }
+    i += parse_num_base(&s[i..], &mut base);
+    let val_start = i;
+    let mut z = BigInt::zero();
+    let bbase = BigInt::from_int(base as i64);
+    while i < top {
+        let mut dig = s[i];
+        if dig.is_ascii_digit() {
+            dig -= b'0';
+        } else if dig == b'_' {
+            i += 1;
+            continue;
+        } else {
+            dig |= 0x20;
+            if dig.is_ascii_lowercase() {
+                dig -= b'a' - 10;
+            } else {
+                break;
+            }
+        }
+        if dig as i32 >= base {
+            break;
+        }
+        z.mul_assign(&bbase);
+        z.add_assign(&BigInt::from_int(dig as i64));
+        i += 1;
+    }
+    if i == val_start {
+        return Err(ParseNumIntError::InvalidSyntax);
+    }
+    while i < top && is_space(s[i]) {
+        i += 1;
+    }
+    if i != top {
+        return Err(ParseNumIntError::InvalidSyntax);
+    }
+    if neg {
+        z = -z;
+    }
+    Ok(z)
+}
+
+// ── Decimal entry points (Lane C17) ──────────────────────────────────
+
+/// `mp_parse_num_decimal` result (`parsenum.zig: parseDecimalImpl`).
+/// Under the full config `complex_enabled` is true, so the `j`
+/// suffix and the two-pass `force_complex` paths are live.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DecimalNum {
+    Float(f64),
+    Complex { re: f64, im: f64 },
+}
+
+/// `mp_parse_num_decimal` failure: `ValueError("invalid syntax for
+/// number")` (`parsenum.zig: invalidNumberExc`). (With a non-null
+/// `lex` the Zig converts it to a `SyntaxError` — the `.mpy`
+/// loader and `float()` pass `lex = NULL`, so the Rust form
+/// carries the `ValueError` shape only.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseNumError {
+    InvalidNumber,
+}
+
+impl ParseNumError {
+    /// The TERSE message literal the original raises.
+    pub(crate) fn message(&self) -> &'static str {
+        "invalid syntax for number"
+    }
+}
+
+/// `mp_parse_num_decimal` (`parsenum.zig:395-487`, `parseDecimalImpl`):
+/// parse a decimal number, optionally with an imaginary part.
+/// `allow_imag` enables the `j` suffix (`"j"` alone means `1j`);
+/// `force_complex` re-parses a second part after the first, so
+/// `"3+4j"` becomes `Complex { re: 3, im: 4 }` (and `"3+"` with no
+/// imaginary follow-up is an error). `inf` / `infinity` / `nan`
+/// are recognised case-insensitively; the value itself comes from
+/// [`parse_float_internal_with_len`] (Zig: libc `strtod`,
+/// correctly rounded).
+///
+/// Full config only: the `complex_enabled = false` (nano) arms —
+/// the `j` branch and the two-pass `force_complex` branch
+/// comptime-eliding — are dead here and not represented.
+pub(crate) fn parse_num_decimal(
+    s: &[u8],
+    allow_imag: bool,
+    force_complex: bool,
+) -> Result<DecimalNum, ParseNumError> {
+    const STATE_START: u32 = 0;
+    const STATE_HAVE_REAL: u32 = 1;
+    const STATE_HAVE_IMAG: u32 = 2;
+    let top = s.len();
+    let mut i = 0;
+    // Declared without an initial value, as in the Zig (`dec_val`
+    // is assigned by every branch below before any read).
+    let mut dec_val: f64;
+    let mut dec_real = 0.0f64;
+    let mut state: u32 = STATE_START;
+    loop {
+        let mut dec_neg = false;
+        while i < top && is_space(s[i]) {
+            i += 1;
+        }
+        if i < top {
+            if s[i] == b'+' {
+                i += 1;
+            } else if s[i] == b'-' {
+                i += 1;
+                dec_neg = true;
+            }
+        }
+        let str_val_start = i;
+        // inf / infinity / nan / fall through to float-internal.
+        // The `str + 2 < top` guard needs at least 3 bytes left.
+        if i + 2 < top
+            && (s[i] | 0x20) == b'i'
+            && (s[i + 1] | 0x20) == b'n'
+            && (s[i + 2] | 0x20) == b'f'
+        {
+            i += 3;
+            dec_val = f64::INFINITY;
+            // "inity" needs 5 more bytes (`str + 4 < top`).
+            if i + 4 < top
+                && (s[i] | 0x20) == b'i'
+                && (s[i + 1] | 0x20) == b'n'
+                && (s[i + 2] | 0x20) == b'i'
+                && (s[i + 3] | 0x20) == b't'
+                && (s[i + 4] | 0x20) == b'y'
+            {
+                i += 5;
+            }
+        } else if i + 2 < top
+            && (s[i] | 0x20) == b'n'
+            && (s[i + 1] | 0x20) == b'a'
+            && (s[i + 2] | 0x20) == b'n'
+        {
+            i += 3;
+            dec_val = f64::NAN;
+        } else {
+            match parse_float_internal_with_len(&s[i..]) {
+                Some((consumed, v)) => {
+                    dec_val = v;
+                    i += consumed;
+                }
+                // Dangling exponent ("1e+") — the Zig's NULL return.
+                None => return Err(ParseNumError::InvalidNumber),
+            }
+        }
+        // 'j' suffix → mark imaginary.
+        if allow_imag && i < top && (s[i] | 0x20) == b'j' {
+            if i == str_val_start {
+                dec_val = 1.0; // "j" → "1j"
+            }
+            i += 1;
+            state |= STATE_HAVE_IMAG;
+        }
+        if dec_neg {
+            dec_val = -dec_val;
+        }
+        if i == str_val_start {
+            return Err(ParseNumError::InvalidNumber);
+        }
+        while i < top && is_space(s[i]) {
+            i += 1;
+        }
+        if i != top {
+            if force_complex && state == STATE_START {
+                // "3+4j" two-pass: captured real, parse imag. (The
+                // Zig also resets `dec_val = 0` here, but the next
+                // pass reassigns it — inf/nan/float-internal — before
+                // any read, so the reset is unobservable; omitted.)
+                dec_real = dec_val;
+                state |= STATE_HAVE_REAL;
+                continue;
+            }
+            return Err(ParseNumError::InvalidNumber);
+        }
+        break;
+    }
+    if state == STATE_HAVE_REAL {
+        // "3+" with no imag follow-up.
+        return Err(ParseNumError::InvalidNumber);
+    }
+    if state != STATE_START {
+        return Ok(DecimalNum::Complex { re: dec_real, im: dec_val });
+    }
+    if force_complex {
+        return Ok(DecimalNum::Complex { re: dec_val, im: 0.0 });
+    }
+    Ok(DecimalNum::Float(dec_val))
+}
+
+/// `mp_parse_num_float` — vendor `parsenum.h:47-49`: the
+/// static-inline wrapper is `mp_parse_num_decimal(..., allow_imag,
+/// false, lex)`. Under full, the Zig export of this name is an
+/// unused symbol (callers see the inline); the `.mpy` loader calls
+/// it with `allow_imag = (obj_type == COMPLEX)`.
+pub(crate) fn parse_num_float(s: &[u8], allow_imag: bool) -> Result<DecimalNum, ParseNumError> {
+    parse_num_decimal(s, allow_imag, false)
+}
+
+/// `mp_parse_num_complex` — vendor `parsenum.h:51-53`:
+/// `mp_parse_num_decimal(..., true, true, lex)`. The `complex(str)`
+/// builtin's entry point (C18 owns the float/complex types; this
+/// is ready for it). No in-tree caller yet — the `.mpy` loader
+/// deliberately calls `parse_num_float` (force_complex=false).
+#[allow(dead_code)]
+pub(crate) fn parse_num_complex(s: &[u8]) -> Result<DecimalNum, ParseNumError> {
+    parse_num_decimal(s, true, true)
+}
+

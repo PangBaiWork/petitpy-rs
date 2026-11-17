@@ -13,9 +13,13 @@
 //!   power / divmod operations.
 //! - [`formatfloat`] — float formatting (`py/formatfloat.c`, Lane
 //!   FMT): `mp_format_float`.
-//! - [`parsenum`] — the `parsenum.c` helpers it needs (Lane FMT):
-//!   `mp_decimal_exp` and `mp_parse_float_internal` (the latter as
-//!   linked in petitpy: the Zig version, see that module).
+//! - [`parsenum`] — the `parsenum.c` helpers (Lane FMT +
+//!   Lane C17): `mp_decimal_exp`, `mp_parse_float_internal`
+//!   (the latter as linked in petitpy: the Zig version, see that
+//!   module), plus the canonical `mp_parse_num_base` /
+//!   `mp_parse_num_integer` / `mp_parse_num_float` /
+//!   `mp_parse_num_decimal` / `mp_parse_num_complex` entries
+//!   (C17 — used by `int()` and the `.mpy` const loader).
 //! - [`re15`] — the re1.5 regex engine (Lane RE15), ported from
 //!   petitpy's patched copy `port/re1.5-patched/` (int16 jump
 //!   offsets), not the vanilla vendor `lib/re1.5/`.
@@ -42,6 +46,8 @@ pub use mpz::BigInt;
 
 #[cfg(test)]
 mod formatfloat_tests;
+#[cfg(test)]
+mod parsenum_tests;
 #[cfg(test)]
 mod mpz_tests;
 #[cfg(test)]

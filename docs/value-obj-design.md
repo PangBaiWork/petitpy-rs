@@ -126,12 +126,25 @@ pub struct TypeData {
     pub binary_op: Option<BinaryOpFn>,
     pub call: Option<CallFn>,
     pub getiter: Option<GetIterFn>,
-    // 其余槽位（subscr、buffer、print 等）按 lane 需要增补
+    // C6 增补：subscr、buffer、print（其余槽位按 lane 需要增补）
+    pub subscr: Option<SubscrFn>,
+    pub buffer: Option<BufferFn>,
+    pub print: Option<PrintFn>,
 }
 ```
 
 - 方法槽位是 Rust 函数指针（`fn(&mut Vm, Value, ...) -> PyResult<Value>`），
   不是 trait object——与原版 `mp_obj_type_t` 的槽位表一一对应。
+- **C6 修正（2026-11-17）：槽位函数带 op 参数。** C0 的
+  `UnaryOpFn`/`BinaryOpFn` 没有 op，但原版槽是
+  `mp_unary_op(op, arg)` / `mp_binary_op(op, lhs, rhs)`——没有 op
+  就无法表达 LEN/BOOL/EQUAL。现为
+  `UnaryOpFn = fn(&mut CallCtx, UnaryOp, Value)`,
+  `BinaryOpFn = fn(&mut CallCtx, BinaryOp, Value, Value)`，
+  `UnaryOp`（12 变体，vendor 判别值 0–11）与 `BinaryOp`
+  （52 变体，vendor 判别值 0–51，NOT_IN=50、IS_NOT=51）定义在
+  `src/objects/slots.rs`。修正时 grep 确认此前没有任何 lane
+  实现过槽，故不破坏任何已有代码。
 - 内置类型（int/str/list/…）的 `TypeData` 由各对象 lane 在
   `GcArena` 里构造并登记；`mp_type_roms.zig` 的静态 ROM 表在 Rust
   里改为启动时构造（无 `extern const`）。
@@ -140,8 +153,15 @@ pub struct TypeData {
 
 - mark-sweep；`collect(roots) -> usize` 返回释放的对象数（原版
   `gc_collect()` 的返回值语义；`gc` 模块的 `collect()` 透传它）。
-- 触发：分配计数达阈值时自动 collect（原版 `alloc_count` 规则）；
-  `threshold == -1` 时按原版默认。
+- 触发：**C4 修正（2026-11-17）：不是 `alloc_count >= threshold`
+  收集一次，而是压力取模规则**——`stress_every != 0` 且
+  `autoCollect()`（lock_depth == 0 且 auto_collect_enabled）
+  时，`alloc_count % stress_every == 0` 触发 collect
+  （gc.zig:489-493）；`threshold` 字段即 stress 控制
+  （`NPY_GC_STRESS` 环境变量设定），`threshold == -1` 时不触发。
+  另用单调的 `stress_alloc_count` 保相位（显式 collect 不重置它）。
+  vendor py/gc.c 的 `gc_alloc_amount >= gc_alloc_threshold`
+  规则没有进 gc.zig，不要按它实现。
 - `mem_alloc()` / `mem_free()`：按原版的块记账口径换算为字节
   （原版以块为单位，`MICROPY_MEM_STATS` 语义；C4 lane 落地时与
   原版二进制逐项对数）。

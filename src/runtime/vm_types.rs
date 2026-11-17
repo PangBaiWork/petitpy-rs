@@ -35,6 +35,8 @@ use crate::objects::objtype::rom::{
 };
 use crate::objects::primitives::objbool::bool_type_data;
 use crate::objects::primitives::objcell::cell_type_data;
+use crate::objects::primitives::objcomplex::complex_type_data;
+use crate::objects::primitives::objfloat::float_type_data;
 use crate::objects::primitives::objint::{fun_n_args, int_locals_dict, int_type_data};
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BuiltinFn, BuiltinKwFn, MethodEntry};
@@ -54,8 +56,7 @@ fn empty_dict(ctx: &mut CallCtx) -> GcRef {
 
 /// A plain type object (no slots, empty mro) — the fixture
 /// `make_type` pattern, for types whose lane has no `*_type_data`
-/// yet (`float`, `complex`, `NoneType`, the `type` placeholder,
-/// the ellipsis type).
+/// yet (`NoneType`, the `type` placeholder, the ellipsis type).
 fn plain_type(ctx: &mut CallCtx, name: u32) -> GcRef {
     let dict = empty_dict(ctx);
     ctx.alloc(
@@ -204,14 +205,13 @@ pub(crate) fn build_vm_types(
     let bool_ = ctx.alloc(None, Obj::Type(bool_type_data(bool_dict)));
     let cell_dict = empty_dict(ctx);
     let cell = ctx.alloc(None, Obj::Type(cell_type_data(cell_dict)));
-    let float = plain_type(
-        ctx,
-        static_qstr_id(b"float").expect("float is a static qstr"),
-    );
-    let complex = plain_type(
-        ctx,
-        static_qstr_id(b"complex").expect("complex is a static qstr"),
-    );
+    // C18a: float / complex carry their vendor slots now
+    // (`objfloat.rs` / `objcomplex.rs`); the vendor types have no
+    // locals_dict, so the bootstrap empty dict is passed.
+    let float_dict = empty_dict(ctx);
+    let float = ctx.alloc(None, Obj::Type(float_type_data(float_dict)));
+    let complex_dict = empty_dict(ctx);
+    let complex = ctx.alloc(None, Obj::Type(complex_type_data(complex_dict)));
     let none_type = plain_type(
         ctx,
         static_qstr_id(b"NoneType").expect("NoneType is a static qstr"),

@@ -8,13 +8,14 @@
 //! Vm` wrappers live in `vm_rt_iter.rs` (`runtime.zig:1055-1123`,
 //! `:1277-1456`).
 //!
-//! Float/complex (C18): `int op float` / `float op …` /
-//! `int op complex` route to `binop_unsupported` until C18
-//! fills the float/complex slots (`mp_obj_float_binary_op` /
-//! `mp_obj_complex_binary_op` are `objfloat.c` / `objcomplex`,
-//! C18's scope). The two pure-int float results — `int / int`
-//! and `int ** -n` — construct a `Float` value directly (f64
-//! arithmetic, no float op needed) with the Zig's precheck.
+//! Float/complex (C18a, LANDED): `int op float` / `float op …` /
+//! `int op complex` go through the generic loop now — the int
+//! slot delegates float/complex rhs to `mp_obj_float_binary_op` /
+//! `mp_obj_complex_binary_op` (`objfloat.rs` / `objcomplex.rs`,
+//! vendor `objint_mpz.c:175-183`). The two pure-int float results
+//! — `int / int` and `int ** -n` — construct a `Float` value
+//! directly (f64 arithmetic, no float op needed) with the Zig's
+//! precheck.
 
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::map::hash_of;
@@ -265,7 +266,14 @@ fn float_precheck_int(
             if lhs_val == 0 && rhs_f < 0.0 {
                 return Some(binop_zero_div(ctx, state));
             }
-            if lhs_val < 0 && rhs_f.fract() != 0.0 {
+            // The Zig's test is `r != trunc(r)` (`runtime.zig:493`);
+            // `fract() != 0.0` is wrong for `inf` (`fract(inf)` is
+            // NaN, so `(-8) ** inf` would raise — the reference
+            // returns `inf`, probed 2026-11-18). `trunc` agrees
+            // with `fract` on every finite value and is correct
+            // for `inf` (no raise) and `nan` (raises, since
+            // `nan != nan`).
+            if lhs_val < 0 && rhs_f != rhs_f.trunc() {
                 return Some(crate::objects::objtype::objexcept::new_exception_msg(
                     ctx,
                     state.exc.value_error,
@@ -285,10 +293,11 @@ fn float_precheck_int(
 /// Order: IS → EQUAL/NOT_EQUAL → EXCEPTION_MATCH → the
 /// full-only `|` typing-union stub → `nativeSubclassOp` stub →
 /// the small-int/small-int fast path (wrapping arithmetic,
-/// overflow → heap int + generic path) → `int op float` /
-/// `int op complex` (C18 stubs) → IN→CONTAINS swap → the
+/// overflow → heap int + generic path) → IN→CONTAINS swap → the
 /// generic loop (lhs slot → inplace→plain → reverse → CONTAINS
-/// iteration → `binopUnsupported`).
+/// iteration → `binopUnsupported`). `int op float` /
+/// `int op complex` fall through to the generic loop (C18a) —
+/// the int slot delegates them to the float/complex ops.
 pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lhs_in: Value, rhs_in: Value) -> Result<Value, Value> {
     use crate::objects::value::{SMALL_INT_MAX, SMALL_INT_MIN};
     let mut op = op_in;
@@ -503,18 +512,15 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
             return Ok(v);
         }
     }
-    // `int op float` / `int op complex` (lhs small, rhs heap) —
-    // C18's `mp_obj_float_binary_op` / `mp_obj_complex_binary_op`.
-    if let Value::SmallInt(_) = lhs {
-        if let Value::Heap(r) = rhs {
-            match ctx.arena.get(r) {
-                Obj::Float(_) | Obj::Complex { .. } => {
-                    return Err(binop_unsupported(ctx, state, op, lhs, rhs));
-                }
-                _ => {}
-            }
-        }
-    }
+    // `int op float` / `int op complex` used to short-circuit to
+    // `binopUnsupported` here (C13 stub, C18's scope). C18a
+    // removes the block: the generic loop below reaches the int
+    // slot, which delegates float/complex rhs to
+    // `mp_obj_float_binary_op` / `mp_obj_complex_binary_op`
+    // (vendor `objint_mpz.c:175-183`, `objint.rs`), so small-int,
+    // heap-int and bool lhs all share one path — the Zig's
+    // small-int fast path calls the same two functions directly
+    // (`runtime.zig:703-719`), with identical observable behavior.
     // IN → CONTAINS (operands swapped).
     if op == BinaryOp::In {
         op = BinaryOp::Contains;

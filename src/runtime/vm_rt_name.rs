@@ -173,9 +173,12 @@ pub fn load_method_maybe_ctx(
     // (C12a added the `attr` field to `TypeData`, but the
     // `gen_wrap` literal still carries `attr: None` and the
     // module/exception dispatch below is payload-based;
-    // C14 subsumes this whole function).
+    // C14 subsumes this whole function). C18a adds the generic
+    // fallback to the type's own `attr` slot below — the Zig's
+    // `mp_load_method_maybe` consults it for every type; complex
+    // `.real` / `.imag` rides it.
     if let Some(t) = type_ {
-        let attr_fn = if t == state.vm_types.fun_bc || t == state.vm_types.gen_wrap {
+        let mut attr_fn = if t == state.vm_types.fun_bc || t == state.vm_types.gen_wrap {
             Some(fun_bc_attr as crate::objects::slots::AttrFn)
         } else if t == state.vm_types.bound_meth {
             Some(bound_meth_attr as crate::objects::slots::AttrFn)
@@ -190,6 +193,18 @@ pub fn load_method_maybe_ctx(
         } else {
             None
         };
+        // C18a: fall back to the type's own `attr` slot — the
+        // Zig's `mp_load_method_maybe` consults it for every
+        // type (`runtime.zig:1195-1233`). Only consulted when
+        // the hardcoded dispatch found nothing, so no attr fn
+        // runs twice. Complex `.real` / `.imag` rides this slot
+        // (its `TypeData.attr` is `complex_attr`); any future
+        // type with an `attr` slot gets the same path.
+        if attr_fn.is_none() {
+            if let Obj::Type(d) = ctx.arena.get(t) {
+                attr_fn = d.attr;
+            }
+        }
         if let Some(f) = attr_fn {
             match f(ctx, obj, attr) {
                 Ok(Some(v)) => return Ok((Some(v), None)),

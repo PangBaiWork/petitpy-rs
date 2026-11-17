@@ -20,10 +20,13 @@ use crate::objects::obj::*;
 use crate::objects::obj_ops::*;
 use crate::objects::slots::*;
 use crate::objects::strings::objstr_a::*;
+use crate::objects::strings::objstr_b::str_count;
+use crate::objects::strings::objstr_format::{str_format, str_modulo_format};
 use crate::objects::strings::objstr_methods_b::*;
 use crate::objects::strings::objstr_methods_c::*;
 use crate::objects::value::*;
 use crate::pyerr::PyError;
+use crate::vendor::mpz::BigInt;
 
 fn plain_type_data(name: u32, flags: u16, dict: GcRef) -> TypeData {
     TypeData {
@@ -62,6 +65,20 @@ fn bool_print_stub(_ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mu
 
 fn none_print_stub(_ctx: &mut CallCtx, _value: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
     let _ = sink.write_str("None");
+}
+
+/// Float print stub (Lane C8b, same class as the int/bool/none
+/// stubs above): formats a heap `Float` via Lane FMT's
+/// `format_float` (`'g'`, default precision — the vendor float
+/// print's format). This stands in for C18's float print slot
+/// (registration only); the `{}`-format conversion path that calls
+/// it is C8b's and is tested here.
+fn float_print_stub(ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+    if let Value::Heap(r) = value {
+        if let Obj::Float(f) = ctx.arena.get(r) {
+            let _ = sink.write_str(&crate::vendor::formatfloat::format_float(*f, b'g', -1, 0));
+        }
+    }
 }
 
 pub(crate) struct Fx {
@@ -111,6 +128,7 @@ impl Fx {
         let int = mk_plain(&mut arena, b"int");
         let bool_ = mk_plain(&mut arena, b"bool");
         let none_type = mk_plain(&mut arena, b"NoneType");
+        let float = mk_plain(&mut arena, b"float");
         // Print stubs for the make_new tests (see the module docs).
         if let Obj::Type(d) = arena.get_mut(int) {
             d.print = Some(int_print_stub);
@@ -121,13 +139,16 @@ impl Fx {
         if let Obj::Type(d) = arena.get_mut(none_type) {
             d.print = Some(none_print_stub);
         }
+        if let Obj::Type(d) = arena.get_mut(float) {
+            d.print = Some(float_print_stub);
+        }
         let types = BuiltinTypes {
             int,
             str_: str_,
             bytes: bytes_,
             bool_,
             none_type,
-            float: mk_plain(&mut arena, b"float"),
+            float,
             complex: mk_plain(&mut arena, b"complex"),
             tuple: mk_plain(&mut arena, b"tuple"),
             list: mk_plain(&mut arena, b"list"),
@@ -410,9 +431,10 @@ fn binary_op_multiply() {
     let f = fx.s(b"2.5");
     let r = binary_op_inner(&mut fx.ctx(), &types, BinaryOp::Multiply, a, f);
     assert!(r.is_none());
-    // Modulo is C8b's.
+    // Modulo is C8b's: wired to `str_modulo_format` — `"ab" % "ab"`
+    // has no conversion, so the single argument is extra.
     let r = binary_op_inner(&mut fx.ctx(), &types, BinaryOp::Modulo, a, a);
-    assert!(r.is_none());
+    assert!(matches!(r, Some(Err(StrError::ExtraArgs))));
 }
 
 #[test]
@@ -616,3 +638,76 @@ fn unary_op_len_bool() {
     assert_eq!(take_pending_str_error(), None);
 }
 
+// ── shared helpers for the C8b tests (`objstr_tests_c.rs`,
+// `objstr_tests_d.rs`) ──────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────
+
+pub(crate) fn fmt_pct(fx: &mut Fx, pattern: &[u8], rhs: Value) -> Result<Value, StrError> {
+    let types = fx.types;
+    let pat = fx.s(pattern);
+    str_modulo_format(&mut fx.ctx(), &types, pat, rhs)
+}
+
+pub(crate) fn fmt_str(fx: &mut Fx, pattern: &[u8], args: &[Value], kwargs: &[KwArg]) -> Result<Value, StrError> {
+    let types = fx.types;
+    let mut all = vec![fx.s(pattern)];
+    all.extend_from_slice(args);
+    str_format(&mut fx.ctx(), &types, &all, kwargs)
+}
+
+pub(crate) fn dict_of(fx: &mut Fx, entries: Vec<(Value, Value)>) -> Value {
+    Value::Heap(
+        fx.ctx()
+            .alloc(None, Obj::Dict(DictData { map: MapData { entries } })),
+    )
+}
+
+pub(crate) fn big_2_pow_70(fx: &mut Fx) -> Value {
+    let types = fx.types;
+    let mut z = BigInt::zero();
+    z.set_from_str(b"1180591620717411303424", false, 10);
+    Value::Heap(fx.ctx().alloc(Some(types.int), Obj::Int(z)))
+}
+
+pub(crate) fn float_of(fx: &mut Fx, f: f64) -> Value {
+    let types = fx.types;
+    Value::Heap(fx.ctx().alloc(Some(types.float), Obj::Float(f)))
+}
+
+pub(crate) fn list_items(fx: &Fx, v: Value) -> Vec<Vec<u8>> {
+    match v {
+        Value::Heap(r) => match fx.arena.get(r) {
+            Obj::List(l) => l.items.iter().map(|item| bytes_of(fx, *item)).collect(),
+            _ => panic!("not a list"),
+        },
+        _ => panic!("not a heap value"),
+    }
+}
+
+pub(crate) fn tuple_items(fx: &Fx, v: Value) -> Vec<Vec<u8>> {
+    match v {
+        Value::Heap(r) => match fx.arena.get(r) {
+            Obj::Tuple(items) => items.iter().map(|item| bytes_of(fx, *item)).collect(),
+            _ => panic!("not a tuple"),
+        },
+        _ => panic!("not a heap value"),
+    }
+}
+
+pub(crate) fn count_val(fx: &mut Fx, args: &[Value]) -> i64 {
+    let types = fx.types;
+    match str_count(&mut fx.ctx(), &types, args).unwrap() {
+        Value::SmallInt(n) => n,
+        _ => panic!("count is not a small int"),
+    }
+}
+
+pub(crate) fn call_bytes(
+    fx: &mut Fx,
+    f: fn(&mut CallCtx, &BuiltinTypes, &[Value]) -> Result<Value, StrError>,
+    args: &[Value],
+) -> Vec<u8> {
+    let types = fx.types;
+    let r = f(&mut fx.ctx(), &types, args).unwrap();
+    bytes_of(fx, r)
+}

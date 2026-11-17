@@ -1,0 +1,558 @@
+Lane C8b result — strings: objstr part 2 + vstr
+================================================
+Executor: subagent 9c00f150-7aaa-4c8f-b60a-080ade1b0e03
+Worktree: ~/workspace/petitpy-rs-strings-b, branch lane/strings-b
+Base: master 410e628 (C8a merge fix). lib 384 + bin 9 baseline.
+Original: ~/workspace/petitpy-orig, petitpy 0.9.0 (Zig 0.16.0).
+
+ACCEPTANCE
+----------
+cargo test --release --lib --tests:  412 passed, 0 failed, 1 ignored
+  (384 baseline + 28 new C8b tests; the 1 ignored is the pre-existing
+  stale upstream empty-file expectation from A3.)
+cargo test --release --bins:          9 passed, 0 failed.
+0 warnings. No unsafe in any C8b file (grep-verified).
+All files < 800 lines (max 776). Original repo clean
+(`git status --porcelain` in ~/workspace/petitpy-orig: empty).
+One commit: "Lane C8b: port objstr part 2 + vstr to Rust".
+
+*** MERGE NOTE — base has moved (read before merging) ***
+This lane was built on 410e628. Master has since advanced to b2cb62b
+(C9a merged: "Fix C9a merge: MapData::new in strings fixtures,
+BuiltinTypes.dict, CallCtx 4-arg, dict-keys join via MapEntry").
+Merge integration WILL be needed:
+- MapData shape changed: C9a replaced the stub `MapData { entries:
+  Vec<(Value, Value)> }` with the real insertion-ordered hash table.
+  My `dict_get` (objstr_b.rs) and the fixture `dict_of` helper
+  (objstr_tests.rs) still use the OLD stub shape. `dict_get` must be
+  re-pointed at C9's `dict_get` (or adapted to the new MapData API)
+  at merge time — see "C9a re-point" below. The master merge fix
+  already converted the strings fixtures to `MapData::new`, so the
+  fixture will conflict on merge; keep master's fixture shape and
+  re-apply the C8b helpers on top of it.
+- CallCtx is now 4-arg on master (was 3-arg on 410e628). My code
+  calls `CallCtx::new(&mut arena, &mut roots, &types)` (3-arg) and
+  `ctx()` in the fixture; update to the 4-arg form at merge time.
+- BuiltinTypes now has a `.dict` field on master. My `dict_get`
+  checks dict-ness by payload `Obj::Dict(_)` (no dict field existed
+  on 410e628); at merge time it may switch to the type check.
+- `str.join` on dict keys now goes via `MapEntry` on master; my
+  `iter_items` (objstr_a.rs, C8a) yields dict keys from the stub
+  `MapData.entries` — verify it still compiles against the new
+  MapData and re-point if needed.
+
+FILES
+-----
+New:
+  src/objects/strings/vstr.rs            315 lines  (vstr.zig, 278 lines)
+  src/objects/strings/objstr_b.rs        774 lines  (objstr 2081-3864, part 1)
+  src/objects/strings/objstr_format.rs   776 lines  (`%`-format + str.format)
+  src/objects/strings/objstr_print.rs    365 lines  (mpprint.c mirrors, split out)
+  src/objects/strings/objstr_slice.rs    126 lines  (slice helpers, split out)
+  src/objects/strings/objstr_tests_c.rs  464 lines  (vstr + str-method tests)
+  src/objects/strings/objstr_tests_d.rs  455 lines  (`%`-format + str.format tests)
+Modified:
+  src/objects/strings/mod.rs             (+ objstr_print, objstr_slice,
+                                           objstr_tests_d)
+  src/objects/strings/objstr_a.rs        723 lines  (StrError additions;
+                                           slice helpers moved out)
+  src/objects/strings/objstr_methods_c.rs 650 lines (Modulo arm wired;
+                                           1 test assertion updated)
+  src/objects/strings/objstr_tests.rs    713 lines  (float print stub;
+                                           9 shared C8b helpers moved in)
+  scripts/strings_b_result.txt           (this file)
+
+File splits (800-line cap, enforced — same as C9a's split commit
+783a829):
+- objstr_format.rs was 1128 lines → the mpprint mirrors
+  (PF_FLAG consts, print_strn, print_mp_int, print_float,
+  print_float_pct, IntValue/int_value) moved to objstr_print.rs
+  (365 lines); objstr_format.rs is now 776 lines.
+- objstr_a.rs was 832 lines (C8a 764 + C8b StrError additions) →
+  the slice helpers (BoundSlice, slice_indices, fast_slice_indexes,
+  slice_count) moved to objstr_slice.rs (126 lines), re-exported
+  from objstr_a.rs so existing `use objstr_a::*` imports keep
+  working; objstr_a.rs is now 720 lines.
+- objstr_tests_c.rs was 974 lines → the 9 shared helpers moved into
+  objstr_tests.rs (now 713 lines) as pub(crate); the format tests
+  moved to objstr_tests_d.rs (455 lines); objstr_tests_c.rs is now
+  464 lines.
+
+1:1 MAPPING — original → Rust
+-----------------------------
+vstr.zig (278 lines, 0 test blocks) → src/objects/strings/vstr.rs:
+  VstrT { alloc, len, buf, fixed_buf } → Vstr { alloc, len, buf: Vec<u8>,
+    fixed_buf }; vstr_init → Vstr::init; init_len → init_len;
+  init_fixed_buf → init_fixed_buf; init_print → (not ported: needs the
+    print machinery — C8c/C13); clear → clear (frees buf, does NOT reset
+    alloc/len — C semantics); new → new; free → free; extend → extend
+    (alloc += size exactly; fixed → RuntimeError); hint_size →
+    hint_size; vstrEnsureExtra → ensure_extra (grows to
+    round_alloc(len+size+16); fixed → RuntimeError); add_len → add_len;
+    null_terminated_str → null_terminated_str (bytes INCLUDING the
+    terminator) + nul_terminated_vec; add_byte → add_byte; add_char →
+    add_char (UTF-8 ladder under STR_UNICODE=1, else truncate);
+    add_strn/add_str → add_strn/add_str; ins_byte/ins_char →
+    ins_byte/ins_char (truncates the char — s[0] = @truncate(chr));
+    cut_head/cut_tail/cut_out_bytes → cut_head_bytes/cut_tail_bytes/
+    cut_out_bytes; roundAlloc(a) = (a & 0x00000000FFFFFFF8) + 8
+    (32-bit mask quirk — high bits cleared, preserved exactly);
+    fixed_buf extend → RuntimeError with no message.
+    vstr_printf/vstr_vprintf live in va_ops.c — NOT in scope.
+    VstrSink<'a>(&'a mut Vstr) implements fmt::Write for
+    obj_print_helper into a temp bundle.
+  vsp helpers (objstr.zig 1769-1816, C8a range but NOT ported by C8a):
+    vspInit/vspAddByte/vspLen/vspNulTerminated/vspClear/vspToObj/
+    vspPrintStrn/vspPrintMpInt/vspPrintFloat/vspPrintFloatPct/
+    vspPrintHelperIntoTemp → print_value_into / print_strn /
+    print_mp_int / print_float / print_float_pct in objstr_print.rs
+    and objstr_format.rs (the vsp bundle itself is a [128]u8
+    vstr+print pair; Rust uses a Vstr temp instead — same behaviour).
+
+objstr.zig 2081-3864 → src/objects/strings/objstr_b.rs +
+  objstr_format.rs + objstr_print.rs + objstr_methods_c.rs (Modulo arm):
+  2083-2090  mp_obj_str_get_buffer — ALREADY ported by C8a as
+              str_get_buffer (objstr_methods_c.rs:391-397). SKIPPED,
+              not rewritten (verified by grep).
+  2091      str_splitlines_impl → str_splitlines (objstr_b.rs).
+              Only \n and \r are boundaries (NOT \v \f \x1c \x1d \x1e
+              \x85 or U+2028). keepends from args[1] positionally;
+              kw-map fallback needs C10/C13 (see gaps).
+  2135/2189/2192 partitionerImpl/str_partition/str_rpartition →
+              partitioner_impl/str_partition/str_rpartition.
+  2217      str_count → str_count. Empty needle =
+              utf8_charlen(slice) + 1; non-overlapping.
+  2265      str_center → str_center (via pad_one_side).
+  2306/2337/2340 strPadOneSide/str_ljust/str_rjust → pad_one_side/
+              str_ljust/str_rjust. Extra pad goes right:
+              left=(width-chars)/2. Width counts CHARS (é is 1 char).
+  2350/2357  bytes_decode/str_encode → bytes_decode/str_encode.
+              encoding/errors args are parsed but NEVER used (the
+              original copies bytes raw — probed: utf-16 is ignored,
+              \xff decodes raw with no error).
+  2376      str_to_int → str_to_int (objstr_format.rs). Format-internal
+              digit scanner — see brief corrections.
+  2389/2396  isalignment/istype → is_alignment/is_type.
+              isalignment = < > = ^; istype = b c d e E f F g G n o s
+              x X % (NO i/u — those are only %-format conversions).
+  2403/2409  arg_looks_integer/arg_looks_numeric → same names.
+              integer = bool or int; numeric = integer or float
+              (complex is COMPLEX=0, absent).
+  2415      arg_as_int → format_arg_as_int (objstr_format.rs).
+              Float → int_from_float (NaN → ValueError "can't
+              convert NaN to int", Inf → OverflowError "can't
+              convert inf to int"); else identity. Only the %d/%i/%u
+              arm uses it — %o/%x/%X do NOT.
+  2423-2462  format raises → StrError variants (see below).
+  2467/2673  strModuloFormatImpl/str_modulo_format →
+              str_modulo_format_impl/str_modulo_format.
+  2709/3040/3050 formatHelperInto/mpObjStrFormatImpl/mp_obj_str_format
+              → format_helper_into/str_format (+ str_format_builtin,
+              the empty-kwargs wrapper).
+  3082      mp_obj_new_str_copy → new_str_copy.
+  3096      mp_obj_new_str_via_qstr → (C8a's new_str_via_qstr kept;
+              verified identical to the formal definition).
+  3100      mp_obj_new_bytes → (C8a's new_bytes kept; verified).
+  3155      mp_obj_new_str → (C8a's new_str kept; verified).
+  3163      mp_obj_new_str_from_cstr → new_str_from_cstr (truncate
+              at first NUL).
+  3169      mp_obj_new_str_of_type → (C8a's new_str_of_type kept;
+              verified).
+  3179/3184  mp_obj_str_intern/intern_checked → intern/intern_checked
+              (non-str → Qstr(0)).
+  3221/3256/3272 mp_obj_new_str_type_from_vstr/from_vstr/
+              new_bytes_from_vstr → new_str_type_from_vstr/
+              new_str_from_vstr/new_bytes_from_vstr. Static-qstr
+              interning for str; leaves the vstr emptied with
+              alloc = 0, len untouched (C semantics).
+  3276      mp_obj_str_equal → str_equal (does NOT distinguish str
+              from bytes).
+  3297/3312/3321 mp_obj_str_get_qstr/get_str/get_data → get_qstr
+              (Option<u32>; None for non-static heap content — C13
+              gap) / get_str / get_data (wrappers over str_data;
+              pending error not recorded — C8a precedent).
+  3364-3616 method-object table + locals dicts → STR_METHODS (33
+              entries) / BYTES_METHODS (35 entries) in objstr_b.rs
+              as &[(&str, BuiltinFn)] + lookup_str_method/
+              lookup_bytes_method. 9 explicit *_builtin wrappers
+              (C8a's builtin_method! macro is scoped to
+              methods_b.rs, so these are written out in the same
+              shape). See brief corrections for the counts.
+  3624      str_unary_op_full — already ported by C8a. Not touched.
+  3638/3702  mp_type_str/mp_type_bytes — already ported by C8a.
+  3736      mp_const_empty_bytes_obj — C8a's new_empty_bytes
+              (fresh heap object, NOT the ROM singleton — C12 gap).
+  844-871   mp_obj_str_binary_op MODULO dispatch → wired into
+              binary_op_inner (objstr_methods_c.rs): tuple rhs (exact
+              tuple OR tuple-compatible) → items; dict rhs → dict=rhs,
+              args=[rhs]; else args=[rhs], dict=NULL. A failed format
+              is Some(Err(..)), NOT None, so the dispatcher does not
+              fall through to the rhs slot. The NULL-vs-None sentinel
+              is critical.
+  246-400   npyStr helpers → npyStrObjStrDataLen (str_data, C8a);
+              npyStrVstrInitLen/VstrToObj/NewStrOfType
+              (new_str_type_from_vstr etc.); npyStrDictGet → dict_get
+              (objstr_b.rs — see C9a re-point); npyStrKwargsLookup →
+              kwargs_lookup (via find_static_qstr — a non-static field
+              name can never match a qstr-id kwarg name);
+              npyStrSplitlinesParseKeepends → keepends handling in
+              str_splitlines (pos_args[1] or kw map, else False).
+  97-122    exception constructors → StrError variants:
+              excBadFormatStr → BadFormatStr (ValueError "bad format
+              string"); excFormatNeedsDict → FormatNeedsDict (TypeError
+              "format needs a dict"); excMoreArgs → MoreArgs (TypeError
+              "format string needs more arguments"); excPctC → PctC
+              (TypeError "%c needs int or char"); excIntegerNeeded →
+              IntegerNeeded (TypeError "integer needed");
+              excExtraArgs → ExtraArgs (TypeError "format string
+              didn't convert all arguments"); excIndexOOR →
+              TupleIndexOutOfRange (IndexError "tuple index out of
+              range"); excKeyErr(key) → KeyError(Value) (KeyError with
+              args=[key]); excAttrsNotSupp → AttrsNotSupported
+              (NotImplementedError "attributes not supported").
+              Plus FillcharMustBeOne (TypeError "fillchar must be 1
+              character"), Prim(PrimError) (delegates to PrimError's
+              exc_type/message), RuntimeError (no message), and
+              Obj(ObjError) (re-added after an edit accidentally
+              deleted it — caught by the compiler).
+  vendor py/mpprint.h:31-40 → PF_FLAG_* consts in objstr_print.rs
+              (LEFT_ADJUST 0x001, SHOW_SIGN 0x002, SPACE_SIGN 0x004,
+              SHOW_PREFIX 0x008, PAD_AFTER_SIGN 0x010, CENTER_ADJUST
+              0x020, ADD_PERCENT 0x040, SHOW_OCTAL_LETTER 0x080,
+              SEP_POS 9, ALWAYS_DECIMAL 0x100).
+              PRINT_STR=0, PRINT_REPR=1, PRINT_RAW=4 (py/obj.h:581-585).
+  vendor py/mpprint.c → objstr_print.rs: mp_print_strn (73-157),
+              mp_print_mp_int (233-360), mp_print_float (361-392).
+              print_float uses a 33-byte buffer to match the C's
+              buf[36] + buf_size 33.
+
+BRIEF CORRECTIONS (premises in scripts/strings_b_brief.md that were wrong)
+---------------------------------------------------------------------------
+(a) §5's premise is wrong: `str_to_int` is NOT related to `int()`; it
+    is a format-internal digit scanner used only at 5 format call
+    sites (objstr.zig:2565, 2584, 2802, 2913, 2920). It DOES reset
+    `num` to 0 when the first byte is a digit (width/precision start
+    at -1; the reset is what makes "05" parse as 5, not -95).
+(b) `mp_obj_str_get_buffer` (2083-2090) was already ported by C8a —
+    skipped as briefed (verified by grep before writing).
+(c) Four cases ABORT the reference binary (rc=134) — Rust
+    wraps/saturates/returns-self instead (intentional divergences,
+    same class as C8a's):
+    - `str_to_int` i32 overflow: "%9999999999d" % 1 → panic "integer
+      overflow" at objstr.zig:2381. Rust wraps (wrapping arithmetic).
+    - `%c` i32 cast: "%c" % (2**40) → panic "integer does not fit in
+      destination type" at objstr.zig:2622. Rust truncates to u8.
+    - `%*d` width cast: "%*d" % (2**40, 42) → panic "integer does
+      not fit in destination type" at objstr.zig:2561. Rust wraps
+      (`as i32`).
+    - `center` negative width: "ab".center(-1) → panic at
+      objstr.zig:2270 (@intCast i64→usize). Rust returns self.
+    - `count` empty-needle start>end: "abc".count("", 5, 1) → panic
+      "integer overflow" at objstr.zig:2238 (end - start pointer
+      underflow). Rust saturates the slice to empty; the empty
+      needle then counts the single empty position → 1 (consistent
+      with count("",0,0) = 1).
+(d) Method table counts are 33/35, not 32/34 as briefed: str locals
+    = entries 5..38 = 33 (find..encode, including encode); bytes
+    locals = entries 2..37 = 35 (hex, fromhex, decode, find..isalnum,
+    no encode). Verified against objstr.zig:3536-3616.
+(e) First-batch probe records for center/align cases had collapsed
+    trailing/leading spaces — the repr probes are authoritative:
+    "ab".center(5) = ' ab  ', center(6) = '  ab  ';
+    "%+d % d" % (42,42) = '+42  42'; "%5.2d|" % 3 = '   03|',
+    "%-5.2d|" % 3 = '03   |', "%5.0d|" % 0 = '    0|',
+    "%*d" % (5,42) = '   42'; "é".center(4) = ' é  ' (4 chars).
+
+KEY FINDINGS (verified by the executor, main agent to re-verify)
+---------------------------------------------------------------
+1. TWO `is_exact_int` definitions with DIFFERENT semantics (naming
+   trap — this broke every `"{:d}"` on a small int until fixed):
+   - C6's `obj::is_exact_int` = heap-only (`isExactType` semantics):
+     returns FALSE for SmallInt.
+   - C7's `primitives::ops::is_exact_int` = `mp_obj_is_int` (small
+     int OR exact heap int) — the Zig's `objIsInt`.
+   `arg_looks_integer` must use C7's (aliased `obj_is_int` in
+   objstr_format.rs). The doc comment there records the distinction.
+   C6/C7 lanes may want to rename one of them; not this lane's scope.
+2. `mp_obj_get_int` raises TypeError "can't convert to int" for
+   floats (vendor py/obj.c:306-313 — no implicit float→int
+   conversion in the core language). `int_value` therefore checks
+   for a heap Obj::Int FIRST (before calling obj_get_int_maybe,
+   which ERRORS Overflow on an out-of-range heap int) — so
+   `"%d" % (2**70)` prints all 19 digits, while `"%o" % 3.0`
+   raises TypeError. C18 REQUIREMENT: the float type's IntMaybe
+   slot must return NotImplemented (not convert), or this breaks.
+3. `print_mp_int` prec>1 path (vendor mpprint.c:233-360, read in
+   full): spaces_before = width - max(fmt_size, prec) (+ sign/
+   prefix), then width = prec and the digits print zero-padded.
+   Verified against the vendor source AND the reference binary
+   ("%5.2d|" % 3 → '   03|').
+4. `strModuloFormatImpl` flags: '0' sets PF_FLAG_PAD_AFTER_SIGN AND
+   fill='0'; '#' sets a SEPARATE `alt` (not flags) — %d ignores #,
+   %x/%X pass flags|alt, %o ORs SHOW_PREFIX|SHOW_OCTAL_LETTER when
+   alt != 0. `nativeBase` for full builds except under %s/%r/%a
+   (identity in Rust — no user classes yet, C12/C13).
+5. `formatHelperInto` spec grammar: the '0' flag is NOT consumed
+   where it is parsed — `str_to_int` eats it as part of the width.
+   Sign flag with conv_type 's'/'c' (explicit only) → BadFormatStr,
+   so "{:+}".format("ab") → "ab" but "{:+s}".format("ab") →
+   BadFormatStr. Default align: numeric → '>', else '<'. The
+   integer branch is entered when arg_looks_integer (bool counts) —
+   hence "{:d}".format(True) → 1 but "{:s}".format(True) →
+   BadFormatStr. Precision truncates BYTES ("{:.1s}".format("é") →
+   first byte 0xC3). `__format__`/nativeBase are IDENTITY in Rust
+   (no methods yet, C12/C13/C14 must wire them).
+6. `"%*d"` negative width via `*` = NO padding (not left-adjust,
+   unlike CPython); `"%.*d"` prec -1 = no precision; prec 0 does
+   NOT suppress zero ("%.0d|" % 0 → "0|").
+7. `"%c"`: str arg must be exactly 1 BYTE (else PctC); bytes arg is
+   NOT str for %c (TypeError "integer needed"); int arg truncates
+   to u8 ("%c" % 256 → \x00, "%c" % -1 → \xff).
+8. `%b` is NOT supported in %-format → ValueError "bad format
+   string" (probed). ure treats {n,m} as literals (RE15 finding,
+   unrelated).
+9. `str.format` conversion prints the arg with PRINT_STR/REPR into
+   a temp str, then the spec applies to the CONVERTED str. Nested
+   specs share `arg_i` (they consume args). Manual index after auto
+   (or vice versa) → BadFormatStr. `"{0[0]}"` → AttrsNotSupported
+   (NotImplementedError "attributes not supported") — no item
+   access in format fields.
+10. `bytes_decode`/`str_encode` IGNORE encoding/errors (probed:
+    "ab".encode("utf-16") → b'ab'; b"\xff".decode() → raw \xff
+    byte, no error). C8a's make_new likewise never validates them.
+11. `str_splitlines` boundaries are ONLY \n and \r (probed: \v \f
+    \x1c-\x1e \x85 U+2028 are NOT boundaries).
+12. `dict_get` (objstr_b.rs) is a LINEAR scan of the stub
+    MapData.entries via obj_equal with Qstr/SmallInt/Bool fast
+    paths; a comparison raise is treated as "not equal". See
+    "C9a re-point" — it must be replaced by C9's dict_get at
+    merge time (C9a has now landed on master).
+
+PROBE RECORDS (reference binary, repr form unless noted)
+--------------------------------------------------------
+%-format: "%d" % 3.0 → 3; "%d" % True → 1; "%s" % b"ab" → b'ab';
+  b"%s" % b"ab" → RAW bytes arg undecorated; b"%r" % b"x" → b"b'x'";
+  "%(x)s" % {"x": 1} → 1; "%(x)s" % {} → KeyError: x;
+  "%d" % "a" → TypeError "can't convert to int";
+  "%5.2f" % 3.14159 → ' 3.14'; "%-5d|" → '42   |' (first record
+  collapsed — Rust prints '42   |'); "%05d" % -42 → '-0042';
+  "%x %#x %o %#o" % (255,255,8,8) → 'ff 0xff 10 0o10';
+  "%c" % 65 → 'A'; "%c" % "a" → 'a'; "%r" % "ab" → "'ab'";
+  "%s %s" % "a" → TypeError "format string needs more arguments";
+  "%d" % (1,2) → TypeError "format string didn't convert all arguments";
+  "%*d" % (5,42) → '   42'; "%.*f" % (2,3.14159) → '3.14';
+  "%.3s" → 'abc'; "%e/%E/%g/%G" → '1.234568e+04' / '1.234568E+04' /
+  '1.2345e-05' / '1.2345E-05'; "%+d % d" % (42,42) → '+42  42';
+  "%s" % (1,) → '1'; "%i %u" % (-5,-5) → '-5 -5'; "%#o" % 8 → '0o10';
+  "%#x" % 0 → '0x0'; "%#X" % 255 → '0XFF'; "%o" % 8 → '10';
+  "%#o" % 0 → '0o0'; "%d" % (2**70) → 19 digits;
+  "%x" % (2**70) → '400000000000000000';
+  "%5s|"/"%-5s|" % "ab" → '   ab|'/'ab   |' (first record collapsed);
+  "%s"/"%r" % None → 'None'; "%d" % 3.9 → 3, "%d" % -3.9 → -3;
+  "%c" % 256 → '\x00', "%c" % -1 → '\xff'; b"%d" % 42 → b'42';
+  "%s" % [1,2] → '[1, 2]', "%s" % {"a":1} → "{'a': 1}" (needs C9
+  print slots — not testable in Rust unit tests yet);
+  "%d" % b"5" → TypeError "can't convert to int";
+  "%x" % -1 → '-1'; "%o" % -8 → '-10'; "%#x" % -255 → '-0xff'
+  (sign BEFORE prefix); "%#o" % -8 → '-0o10'; "%+x" % 255 → '+ff';
+  "% x" % 255 → ' ff'; "%*d|" % (-5,42) → '42|' (negative width via
+  * = NO padding); "%.*d" % (-1,42) → '42';
+  "%5.0d|" % 0 → '    0|'; "%.0d|" % 0 → '0|';
+  "%-05d|" % 42 → '42000|' (LEFT + fill 0 → zero right-pad);
+  "%05.2f" → '03.14'; "%05d|" % 0 → '00000|';
+  "%-5.2d|" % 3 → '03   |'; "%5.2d|" % 3 → '   03|';
+  "%#.0o|" % 0 → '0o0|'; "%+.2f"/"% .2f" → '+3.10'/' 3.10';
+  "%g" % 100000.0 → '100000', 0.00001 → '1e-05', 1000000.0 →
+  '1e+06', 123456789.0 → '1.23457e+08'; "%f" % 0.1 → '0.100000',
+  "%.20f" % 0.1 → '0.10000000000000000000';
+  "%e" % 0.0 → '0.000000e+00', -0.0 → '-0.000000e+00',
+  inf → 'inf', nan → 'nan'; "%10s|" % 1.5 → '     1.5|'
+  (first record collapsed).
+str.format: "{} {} {}".format(1,"a",2.5) → '1 a 2.5';
+  "{0} {1} {0}" works; "{name} is {age}".format(name="bob", age=3)
+  → 'bob is 3'; "{:>10}|"/"{:<10}|"/"{:^10}|" of "ab" →
+  '        ab|'/'ab        |'/'    ab    |';
+  "{:05d}" → '00042', "{:05d}".format(-42) → '-0042', "{:+d}" →
+  '+42', "{: d}" → ' 42'; "{:.2f}" → '3.14', "{:e}" →
+  '1.234568e+04', "{:g}" → '1.2345e-05';
+  "{:x} {:X} {:o} {:b}" → 'ff FF 10 101'; "{!r}" → "'ab'",
+  "{!s}".format(42) → '42'; "{{}}" → '{}', "{{x}}" → '{x}';
+  "{:,}" → '1,234,567', "{:_}" → '1_234_567';
+  "{:#x} {:#o}" → '0xff 0o10'; "{:.3s}" → 'abc';
+  "{:10.3s}|" → '       abc|'; "{:c}".format(65) → 'A';
+  "{:%}".format(0.25) → '25.000000%', "{:.1%}" → '25.0%'
+  (0.25) / '25.6%' (0.256); "{}".format() → IndexError "tuple
+  index out of range"; "{0.x}" → NotImplementedError "attributes
+  not supported"; "{1}".format("a") → IndexError; "{!x}" →
+  ValueError "bad format string"; "{:z}" → ValueError;
+  "{0:>{1}}".format("ab",6) → '    ab'; "{:05.2f}" → '03.14';
+  "{:n}".format(1234567) → '1234567' ('n' → 'g', no grouping);
+  "{:}".format(42) → '42'; "{:s}" → 'ab';
+  "{0} {1}".format("a") → IndexError; "{a}".format() → KeyError: a;
+  "{:}".format("ab") → 'ab'; "{:>5}"/"{:<5}|"/"{:^5}|" of 42 →
+  '   42'/'42   |'/'  42  |'; "{:=+8d}" → '+     42',
+  "{:=8d}".format(-42) → '-     42' (re-probed 2026-11-17: the
+  earlier '+ 42'/'- 42' records were collapsed-space errors);
+  "{:08.2f}" → '00003.14';
+  "{:.0f}" of 3.9 → '4', 3.4 → '3';
+  "{:d}".format(True) → '1' but "{:s}".format(True) → ValueError
+  "bad format string"; "{:d}".format("ab") → ValueError;
+  "{0[0]}" → NotImplementedError "attributes not supported";
+  "{:+}".format("ab") → 'ab'; "{:+s}".format("ab") → ValueError;
+  "{:05.2d}".format(42) → '00042' (precision ignored for ints);
+  "{:>5}".format([1]) → TypeError "can't convert to str implicitly";
+  "%c" % "é" → TypeError "%c needs int or char";
+  "{:e}".format(42) → '4.200000e+01'; "{:d}".format(3.5) →
+  ValueError; "{:s}".format(42) → ValueError;
+  "{:=5}".format("ab") → ValueError; "{:05}".format("ab") →
+  'ab000'; "{:.1s}".format("é") → first byte 0xC3;
+  "%f" % 42 → '42.000000'; "%f" % "a" → TypeError "can't convert
+  to float".
+splitlines: "a\nb\r\nc\rd" → ['a','b','c','d']; keepends True →
+  ['a\n']; "" → [], "\n" → [''], "a\n\nb" → ['a','','b']; bytes work.
+partition: ("a","b","c") / rpartition same; not found →
+  ('abc','','') / ('','','abc'); empty sep → ValueError "empty
+  separator"; non-str arg → TypeError "can't convert to str
+  implicitly"; bytes work.
+count: "aaa".count("aa") = 1; "aaa".count("") = 4;
+  "abc".count("b",1) = 1, (...,5) = 0; ("b",-1) = 0;
+  "héllo".count("") = 6; ("b",0,2) = 1, ("b",1,2) = 1;
+  "abc".count("",0,0) = 1; "abc".count("b",1.5) → TypeError
+  "string indices must be integers".
+center/ljust/rjust: "ab".center(5) = ' ab  ', center(6) = '  ab  ',
+  center(5,"*") = '*ab**', center(2) = 'ab'; "ab".center(5,"xy")
+  → TypeError "fillchar must be 1 character"; "ab".ljust(5) =
+  'ab   ', "ab".rjust(5,"0") = '000ab'; b"ab".center(5) = b' ab  ';
+  "é".center(4) = ' é  ' (4 chars).
+encode/decode: b"ab".decode() → 'ab'; "ab".encode() → b'ab';
+  b"\xff".decode() → raw \xff byte (no error); "ab".encode("utf-16")
+  → b'ab' (encoding ignored).
+
+NEW TESTS (28, objstr_tests_c.rs 14 + objstr_tests_d.rs 14)
+------------------------------------------------------------
+objstr_tests_c.rs: vstr_init_and_growth, vstr_add_char_utf8,
+  vstr_fixed_buf_runtime_error, vstr_cut_ops,
+  vstr_null_terminated_and_clear, vstr_ins_ops, splitlines_basic,
+  partition_basic, count_basic, center_ljust_rjust, encode_decode,
+  constructors_and_getters, str_to_int_scan, method_tables,
+  dict_get_helper (15 — count: 6 vstr + 9 method/constructor).
+objstr_tests_d.rs: modulo_ints, modulo_str_repr, modulo_floats,
+  modulo_dict_keys, modulo_errors, modulo_bytes_pattern,
+  format_positional, format_keyword, format_align_fill,
+  format_types, format_conversion, format_spec_nested_and_pct,
+  format_mixing_errors (13).
+(28 total: 15 + 13. The earlier "14 + 14" split was miscounted;
+the file split moved dict_get_helper into tests_c and
+modulo_bytes_pattern into tests_d.)
+
+C8a TEST UPDATED (1 assertion, objstr_tests.rs)
+------------------------------------------------
+binary_op_multiply's Modulo assertion changed from `r.is_none()`
+to `matches!(r, Some(Err(StrError::ExtraArgs)))` ("ab" % "ab" has
+no conversion, so the argument is extra). This was the one failure
+when the Modulo arm landed.
+
+FIXTURE CHANGE (objstr_tests.rs — shared test infrastructure)
+--------------------------------------------------------------
+- Float print stub added (same class as the existing int/bool/none
+  stubs): formats a heap Float via Lane FMT's `format_float(f, 'g',
+  -1, 0)` — the vendor float print's format. It stands in for C18's
+  float print slot (REGISTRATION only); the `{}`-format conversion
+  path that calls it is C8b's and is tested here (format_positional
+  asserts "{} {} {}".format(1,"a",2.5) → '1 a 2.5'). C18 must
+  replace the stub with the real slot; the stub's output for the
+  tested values (2.5 → '2.5') matches the reference binary.
+- The 9 C8b shared helpers (fmt_pct, fmt_str, dict_of, big_2_pow_70,
+  float_of, list_items, tuple_items, count_val, call_bytes) moved
+  into objstr_tests.rs as pub(crate) (see file splits).
+
+GAPS FOR LATER LANES
+--------------------
+C9a (NOW LANDED on master — merge-time re-point, see top):
+  `dict_get` must be re-pointed at C9's `dict_get` (real hash table);
+  `iter_items` dict-keys path must be checked against the new
+  MapData; `str.join` on dict keys goes via MapEntry on master.
+C10 (callables):
+  `str.format` core takes kwargs: &[KwArg] but the builtin wrapper
+  passes empty kwargs — C10/C13 must pass kwargs through.
+  `FunBuiltinData.n_args` encoding for the method table entries
+  (split/join/replace/count use kwVar; splitlines/format are
+  FunBuiltinVar with KW sig; partition/rpartition/capitalize/title/
+  zfill/lower/upper/is* are Fixed 1 or 2; codec kwVar with defaults
+  encoding="utf-8", errors=None) is still undetermined.
+C12 (objtype/except/module/object):
+  `new_empty_bytes` is a fresh heap object, NOT the ROM singleton;
+  `get_qstr` returns None for non-static heap content (dynamic
+  interning deferred); `new_str_via_qstr` dynamic interning deferred.
+C13 (VM):
+  - Dynamic qstr pool (non-static names like "x"/"age" are heap
+    strs today; `kwargs_lookup` can never match them — a non-static
+    field name can never match a qstr-id kwarg name).
+  - `PENDING_STR_ERROR` cell must be replaced by
+    `VmState.pending_exc` (C8a's design doc D7 convention; the cell
+    is KEPT, as in C8a).
+  - `"abc"[5]` shows TypeError not IndexError at the dispatch layer
+    (C8a gap, unchanged).
+  - `__format__` / `nativeBase` are IDENTITY in format_helper_into
+    (no user classes/methods yet) — C13/C14 must wire them.
+  - `str.format` kwargs passing (see C10).
+  - `get_buffer` on non-str/bytes reports BufferProtocol (C8a gap,
+    unchanged — needs a safe copy when array/bytearray land).
+C18 (float/complex):
+  - The float type's IntMaybe slot must return NotImplemented (not
+    convert) — otherwise `"%o" % 3.0` stops raising TypeError (see
+    finding 2). Verified against vendor py/obj.c:306-313.
+  - The real float print slot must replace the fixture stub (see
+    above). Float → str conversion via `{}`/`{!s}`/`{!r}`/`%s` is
+    blocked on it in the real VM (the format code itself is done).
+  - `2 * "ab"` → NotHandled (C14); float/complex rhs → NotHandled
+    (C18) — C7's deferred items, unchanged.
+C8c (mpprint):
+  - Unify the three print helpers in objstr_print.rs (print_strn,
+    print_mp_int, print_float) with the vendor `py/mpprint.c` port.
+    They are the single implementation today; C8c must keep their
+    observable behaviour — the probe records in this file pin it.
+    `print_float_pct` (vspPrintFloatPct) is also here.
+
+DESIGN DECISIONS
+----------------
+- Borrow rule (C8a's pattern): `str_data` results are copied with
+  `to_vec()` before any `ctx` mutation — a borrow of the arena
+  cannot outlive a `ctx` mutation.
+- `Vstr::clear` frees buf but leaves alloc/len (C semantics); the
+  defensive `buf.len()` check in `ensure_extra` covers a cleared
+  buffer whose stale `alloc` would otherwise skip the realloc —
+  invisible when Zig is correct.
+- `new_str_type_from_vstr` leaves the vstr emptied with alloc = 0,
+  len untouched (C semantics).
+- `str_data` on a qstr immediate reads the static table; heap
+  Str/Bytes read payload bytes; anything else → None (the Zig
+  reads the MpObjStr layout unconditionally — UB on a non-str;
+  Rust refuses instead).
+- `check_is_str_or_bytes` is a no-op in the original
+  (objstr.zig:681-683, mp_check_self no-op under nano + NDEBUG) —
+  not ported (nothing to port).
+- `format_arg_as_int` is C8b's own (separate from C7's
+  `primitives::ops::arg_as_int`, which returns i64 with a different
+  error type and is NOT the Zig's Obj-returning `arg_as_int` either).
+- `IntValue` (I64/Big) exists because `%d` must print big ints
+  (2**70 → 19 digits) while `%o`/`%x` must NOT convert floats.
+- Values are always bound in `let` statements before a call taking
+  `&mut fx.ctx()` (building a value and taking the call-context
+  borrow in the same expression is a borrow error — hit twice).
+- `str_modulo_format`'s dict-key form sets `arg_i = 1`; missing dict
+  key → KeyError (not MoreArgs); end: `if (dict == NULL and
+  arg_i != n_args)` → ExtraArgs. Result type = pattern's type
+  (bytes in, bytes out).
+
+DIVERGENCES FROM THE ORIGINAL (intentional, documented)
+-------------------------------------------------------
+- Reference-binary aborts (rc=134) → Rust wrap/saturate/return-self:
+  str_to_int i32 overflow (wrap), %c i32 cast (truncate to u8),
+  %*d width cast (wrap), center negative width (return self),
+  count empty-needle start>end (saturate → 1). See brief
+  corrections (c).
+- `str.center` on a non-str fillchar → BadImplicitConversion
+  (TypeError "can't convert to str implicitly"); the original
+  crashes with "incorrect alignment" (mp_mirrors.zig:621).
+- `"%c" % (2**40)` etc. — see above (truncate, not abort).

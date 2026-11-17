@@ -1,0 +1,222 @@
+# Result — petitpy-rs Phase A2: lexer
+
+## Headline
+DONE. Port of `src/compiler/lexer.zig` (1,436 lines) to Rust:
+`src/compiler/lexer/` (mod 678 + tables 442 + string 252 + chars 136 +
+peek 107 + tests 466 lines), `cargo test` 33/33, `cargo build --release`
+0 warnings, no unsafe, pure std, every .rs file < 800 lines.
+Strongest evidence: **Zig-vs-Rust token streams are byte-identical
+on all 552 corpus files** (`scripts/check_lexer_zigdiff.py`: 552/552),
+plus the verdict check (`scripts/check_lexer_corpus.py`: Rust 552
+clean / 0 error; original 551 ok / 1 runtime fail) and the
+dump-and-diff table check (245/245 values identical).
+
+## Baseline (original, measured this session)
+- `zig build lexer-unit` in petitpy-orig: **11/11 tests passed**
+  (`compiler-lexer`, 21ms). No source changes in petitpy-orig
+  (git status clean after all runs).
+- `zig build unit-compiler` was NOT re-run (A1 already recorded
+  97/98 there); the lexer-specific step is the baseline for A2.
+
+## Files ported / created
+| File | Lines | Source |
+|---|---|---|
+| src/compiler/lexer/mod.rs | 678 | lexer.zig: Lexer struct, Reader, next_char, indent stack, skip_whitespace, scan_next, constructors, Drop |
+| src/compiler/lexer/tables.rs | 442 | lexer.zig: TokenKind (96 variants + NUMBER_OF), tok_enc, tok_enc_kind, tok_kw, strcmp |
+| src/compiler/lexer/chars.rs | 136 | lexer.zig: character predicates |
+| src/compiler/lexer/string.rs | 252 | lexer.zig: get_hex, parse_string_literal_inner, append_unichar |
+| src/compiler/lexer/peek.rs | 107 | lexer.zig: soft-keyword lookahead (SavedTok, peek_*) |
+| src/compiler/lexer/tests.rs | 466 | 11 ported tests + 5 extra |
+| src/compiler/mod.rs | +1 | `pub mod lexer;` |
+| build.rs | +18 | emits build_options.rs (STR_UNICODE, see below) |
+| examples/lex_dump.rs | 89 | token dump in lexer_test.zig's wire format |
+| scripts/check_lexer_tables.py | — | dump-and-diff for the tables |
+| scripts/check_lexer_corpus.py | — | verdict check vs original binary |
+| scripts/check_lexer_zigdiff.py | — | Zig-vs-Rust stream diff (builds a scratch Zig dump) |
+| scripts/a2_result.txt | — | this file |
+
+## @cImport finding (the brief's premise was WRONG — verified by grep)
+- `lexer.zig` has NO `@cImport`: the only occurrence is the header
+  comment "1. No @cImport. The `mp_token_kind_t` enum is mirrored
+  locally as `TokenKind`…". The earlier grep that listed lexer.zig
+  matched that comment.
+- `lexer_test.zig` DOES use `@cImport`, but only for libc
+  `unistd.h`/`stdlib.h`, used for `libc.write` (fd 1/2 output) and
+  `std.process.exit` — both plain Rust std (`std::io::Write` /
+  `std::process::exit`) in the port. No C FFI anywhere, nothing
+  load-bearing: there is no C table or constant to reproduce.
+- `lexer.zig` imports `build_options` (Zig build option) for one
+  bool: `STR_UNICODE` (default on, build.zig:364 `orelse true`).
+  Reproduced by extending `build.rs` to emit `build_options.rs`
+  into OUT_DIR with `pub(crate) const STR_UNICODE: bool`, read from
+  `PETITPY_STR_UNICODE` (default true); `lexer/mod.rs` includes it.
+  Verified: the corpus diff below runs with STR_UNICODE=true.
+
+## Tests (cargo test --release --lib --tests: 33 passed, 0 failed)
+Ported from the 11 `test` blocks in lexer.zig (the acceptance bar):
+ 1. smoke_empty_input_yields_newline_then_end
+ 2. smoke_pass_tokenises_to_kw_pass_newline_end
+ 3. smoke_identifier_accumulates_into_vstr
+ 4. smoke_integer_literal
+ 5. smoke_simple_string_literal
+ 6. smoke_indent_dedent
+ 7. smoke_debug_flips_on_debug_mode
+ 8. smoke_hex_escape_in_string_literal
+ 9. smoke_nested_brackets_suppress_newline
+ 10. soft_keywords_peeking_a_line_replays_it_byte_identically
+     (6 cases x 2 keywords, incl. f-string + unbalanced-bracket cases)
+ 11. soft_keywords_the_colon_verdict_separates_statement_from_call
+     (10 cases)
+Extra evidence (own tests, not part of the Zig bar):
+ 12. token_kind_fingerprint_number_of_is_96 (from_u8 round-trips
+     0..=95; 96/255 are None; name() spot checks)
+ 13. keyword_table_lookup (all 36 keywords -> right kind; async/
+     await unconditional; match/case/print stay NAME; table sorted
+     by strcmp — the invariant the early break relies on)
+ 14. operator_table_spot_check (48 operator/delimiter cases incl.
+     `!` -> INVALID; TOK_ENC_KIND has 44 entries)
+ 15. string_escapes_and_numbers (27 literal forms with exact vstr:
+     \n \t \r \\ \' \" \a \b \v \f \x41 \u00e9 (UTF-8 C3 A9)
+     octal \101, \0, raw r'\n', b'...' incl. b'\u1234' staying
+     literal, triple quotes, adjacent concat + kind-mismatch stop,
+     0x/0b/0o, 1_000, 1.5, .5, 1e5, 1E-5 -> "1e-5", 2j;
+     \N{...} -> LexError::UnicodeNameEscape; unterminated string
+     -> LONELY_STRING_OPEN; dedent mismatch token present)
+ 16. fstring_rewrite_emits_format_call (f'{a}' -> STRING "{}" then
+     the injected .format((a,),) token stream; f'{{}}' -> "{{}}";
+     f'{a=}' -> "a={}")
+ 17. corpus_basics_lexes_without_panic (lexes all 552 corpus files
+     in-process: 552 clean, 0 error, no panics)
+
+## Table verification (dump-and-diff, not eyeballing)
+- `scripts/check_lexer_tables.py`: PASS — all 245 values identical
+  (TokenKind 97 discriminants incl. NUMBER_OF, TOK_ENC 68 chars in
+  15 segments, TOK_ENC_KIND 44, TOK_KW 36).
+- Structural check: simulating the phase-1 scan walk over the whole
+  encoding string yields 46 entries = 44 kinds + the two
+  special-cased first chars ('!' and '.'), which never index
+  TOK_ENC_KIND. (Verified by hand-tracing the walk for '=', ':=',
+  '<<=' etc. while writing the port; the script asserts it.)
+
+## Differential checks
+- `scripts/check_lexer_zigdiff.py`: **PASS — 552/552 token streams
+  byte-identical** (Zig dump vs Rust `lex_dump`, wire format
+  `idx\tkind\tline\tcolumn\tlen\thexbytes`, 22.5s). The Zig side is
+  a scratch build in /tmp/zig_lexdump linking the ORIGINAL
+  lexer.zig + qstr.zig + mpy.zig (copied read-only) with a stub
+  build_options (str_unicode=true) and the original's generated
+  qstrdefs header. This is the strong form of the upstream C3
+  criterion ("552/552 byte-identical").
+- `scripts/check_lexer_corpus.py`: PASS — Rust lexer 552 clean /
+  0 error; original binary 551 ok / 1 fail. The one original
+  failure is `corpus/basics/deque_micropython.py`, which fails at
+  RUNTIME (`TypeError: argument num/types mismatch`), not at lex
+  time — the Rust lexer correctly lexes it cleanly.
+- Note on the Zig side's own harness: `lexer_test.zig` (the
+  differential CLI vs vendor `token_dump`) is DEFERRED upstream —
+  build.zig:1022-1026 says the C harness `tools/token_dump.c`
+  "not yet built" and several Zig 0.16 API translations are TBD, and
+  the file is not wired into any build step. The zigdiff check above
+  is the equivalent check with the Zig lexer itself as oracle, which
+  is strictly stronger than the deferred vendor comparison (the Zig
+  lexer is already proven against vendor by the project's own
+  552-file corpus pass at the full-pipeline level).
+
+## lexer_test.zig — NOT ported as a CLI (same reason as A1's
+## qstr_test.zig, by design)
+- It is a differential CLI program, not unit tests: it spawns a
+  `token_dump` binary that does not exist anywhere (see above) and
+  diffs its output against the Zig lexer's dump. Porting it now
+  would reproduce a harness for a binary that was never built.
+- Its assertions are covered in stronger form by the zigdiff check:
+  every corpus file's full token stream (kind + line + column +
+  vstr bytes) matches the Zig lexer's, which is exactly what
+  lexer_test.zig was built to prove.
+- The `examples/lex_dump.rs` binary IS the Rust spelling of its
+  `dumpZig` (same wire format, same stop conditions: break after
+  END/INVALID, continue past DEDENT_MISMATCH/LONELY_STRING_OPEN),
+  so the Zig-side flow can be re-implemented against it if a vendor
+  token_dump ever appears.
+
+## Divergences from the Zig original (all deliberate, documented in code)
+- Layout split: one 1,436-line Zig file became `lexer/` (mod +
+  tables + chars + string + peek + tests) because the project rule
+  caps every .rs file at 800 lines. Module path from outside is
+  unchanged (`crate::compiler::lexer`); `impl Lexer` blocks live in
+  the submodules, which can see the struct's private fields.
+- `Reader` is a trait object (`Box<dyn ByteSource>`) instead of two
+  fn pointers + `*anyopaque`; the slice reader OWNS a copy of the
+  source (`Vec<u8>`) instead of borrowing it, so the Lexer carries
+  no lifetime parameter. Token streams, positions and errors are
+  identical; the copy is an allocation detail.
+- `LexError` is a local enum (`UnicodeNameEscape`, `OutOfMemory`)
+  mirroring Zig's local `StringParseError` set (deliberately NOT
+  `PyError`, as the Zig file documents). `OutOfMemory` is
+  unreachable in practice: Rust allocation failure aborts where Zig
+  would propagate the error — observable difference only under
+  actual OOM.
+- No `lexerFree`: Rust `Drop` calls `reader.close()` (mirroring
+  lexerFree's close call); the Vecs drop automatically.
+- Keyword lookup does not append a NUL to the vstr: `strcmp_slice`
+  treats the end of each slice as the NUL, exactly equivalent to C
+  strcmp on the NUL-terminated copy the Zig side builds (and pops).
+- `source_name` is carried but never read by the lexer (same as
+  Zig); the field has `#[allow(dead_code)]` with a comment — the
+  parser (A3) will read it. This was the only warning source.
+- `TokenKind` keeps Zig/vendor SCREAMING_SNAKE variant names with a
+  file-level `#![allow(non_camel_case_types)]` (same precedent as
+  A1's `non_upper_case_globals` allow); renaming would break
+  line-by-line checkability and the `@tagName` spellings used by
+  the dump. `TokenKind::from_u8` replaces `@enumFromInt`;
+  `TokenKind::name()` replaces `@tagName`.
+- `indent_push` uses `u16::try_from(...).expect(...)` (mirrors Zig
+  `@intCast` panicking on overflow in debug mode); the Zig
+  alloc/num indent bookkeeping is a `Vec<u16>` with the bottom
+  entry always 0.
+- `f'{a=}'` / `f'{{}}'` expectations were first written wrong from
+  intuition (`"{a=}"`, `"{}"`) and the tests caught it: the real
+  vstr values are `"a={}"` and `"{{}}"` (the format string, not the
+  formatted result). Fixed before commit.
+
+## What did NOT port cleanly
+- Nothing in scope failed to port. Three self-inflicted mistakes
+  during the work, all caught by tests before commit:
+  a) `keyword_table_lookup` expected `__debug__` to stay
+     KW___DEBUG__, but the lexer (like Zig) flips it to KW_TRUE
+     under debug_mode=true. Test fixed, lexer was right.
+  b) `lex_dump` used `writeln!` for the token prefix, putting the
+     hex bytes on a separate line — the zigdiff run caught it
+     (streams diverged on every file). Fixed to `write!` + trailing
+     `writeln!`; zigdiff then passed 552/552.
+  c) `check_lexer_zigdiff.py` deleted its own `run()` helper in one
+     edit (NameError); restored. Also fixed in the same script: Zig
+     0.16 API drift — `b.path()` rejects absolute paths (header now
+     copied into scratch), `std.process.argsAlloc` gone (use the
+     `main(init)` + `init.minimal.args` pattern from main.zig),
+     `std.fs.cwd()` gone (use `std.Io.Dir.cwd()` +
+     `readFileAllocOptions` / `writeStreamingAll` from main.zig),
+     `ArrayList.writer` gone (use `allocPrint` + appends),
+     `c_allocator` needs libc (use `init.gpa`).
+     Note for later phases: `lexer_test.zig`'s TBD "Zig 0.16 API
+     translations" are exactly these four renames.
+
+## Acceptance checklist
+- cargo test --release --lib --tests: 33 passed, 0 failed (11
+  ported + 6 extra lexer tests + 16 A1 qstr tests).
+- Zig baseline: `zig build lexer-unit` 11/11 passed.
+- Table check: 245/245 identical.
+- Corpus verdict: PASS (552 clean / 0 error; original 1 runtime fail).
+- Zig-vs-Rust streams: 552/552 byte-identical.
+- cargo build --release: clean, 0 warnings.
+- No new unsafe (grep: none). Pure Rust std, no external crates.
+- Every .rs file < 800 lines (max mod.rs 678, tables.rs 442).
+- petitpy-orig untouched (git status clean).
+- Commits: this chunk landed in TWO commits, not one — the parent
+  agent's lane-setup commit e4d568f (14:31) ran `git add -A` while
+  this chunk was in flight and swept in the four finished files
+  (tables/chars/string/peek.rs + `pub mod lexer;` in mod.rs); the
+  present commit adds the rest (lexer/mod.rs, tests.rs, build.rs,
+  examples/lex_dump.rs, the three check scripts, this file). The
+  swept files are byte-identical to the working tree (git status
+  showed no diff on them), so nothing was lost — but future
+  `git add -A` commits should avoid scooping in-flight lane work.

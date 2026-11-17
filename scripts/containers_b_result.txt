@@ -1,0 +1,205 @@
+# Lane C9b — list + tuple + array + sequence + binary — RESULT
+
+Base: master `b2cb62b` (lib 412 + bin 9). Worktree
+`~/workspace/petitpy-rs-containers-b`, branch `lane/containers-b`.
+Commit: `Lane C9b: port list + tuple + array + sequence + binary to Rust`.
+
+## Acceptance (verified by the executor, `cargo test --release`)
+
+- lib: **487 passed, 0 failed, 1 ignored** (412 baseline + 75 new:
+  binary 13, sequence 7, tuple 12, list 23, array 20); bins: **9
+  passed**. **0 warnings. No `unsafe`** (the word appears only in
+  one doc comment). Every file < 800 lines (max
+  `objlist_tests.rs` 788, `objarray.rs` 753,
+  `objarray_tests.rs` 707, `objlist.rs` 663,
+  `objarray_methods.rs` 654, `binary.rs` 638,
+  `objtuple.rs` 621). Original repo `~/workspace/petitpy-orig`
+  clean (`git status --porcelain` empty).
+
+## Files
+
+- `src/objects/containers/binary.rs` (638) + `binary_tests.rs`
+  (392): `binary_get_size`/`get_val_array`/`get_int`/`set_int`/
+  `get_val`/`set_val`/`set_val_array`/`set_val_array_from_int`,
+  `value_word`/`new_int_from_u64`/`new_int_from_i64`,
+  `array_item_size`, `buffer_bytes` (readable bytes of a
+  buffer-protocol value + masked typecode), `binary_set_val_bytes`
+  (see below).
+- `src/objects/containers/sequence.rs` (244) + `sequence_tests.rs`
+  (174): `seq_multiply` (fallible — `None` on overflow/OOM),
+  `seq_cmp_objs`, `seq_index_obj`, `seq_count_obj`,
+  `seq_extract_slice`. `seq_cmp_bytes` / `fast_slice_indexes`
+  NOT re-ported (C8a owns them; imported).
+- `src/objects/containers/objtuple.rs` (621) + `objtuple_tests.rs`
+  (547): make_new (polled-sig model), HASH slot (seed 0, see
+  below), unary/binary/subscr/getiter/print, `tuple_type_data`.
+- `src/objects/containers/objlist.rs` (663) +
+  `objlist_methods.rs` (510) + `objlist_tests.rs` (788):
+  make_new, unary/binary/subscr/getiter/print, append/extend/
+  clear/copy/count/index/insert/pop/remove/reverse/sort
+  (in-place quicksort, first-failure-wins — see below),
+  `list_get`/`list_set_len`/`list_store`, `list_type_data`.
+- `src/objects/containers/objarray.rs` (753) +
+  `objarray_methods.rs` (654) + `objarray_tests.rs` (707):
+  array/bytearray/memoryview make_new, unary/binary/subscr/
+  getiter/buffer/print, append/extend, `array_new`/
+  `array_construct`/`new_memoryview`/`new_bytearray`/
+  `new_bytearray_by_ref`, `array_type_data`/
+  `bytearray_type_data`/`memoryview_type_data` (flags 0 / 0x0408
+  / 0x0408; memoryview has NO print slot).
+- `src/objects/value.rs`: `ArrayData` reshaped from the stub
+  `{typecode, items: Vec<Value>}` to `{typecode, free, len,
+  data: Vec<u8>, source: Option<GcRef>}` (`free` = element
+  offset for views, reserve for owned; `data` = owned element
+  bytes; `source` = viewed object; views-of-views flatten).
+- `src/objects/obj.rs`: added `FLAG_SUBSCR_ALLOWS_STACK_SLICE
+  = 0x0400`.
+- `src/objects/containers/objdict_methods.rs`: `collect_iterable`
+  gained an `IterPlan::ArrayBytes` arm (array → elements via
+  `buffer_bytes` + `binary_get_val_array`).
+- `src/objects/containers/tests.rs` (fixture): real tuple/list
+  types (retired `tuple_print_double`), new fields `array`,
+  `bytearray`, `memoryview` (fixture fields, NOT `BuiltinTypes`
+  fields), `heap_bigint` helper.
+- `src/objects/containers/map_tests.rs`: tuple-hash assertion
+  updated (identity hash → `hash((1,)) == 1`).
+- `src/objects/containers/objlist_tests.rs`: nested-print
+  expectation updated to `"[[1, 2], (3,)]"`.
+
+## Key findings (all probed on the reference binary, 2026-11-17)
+
+### 1. The polled-only sig check
+`src/runtime/argcheck.zig:100` defines the Zig's OWN
+`mp_arg_check_num_sig` — it sets `pyerr.pending_exc` and
+RETURNS; callers that never poll let a later error overwrite
+it. Verified: `tuple(1, 2)` → "object not iterable" (getiter
+overwrites), `tuple("a", "b")` → "argument num/types mismatch"
+(getiter succeeds), `tuple((1, 2), 99)` → arg-mismatch
+(exact-tuple early return leaves the pending error),
+`tuple(1, 2, 3)` / `list(1, 2)` → "object not iterable",
+`tuple([1], 2)` / `tuple('a', 'b')` → arg-mismatch,
+`array(1, 2, 3)` would be overwritten by "can't convert to str
+implicitly", `memoryview(b"abc", 1)` → arg-mismatch. Same
+model in Rust: record `sig_err`, continue, let a later
+failure overwrite it and a later success preserve it.
+
+### 2. Tuple hash seed is 0, NOT the reference binary's 22815552
+The Zig seeds with the ROM empty-tuple object's *address*
+(`@bitCast(objFromPtr(&mp_const_empty_tuple_obj))`) — a link
+artifact, not a language semantic. The structure (seed +
+wrapping `+%` sum of element hashes, returned through
+`newSmallInt` tag-wrap) is ported faithfully; equal tuples
+still hash equal. Seed-0 Rust values asserted in tests:
+`hash(()) == 0`, `hash((1,2)) == 3`, `hash((None,)) == 6`,
+`hash(('a',)) == 46532`, `hash((2**62-1, 2**62-1)) == -2`.
+**C12 must revisit**: when the ROM singleton lands, the seed
+should become the singleton's identity word so
+`hash(()) == id(())` holds in Rust too.
+
+### 3. C7 int-HASH divergence — FOUND, NOT fixed (outside this lane)
+Vendor `objint_mpz.c:147-148` returns
+`MP_OBJ_NEW_SMALL_INT(mpz_hash(...))` (tag-wrap, no window
+check), so the reference `hash(2**62) == -(2**62)` (probed).
+C7's `objint.rs:461-466` returns `new_int_from_i64(hash_mpz())`
+→ `Value::int` → a heap `Int(2**62)` for out-of-window
+hashes. So Rust `hash(2**62)` is currently `2**62` (heap int),
+not `-(2**62)`. It cancels out at the tuple level (reference
+tuple hash `seed + (-(2**62))`; Rust
+`wrap_small_int(0 + 2**62) == -(2**62)` — same final value,
+pinned by the tuple test with a comment). **Main agent: fix
+`objint.rs` (or record it as a known divergence).**
+
+### 4. Sort is IN PLACE with first-failure-wins
+The quicksort does NOT stop on a failed comparison: the Zig's
+`mp_binary_op` export wraps the call in `pyerr.bridge`, which
+on error returns `OBJ_NULL` and sets `pending_exc` — the
+sorter treats NULL as "not less" and runs to COMPLETION, then
+the caller raises the FIRST failure. Probed partial states
+(all asserted in `objlist_tests.rs`): `[3, "a", 1, 2]` →
+`'str','int'`, list `[1, 2, 'a', 3]`; `[3, 1, "a", 2]` →
+`'int','str'`, `[1, 'a', 2, 3]`; `[2, "a", 1]` → `[1, 'a',
+2]`; `[4, "a", 3, 2, 1]` → `['a', 1, 2, 3, 4]`.
+`sort(key=len)` on ints ABORTS the reference rc=134
+(`fromPtr(NULL)`); Rust returns `PyRaise` for any non-None
+key (documented gap — key sorting needs the VM call
+machinery, C13/C14).
+
+### 5. Original aborts Rust deliberately does NOT reproduce
+- `bytearray(-1)` aborts rc=134 (`@intCast` panic at
+  `objarray.zig:293`) → Rust raises `ValueError("negative
+  count")` (CPython's message).
+- `memoryview([1,2])` / `memoryview(123)` abort rc=134
+  (uninitialized typecode at `objarray.zig:321`) → Rust raises
+  the buffer-protocol `TypeError`.
+- `array('i') + array('i')` and `bytearray() + bytearray()`
+  abort rc=134 (`res.items.?` on a NULL buffer at
+  `objarray.zig:377`) → Rust returns the empty array.
+- `sort(key=len)` on ints aborts rc=134 (see §4).
+
+### 6. Brief premises that were WRONG (corrected by probing)
+- `array` has NO `tobytes`/`frombytes`/`itemsize` methods
+  (probed: `AttributeError`); locals = append/extend only.
+- `98 in bytearray(b'abc')` does NOT return True — int rhs
+  raises bare `NotImplementedError` (the Zig checks the rhs
+  kind before searching); `b'bc' in bytearray` → True,
+  `'a' in bytearray` → True (str HAS a buffer).
+- `array` is a MODULE, not a builtin — probes need
+  `from array import array`.
+
+### 7. Other verified semantics
+- `insert` uses the raw REPR_A word (`smallIntValue`):
+  False→7, True→15, None→3, qstr(id)→`(id<<2)|1`, heap→i64::MAX
+  (clamp to end); `insert(1.5, x)` / `insert(2**70, x)` append.
+- `remove` on a miss leaves the list unchanged (index raises
+  before pop runs).
+- `[1,2,3][::0]` → `ValueError("slice step can't be zero")`
+  but `(1,2,3)[::0]` → NotImplementedError with the step-1
+  message (list differs from tuple); array slice step != 1
+  (incl. 0) → SliceStep in every case.
+- `==`/`!=` dispatch: the EQ_CHECKS_OTHER_TYPE gate
+  (`mp_obj_equal_not_equal`, vendor `py/obj.c:221`) explains
+  `array('b')==bytes` → False while `array('b')<bytes` → True;
+  bytearray/memoryview HAVE the flag (0x0408). NotEqual is NOT
+  a slot op for list/tuple/array (VM inverts `==`).
+- `bytearray(b'abc')[1:] = b'xy'` grows; `ba[0:1] = b'xyzw'`
+  grows; memoryview slice shares the source (free += start);
+  view store with len change → "lhs and rhs should be
+  compatible"; view store to a read-only view → NotImplemented.
+- `array('i',[1])+b'\x05\x00\x00\x00'` → `array('i',[1,5])`
+  (memcpy reinterpretation); `l += (3,)` extends from ANY
+  iterable; `(1,2)*0 is ()` → True; `() is ()` → True.
+- `objstr.zig:3500-3660` shared locals table: C8b assembles it;
+  C9b provides the array append/extend `BuiltinFn` adapters.
+  `objstr_shim.c` does NOT exist (stale comment in objarray.zig).
+
+## Implementation notes for the main agent / later lanes
+
+- `binary_set_val_array` takes `&mut CallCtx` AND `&mut [u8]`
+  into the arena — the two borrows cannot overlap. The lane
+  added `binary_set_val_bytes(ctx, tc, val) ->
+  Result<(usize, [u8; 8]), BinaryError>` (resolve first, copy
+  second via `copy_element_bytes` in `objarray_methods.rs`);
+  `binary_set_val_array` itself is unchanged (its tests still
+  pass).
+- Slot errors are `PyError::PyRaise` at the slot boundary (C6
+  convention): `array_binary_op` / `array_subscr` return
+  `PyResult`, so their messages ("lhs and rhs should be
+  compatible", "only slices with step=1…", "object with buffer
+  protocol required") are dropped until C13 adds `pending_exc`.
+  The method fns (`array_append`/`array_extend`, make_news)
+  return typed `ArrayError`s.
+- `array_make_new(ctx, array_type, bytearray_type, args, n_kw)`;
+  `bytearray_make_new(ctx, array_type, bytearray_type, args,
+  kwargs: &[KwArg])` (kwargs are a separate slice, NOT
+  interleaved); `memoryview_make_new(ctx, memoryview_type,
+  args, n_kw)`. `array_get_element` returns `Value` directly
+  (None on a non-array); `array_iternext` returns
+  `Result<Option<Value>, ArrayError>`.
+- `objlist_tests.rs` is at 788 lines — 12 lines of headroom;
+  do NOT add tests to that file without splitting it first.
+- NOTE (2026-11-17, during this lane): MEMORY.md was condensed
+  by a background job — C8b and C8c have MERGED since this
+  lane's base (master now 475 tests green) and C9c was
+  dispatched ~20:07. This lane's base `b2cb62b` is therefore
+  stale; the merge will need a rebase/merge against current
+  master and a full re-test.

@@ -264,9 +264,13 @@ enum IterPlan {
     Range(i64, i64, i64),
     /// A dict view / view-it to step (`dict`, `kind`, start cursor).
     ViewSteps(Value, DictViewKind, usize),
+    /// An array-family value to materialise (`typecode`, raw
+    /// bytes, element count) — elements are read with
+    /// `binary_get_val_array` below, where `&mut ctx` is free.
+    ArrayBytes { tc: u8, bytes: Vec<u8>, n: usize },
 }
 
-fn collect_iterable(ctx: &mut CallCtx, value: Value) -> Result<Vec<Value>, DictError> {
+pub(crate) fn collect_iterable(ctx: &mut CallCtx, value: Value) -> Result<Vec<Value>, DictError> {
     // Decide the plan from an immutable borrow (cloning payloads);
     // the allocations happen after the borrow ends.
     let plan = match value {
@@ -295,6 +299,21 @@ fn collect_iterable(ctx: &mut CallCtx, value: Value) -> Result<Vec<Value>, DictE
             ),
             Obj::Range(range) => IterPlan::Range(range.start, range.stop, range.step),
             Obj::Set(s) => IterPlan::Elems(s.items.clone()),
+            Obj::Array(a) => {
+                // Elements via `binary_get_val_array`
+                // (materialised — the same observable as the
+                // Zig's getiter loop). The bytes are resolved
+                // here; the `Value`s are built below, where
+                // `&mut ctx` is free (`binary_get_val_array`
+                // may allocate for `I`/`L`/`Q` elements).
+                let tc = a.typecode
+                    & crate::objects::containers::binary::TYPECODE_MASK;
+                let n = a.len;
+                match crate::objects::containers::binary::buffer_bytes(ctx, value) {
+                    Some((bytes, _)) => IterPlan::ArrayBytes { tc, bytes, n },
+                    None => return Err(DictError::TypeError(NOT_ITERABLE)),
+                }
+            }
             Obj::Iterator(_) => match as_dict_view_it(ctx.arena, value) {
                 Some((d, k, cur)) => IterPlan::ViewSteps(d, k, cur),
                 None => match as_dict_view(ctx.arena, value) {
@@ -351,6 +370,11 @@ fn collect_iterable(ctx: &mut CallCtx, value: Value) -> Result<Vec<Value>, DictE
             }
             Ok(out)
         }
+        IterPlan::ArrayBytes { tc, bytes, n } => Ok((0..n)
+            .map(|i| {
+                crate::objects::containers::binary::binary_get_val_array(ctx, tc, &bytes, i)
+            })
+            .collect()),
     }
 }
 

@@ -58,6 +58,12 @@ pub const FLAG_EQ_NOT_REFLEXIVE: u16 = 0x0004;
 pub const FLAG_EQ_CHECKS_OTHER_TYPE: u16 = 0x0008;
 pub const FLAG_EQ_HAS_NEQ_TEST: u16 = 0x0010;
 pub const FLAG_INSTANCE_TYPE: u16 = 0x0200;
+/// `MP_TYPE_FLAG_SUBSCR_ALLOWS_STACK_SLICE` (vendor
+/// `py/obj.h:578`): the subscr slot accepts a slice object
+/// allocated on the stack. bytearray and memoryview set it;
+/// array does not (its slice path still works — the flag only
+/// gates the VM's stack-slice fast path, C13/C14).
+pub const FLAG_SUBSCR_ALLOWS_STACK_SLICE: u16 = 0x0400;
 
 /// Buffer-protocol flags (vendor `py/obj.h:622-625`).
 pub const BUFFER_READ: u32 = 1;

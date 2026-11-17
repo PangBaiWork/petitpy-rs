@@ -233,13 +233,14 @@ fn map_hash_of_unhashable_and_unslotted() {
         }
         other => panic!("dict key hash: {other:?}"),
     }
-    // A tuple value: the fixture's tuple type has NO unary_op slot
-    // → identity hash (the `obj_id` word).
+    // A tuple value: the fixture's tuple type now has the
+    // real HASH slot (C9b) — the seed is 0 and the sum wraps
+    // through `wrap_small_int`, so `hash((1,)) == 1`.
     let t = fx.heap_tuple(vec![Value::SmallInt(1)]);
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
     let h = hash_of(ctx, ctx.types, t).unwrap();
-    assert_eq!(h, obj_id(t).as_small_int().unwrap() as usize);
+    assert_eq!(h, 1);
 }
 
 #[test]

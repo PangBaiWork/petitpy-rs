@@ -34,7 +34,11 @@
   `py/modio.c`, `py/objstringio.c`, `py/builtinhelp.c`, `py/warning.c`,
   `py/objfloat.c`, `py/formatfloat.c`, `extmod/modre.c` + `lib/re1.5/`
   (~1,100 LOC). Everything else in MicroPython's `py/` core has already
-  been replaced by Zig. (Exact C LOC measured after vendor clone lands.)
+  been replaced by Zig. **Measured 2026-11-17 after vendor clone at
+  b14d129a1: 5,318 lines total** — mpz.c 1,758; formatfloat.c 569;
+  modre.c 519; objint.c 496; objint_mpz.c 473; objfloat.c 339;
+  objstringio.c 269; modio.c 232; builtinhelp.c 175; re1.5/*.c 432;
+  warning.c 56. Total port scope ≈ 53,654 Zig + 5,318 C ≈ 59k lines.
 - Python files in repo: 1,345 (tests, corpus, golden-programs, examples,
   benchmarks, `petitpy-lib/*.py` frozen stdlib).
 

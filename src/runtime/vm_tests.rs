@@ -608,9 +608,15 @@ fn dispatch_type_error_call() {
 
 #[test]
 fn dispatch_import_error() {
-    // The import system is C15's — `IMPORT_NAME` raises.
+    // The import system is live (C15b) — with no `os` module
+    // registered and no `os.py` on `sys.path`, `import os`
+    // raises `ModuleNotFoundError` (an `ImportError` subclass;
+    // the C13 stub raised a plain `ImportError`).
     let mut fx = Fx::new();
-    assert_eq!(raised_name(&mut fx, "import os\n"), "ImportError");
+    assert_eq!(
+        raised_name(&mut fx, "import os\n"),
+        "ModuleNotFoundError"
+    );
 }
 
 #[test]

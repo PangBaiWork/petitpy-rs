@@ -4,14 +4,15 @@
 //! The `Vm`-level entries (`Vm::eval_exec`,
 //! `Vm::register_mpy_code`) intern through `&mut self.pool`;
 //! the dispatch-path twins (`Vm::eval_exec_ctx`,
-//! `Vm::register_mpy_code_ctx`) resolve the qstr table
-//! read-only — see `resolve_qstr_table_readonly` for the gap
-//! that leaves (a genuinely-new name fails with
-//! `OutOfMemory` instead of being interned).
+//! `Vm::register_mpy_code_ctx`) resolve the qstr table through
+//! the shared `CallCtx.pool` — `from_strn` interns through
+//! `&self` since C15b, so genuinely-new names are interned on
+//! both paths (the old read-only fallback failed them with
+//! `OutOfMemory`).
 
 use crate::compiler::bridge::compile_to_mpy_named;
 use crate::compiler::compile::CompileError;
-use crate::compiler::mpy::{self, QstrEntry};
+use crate::compiler::mpy::{self};
 use crate::compiler::parser::InputKind;
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objfun::new_fun_bc;
@@ -19,19 +20,18 @@ use crate::objects::objtype::objexcept::new_exception_msg;
 use crate::objects::objtype::objmodule::new_module;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{GcRef, Obj, Value};
-use crate::pyerr::{PyError, PyResult};
-use crate::runtime::qstr::RuntimeQstr;
-use crate::runtime::vm::{resolve_qstr_table, Vm, VmError, VmState};
+use crate::runtime::persistentcode::LoadedCode;
+use crate::runtime::qstr::resolve_qstr_table;
+use crate::runtime::vm::{Vm, VmError, VmState};
 
 impl Vm {
     /// The shared tail of `register_mpy_code` /
     /// `register_mpy_code_ctx`: convert + pin the const-object
     /// table, create the module object, patch its dict when
     /// asked, register the code. Takes the already-interned
-    /// module name id and the already-resolved qstr table — the
-    /// two callers resolve them differently (the `Vm` one
-    /// interns through `&mut pool`; the dispatch one looks up
-    /// read-only, see `resolve_qstr_table_readonly`).
+    /// module name id and the already-resolved qstr table — both
+    /// callers intern through the shared pool (`from_strn`
+    /// takes `&self` since C15b).
     fn register_code_inner(
         ctx: &mut CallCtx,
         state: &mut VmState,
@@ -42,24 +42,16 @@ impl Vm {
         register: bool,
     ) -> Result<(Value, usize), VmError> {
         let module_type = state.vm_types.module;
-        // Convert the module's const-object table once
-        // (`obj_from_entry`) and pin every value in `roots.extra`
-        // (inserted at `extra_base`, so `rebuild_frame_roots`
-        // keeps them) — `LOAD_CONST_OBJ` must push the SAME
-        // object on every load, as the Zig's `obj_table` does.
-        // Each value is pinned immediately after conversion so a
-        // GC during the next conversion cannot collect it.
-        let mut const_table: Vec<Value> = Vec::with_capacity(module.objs.len());
-        for entry in &module.objs {
-            let types = ctx.types;
-            let v = crate::runtime::vm_raise::obj_from_entry(
-                ctx, types, state.ellipsis, entry,
-            )
-            .map_err(|_| VmError::OutOfMemory)?;
-            ctx.roots.extra.insert(state.extra_base, v);
-            state.extra_base += 1;
-            const_table.push(v);
-        }
+        // Load the code (`mp_raw_code_load_mem`, C15b): header
+        // check + const-table conversion with pinning.
+        let loaded = crate::runtime::persistentcode::raw_code_load_mem(
+            ctx, state, module, qstr_table,
+        )?;
+        let LoadedCode {
+            rc,
+            qstr_table,
+            const_table,
+        } = loaded;
         let module_val = new_module(ctx, name_id, module_type);
         let module_ref = match module_val {
             Value::Heap(r) => r,
@@ -71,7 +63,7 @@ impl Vm {
             }
         }
         let code_idx = state.code_store.register_module(
-            module.rc.clone(),
+            rc,
             qstr_table,
             const_table,
             module_ref,
@@ -80,6 +72,31 @@ impl Vm {
             state.modules.insert(name_id, module_ref);
         }
         Ok((module_val, code_idx))
+    }
+
+    /// Register already-loaded code under an EXISTING module object
+    /// (the import loader's `execMpyInModule`: the module was
+    /// created and registered in `state.modules` by
+    /// `try_load_component` BEFORE the code was loaded, so no new
+    /// module is created and nothing is re-registered here).
+    /// Returns the code index.
+    pub(crate) fn register_loaded_into(
+        state: &mut VmState,
+        loaded: LoadedCode,
+        module_val: Value,
+    ) -> usize {
+        let module_ref = match module_val {
+            Value::Heap(r) => r,
+            _ => unreachable!("module value"),
+        };
+        let LoadedCode {
+            rc,
+            qstr_table,
+            const_table,
+        } = loaded;
+        state
+            .code_store
+            .register_module(rc, qstr_table, const_table, module_ref)
     }
 
     /// Read `.mpy` bytes, resolve the qstr table (interning
@@ -103,14 +120,15 @@ impl Vm {
         register: bool,
     ) -> Result<(Value, usize), VmError> {
         let module = mpy::read(data).map_err(VmError::Mpy)?;
-        // (Intern with `&mut self.pool` BEFORE the split — the
-        // ctx carries the pool shared.)
+        // (Intern the name BEFORE the split — the ctx carries
+        // the pool shared, and `from_strn` interns through `&self`
+        // since C15b, so either order works.)
         let name_id = self
             .pool
             .from_strn(name.as_bytes())
             .map_err(|_| VmError::OutOfMemory)?;
         let qstr_table =
-            resolve_qstr_table(&mut self.pool, &module.qstrs).map_err(|_| VmError::OutOfMemory)?;
+            resolve_qstr_table(&self.pool, &module.qstrs).map_err(|_| VmError::OutOfMemory)?;
         let (mut ctx, state) = self.split();
         Self::register_code_inner(
             &mut ctx,
@@ -124,11 +142,11 @@ impl Vm {
     }
 
     /// The dispatch-path twin of `register_mpy_code`: same
-    /// steps, but the qstr table is resolved READ-ONLY (see
-    /// `resolve_qstr_table_readonly` — a genuinely-new name
-    /// fails with `OutOfMemory` because the shared
-    /// `CallCtx.pool` cannot intern). Used by `eval_exec_ctx`
-    /// (the `call_function_ctx` interception of `eval`/`exec`).
+    /// steps, resolving the qstr table through the shared
+    /// `CallCtx.pool` (`from_strn` interns through `&self`
+    /// since C15b — genuinely-new names are interned, as on the
+    /// `Vm`-level path). Used by `eval_exec_ctx` (the
+    /// `call_function_ctx` interception of `eval`/`exec`).
     pub(crate) fn register_mpy_code_ctx(
         ctx: &mut CallCtx,
         state: &mut VmState,
@@ -137,20 +155,28 @@ impl Vm {
         module_dict: Option<GcRef>,
     ) -> Result<(Value, usize), VmError> {
         let module = mpy::read(data).map_err(VmError::Mpy)?;
-        let name_id = resolve_one_qstr_readonly(ctx.pool, name.as_bytes())
+        let name_id = ctx
+            .pool
+            .from_strn(name.as_bytes())
             .map_err(|_| VmError::OutOfMemory)? as u32;
         let qstr_table =
-            resolve_qstr_table_readonly(ctx.pool, &module.qstrs).map_err(|_| VmError::OutOfMemory)?;
+            resolve_qstr_table(ctx.pool, &module.qstrs).map_err(|_| VmError::OutOfMemory)?;
         Self::register_code_inner(ctx, state, module, name_id, qstr_table, module_dict, false)
     }
 
     /// Build the exception object for a compile failure
     /// (`SyntaxError("invalid syntax")` /
-    /// `IndentationError("unexpected indent")` /
-    /// `MemoryError("out of memory")` — the `CompileError`
-    /// `Display` texts). Used by `eval_exec`: a compile failure
-    /// inside `eval`/`exec` raises the exception, it does not
-    /// surface as a `VmError::Compile`.
+    /// `IndentationError("invalid syntax")` /
+    /// `OSError(12)` — the `raise_from_code` mapping,
+    /// `compile_bridge.rs`; the old version mapped
+    /// `IndentationError` to `"unexpected indent"` and
+    /// `OutOfMemory` to `MemoryError`, both wrong against the
+    /// original — see `scripts/import_result.txt` §5).
+    /// The traceback file is `"<string>"` (the eval source
+    /// name — a static qstr, so the resolve succeeds). Callers with a REGISTER-path allocation
+    /// failure must NOT pass `OutOfMemory` here — that class of
+    /// failure is `MemoryError("out of memory")`, built
+    /// directly at the call site.
     fn compile_error_value(&mut self, e: CompileError) -> Value {
         let (mut ctx, state) = self.split();
         Self::compile_error_value_ctx(&mut ctx, state, e)
@@ -158,10 +184,10 @@ impl Vm {
 
     /// The dispatch-path twin of `eval_exec` (the
     /// `call_function_ctx` interception of `eval`/`exec`):
-    /// same steps, but the qstr table resolves read-only
-    /// (`register_mpy_code_ctx` — a genuinely-new name in the
-    /// eval'd source fails with `MemoryError`, see
-    /// `resolve_qstr_table_readonly`), and the body runs through
+    /// same steps — the qstr table resolves through the shared
+    /// pool (`from_strn` interns through `&self` since C15b, so
+    /// genuinely-new names in the eval'd source are interned,
+    /// as on the `Vm`-level path) — and the body runs through
     /// `call_function_ctx` (no `&mut Vm` is available inside
     /// dispatch). The `Vm`-level `eval_exec` is the complete
     /// one; this one is the interception.
@@ -191,10 +217,14 @@ impl Vm {
             match Self::register_mpy_code_ctx(ctx, state, &mpy, "<string>", Some(globals)) {
                 Ok(v) => v,
                 Err(VmError::OutOfMemory) => {
-                    return Err(Self::compile_error_value_ctx(
+                    // Register-path allocation failure — NOT a
+                    // compiler-reported OOM (that is OSError(12)
+                    // via `raise_from_code`); the tree's
+                    // convention for allocation failure.
+                    return Err(new_exception_msg(
                         ctx,
-                        state,
-                        CompileError::OutOfMemory,
+                        state.exc.memory_error,
+                        "out of memory",
                     ));
                 }
                 Err(e) => unreachable!("eval code registration cannot fail: {e:?}"),
@@ -228,25 +258,18 @@ impl Vm {
     }
 
     /// `compile_error_value`'s ctx+state form (see the
-    /// `Vm`-level one).
+    /// `Vm`-level one). Delegates to the bridge's
+    /// `raise_from_code` (the canonical mapping).
     fn compile_error_value_ctx(
         ctx: &mut CallCtx,
         state: &VmState,
         e: CompileError,
     ) -> Value {
-        match e {
-            CompileError::SyntaxError => {
-                new_exception_msg(ctx, state.exc.syntax_error, "invalid syntax")
-            }
-            CompileError::IndentationError => new_exception_msg(
-                ctx,
-                state.exc.indentation_error,
-                "unexpected indent",
-            ),
-            CompileError::OutOfMemory => {
-                new_exception_msg(ctx, state.exc.memory_error, "out of memory")
-            }
-        }
+        let file = match ctx.pool.from_strn(b"<string>") {
+            Ok(id) => u32::from(id),
+            Err(_) => 0,
+        };
+        crate::runtime::compile_bridge::raise_from_code(ctx, state, &e, file)
     }
 
     /// `call_module_fun`'s ctx+state form: the module-body
@@ -312,7 +335,16 @@ impl Vm {
             match self.register_mpy_code(&mpy, "<string>", Some(globals), false) {
                 Ok(v) => v,
                 Err(VmError::OutOfMemory) => {
-                    return Err(self.compile_error_value(CompileError::OutOfMemory));
+                    // Register-path allocation failure — NOT a
+                    // compiler-reported OOM (that is OSError(12)
+                    // via `raise_from_code`); the tree's
+                    // convention for allocation failure.
+                    let (mut ctx, state) = self.split();
+                    return Err(new_exception_msg(
+                        &mut ctx,
+                        state.exc.memory_error,
+                        "out of memory",
+                    ));
                 }
                 Err(e) => unreachable!("eval code registration cannot fail: {e:?}"),
             };
@@ -347,48 +379,22 @@ impl Vm {
     }
 }
 
-/// Resolve one `New` qstr entry read-only: the id when the name
-/// is already in the pool, `Err(OutOfMemory)` when it is not
-/// (see `resolve_qstr_table_readonly`).
-fn resolve_one_qstr_readonly(pool: &RuntimeQstr, bytes: &[u8]) -> PyResult<u16> {
-    let id = pool.find_strn(bytes);
-    if id == 0 {
-        return Err(PyError::OutOfMemory);
+impl Vm {
+    /// Replace the module search path (`sys.path` — the `sys`
+    /// module that exposes it is D's `modsys`; the default is
+    /// `[""]`, the current directory — `runtime.zig:276-279`).
+    /// Added by C15b for the import tests (and D1's `modsys`).
+    pub fn set_sys_path(&mut self, paths: Vec<String>) {
+        self.state.sys_path = paths;
     }
-    Ok(id)
-}
 
-/// `resolve_qstr_table`'s read-only twin, for the dispatch path
-/// (`eval`/`exec` called from running code): static entries pass
-/// through; `New` bytes resolve through `pool.find_strn` — the
-/// name must ALREADY be in the pool (static, or interned by an
-/// earlier module load). A genuinely-new name cannot be interned
-/// through the shared `CallCtx.pool` (it is `&`, not `&mut` —
-/// the C0 design, so the dispatch loop never mutates the pool),
-/// so the resolve fails with `OutOfMemory`: the interning
-/// subsystem's own error (`from_strn`'s only failure), raised
-/// LOUDLY rather than silently mis-resolving the name to `""`
-/// (qstr 0). Consequences, verified against the corpus tests:
-/// `eval("1+2")`, `eval('x')` with `x` an outer variable, and
-/// `exec("def foo(): ...")` with `foo` an outer variable all
-/// work (their names are static or interned by the outer
-/// module's load); `exec("def bar(): ...")` where `bar` never
-/// appeared as an identifier fails with `MemoryError` — the
-/// precise gap. The `Vm`-level `eval_exec` (which holds `&mut
-/// pool`) interns correctly. Closing this gap for dispatch-path
-/// `eval` needs a `CallCtx.pool` mutability decision — see the
-/// result file. (`New` entries longer than 255 bytes fail the
-/// same way: `find_strn` returns 0 for them, `qstr.rs:121-123`.)
-pub fn resolve_qstr_table_readonly(
-    pool: &RuntimeQstr,
-    qstrs: &[QstrEntry],
-) -> PyResult<Vec<u16>> {
-    let mut table = Vec::with_capacity(qstrs.len());
-    for q in qstrs {
-        match q {
-            QstrEntry::Static(id) => table.push(*id),
-            QstrEntry::New(bytes) => table.push(resolve_one_qstr_readonly(pool, bytes)?),
-        }
+    /// Replace the frozen-module table (`frozen_modules.zig`).
+    /// Added by C15b for the import tests (and D1's registration
+    /// of the frozen `petitpy-lib` bundle).
+    pub fn set_frozen_modules(
+        &mut self,
+        table: crate::runtime::frozen_modules::FrozenTable,
+    ) {
+        self.state.frozen_modules = table;
     }
-    Ok(table)
 }

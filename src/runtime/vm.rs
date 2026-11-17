@@ -66,16 +66,16 @@
 use std::collections::HashMap;
 
 use crate::compiler::bridge::compile_to_mpy_named;
-use crate::compiler::mpy::{self, QstrEntry, RawCode};
+use crate::compiler::mpy::{self, RawCode};
 use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::objtype::objexcept_types::ExceptionTypes;
 use crate::objects::primitives::objint::fun_n_args;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{DictData, FunBuiltinData, GcRef, MapData, Obj, Value};
-use crate::pyerr::PyResult;
 use crate::runtime::bc::CodeState;
 use crate::runtime::builtinevex::{compile_builtin_fn, eval_builtin_fn, exec_builtin_fn};
+use crate::runtime::builtinimport::import_builtin_fn;
 use crate::runtime::qstr::RuntimeQstr;
 use crate::runtime::vm_builtins::{
     build_class_builtin_fn, next_builtin_fn, print_builtin, print_builtin_nokw,
@@ -272,6 +272,40 @@ pub struct VmState {
     /// raises `NotImplementedError` — there is no `Obj::Code`
     /// yet, see `builtinevex.rs`).
     pub compile_builtin: Value,
+    /// The `__import__` builtin (intercepted by GcRef identity
+    /// in `call_function_ctx`, like `eval` — its `func` is a
+    /// stub, see `builtinimport.rs`). Added by C15b.
+    pub import_builtin: Value,
+    /// The scheduler pending-exception slot
+    /// (`MP_STATE_THREAD(mp_pending_exception)`,
+    /// `scheduler.zig:33`): `None` = `MP_OBJ_NULL` = nothing
+    /// pending. Added by C15b; set by `mp_sched_exception`,
+    /// drained by `pending_exc_check` (the dispatch loop's
+    /// per-iteration poll, `vm.zig:110-114` Tier G).
+    pub pending_sched: Option<Value>,
+    /// `sys.path` (`MP_STATE_VM(sys_mutable[0])`,
+    /// `runtime.zig:276-279`): the import search path. Default
+    /// `[""]` — `mp_init` creates an empty list and appends the
+    /// empty qstr (the current directory); the entry point
+    /// overwrites `[0]` with the script dir and appends
+    /// `PETITPY_LIB` (`main.zig:244-248`, Phase E). Added by
+    /// C15b. A `Vec<String>` (not a Python list object — the
+    /// `sys` module that exposes it is D's `modsys`).
+    pub sys_path: Vec<String>,
+    /// The frozen-module table (`frozen_modules.zig`): `(dotted
+    /// name, .mpy bytes)` pairs. Empty by default (the default
+    /// build has `MICROPY_FROZEN_TINY_ENABLED=0`); Phase D fills
+    /// it from the frozen petitpy-lib bundle. Added by C15b.
+    pub frozen_modules: crate::runtime::frozen_modules::FrozenTable,
+    /// Registered builtin modules (`mp_module_get_builtin`'s
+    /// non-extensible table, `objmodule.zig`): `(name qstr,
+    /// module)` pairs. Empty until D1 registers modules (the
+    /// `sys` module lives here). Added by C15b.
+    pub builtin_modules: Vec<(u32, Value)>,
+    /// Registered extensible builtin modules (the `u`-strip
+    /// table — `import ufoo` maps to extensible `foo`).
+    /// Added by C15b; filled by D1.
+    pub extensible_modules: Vec<(u32, Value)>,
     /// Loaded modules by name qstr (C15 fills this via imports).
     pub modules: HashMap<u32, GcRef>,
     /// The VM-owned type objects (fun_bc, gen_wrap, …) — kept in
@@ -394,6 +428,12 @@ impl Vm {
                 eval_builtin: Value::None,
                 exec_builtin: Value::None,
                 compile_builtin: Value::None,
+                import_builtin: Value::None,
+                pending_sched: None,
+                sys_path: vec![String::new()],
+                frozen_modules: crate::runtime::frozen_modules::FrozenTable::new(),
+                builtin_modules: Vec::new(),
+                extensible_modules: Vec::new(),
                 modules: HashMap::new(),
                 vm_types,
                 extra_base: 0,
@@ -584,6 +624,12 @@ impl Vm {
         let eval_val = mk_var(&mut ctx, "eval", 1, 3, eval_builtin_fn, &mut pairs);
         let exec_val = mk_var(&mut ctx, "exec", 1, 3, exec_builtin_fn, &mut pairs);
         let compile_val = mk_var(&mut ctx, "compile", 3, 6, compile_builtin_fn, &mut pairs);
+        // `__import__` (1–5 args: `builtinimport.zig:179-184`,
+        // `MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(..., 1, 5, ...)`),
+        // intercepted by identity in `call_function_ctx` — its
+        // `func` is a stub, as `eval`'s is. Added by C15b.
+        let import_val =
+            mk_var(&mut ctx, "__import__", 1, 5, import_builtin_fn, &mut pairs);
 
         let builtins = ctx.alloc(
             None,
@@ -600,6 +646,7 @@ impl Vm {
         state.eval_builtin = eval_val;
         state.exec_builtin = exec_val;
         state.compile_builtin = compile_val;
+        state.import_builtin = import_val;
         // Pin everything live: the types, the singletons, the
         // builtins dict and the builtin values.
         let mut pins: Vec<Value> = Vec::new();
@@ -652,6 +699,7 @@ impl Vm {
         pins.push(eval_val);
         pins.push(exec_val);
         pins.push(compile_val);
+        pins.push(import_val);
         drop(ctx);
         for v in pins {
             self.pin(v);
@@ -753,23 +801,4 @@ pub(crate) fn frame_roots_of(frame: &CodeState) -> Vec<Value> {
 pub(crate) fn sync_frame_roots(ctx: &mut CallCtx, frame: &CodeState, mark: usize) {
     ctx.roots.stack.truncate(mark);
     ctx.roots.stack.extend(frame_roots_of(frame));
-}
-
-/// Resolve a module's `.mpy` qstr table to ids: static entries
-/// pass through, `New` bytes are interned into the (mutable)
-/// pool. The `CallCtx` carries the pool shared, so callers
-/// resolve the table with `&mut self.pool` BEFORE splitting the
-/// VM into a ctx.
-pub fn resolve_qstr_table(
-    pool: &mut RuntimeQstr,
-    qstrs: &[QstrEntry],
-) -> PyResult<Vec<u16>> {
-    let mut table = Vec::with_capacity(qstrs.len());
-    for q in qstrs {
-        match q {
-            QstrEntry::Static(id) => table.push(*id),
-            QstrEntry::New(bytes) => table.push(pool.from_strn(bytes)? as u16),
-        }
-    }
-    Ok(table)
 }

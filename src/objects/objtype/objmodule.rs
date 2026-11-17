@@ -77,7 +77,15 @@ pub fn module_type_data(dict: GcRef, object: GcRef) -> TypeData {
         base: Some(object),
         mro: Vec::new(),
         dict,
-        attr: None,
+        // The module type's attr slot IS `module_attr`
+        // (`objmodule.zig` — dict hit → `__dict__` → `__getattr__`
+        // → delegation). C12b left it `None` and C14's note left
+        // the wiring to D1; C15b wires it here because the import
+        // system itself needs attribute reads on modules
+        // (`from x import y`, `pkg.__path__`, the submodule
+        // attribute probe). The `__getattr__` seam stays `None`
+        // (C13's note) — a module `__getattr__` is not called.
+        attr: Some(module_attr),
         make_new: None,
         bases: None,
         namedtuple_fields: None,

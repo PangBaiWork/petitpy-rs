@@ -1,7 +1,8 @@
 //! Getiter / iternext / resume / unpack — the `runtime.zig:1055-1123`
 //! and `:1277-1456` ports: `mp_getiter` / `mp_iternext` /
 //! `mp_iternext_allow_raise` / `mp_resume` / `mp_unpack_sequence` /
-//! `mp_unpack_ex`, the import stubs (C15's), the `CALL_FUNCTION`
+//! `mp_unpack_ex`, the import opcode paths (C15b, via C14's
+//! `runtime_import`), the `CALL_FUNCTION`
 //! operand marshalling, and the `&mut Vm` wrappers.
 //! Split out of `vm_rt.rs` (file-size rule).
 
@@ -422,48 +423,110 @@ pub fn unpack_ex_ctx(
     Ok(out)
 }
 
-// ── import stubs (C15 owns the import system) ───────────────────────
+// ── imports (C15b) ──────────────────────────────────────────────────
 
-/// `mp_import_name` — C15's. Until then every import raises
-/// `ImportError` (documented stub, not a silent pass).
+/// `mp_import_name` (`runtime.zig:1459-1490` via C14's
+/// `runtime_import::import_name`): the `IMPORT_NAME` opcode path.
+/// `level` is the compiler-pushed level value (`SmallInt(0)` =
+/// absolute). The `import_default` seam is C15b's
+/// `import_default_seam` (a state-borrowing closure — the
+/// `RuntimeSeams<'a>` lifetime is this call); the generator seam
+/// stays the stub (import never resumes a generator). The seams
+/// borrow `state`, so they are dropped before the error mapping
+/// uses `state` again.
 pub fn import_name_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
-    _qst: u32,
-    _from_list: Value,
+    qst: u32,
+    from_list: Value,
+    level: Value,
 ) -> Result<Value, Value> {
-    Err(crate::objects::objtype::objexcept::new_exception_msg(
-        ctx,
-        state.exc.import_error,
-        "import system not implemented (C15)",
-    ))
+    let globals = Value::Heap(state.globals);
+    let builtins = crate::runtime::runtime::Builtins {
+        globals: Value::Heap(state.builtins),
+        override_dict: None,
+    };
+    let mut seams: crate::runtime::runtime::RuntimeSeams<'_> =
+        crate::runtime::runtime::RuntimeSeams::stub();
+    seams.import_default =
+        Box::new(crate::runtime::builtinimport::import_default_seam(state));
+    let result = crate::runtime::runtime_import::import_name(
+        ctx, qst, from_list, level, globals, &builtins, &mut seams,
+    );
+    drop(seams);
+    result.map_err(|e| match e {
+        // `PyRaise` from the seam carries its exception in
+        // `state.pending_exc` (the C14 contract) — drain it with
+        // the `drain_seam_raise` convention, not
+        // `exc_from_pyerror` (which only sees the recorded
+        // `pending_raise` and would fall back to a bare
+        // `TypeError`).
+        crate::runtime::runtime::RtError::PyRaise => drain_seam_raise(ctx, state),
+        other => {
+            crate::runtime::import_search::rt_error_to_value(ctx, state, other)
+        }
+    })
 }
 
-/// `mp_import_from` — C15's.
+/// `mp_import_from` (`runtime.zig:1492-1546` via C14's
+/// `runtime_import::import_from`): the `IMPORT_FROM` opcode path.
+/// The name is interned for real (`from_strn` takes `&self`
+/// since C15b).
 pub fn import_from_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
-    _module: Value,
-    _qst: u32,
+    module: Value,
+    qst: u32,
 ) -> Result<Value, Value> {
-    Err(crate::objects::objtype::objexcept::new_exception_msg(
-        ctx,
-        state.exc.import_error,
-        "import system not implemented (C15)",
-    ))
+    let globals = Value::Heap(state.globals);
+    let next_obj = state.next_builtin;
+    let builtins = crate::runtime::runtime::Builtins {
+        globals: Value::Heap(state.builtins),
+        override_dict: None,
+    };
+    let pool = ctx.pool;
+    let mut intern = |b: &[u8]| {
+        pool.from_strn(b).map(u32::from)
+    };
+    let mut seams: crate::runtime::runtime::RuntimeSeams<'_> =
+        crate::runtime::runtime::RuntimeSeams::stub();
+    seams.import_default =
+        Box::new(crate::runtime::builtinimport::import_default_seam(state));
+    let result = crate::runtime::runtime_import::import_from(
+        ctx, module, qst, globals, &builtins, &mut intern, next_obj, &mut seams,
+    );
+    drop(seams);
+    result.map_err(|e| match e {
+        // As in `import_name_ctx`: the seam's exception lives in
+        // `state.pending_exc` (see `drain_seam_raise`).
+        crate::runtime::runtime::RtError::PyRaise => drain_seam_raise(ctx, state),
+        other => {
+            crate::runtime::import_search::rt_error_to_value(ctx, state, other)
+        }
+    })
 }
 
-/// `mp_import_all` — C15's.
+/// `mp_import_all` (`runtime.zig:1550-1570` via C14's
+/// `runtime_import::import_all`): the `IMPORT_STAR` opcode path.
+/// Locals default to globals when `state.locals` is `None`
+/// (the C15a convention).
 pub fn import_all_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
-    _module: Value,
+    module: Value,
 ) -> Result<(), Value> {
-    Err(crate::objects::objtype::objexcept::new_exception_msg(
-        ctx,
-        state.exc.import_error,
-        "import system not implemented (C15)",
-    ))
+    let locals = match state.locals {
+        Some(l) => Value::Heap(l),
+        None => Value::Heap(state.globals),
+    };
+    let pool = ctx.pool;
+    let mut intern = |b: &[u8]| {
+        pool.from_strn(b).map(u32::from)
+    };
+    crate::runtime::runtime_import::import_all(ctx, module, locals, &mut intern)
+        .map_err(|e| {
+            crate::runtime::import_search::rt_error_to_value(ctx, state, e)
+        })
 }
 
 // ── call-operand marshalling ────────────────────────────────────────
@@ -597,9 +660,14 @@ pub fn unpack_ex(vm: &mut Vm, seq: Value, num: usize) -> Result<Vec<Value>, Valu
     unpack_ex_ctx(&mut ctx, &mut state, seq, num)
 }
 
-pub fn import_name(vm: &mut Vm, qst: u32, from_list: Value) -> Result<Value, Value> {
+pub fn import_name(
+    vm: &mut Vm,
+    qst: u32,
+    from_list: Value,
+    level: Value,
+) -> Result<Value, Value> {
     let (mut ctx, mut state) = vm.split();
-    import_name_ctx(&mut ctx, &mut state, qst, from_list)
+    import_name_ctx(&mut ctx, &mut state, qst, from_list, level)
 }
 
 pub fn import_from(vm: &mut Vm, module: Value, qst: u32) -> Result<Value, Value> {

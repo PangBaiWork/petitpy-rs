@@ -1,0 +1,335 @@
+Lane C15b: import system — builtinimport/import_search/persistentcode load/bridge/scheduler
+============================================================================================
+Executor: lane/import (worktree ~/workspace/petitpy-rs-import)
+Base: master 29dc637 (C15a merged). Result: lib 1022 -> 1076 (+54 new:
+frozen_modules 2 + scheduler 7 + import_tests 45), bins 9/9,
+0 warnings, no unsafe, every file <800 lines, orig clean. One commit.
+
+§1 — Overlap tables (written BEFORE any code; each Zig fn mapped to its Rust home)
+--------------------------------------------------------------------------------
+
+### 1a. persistentcode.zig (475) vs Lane M mpy.rs + C5 bc.rs + C13 vm_eval.rs
+
+| Zig fn (persistentcode.zig) | Rust home | Verdict |
+|---|---|---|
+| read_byte :91 / read_bytes :99 / read_uint :109 | `src/compiler/mpy.rs` `Reader::read_byte/read_bytes/read_uint` | ALREADY PORTED (Lane M) — same 7-bit big-endian varint |
+| decodePreludeSig :134 | `src/runtime/bc.rs:165` `prelude_sig_decode` (pub(crate)) | ALREADY PORTED (C5) — same 6-field SIG decode |
+| decodePreludeSize :178 | `src/runtime/bc.rs:206` `prelude_size_decode` (pub(crate)) | ALREADY PORTED (C5) |
+| load_qstr :204 (static-id fast path + intern) | `mpy::read` qstr section (`QstrEntry::Static/New`) + `resolve_qstr_table` / `resolve_qstr_table_readonly` (`vm_eval.rs`) | ALREADY PORTED — the read side is Lane M, the intern side is C13/C15a |
+| load_obj :227 (tag dispatch → None/False/True/Ellipsis/Str/Bytes/Int/Float/Complex/Tuple) | `mpy::read_obj` → `ObjEntry` (Lane M) + `vm_raise::obj_from_entry` (C13) | ALREADY PORTED — every tag has an `ObjEntry` arm; `obj_from_entry` reuses C7 int / C8 str/bytes / C9 tuple construction, no second copy |
+| load_raw_code :299 (kind check + fun_data + children + prelude SIG) | `mpy::read_raw_code` (Lane M) + `CodeStore::register_module` (`bc.rs`) | ALREADY PORTED — `mpy::read` returns the whole `Module { rc, qstrs, objs }`; the code store owns the tree |
+| mp_module_context_alloc_tables :368 | `register_code_inner` (`vm_eval.rs`): the qstr table (`Vec<u16>`) + const table (`Vec<Value>`) are Rust vecs, no combined malloc block | SUBSUMED — no C-ABI block to allocate; the two tables are the `CodeStore` registration args |
+| mpRawCodeLoadImpl :401 (header check + n_qstr/n_obj + load loop) | `mpy::read` (magic/version) + NEW `persistentcode::raw_code_load_mem` | PARTIAL — `mpy::read` checks magic 'M' + version 6 but does NOT check arch==NONE or small-int-bits<=63; the Zig rejects arch!=0 and header[3]>63 with ValueError "incompatible .mpy file" (:419-426). The new `raw_code_load_mem` adds exactly that check on `Module.feature_flags/small_int_bits` and does the read+resolve+const-convert in one place |
+| mp_raw_code_load :449 (reader-based entry) | — | NO RUST CALLER — the reader form is C-ABI surface (`MpReader` callbacks); Rust always loads from `&[u8]`. Not ported, no stub |
+| mpRawCodeLoadMemImpl :459 / mp_raw_code_load_mem :469 | NEW `src/runtime/persistentcode.rs`: `raw_code_load_mem(ctx, state, data, qstr_table) -> Result<LoadedCode, VmError>` + `LoadedCode { rc, qstr_table, const_table }` | NEW — thin: `mpy::read` + const conversion with per-value pinning (moved out of `register_code_inner`, behaviour unchanged) + the header check above. `register_code_inner` and the import loader both call it |
+
+### 1b. zig_compile_bridge.zig (329) vs C15a vm_eval.rs / C13 load_module_from_source
+
+| Zig fn (zig_compile_bridge.zig) | Rust home | Verdict |
+|---|---|---|
+| raiseFromCode :108 (OOM→OSError(12) polled; SYNTAX/INDENT→SyntaxError/IndentationError "invalid syntax" + traceback; else RuntimeError "zigpy compile failed") | NEW `src/runtime/compile_bridge.rs`: `raise_from_code(ctx, state, err: &CompileError, source_file: u32) -> Value` | NEW — the canonical mapping. TWO C15a CORRECTIONS folded in (verified on the reference binary, see §5): (1) `vm_eval.rs::compile_error_value_ctx` mapped IndentationError→"unexpected indent" — the original says "invalid syntax" for BOTH syntax and indent errors (probed: `exec("  x = 1")` → IndentationError 'invalid syntax'); (2) it mapped OutOfMemory→MemoryError("out of memory") — the Zig raises OSError(12) (`mp_raise_OSError_polled(MP_ENOMEM)`, reuse `raise::raise_os_error`). `compile_error_value_ctx` now delegates to `raise_from_code` |
+| compileAndLoad :133 (compile src→mpy→load→make function, globals = current globals) | `Vm::load_module_from_source` (C13, vm.rs:649) + NEW `compile_bridge::compile_and_load(ctx, state, src, kind, source_name)` | PARTIAL — `load_module_from_source` is the Vm-level compile+register+RUN path (same road, already exists). `compile_and_load` is the ctx twin that stops after building the module FunBc (the `npy_zig_compile_source` shape: caller invokes the result). Used by the import loader's exec path? NO — the loader executes, so it uses `eval_exec_ctx`-equivalent; `compile_and_load` exists for the bridge contract + tests |
+| npyZigCompileSourceImpl :173 / npy_zig_compile_source :182 | `compile_and_load` (above) | PORTED as the ctx fn (the C export wrapper has no Rust counterpart) |
+| npyZigEvalExecImpl :201 (globals/locals swap + defer restore + compileAndLoad + call) | `Vm::eval_exec_ctx` (C15a, vm_eval.rs) | ALREADY PORTED — same swap/restore/call shape; the import loader's execSourceInModule/execMpyInModule reuse `eval_exec_ctx` with globals=locals=module dict, plus `register_loaded_into` for the pre-created module object |
+| compile_to_code_glue.impl (FULL arm) :316 (compile→load→wrap as `code` object, globals=NULL) | NEW `compile_bridge::compile_to_code(ctx, state, src, kind, source_file) -> Result<Value, Value>` | PARTIAL — compiles first (a SyntaxError now correctly beats NotImplementedError: C15a's `compile_glue` validated args but never compiled, so `compile("1+", "f", "eval")` raised NotImplementedError in Rust vs SyntaxError on the original — probed), loads via `raw_code_load_mem`, then raises NotImplementedError (no `Obj::Code` yet — Phase E/C18). `call_compile_ctx` delegates the post-validation tail to it |
+| compile_to_code_glue (nano arm) | — | DEAD under full — `unreachable` in the Zig; no Rust form |
+
+### 1c. The other six files (summary; details in §2/§3)
+
+- builtinimport.zig: `importImpl` + `processComponent` + `mp_builtin___import___obj` — NEW
+  (`src/runtime/builtinimport.rs`); `loadedLookup` → `VmState.modules` (C13's
+  `HashMap<u32, GcRef>` — no second table).
+- import_search.zig: `tryLoadComponent`/`loadAttrMaybe`/`execSourceInModule`/
+  `execMpyInModule`/`searchTopLevel`/`loadFound`/`parentPath`/`loadFrozen`/
+  `removeFromLoaded`/`readFileFull`/`buildPath`/`pathIsDir`/`pathIsFile` — NEW
+  (`src/runtime/import_search.rs`). `sys.path` has NO Rust home yet: added as
+  `VmState.sys_path: Vec<String>`, default `[""]` (`runtime.zig:276-279`:
+  mp_init creates an empty list + appends the empty qstr; `main.zig:244-248`
+  overwrites [0] with the script dir and appends PETITPY_LIB — entry work,
+  Phase E). `std::fs` replaces libc fopen/stat; `PATH_MAX_LEN = 1024` kept.
+- frozen_modules.zig: `lookup`/`isPackage` — NEW (`src/runtime/frozen_modules.rs`,
+  `FrozenTable { entries: Vec<(String, Vec<u8>)> }`, default EMPTY — the
+  reference build freezes `json`/`types` via `make freeze`; the Rust frozen
+  bundle is Phase D work).
+- mpstate.zig: see §3 (no module).
+- scheduler.zig: see §2 (small module, slot on `VmState`).
+- full_stubs.zig: see §2 (mapping only, nothing ported).
+
+§2 — full_stubs + scheduler + mpstate
+--------------------------------------
+
+### full_stubs.zig (258) — MAPPING ONLY, nothing ported, no `panic!`
+
+Every symbol in the file is either a `@panic` stub or a zero-init
+sentinel (plus one real init fn for the stdout print). Verified by
+reading the whole file (2026-11-18). Map:
+
+| Stub / symbol (full_stubs.zig) | Status |
+|---|---|
+| Long-int / mpz (14 stubs) | PORTED — Lane C + C7 (vendor mpz reimplemented in Rust; `src/vendor/`, `src/objects/primitives/`) |
+| Complex: `mp_obj_complex_binary_op` / `mp_obj_complex_get` / `mp_obj_new_complex` / `mp_type_complex` | C18 — NOT ported. `Obj::Complex` exists as a VALUE (C0) but the complex TYPE has no slots yet |
+| `mp_sys_maxsize_obj` | PORTED — vendor objint_mpz side effect (C7); `sys.maxsize` is D (modsys) |
+| `mp_sys_stdout_print` (+ `_init_full_stubs_impl`) | PORTED — C8c's `mp_plat_print` (plain `write(1, …)`); no init fn needed in Rust (no stubs to initialise) |
+| `cur_exception` (MP_STATE_VM root slot) | NO RUST HOME YET — `sys.exc_info` is D (modsys). `VmState.pending_exc` (C13) is the pending slot, not the current-handler slot |
+| `mp_module_io` | PORTED (per header) — vendor modio.c re-added under full; the Rust port is C18's modio+objstringio lane, NOT this lane |
+| `mp_const_notimplemented_obj` | NO RUST HOME — the NotImplemented singleton VALUE does not exist in the tree (only `NotImplementedError` the type and the `ObjError::NotImplemented` slot signal, C6). Nothing in the tree needs the value yet; a future lane adds it if a `__eq__` path needs to return it |
+| `mp_type_code` | NOT PORTED — no `Obj::Code` yet (Phase E/C18; blocks `compile()` returning a code object — C15a) |
+| `mp_warning` | PORTED (per header) — vendor warning.c; the Rust port is C18's, NOT this lane |
+| `mp_obj_is_str` | COVERED — `is_str` (`src/objects/obj.rs`, C6) |
+| `mp_obj_is_tuple_compatible` | COVERED — the tuple-iter-slot rule (`rhs_has_tuple_getiter`, C9c/C11) |
+| `str_index_to_ptr` | PORTED (per header) — `objstr.zig::_full_str_index_to_ptr`; Rust str/bytes indexing is C8a/C8b |
+| `mp_raise_msg` / `mp_raise_msg_varg` / `mp_raise_ValueError` / `mp_raise_TypeError_int_conversion` | PORTED — C15a's `src/runtime/raise.rs` (real impls, not stubs) |
+| `npy_init_full_stubs` (export gate) | NO RUST FORM — there are no stubs to initialise in Rust |
+
+One LIVE function hides in the file: `_init_full_stubs_impl` (writes
+`mp_sys_stdout_print`). Its effect is C8c's `mp_plat_print`, already
+live — nothing to do. No other live code: the rest is `@panic` or
+zero-init storage.
+
+### scheduler.zig (110) — small module, slot on `VmState`
+
+Live remainder per the file header + source read: `mp_sched_exception`
+(set pending, no raise), `mpHandlePendingInternalImpl` (the ONLY raise
+path), `mp_event_handle_nowait` / `_wait_indefinite` / `_wait_ms`
+(thin wrappers → `mp_handle_pending(true)`), the three `npy_sch_*`
+accessors. `MP_HANDLE_PENDING_*` = 0/1/2 (`py/runtime.h:55-59`, C enum
+from 0: CALLBACKS_ONLY=0, CALLBACKS_AND_EXCEPTIONS=1,
+CALLBACKS_AND_CLEAR_EXCEPTIONS=2). The pending slot is thread state:
+Rust home is a NEW field `VmState.pending_sched: Option<Value>`
+(`None` = MP_OBJ_NULL = no pending exc). NO global static.
+`SCHEDULER=0 + PY_THREAD=0` blocks are dead (recorded, not ported);
+`atomic_state` is a no-op in the Zig and does not exist in Rust.
+`mp_handle_pending_internal` semantics: behavior==1 raises the pending
+exc (clears the slot first); behavior==0 only handles callbacks (none
+exist — no-op); behavior==2 clears the pending exc without raising.
+New module `src/runtime/scheduler.rs`.
+
+### mpstate.zig (319) — NO MODULE, mapping only
+
+Verified by own grep (2026-11-18): **0 `pub fn`** in the file. Its
+only pub items are two `extern struct` layouts (`StateThread`,
+`StateCtx`), one `pub export var mp_state_ctx` global, and three
+trivial inline field-address accessors (`vmState`/`memState`/
+`threadState` — no Rust form; Rust accesses fields directly). The
+file is a C-ABI layout mirror for the Zig/C link contract; a pure-Rust
+tree has no such contract. Mapping (Zig field → Rust home):
+
+| mp_state_ctx field | Rust home |
+|---|---|
+| thread.dict_locals | `VmState.locals: Option<GcRef>` (C15a) |
+| thread.dict_globals | `VmState.globals: GcRef` (C13) |
+| thread.nlr_top / nlr_jump_callback_top | NONE — NLR deleted (C15a; `PyError`/`pending_raise`/`pending_exc` are the mechanism) |
+| thread.mp_pending_exception | NEW `VmState.pending_sched: Option<Value>` (this lane, scheduler.zig) |
+| thread.stop_iteration_arg | NONE as a slot — travels in return values / `ResumeOutcome` (C14) |
+| vm.last_pool | `RuntimeQstr` (C1) |
+| vm.mp_emergency_exception_obj | NONE — `MICROPY_ENABLE_EMERGENCY_EXCEPTION_BUF=0` |
+| vm.mp_loaded_modules_dict | `VmState.modules: HashMap<u32, GcRef>` (C13) |
+| vm.dict_main | SUBSUMED by `VmState.modules` (the `__main__` module is registered under its name like any module) |
+| vm.root_pointers.cur_exception | NONE YET — `sys.exc_info`, D (modsys) |
+| vm.root_pointers.mp_sys_argv_obj | NONE YET — entry argv, Phase E |
+| vm.root_pointers.sys_mutable[0] (PATH) | NEW `VmState.sys_path: Vec<String>` (this lane; default `[""]`, see §1c) |
+| vm.root_pointers.sys_mutable[1..3] (PS1/PS2) | NONE — REPL, Phase F |
+| vm.qstr_last_chunk/alloc/used | `RuntimeQstr` internals (C1) |
+| vm.mp_optimise_value | NONE — no `-O` level in the Rust compiler yet (Phase E entry) |
+| mem.area / gc_block_stack / gc_stack_overflow | `GcArena` (C4) |
+| mem.gc_auto_collect_enabled | `GcArena.auto_collect_enabled` (C4, `gc.rs:378-381`) |
+| comptime layout asserts (offsets/sizes) | NONE — Zig-only guards for the C-ABI mirror; Rust structs are not layout mirrors |
+
+
+
+§4 — Not done in this lane (handoff to D / Phase E)
+----------------------------------------------------
+
+* `Obj::Code` does not exist: `compile()` compiles, loads and
+  validates the source, then raises NotImplementedError
+  (`compile_bridge::compile_to_code`). `eval`/`exec` work (they
+  build a FunBc and call it); `compile()` returning a code object
+  is Phase E / C18's.
+* No `sys` module exists in the Rust VM yet: `import sys` raises
+  ModuleNotFoundError until D1 registers the builtin modules.
+  The builtin-module registry (`VmState.builtin_modules`) starts
+  EMPTY; `import` of a frozen module only works for entries the
+  caller registered via `Vm::set_frozen_modules`.
+* `modsys` (sys.argv, sys.exc_info, sys.path exposure) is D's.
+  `VmState.sys_path` is the storage; `Vm::set_sys_path` is the
+  setter for D1's `modsys` and for the CLI entry (Phase E).
+* The CLI entry does not yet set `sys.path` from the script's
+  directory + `PETITPY_LIB` (the reference binary's behaviour,
+  probed in §5) — Phase E entry work.
+* `mp_raw_code_load` (the `MpReader`-callback entry) has no Rust
+  caller and was not ported (no stub) — §1a.
+* `mp_const_notimplemented_obj` has no Rust home: the
+  NotImplemented singleton VALUE does not exist in the tree
+  (only the type + `ObjError::NotImplemented` signal) — §2.
+* Frozen-module search is by exact full dotted name only; the
+  Zig's frozen table is a flat list, same shape — no divergence.
+* A module name longer than 255 bytes cannot be interned
+  (`from_strn` fails) — same limit as the Zig's qstr chunking.
+
+§5 — Reference-binary probes, corrections, and design changes
+---------------------------------------------------------------
+
+Probes (all run 2026-11-18 against
+`~/workspace/petitpy-orig/zig-out/bin/petitpy`, scripts in
+`/tmp/c15bprobe/` — /tmp is volatile, the results are recorded
+here):
+
+* `sys.path` = `['/tmp/c15bprobe', '/home/hatch/.petitpy/lib']`
+  (script dir + `PETITPY_LIB`).
+* `import nonexistent` → ModuleNotFoundError
+  "No module named 'nonexistent_mod_xyz'".
+* `import aaa.bbb` → "No module named 'aaa'".
+* `__import__('x', {}, {}, [], 1)` → NotImplementedError
+  "relative import".
+* `__import__('')` / `__import__(123)` → ImportError
+  "module not found".
+* `import json` works (frozen in the reference build).
+* `import x` from sys.path works, `x is x2` is True
+  (sys.modules cache).
+* `pkg.__path__` = package dir; `pkg.sub` attribute hookup
+  works; `from pkg import sub` returns the same object.
+* `from x import missing_name` → ImportError
+  "can't import name missing_name".
+* `import pkg.nothere` → ModuleNotFoundError
+  "No module named 'pkg.nothere'".
+* `exec(" x = 1")` → IndentationError 'invalid syntax' (BOTH
+  syntax and indent errors say "invalid syntax").
+
+Two C15a corrections folded in (both verified by the probes
+above):
+
+1. `vm_eval.rs::compile_error_value_ctx` mapped
+   IndentationError → "unexpected indent" — WRONG, the original
+   says "invalid syntax" for both. It now delegates to
+   `compile_bridge::raise_from_code`.
+2. It mapped OutOfMemory → MemoryError("out of memory") —
+   WRONG, the Zig raises OSError(12). Compiler-reported OOM now
+   goes through `raise_from_code` (→ OSError(12)); the
+   register-path allocation failure (a Rust-side OOM after a
+   successful compile) still builds MemoryError directly at
+   both call sites (`Vm::eval_exec`, `eval_exec_ctx`).
+
+Fixes found by this lane's own tests (all verified in-lane):
+
+* Seam-drain bug (C14 contract): `exception_from_pending`
+  reads only `ctx.take_pending_raise()` and never looks at
+  `state.pending_exc`, so a seam-stashed exception fell through
+  `exc_from_pyerror` to a bare TypeError. Evidence:
+  `dispatch_import_error` failed with left "TypeError" vs
+  right "ImportError". Fix: `import_name_ctx` /
+  `import_from_ctx` map `RtError::PyRaise` via the existing
+  `drain_seam_raise` convention in `vm_rt_iter.rs` (same
+  pattern the iterator `call` seam uses). The C13 test
+  `dispatch_import_error` now expects "ModuleNotFoundError"
+  (the C13 stub raised a plain `ImportError`; with a real
+  import system and no `os` module registered, `import os`
+  raises ModuleNotFoundError, an ImportError subclass).
+* Module-attr slot: the module type's `attr` slot was `None`
+  in `module_type_data`, so `load_method_maybe` on modules
+  returned `None` and from-import / dotted imports /
+  `__path__` reads all failed (19 of the 49 import tests).
+  Fix: `module_type_data` now sets `attr: Some(module_attr)`
+  (`src/objects/objtype/objmodule.rs`; `module_attr` =
+  `module_attr_load`, no `__getattr__` seam — a module
+  `__getattr__` is still not called). This CLOSES C14's
+  "D1 must set attr: Some(module_attr)" note — D1 no longer
+  needs to wire it. C14's test Env manual assignment
+  (`runtime_tests.rs:105`) is now redundant (kept, same fn).
+* Qstr interning on the dispatch path (the blocker): the
+  dispatch path could not intern new qstrs — `CallCtx.pool`
+  is a shared `&RuntimeQstr` and `from_strn` took `&mut self`,
+  so the C15a read-only fallback failed genuinely-new names
+  with MemoryError. Every imported module defines new names,
+  so this was not an edge case: a temporary debug probe proved
+  the failing name was `"VAL"` in `py_module_identity` (the
+  test source never mentions `VAL`; the first import of
+  `m1.py` failed resolving its qstr table).
+  Fix: dynamic bytes are now LEAKED (`Box::leak` → `&'static
+  [u8]`) and the entry table is `RefCell<Vec<DynamicEntry>>`,
+  so `from_strn` / `from_str` take `&self`. Soundness
+  (documented in `qstr.rs`, divergence #2 updated): each
+  entry's bytes live in their own heap allocation, so pushing
+  to the entry table never moves an already-returned slice
+  (the table holds only `&'static` pointers); `qstr_str`
+  copies the `&'static` reference out from under a short-lived
+  shared borrow, then shortens it to `&self`. The leak is
+  bounded by the number of distinct dynamic names (≤255 bytes
+  each); `reset()` uses `get_mut().clear()` — leaked buffers
+  stay allocated, as the Zig's chunks do until `qstr_init`.
+  `RuntimeQstr` is therefore `!Sync` (a `RefCell`); the VM is
+  single-threaded, so nothing requires `Sync`. `from_strn`
+  reserves the slot BEFORE leaking (a failed reserve leaks
+  nothing). Consequences: the read-only fallback is DELETED
+  (`resolve_one_qstr_readonly`,
+  `resolve_one_qstr_readonly_u32`,
+  `resolve_qstr_table_readonly` in `vm_eval.rs`;
+  `resolve_table_readonly` in `import_search.rs`) —
+  including the C15a eval gap for genuinely-new names.
+  `resolve_qstr_table` moved from `vm.rs` to `qstr.rs` in
+  the same change (it is a qstr utility). One C15a test was
+  updated for the new behaviour: `eval_dispatch_new_name_fails_loud`
+  → `eval_dispatch_new_name_interns`, now asserting
+  `NameError` (the name interns; the variable is unbound —
+  the original's behaviour).
+* `vm.rs` split: the lane pushed `vm.rs` to 825 lines, over
+  the 800-line cap. `resolve_qstr_table` moved to `qstr.rs`
+  and `set_sys_path` / `set_frozen_modules` moved to
+  `vm_eval.rs` (new `impl Vm` block) — `vm.rs` is 787 lines
+  again. Full suite re-run after the split: 1076 passed.
+
+Design decisions that changed since §1–§3 were written:
+
+(a) `raw_code_load_mem` takes a parsed `mpy::Module` and
+    returns header failures via `VmError::Raised` (the
+    exception object itself), not `pending_exc` + OutOfMemory.
+(b) The C14 seam's stashed exception is drained via
+    `drain_seam_raise`, NOT `exc_from_pyerror` (which only
+    sees `ctx.pending_raise`).
+(c) `from_strn` now takes `&self` (leak + RefCell) so
+    dispatch-path imports intern for real — the read-only
+    fallback is deleted.
+(d) `module_type_data` now wires `attr: Some(module_attr)` —
+    C14's D1 note is closed.
+(e) `import_impl` does NOT validate globals/locals/fromlist
+    (verified against the Zig — an earlier plan guessed a
+    dict check, wrong). It reads only `args[0]` (name),
+    `args[3]` (fromtuple, default `None`), `args[4]` (level,
+    default 0). Level: only `SmallInt(0)` passes; ANY other
+    REPR_A word (heap pointer, qstr, `None`, `True`) is
+    non-zero → NotImplementedError "relative import". Return:
+    `fromtuple is None` → TOP module, else LEAF (any
+    non-`None` fromlist — even `()` — returns the leaf;
+    diverges from CPython; the opcode path never passes an
+    empty tuple). The dotted walk is the Zig's index loop
+    (`i` from 1 — a leading `.` is NOT a separator, so
+    `".foo"` is one component `".foo"`; `"a..b"` yields
+    `"a"`, `""`, `"b"`).
+(f) `register_loaded_into` registers already-loaded code
+    under an EXISTING module object (no new module, no
+    re-registration) — the import loader's `execMpyInModule`
+    path; `state.modules` holds the same object the first
+    `import x` returned.
+(g) `load_found`: a FilePy/FileMpy read failure raises
+    ImportError "module not found" — the Zig returns a bare
+    PyRaise with NO pending exception here (a TOCTOU wart,
+    documented). A PRESENT-but-unreadable `__init__.py`
+    returns silently WITHOUT trying `__init__.mpy` (the
+    Zig's `return` sits inside the `pathIsFile` block).
+    Namespace packages (no `__init__.py`) are OK.
+(h) `new_module` sets `__name__` but does NOT register in
+    `state.modules` — `try_load_component` inserts BEFORE
+    `load_found` (circular-import + failure-removal
+    semantics) and `remove_from_loaded` deletes on failure.
+
+Acceptance (verified 2026-11-18, this worktree):
+  cargo test --release --lib --tests: 1076 passed, 0 failed,
+    1 ignored (baseline 1022 + 54 new).
+  cargo test --release --bins: 9 passed, 0 failed.
+  0 warnings. No `unsafe` in any touched file. Every file
+  <800 lines (max: vm.rs 787, import_tests.rs 728,
+  vm_rt_iter.rs 681, vm_dispatch.rs 651, import_search.rs
+  622). `git -C ~/workspace/petitpy-orig status` clean.
+  Base 29dc637 is STALE vs master 9091ad8 (C13b merged
+  after dispatch) — the main agent rebases at merge; expect
+  fallout in vm.rs/vm_call.rs/vm_rt_name.rs + the
+  BuiltinTypes move (obj.rs → builtin_types.rs).

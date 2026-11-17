@@ -588,8 +588,12 @@ pub(crate) fn dispatch_exec(
             MP_BC_IMPORT_NAME => {
                 let q = decode_qstr(state, code_idx, ip);
                 let from_list = spop(frame).unwrap_or(Value::None);
-                let _level = spop(frame);
-                match import_name_ctx(ctx, state, q, from_list) {
+                // Level was discarded (`_level`) while the import
+                // system was a stub — C15b wires it through to
+                // `import_name_ctx` (a non-zero level raises
+                // `NotImplementedError("relative import")`).
+                let level = spop(frame).unwrap_or(Value::None);
+                match import_name_ctx(ctx, state, q, from_list, level) {
                     Ok(v) => spush(frame, v),
                     Err(e) => return Some(DispatchOutcome::Raised(e)),
                 }

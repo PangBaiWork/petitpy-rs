@@ -56,8 +56,9 @@ pub(crate) struct Env {
     /// explicitly).
     pub gen_instance: GcRef,
     /// The `module` type, with its `attr` slot wired to
-    /// `module_attr` (production wiring — `module_type_data`
-    /// leaves it `None`; D1's module setup must do the same).
+    /// `module_attr` (wired by `module_type_data` since C15b — the
+    /// manual assignment below is now redundant, kept as the
+    /// explicit record).
     pub module_type: GcRef,
 }
 

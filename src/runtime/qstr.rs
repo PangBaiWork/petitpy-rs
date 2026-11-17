@@ -27,6 +27,25 @@
 //!      Dynamic bytes are stored WITHOUT the trailing NUL the Zig
 //!      side keeps for C-interop; `qstr_str` / `qstr_data` return
 //!      `&[u8]` instead of `[:0]` / raw pointers.
+//!
+//!      C15b: dynamic bytes are LEAKED (`Box::leak`) and the entry
+//!      table is a `RefCell<Vec<…>>`, so `from_strn` takes `&self`
+//!      instead of `&mut self`. The Zig interns freely from anywhere
+//!      (`qstr_from_strn` grows the global pool); the Rust pool is
+//!      shared through `CallCtx`, so the dispatch path (imports,
+//!      `eval`) could not intern at all — every imported module
+//!      defines new names, and the read-only fallback failed them
+//!      with `MemoryError`. The leak is sound: each entry's bytes
+//!      live in their own heap allocation, so pushing to the entry
+//!      table never moves an already-returned slice (the table holds
+//!      only `&'static` pointers); `qstr_str` copies the `&'static`
+//!      reference out from under a short-lived shared borrow.
+//!      The leak is bounded by the number of distinct dynamic names
+//!      (≤255 bytes each); `reset()` drops the entries but the
+//!      leaked buffers stay allocated, as the Zig's chunks do until
+//!      `qstr_init`. `RuntimeQstr` is therefore `!Sync` (a
+//!      `RefCell`); the VM is single-threaded, so nothing requires
+//!      `Sync`.
 //!   3. `qstr` is aliased to `u16` (not vendor's `usize`) — same as
 //!      A1; the qstr id range fits comfortably.
 //!   4. `from_strn` returns `PyResult<Qstr>` (`Err(OutOfMemory)` on a
@@ -53,15 +72,19 @@
 //! — the comment above it says the qstr_total override it belonged
 //! to was removed.
 
+use crate::compiler::mpy::QstrEntry;
 use crate::pyerr::{PyError, PyResult};
 use crate::qstr_table::{Qstr, QSTR_HASHES, QSTR_LENGTHS, QSTR_STRINGS};
+use std::cell::RefCell;
 
 /// Re-exported so `runtime::qstr::*` is a complete mirror of the Zig
 /// file's public surface (the Zig file defines these itself).
 pub use crate::qstr_table::{qstr_compute_hash, N_MAIN, N_STATIC, N_TOTAL};
 
+/// One dynamic entry: the interned bytes (a leaked heap
+/// allocation — see the module docs), its hash and length.
 struct DynamicEntry {
-    bytes: Vec<u8>,
+    bytes: &'static [u8],
     hash: u16,
     len: u8,
 }
@@ -75,31 +98,33 @@ struct DynamicEntry {
 /// `reset()` is the Zig `qstr_init` (safe to call multiple times:
 /// it drops all dynamic state and renumbers fresh ids from N_TOTAL).
 pub struct RuntimeQstr {
-    entries: Vec<DynamicEntry>,
+    entries: RefCell<Vec<DynamicEntry>>,
 }
 
 impl RuntimeQstr {
     pub fn new() -> Self {
-        RuntimeQstr { entries: Vec::new() }
+        RuntimeQstr {
+            entries: RefCell::new(Vec::new()),
+        }
     }
 
     /// Drop all dynamic state but keep the state usable. Newly
     /// interned qstrs will re-start numbering at N_TOTAL.
     /// (Zig: `qstr_init` — frees the chunks and clears the entries.)
     pub fn reset(&mut self) {
-        self.entries.clear();
+        self.entries.get_mut().clear();
     }
 
     /// Number of dynamic entries currently interned.
     pub fn dynamic_len(&self) -> usize {
-        self.entries.len()
+        self.entries.borrow().len()
     }
 
     /// Total qstr count (static + main + dynamic). Mirrors vendor's
     /// `QSTR_TOTAL()` macro for callers (e.g. builtin_dir) that walk
     /// all qstrs. (Zig: `npy_qstr_total`.)
     pub fn total(&self) -> usize {
-        N_TOTAL as usize + self.entries.len()
+        N_TOTAL as usize + self.entries.borrow().len()
     }
 
     /// Search all pools for a string. Returns 0 (MP_QSTRnull) on miss.
@@ -124,7 +149,8 @@ impl RuntimeQstr {
         let want_len: u8 = s.len() as u8;
 
         // 1) dynamic pool, newest-first
-        for (di, e) in self.entries.iter().enumerate().rev() {
+        let entries = self.entries.borrow();
+        for (di, e) in entries.iter().enumerate().rev() {
             if e.hash == want_hash && e.len == want_len && e.bytes == s {
                 return (N_TOTAL as usize + di) as Qstr;
             }
@@ -145,7 +171,12 @@ impl RuntimeQstr {
     /// new dynamic entry on miss. New dynamic ids start at N_TOTAL.
     /// (Zig: `qstr_from_strn` — copies into chunk storage,
     /// NUL-terminates, appends the entry.)
-    pub fn from_strn(&mut self, s: &[u8]) -> PyResult<Qstr> {
+    ///
+    /// Takes `&self` (C15b): the pool is shared through `CallCtx`,
+    /// and the dispatch path must intern (imports define new names).
+    /// The bytes are leaked (see the module docs) so a push can
+    /// never invalidate a slice `qstr_str` already returned.
+    pub fn from_strn(&self, s: &[u8]) -> PyResult<Qstr> {
         let found = self.find_strn(s);
         if found != 0 {
             return Ok(found);
@@ -154,25 +185,28 @@ impl RuntimeQstr {
             return Err(PyError::OutOfMemory); // u8 length limit on entries
         }
 
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(s.len())
-            .map_err(|_| PyError::OutOfMemory)?;
-        bytes.extend_from_slice(s);
-        self.entries
-            .try_reserve(1)
-            .map_err(|_| PyError::OutOfMemory)?;
-        self.entries.push(DynamicEntry {
+        // Reserve the slot before leaking, so a failed reserve
+        // leaks nothing.
+        {
+            let mut entries = self.entries.borrow_mut();
+            entries
+                .try_reserve(1)
+                .map_err(|_| PyError::OutOfMemory)?;
+        }
+        let boxed: Box<[u8]> = s.into();
+        let bytes: &'static [u8] = Box::leak(boxed);
+        let mut entries = self.entries.borrow_mut();
+        entries.push(DynamicEntry {
             hash: qstr_compute_hash(s),
             len: s.len() as u8,
             bytes,
         });
-        Ok((N_TOTAL as usize + self.entries.len() - 1) as Qstr)
+        Ok((N_TOTAL as usize + entries.len() - 1) as Qstr)
     }
 
     /// Convenience wrapper for `&str` input. (Zig: `qstr_from_str`,
     /// which takes a NUL-terminated C string.)
-    pub fn from_str(&mut self, s: &str) -> PyResult<Qstr> {
+    pub fn from_str(&self, s: &str) -> PyResult<Qstr> {
         self.from_strn(s.as_bytes())
     }
 
@@ -185,8 +219,13 @@ impl RuntimeQstr {
             return QSTR_STRINGS[id as usize];
         }
         let idx = (id - N_TOTAL) as usize;
-        assert!(idx < self.entries.len(), "qstr_str: out-of-range qstr");
-        &self.entries[idx].bytes
+        let entries = self.entries.borrow();
+        assert!(idx < entries.len(), "qstr_str: out-of-range qstr");
+        // Copy the `&'static` reference out from under the shared
+        // borrow (the guard drops here; the bytes live on — see
+        // the module docs), then shorten it to `&self`.
+        let bytes: &'static [u8] = entries[idx].bytes;
+        bytes
     }
 
     pub fn qstr_len(&self, id: Qstr) -> u8 {
@@ -194,8 +233,9 @@ impl RuntimeQstr {
             return QSTR_LENGTHS[id as usize];
         }
         let idx = (id - N_TOTAL) as usize;
-        assert!(idx < self.entries.len(), "qstr_len: out-of-range qstr");
-        self.entries[idx].len
+        let entries = self.entries.borrow();
+        assert!(idx < entries.len(), "qstr_len: out-of-range qstr");
+        entries[idx].len
     }
 
     pub fn qstr_hash(&self, id: Qstr) -> u16 {
@@ -203,8 +243,9 @@ impl RuntimeQstr {
             return QSTR_HASHES[id as usize];
         }
         let idx = (id - N_TOTAL) as usize;
-        assert!(idx < self.entries.len(), "qstr_hash: out-of-range qstr");
-        self.entries[idx].hash
+        let entries = self.entries.borrow();
+        assert!(idx < entries.len(), "qstr_hash: out-of-range qstr");
+        entries[idx].hash
     }
 
     /// Return the bytes for `id` (length is the slice's `.len()`).
@@ -219,6 +260,25 @@ impl Default for RuntimeQstr {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Resolve a module's `.mpy` qstr table to ids: static entries
+/// pass through, `New` bytes are interned into the pool.
+/// Takes `&RuntimeQstr` (C15b): `from_strn` interns through
+/// `&self` now, so the dispatch path resolves tables with the
+/// shared `CallCtx.pool` — no `&mut self.pool` split dance.
+pub fn resolve_qstr_table(
+    pool: &RuntimeQstr,
+    qstrs: &[QstrEntry],
+) -> PyResult<Vec<u16>> {
+    let mut table = Vec::with_capacity(qstrs.len());
+    for q in qstrs {
+        match q {
+            QstrEntry::Static(id) => table.push(*id),
+            QstrEntry::New(bytes) => table.push(pool.from_strn(bytes)? as u16),
+        }
+    }
+    Ok(table)
 }
 
 #[cfg(test)]
@@ -263,19 +323,19 @@ mod tests {
 
     #[test]
     fn from_strn_dynamic_ids_start_at_n_total_and_dedup() {
-        let mut rt = RuntimeQstr::new();
+        let rt = RuntimeQstr::new();
         let a = rt.from_strn(b"my_new_identifier").unwrap();
         assert_eq!(N_TOTAL, a);
 
         // Second call: same id, no new entry.
         let a2 = rt.from_strn(b"my_new_identifier").unwrap();
         assert_eq!(a, a2);
-        assert_eq!(1, rt.entries.len());
+        assert_eq!(1, rt.dynamic_len());
 
         // Different string: next id.
         let b = rt.from_strn(b"another_one").unwrap();
         assert_eq!(N_TOTAL + 1, b);
-        assert_eq!(2, rt.entries.len());
+        assert_eq!(2, rt.dynamic_len());
 
         // All dynamic ids are >= 613.
         assert!(a >= N_TOTAL && b >= N_TOTAL);
@@ -283,7 +343,7 @@ mod tests {
 
     #[test]
     fn find_strn_finds_dynamic_entries() {
-        let mut rt = RuntimeQstr::new();
+        let rt = RuntimeQstr::new();
         let id = rt.from_strn(b"runtime_only_name").unwrap();
         assert_eq!(id, rt.find_strn(b"runtime_only_name"));
         // A fresh state does not know it.
@@ -293,7 +353,7 @@ mod tests {
 
     #[test]
     fn dynamic_accessors_round_trip() {
-        let mut rt = RuntimeQstr::new();
+        let rt = RuntimeQstr::new();
         let id = rt.from_strn(b"hello_world").unwrap();
         assert_eq!(11u8, rt.qstr_len(id));
         assert_eq!(b"hello_world", rt.qstr_str(id));
@@ -304,16 +364,16 @@ mod tests {
 
     #[test]
     fn static_strings_never_create_dynamic_entries() {
-        let mut rt = RuntimeQstr::new();
+        let rt = RuntimeQstr::new();
         assert_eq!(Ok(17 as Qstr), rt.from_strn(b"__init__"));
         assert_eq!(Ok(123 as Qstr), rt.from_strn(b"print"));
-        assert_eq!(0, rt.entries.len());
+        assert_eq!(0, rt.dynamic_len());
         assert_eq!(613, rt.total());
     }
 
     #[test]
     fn total_counts_static_plus_dynamic() {
-        let mut rt = RuntimeQstr::new();
+        let rt = RuntimeQstr::new();
         assert_eq!(613, rt.total());
         rt.from_strn(b"one").unwrap();
         rt.from_strn(b"two").unwrap();
@@ -326,10 +386,10 @@ mod tests {
         let mut rt = RuntimeQstr::new();
         rt.from_strn(b"first").unwrap();
         rt.from_strn(b"second").unwrap();
-        assert_eq!(2, rt.entries.len());
+        assert_eq!(2, rt.dynamic_len());
 
         rt.reset();
-        assert_eq!(0, rt.entries.len());
+        assert_eq!(0, rt.dynamic_len());
         assert_eq!(613, rt.total());
 
         let id = rt.from_strn(b"third").unwrap();
@@ -338,7 +398,7 @@ mod tests {
 
     #[test]
     fn long_string_255_ok_256_rejected() {
-        let mut rt = RuntimeQstr::new();
+        let rt = RuntimeQstr::new();
         let buf255 = [b'x'; 255];
         let id = rt.from_strn(&buf255).unwrap();
         assert_eq!(255u8, rt.qstr_len(id));
@@ -363,7 +423,7 @@ mod tests {
         // re-interning returns the same id without creating a dynamic
         // entry. (Id 0, MP_QSTRnull, is exempt from the hash check:
         // the vendor table records hash 0 for it by definition.)
-        let mut rt = RuntimeQstr::new();
+        let rt = RuntimeQstr::new();
         for id in 0..N_TOTAL {
             // Copy out: the borrow of `rt` cannot be held across the
             // `&mut self` calls below.
@@ -377,6 +437,6 @@ mod tests {
                 assert_eq!(Ok(id), rt.from_strn(&bytes));
             }
         }
-        assert_eq!(0, rt.entries.len());
+        assert_eq!(0, rt.dynamic_len());
     }
 }

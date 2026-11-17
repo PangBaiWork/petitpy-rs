@@ -1,0 +1,179 @@
+Lane C3 result — port zigpy-compile CLI (compiler/main.zig → Rust)
+======================================================================
+Executor: Lane C3 subagent, worktree ~/workspace/petitpy-rs-cli,
+branch lane/cli, base master c365309 (203 tests green, C0 Value/Obj
+interface frozen, Phase B bridge merged). One commit for this chunk
+(see git log): "Lane C3: port zigpy-compile CLI to Rust".
+
+Source (petitpy devel HEAD df7de3a, read-only ~/workspace/petitpy-orig):
+  src/compiler/main.zig — 323 lines, 0 test blocks.
+
+1:1 mapping (main.zig -> src/bin/zigpy-compile.rs, 684 lines)
+-------------------------------------------------------------
+  header comment (CLI shape, exit codes 0/1/2) -> file doc comment
+  VERSION "0.1.0-dev" (inlined, no build_options) -> const VERSION
+  print_usage (main.zig:128-131) -> const USAGE (raw string) + print_usage
+  print_version -> print_version
+  write_stdout / write_stderr (libc write) -> write_stdout / write_stderr
+  print_line / print_err_line (512-byte bufPrint cap) -> print_err_line
+    (cap replicated: lines > 512 bytes are silently dropped)
+  die_infra -> die_infra (uncapped direct writes, exit 2)
+  Args struct -> struct Args (inputs/output/source_name/opt_level)
+  parse_args -> parse_args (returns Result<Args, ArgFlow> instead of
+    exiting inside; main() performs the prints/exits — behaviour
+    identical, parser stays unit-testable)
+  default_output_path -> default_output_path
+  read_file_libc / write_file_libc -> read_file / write_file
+    (File::open + metadata len + read_exact mirrors fopen/fseek/ftell/
+    fread; File::create + write_all mirrors fopen "wb"/fwrite)
+  nul_terminate (4096-byte buffer) -> MAX_PATH_LEN = 4095 checks
+  compile_one -> compile_one (bridge call, error mapping, exit codes)
+  main -> main (argv as raw bytes, loop, any_failed -> exit 1/0)
+
+  bridge.zig is NOT the route main.zig takes (see the debug_mode
+  finding below): main.zig calls lexer/parser/compile/mpy directly.
+  The CLI still goes through the Phase B bridge — via the new
+  `compile_to_mpy_named_debug(..., debug_mode = true)` entry (see
+  "Bridge change" below). No second compilation implementation exists.
+
+Oracle
+------
+Reference binary built from the original: `zig build zigpy-compile`
+in ~/workspace/petitpy-orig. Note: that build step itself exits 1
+because its run step invokes the binary with no arguments (usage +
+exit 2 — expected); the binary is installed to
+zig-out/bin/zigpy-compile before the run and works
+(`--version` -> "zigpy-compile (petitpy 0.1.0-dev) -- emitting mpy v6",
+rc 0). All comparisons below use that binary directly.
+
+Acceptance numbers
+------------------
+- cargo test --release --lib --tests: 212 passed / 0 failed / 1 ignored
+  (baseline 203 kept + 9 new bin unit tests: usage text, version line,
+  arg parsing incl. -h/-v/-o/-s/-O levels/unknown options, output-path
+  derivation). Bin tests run under the brief's exact command.
+- cargo build --release: 0 warnings. No unsafe in any lane file.
+  Every new file < 800 lines (zigpy-compile.rs 684, bridge.rs 84).
+  Pure std, no external crates. Original repo clean (git status empty).
+- Strong differential 1 (scripts/check_cli.py, Part 1): 552/552 corpus
+  .py -> .mpy byte-identical to the oracle zigpy-compile (default
+  options). Rust failures 0, oracle failures 0. PASS.
+- Behaviour battery (scripts/check_cli.py, Part 2): 39 cases, all pass
+  (35 exact (rc, stdout, stderr) matches + 4 documented divergences
+  where the exit code matches and only stderr wording differs — see
+  below). Plus output-bytes checks (-s, -o, default, directory) and
+  the mpy-dump check that -s lands as qstr[0]. PASS.
+- Phase B regression check re-run after the bridge change:
+  scripts/check_compile_mpy.py still PASS (0 mismatches) — the
+  bridge's default behaviour is unchanged.
+
+KEY FINDING — debug_mode: the original disagrees with itself
+-------------------------------------------------------------
+The one-byte lexer.py divergence in the first differential run
+(551/552; byte 324: Rust 0x50 LOAD_CONST_FALSE vs oracle 0x52
+LOAD_CONST_TRUE) traced to the lexer `debug_mode` flag:
+
+- lexer.zig:1023: `__debug__` lexes to KW_TRUE if debug_mode else
+  KW_FALSE. lexer.zig:1139-1140 documents it ("true under the
+  unoptimised (default) Python settings").
+- main.zig:238 (zigpy-compile) passes `true`; bridge.zig:79 (the C-ABI
+  seam used by `petitpy --emit-mpy` and the `petitpy` binary) passes
+  `false`. The Rust bridge faithfully passed `false`.
+- So the ORIGINAL's own two compilers emit different bytecode for
+  `__debug__`: verified `petitpy` prints `False`, while oracle
+  zigpy-compile emits `True`. Corpus file `lexer.py` (line 11,
+  `print(type(__debug__))`) is the only corpus file that uses
+  `__debug__` (grep-verified), hence exactly one differing file.
+- 4-way matrix on lexer.py (md5): Rust zigpy-compile ("") ==
+  Rust compile_mpy ("") == 9437d61f; oracle zigpy-compile ("") ==
+  9b159e64; Rust compile_mpy ("<emit-mpy>") == oracle --emit-mpy ==
+  82f0140a (Phase B's 552/552 stands — both sides of that comparison
+  use the bridge/false path).
+
+Bridge change (one file outside this lane, additive, documented)
+-----------------------------------------------------------------
+To match main.zig while keeping a single pipeline implementation,
+`src/compiler/bridge.rs` gained `compile_to_mpy_named_debug(source,
+kind, source_name, debug_mode)`; `compile_to_mpy_named` now delegates
+to it with `false`, and `compile_to_mpy` is untouched. The CLI calls
+the new entry with `true` (main.zig:238). This does NOT start another
+pipeline: the bin still goes through the bridge (same lexer → parser
+→ compile → mpy.write calls); it only exposes a flag the original
+already threads through both of its entry points. Proof it is
+backward-compatible: Phase B's check_compile_mpy.py re-run after the
+change still passes 552/552, and `examples/compile_mpy.rs` (the only
+other caller of `compile_to_mpy_named`) is unmodified. The alternative
+— duplicating the four pipeline calls in the bin — would have created
+a second call site that can drift from the bridge; the alternative of
+accepting 551/552 would have shipped a CLI that disagrees with its
+own oracle on `__debug__`.
+
+Other divergences / findings (all verified on the oracle)
+----------------------------------------------------------
+- Error-message stage collapse (bridge API, exit codes all match):
+  the bridge returns one CompileError with no stage info, so the CLI
+  prints the parse-stage form for both stages. Documented cases in
+  check_cli.py (rc 1 on both sides in each):
+  * compile-stage SyntaxError (`1 = 2`, `a, *b, *c = ...`): oracle
+    prints bare `SyntaxError`; Rust prints `parse error:
+    error.SyntaxError`.
+  * DedentMismatch (dedent to an unmatched level): oracle prints
+    `parse error: error.DedentMismatch`; Rust prints `parse error:
+    error.IndentationError` (bridge maps DedentMismatch to
+    IndentationError, as bridge.zig does).
+  * Parse-stage SyntaxError / IndentationError (incl. tab-indented
+    file, bad `\N{...}` name) match the oracle exactly.
+- Non-UTF-8 source bytes: the oracle compiles raw 0xFF bytes in
+  string literals fine (rc 0, verified); the Rust bridge takes `&str`,
+  so the CLI reports such a file as a parse failure (exit 1,
+  `parse error: error.SyntaxError`). No corpus file is affected (all
+  552 are valid UTF-8, verified). A non-UTF-8 `-s` value exits 2 with
+  an explicit message. Both are bridge-API limitations, documented in
+  the bin's header comments.
+- Directory as input: the oracle reads it as an empty source (fopen
+  succeeds, ftell returns 0 — verified: 14-byte empty-module .mpy,
+  same as the empty file). The Rust CLI special-cases directories to
+  empty source; the differential confirms byte-identical output.
+- `/proc`-style files (reported size 0): the Rust read path
+  (metadata length + read_exact) mirrors Zig's ftell-based read, so
+  they also read as empty, as in Zig. (Not differentially tested —
+  no corpus file is one.)
+- 512-byte print cap: Zig's `print_err_line` silently drops lines
+  over 512 bytes. Replicated; verified by the battery's long-path
+  (>4095-byte input path) and long-option (600-byte flag) cases, where
+  both sides print nothing and exit 2.
+- OOM paths: Rust aborts on allocation failure (panic = "abort"), so
+  Zig's `out of memory ...` messages are not reproducible; no code
+  path can print them. Not testable in practice.
+- `-s` twice: last wins (no "specified twice" check in main.zig).
+  `-o` twice / `-o` without argument / `-o` with multiple inputs:
+  die_infra messages and exit 2, verified byte-exact.
+- Usage-text bug caught by the differential (not by the unit test):
+  the first USAGE draft used `\` line continuations, which strip the
+  next line's leading whitespace in Rust — the two-space option
+  indents were lost. Fixed with a raw string; the unit test now uses
+  a raw string too and the differential is the real guard.
+- main.zig's `print_err_line` for the "unknown option" path carries
+  the option bytes verbatim; `-` and `--` alone are unknown options;
+  an empty-string argument is an input (read fails -> FopenFailed,
+  exit 2). All verified in the battery.
+
+What is NOT in this chunk
+--------------------------
+- No change to the original repo (read-only; git status clean).
+- No change to A1/A2/A3/Lane M/Lane C/Lane FMT/Lane RE15/Phase B code
+  or tests, except the additive bridge entry above (Phase B behaviour
+  re-verified unchanged). Baseline 203 tests kept intact.
+- No extern "C" exports (Phase F). No Value/Obj work (C0/Phase C).
+
+Files (this lane)
+-----------------
+src/bin/zigpy-compile.rs (new, 684 lines, incl. 9 unit tests),
+src/compiler/bridge.rs (modified: +22/-2, additive debug entry only),
+scripts/check_cli.py (new, differential + behaviour battery),
+scripts/cli_result.txt (this file).
+Scratch only (not committed): /tmp/cli_probe/ (oracle error-message
+probes), /tmp/lexdiff/ (lexer.py 4-way matrix).
+
+Commit: one commit for this chunk (see git log).
+Message: "Lane C3: port zigpy-compile CLI to Rust".

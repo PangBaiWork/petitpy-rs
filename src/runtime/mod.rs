@@ -8,6 +8,15 @@
 pub mod bc;
 pub mod qstr;
 pub mod runner;
+pub mod runtime;
+pub mod runtime_call;
+pub mod runtime_import;
+pub mod runtime_iter;
+pub mod runtime_method;
+pub mod runtime_names;
+pub mod runtime_ops;
+pub mod runtime_resume;
+pub mod runtime_smallint;
 pub mod vm;
 pub mod vm_builtins;
 pub mod vm_call;
@@ -26,3 +35,11 @@ pub mod vm_types;
 mod bc_tests;
 #[cfg(test)]
 mod vm_tests;
+#[cfg(test)]
+mod runtime_tests;
+
+#[cfg(test)]
+mod runtime_tests_b;
+
+#[cfg(test)]
+mod runtime_tests_c;

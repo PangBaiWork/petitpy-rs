@@ -1,0 +1,239 @@
+Lane C14: port runtime/runtime.zig (runtime dispatch) to Rust
+===============================================================
+Branch: lane/runtime (base master 94df920)
+Worktree: ~/workspace/petitpy-rs-runtime
+Original: ~/workspace/petitpy-orig/src/runtime/runtime.zig (1,616 lines)
+Result: lib 912 passed (869 baseline + 43 new), 0 failed, 1 ignored;
+bins 9 passed; 0 warnings; no unsafe; every file < 800 lines.
+
+Files
+-----
+src/runtime/runtime.rs          (423)  RtError, RuntimeSeams, MethodDest,
+    IterNext, ResumeOutcome, Builtins, PreparedCall, ExcRefs, dunder,
+    is_native_scalar, type_name_of, gen_error_to_rt
+src/runtime/runtime_names.rs    (125)  load/store/delete name/global,
+    load_build_class, dict_lookup_qstr
+src/runtime/runtime_ops.rs      (652)  mp_unary_op, mp_binary_op
+    (generic loop, float/complex arms, nativeSubclassOp, typingCall,
+    exception_match, contains_op)
+src/runtime/runtime_smallint.rs (202)  the small-int x small-int fast
+    path (runtime.zig:576-701) + floored div/mod helpers — split out
+    of runtime_ops.rs so that file stays under 800 lines
+src/runtime/runtime_call.rs     (290)  call_function_n_kw (+_0/_1/_2),
+    call_method_n_kw, call_method_self_n_kw,
+    call_prepare_args_n_kw_var, call_method_n_kw_var
+src/runtime/runtime_method.rs   (425)  load_method_maybe / load_method /
+    load_method_protected / load_attr / store_attr, next builtin
+src/runtime/runtime_iter.rs     (362)  getiter, iternext,
+    iternext_allow_raise, unpack_sequence, unpack_ex
+src/runtime/runtime_resume.rs   (229)  resume, resume_gen, resume_throw,
+    make_raise_obj
+src/runtime/runtime_import.rs   (167)  import_name, import_from, import_all
+src/runtime/runtime_tests.rs    (668)  Env + part 1 (names, unary, binary)
+src/runtime/runtime_tests_b.rs  (786)  part 2 (method/attr, iter, resume,
+    imports)
+src/runtime/runtime_tests_c.rs  (239)  part 3 (call protocol, unpack)
+src/runtime/mod.rs              (+4 lines: runtime_smallint, tests_c)
+src/objects/objtype/objexcept.rs (+7 lines: is_exception_type fix, see
+    "Cross-lane fixes" below — the only file outside src/runtime/ touched)
+
+Per-function Zig -> Rust mapping (runtime.zig line numbers)
+-----------------------------------------------------------
+mp_load_name        :288-298  -> runtime_names::load_name
+mp_load_global      :301-325  -> runtime_names::load_global
+mp_load_build_class :326-331  -> runtime_names::load_build_class
+mp_store_name       :332-334  -> runtime_names::store_name
+mp_store_global     :335-337  -> runtime_names::store_global
+mp_delete_name      :338-340  -> runtime_names::delete_name
+mp_delete_global    :341-343  -> runtime_names::delete_global
+mp_unary_op         :352-435  -> runtime_ops::unary_op
+mp_binary_op        :436-810  -> runtime_ops::binary_op
+  small-int chain   :576-701  -> runtime_smallint::small_int_binary_op
+  float/complex arms:703-721  -> runtime_ops (call_binary on exact type)
+  generic loop      :725-788  -> runtime_ops::generic_binary_op
+  binopUnsupported  :436-447  -> runtime_ops::binop_unsupported
+  nativeSubclassOp  :510-535  -> runtime_ops::native_subclass_op
+  typingCall        :537-543  -> runtime_ops::typing_call
+  exception_match   :559-573  -> runtime_ops::exception_match_op
+  CONTAINS          :775-780  -> runtime_ops::contains_op
+mp_call_function_n_kw_py    :811-834 -> runtime_call::call_function_n_kw
+mp_call_method_n_kw_py      :838-845 -> runtime_call::call_method_n_kw
+mpCallMethodSelfNKwImpl     :856-892 -> runtime_call::call_method_self_n_kw
+mp_call_prepare_args_n_kw_var:894-1047 -> runtime_call::
+    call_prepare_args_n_kw_var (+ call_method_n_kw_var)
+mp_load_attr        :1126-1135 -> runtime_method::load_attr
+mp_convert_member_lookup:1137  -> ALREADY PORTED by C12a
+    (objtype/lookup.rs); reused, not re-ported
+mp_load_method_maybe:1195-1231 -> runtime_method::load_method_maybe
+mp_load_method      :1172-1194 -> runtime_method::load_method
+mp_load_method_protected:1235-1254 -> runtime_method::load_method_protected
+mp_store_attr       :1255-1276 -> runtime_method::store_attr (+ the four
+    C12a/C12b free store fns instance/type/exception/module_store_attr)
+mp_getiter          :1277-1300 -> runtime_iter::getiter
+mp_iternext_allow_raise:1304-1325 -> runtime_iter::iternext_allow_raise
+mp_iternext         :1326-1361 -> runtime_iter::iternext
+mp_resume           :1363-1462 -> runtime_resume::resume (+ resume_gen,
+    resume_throw)
+mp_make_raise_obj   :1463-1475 -> runtime_resume::make_raise_obj
+mp_import_name      :1468-1485 -> runtime_import::import_name
+mp_import_from      :1492-1549 -> runtime_import::import_from
+mp_import_all       :1550-...  -> runtime_import::import_all
+mp_init / mp_deinit :240-287   -> OUT OF SCOPE (C13/D own interpreter init;
+    no global MpStateThread)
+
+Reference-binary probes (~/workspace/petitpy-orig/zig-out/bin/petitpy,
+probe files /tmp/c14probe/p1..p9.py)
+---------------------------------------------------------------
+p1 binary ops: 1 in [1] True; 2*"ab"=="abab"; 2.5+1==3.5; 1+2.5==3.5;
+  2**-1==0.5; 1/2==0.5; (2**62)*2==2**63 (go_big); 1<<62==2**62;
+  1<<63==2**63 (go_big); 5>>100==0; 0**0==1; -8%3==1; 8%-3==-1;
+  divmod(10,3)==(3,1); 2*(1,2)==(1,2,1,2); "a"*0=="".
+p2 unary+unpack: +5/-5/~5/abs(-5)/bool(0)/hash(5)/len("abc")/not 0/not []
+  == 5/-5/-6/5/False/5/3/True/True; -(2**62)==-2**62; a,b=[1,2];
+  a,*b,c=[1,2,3,4]; f(1,2,3,4,z=5); f(*[1,2]); f(*"ab") -> a b () {};
+  f(**{"a":1}) -> TypeError missing arg #0.
+p3/p4 ** kwargs: f(0,**{"a":1}) ok; f(0,**{1:2}) -> TypeError
+  "can't convert to str implicitly".
+p5 next/StopIteration: next(iter([1,2])) 1,2 then default; bare SI args
+  (); generator return 99 -> SI args (99,); list("ab"); sum==6.
+p6: exception tuple/subclass match; 1 in 2 -> TypeError "unsupported
+  types for: 'int', 'int'"; len(5) -> "object has no len";
+  float("x") -> ValueError; hasattr/getattr defaults; "a".upper()=="A".
+p7 type names in binop errors: len+1 -> "'function', 'int'";
+  None+1 -> "'NoneType', 'int'"; {}+1 -> "'dict', 'int'";
+  object()+1 -> "'object', 'int'"; "a"-1 -> __sub__ 'str','int';
+  hash("abc")==hash(b"abc")==12933; hash((1,2))==22815555.
+p8 DIVMOD window edge (decides the open question): divmod(-(2**62),-1)
+  -> (-4611686018427387904, 0) — MISTAGGED quotient (raw newSmallInt,
+  no window check); (-(2**62))//-1 -> 4611686018427387904 (correct —
+  the // arm goes through the final window check); (-(2**62))%-1 -> 0.
+  Ported VERBATIM via wrap_small_int (see below).
+p9 except-instance: `except ValueError("b")` -> TypeError "unsupported
+  types for : 'ValueError', 'ValueError'" — is_exception_type of an
+  INSTANCE is false in the original (see "Cross-lane fixes").
+
+Intentional divergences / verbatim quirks (all probed)
+------------------------------------------------------
+- DIVMOD mistag (p8): divmod(-(2**62),-1)[0] is -2**62, not 2**62 —
+  the Zig's DIVMOD arm uses raw newSmallInt; // alone is correct.
+  Rust: wrap_small_int on both DIVMOD results (no-op in-window).
+- Unary small-int else is INVERT for ANY unlisted op (Zig
+  `// assert(op == MP_UNARY_OP_INVERT)`): mp_unary_op(LEN, 5) == -6.
+  The `len(5)` -> "object has no len" error comes from the len
+  builtin's own mp_obj_len_maybe check, not mp_unary_op.
+- `1 in 2` raises binopUnsupported with an EMPTY op name: the
+  small-int chain (both-small-int only) catches IN before the
+  IN->CONTAINS swap.
+- NotIn / IsNot are never emitted (emitter lowers `not in` / `is
+  not` to `in`/`is` + `not`); calling binary_op(NotIn/IsNot)
+  directly raises binopUnsupported, exactly like the Zig.
+- `8 % -3 == -1`, `8 // -3 == -3`, `-8 // 3 == -3` (floored, Zig
+  @mod/@divFloor — NOT Euclidean rem_euclid/div_euclid).
+- `1 << 62` is a HEAP int 2**62 (go_big: 1 > SMALL_INT_MAX >> 62).
+- load_global checks globals FIRST, then override_dict, then
+  builtins globals (runtime.zig:301-325) — the override only
+  fills a miss.
+- Bound-method call prepends self (args[1] rule): a 0-arg fn
+  called bound is an arg-count mismatch in the original too.
+- unpack_sequence / unpack_ex return items in NATURAL order; the
+  Zig's items array is reversed (VM stack-layout detail).
+
+Cross-lane fixes made by this lane (verified against the original)
+-------------------------------------------------------------------
+1. load_method_maybe used MapData::find_qstr on the type's dict —
+   find_qstr is the COMPACT path and panics (index out of bounds)
+   on FIXED ordered ROM dicts (new_fixed, empty index). Re-pointed
+   at the general dict_lookup_qstr. (object_locals_dict lookups
+   hit this in 3 tests.)
+2. C12b's is_exception_type returned TRUE for exception INSTANCES
+   (header-type fallback). The Zig (objexcept.zig:104-111) falls
+   through to mp_obj_is_subclass_fast, which is false for a
+   non-type — probed (p9): `except ValueError("b")` raises
+   binopUnsupported, and make_raise_obj must NOT call an instance.
+   Fixed the non-Type arm to false in objexcept.rs. C12b's test
+   (objtype_tests.rs:551) does not pin the instance case.
+3. RuntimeSeams fields are now owned Box<dyn FnMut> (not &mut dyn):
+   a &mut to a bare-fn stub is a reference to a temporary and
+   cannot leave the stub() constructor (E0515). stub() works
+   unchanged at call sites.
+
+Deviations from the brief (documented, justified)
+-------------------------------------------------
+- load_method_maybe returns Result<Option<MethodDest>, RtError>,
+  not bare Option (the Zig's B2 comment requires the pending-exc
+  propagate; an attr-slot raise must not become "no attribute").
+- call_prepare_args_n_kw_var takes starred: &[Value] (the objects
+  to expand), not a count — the count cannot express which objects.
+- mp_load_method_maybe's attr-slot Ok(None) is the SENTINEL
+  fall-through to the locals-dict lookup (re-read runtime.zig:
+  1195-1231: `if (dest[1] != SENTINEL) return; dest[1] = 0;`
+  then locals_dict), not a short-circuit.
+- mp_import_name takes (name, fromlist, level); globals come from
+  thread state inside (runtime.zig:1468 builds the 5-arg array
+  internally) — the brief's earlier 5-field sketch was wrong.
+- load_method_protected swallows RtError::PyRaise as well as
+  AttributeError from the attr call (corpus builtin_getattr.py
+  requires it: getattr(b, "b", "default") with a raising
+  __getattr__); a non-AttributeError raise arriving as bare
+  PyRaise is swallowed here — documented gap, closable when the
+  slot boundary carries the kind (C13 pending_exc).
+- RuntimeSeams is Box-based (see cross-lane fix 3).
+
+Seams and owners
+-----------------
+- RuntimeSeams.import_default -> C15/D (mp_builtin___import___default).
+- RuntimeSeams.gen_resume -> C10b's gen_resume + C13's runner (frame
+  + runner are C13-side; C14 only calls the seam).
+- InternFn (interning) -> C13's Vm (CallCtx.pool is shared; the seam
+  is find-only in tests — names must be pre-interned with Env::q).
+- __build_class__ object -> D1 (taken as a parameter).
+- mp_init / mp_deinit -> C13/D. stop_iteration_arg thread slot ->
+  C13's VmState (travels in return values / ResumeOutcome here).
+- typingCall's `typing` import -> ImportSeam (fails until C15/D).
+- Float/complex scalar arithmetic -> C18 (see below).
+- Generator resume execution -> C10b resume entry + C13 runner.
+- next(gen) through the next-builtin adapter returns PyRaise until
+  C13 grows CallCtx into the full Vm (a bare BuiltinFn cannot capture
+  seams); builtin_next with explicit seams is implemented and tested.
+
+Float / complex cases waiting for C18 (exact list)
+--------------------------------------------------
+1 + 2.5, 2.5 + 1, 1 + 2j, 2j + 1, 1 / 0.0, 1.0 / 0, 0.0 ** -1,
+(-8.0) ** 0.5 -> ValueError "complex values not supported",
+"%o" % 3.0 must raise, 2.0 ** -1. (2 ** -1 == 0.5 and 1 / 2 == 0.5
+are done inline in runtime.zig itself, not C18.)
+C18 REQUIREMENT: float/complex binary_op slots must accept a
+non-float lhs (converting via mp_obj_get_float semantics) — the
+promotion arms route through the exact float/complex type's slot
+with the plain op (the vendor float slot has no REVERSE_ cases).
+Also (C8b finding, restated): the float type's IntMaybe slot must
+return NotImplemented, or "%o" % 3.0 stops raising.
+
+Known gaps (not fake-done)
+---------------------------
+1. The __next__-method StopIteration translation is unobservable
+   through the call slot until C13's pending_exc — a user iterator's
+   __next__ raising StopIteration propagates as RtError::PyRaise
+   instead of ending iteration (native-iterator fast path and
+   generator path are unaffected). Same root cause hits mp_resume's
+   __next__/send branches and next(it, default) on a user iterator.
+2. The getitem seam can never return Stop through a real
+   __getitem__ call until C13 (any error -> Raise), so
+   __getitem__-protocol iteration ends with an error instead of
+   cleanly at exhaustion — same root cause.
+3. f(*"ab") star-expansion cannot run end to end yet: the tree's
+   str type has getiter: None (C12 TODO — polymorph-iter type)
+   and C11's iternext has no str-iterator tag (new_str_iterator
+   builds extra: vec![]). The getiter expansion path itself IS
+   tested (f(*{"a":1,"b":2}) expands keys via dict getiter).
+4. mp_load_method_protected swallows bare PyRaise (see above).
+5. The C11 `call` seam degrades OutOfMemory to Raise (the seam
+   type has no OOM outcome); IterError::IndexError degrades to
+   RtError::PyRaise (no IndexError variant in RtError).
+6. import_from's submodule fallback needs the dotted name
+   pre-interned (the InternFn seam is find-only in tests).
+7. The module type's attr slot (module_attr) is wired only in the
+   C14 test Env; module_type_data leaves it None — production
+   wiring (D1's module setup) must set attr: Some(module_attr).
+8. mp_init/mp_deinit out of scope; typingCall's typing import goes
+   through the ImportSeam (fails until C15/D).

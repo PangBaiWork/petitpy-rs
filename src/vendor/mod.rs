@@ -16,6 +16,9 @@
 //! - [`parsenum`] — the `parsenum.c` helpers it needs (Lane FMT):
 //!   `mp_decimal_exp` and `mp_parse_float_internal` (the latter as
 //!   linked in petitpy: the Zig version, see that module).
+//! - [`re15`] — the re1.5 regex engine (Lane RE15), ported from
+//!   petitpy's patched copy `port/re1.5-patched/` (int16 jump
+//!   offsets), not the vanilla vendor `lib/re1.5/`.
 //!
 //! Configuration this port targets (petitpy `port/mpconfigport.h`,
 //! full config): `MPZ_DIG_SIZE` is 32 on x86-64, so a digit is a
@@ -32,6 +35,7 @@ pub mod mpn;
 pub mod mpz;
 pub mod mpz_ops;
 pub mod parsenum;
+pub mod re15;
 
 pub use formatfloat::{format_float, format_float_into_buf, MP_FLOAT_REPR_PREC};
 pub use mpz::BigInt;
@@ -43,4 +47,9 @@ mod mpz_tests;
 #[cfg(test)]
 mod probe;
 #[cfg(test)]
+#[cfg(test)]
 mod probe_fmt;
+#[cfg(test)]
+mod re15_probe;
+#[cfg(test)]
+mod re15_tests;

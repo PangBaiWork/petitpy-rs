@@ -1,0 +1,178 @@
+Lane C7r: wire primitives into C6 slots — RESULT
+====================================================
+Worktree ~/workspace/petitpy-rs-prims-rewire, branch lane/prims-rewire,
+base master 2cd10e9 (C6 + C7 merged, main agent's minimal integration
+fix applied). One commit: "Lane C7r: wire primitives into C6 slots".
+
+1. What was done (in order, each step test-green before the next)
+-----------------------------------------------------------------
+a. `src/objects/obj.rs` (+5): `ExcType` gains `ZeroDivisionError`
+   (+ `name()` arm). The int lane's `PrimError` needs it
+   (`0 ** -1`, `int` divide-by-zero — verified on the reference
+   binary by C7).
+b. `src/objects/primitives/ops.rs` (583 -> 358 lines): the four C7
+   temporary mirrors DELETED —
+   - `UnaryOp` (12 variants 0-11) and `BinaryOp` (52 variants):
+     verified verbatim identical to `slots.rs` by the main agent
+     (script diff, identical) and re-checked here; now imported
+     from `crate::objects::slots`.
+   - `BuiltinTypes`: field-for-field identical to `obj.rs:74`;
+     now imported from `crate::objects::obj`.
+   - `ExcType`: deleted only AFTER (a) extended C6's enum; now
+     imported from `crate::objects::obj`.
+   - `PrimUnaryFn` / `PrimBinaryFn`: deleted (zero uses anywhere).
+   - `PrimError` / `PrimOutcome` / `PrimResult` KEPT — the
+     int-specific error model (16 variants, each with `exc_type()` /
+     `message()` / `to_pyerror()`), a parallel type to C6's
+     `ObjError` in a different domain; not merged.
+   - Two imports dropped as unused after the deletions
+     (`CallCtx`, `BinaryOp`/`UnaryOp`); header comment rewritten
+     (the "adapters not writable" note is now stale).
+   - Import lists in `objint.rs`, `objbool.rs`, `mod.rs` rewired
+     to the canonical paths; `mod.rs` re-exports the canonical
+     types so the tests' `super::*` keeps working.
+c. `src/memory/gc.rs` (+15): `CallCtx` gains
+   `pub types: &'a BuiltinTypes` (the C13 growth, done early —
+   a `fn`-pointer slot cannot capture the registry, so it rides
+   on the context; the C5/C6 explicit-parameter precedent,
+   threaded through the context). `CallCtx::new` takes the third
+   argument. Only two `CallCtx::new` call sites exist (both test
+   fixtures) — updated:
+   - `src/objects/obj_tests.rs`: `ctx()` helper takes `types`;
+     24 call sites (`obj_tests.rs` 10 + `obj_ops_tests.rs` 14,
+     all the identical pattern `ctx(&mut fx.arena, &mut fx.roots)`)
+     mechanically extended with `&fx.types`.
+   - `src/objects/primitives/tests.rs`: `Fixture::call` builds
+     the context with `&self.types`. The 26 C7 tests are
+     untouched (closure signature unchanged).
+d. Adapters + slot filling (`objint.rs` +61, `objbool.rs` +50):
+   - `int_unary_slot` / `int_binary_slot` / `bool_unary_slot` /
+     `bool_binary_slot`: thin adapters to the frozen `UnaryOpFn` /
+     `BinaryOpFn` signatures. Each reads the registry from
+     `ctx.types` and converts with `prim_to_pyresult`:
+     `Ok(Value(v))` -> `Ok(v)`; `Ok(NotHandled)` ->
+     `Err(PyError::PyRaise)` (C6 "not implemented": the caller
+     falls through); `Err(e)` -> `Err(e.to_pyerror())`.
+   - `int_type_data`: `unary_op` / `binary_op` / `print` filled;
+     `bool_type_data`: same; `cell_type_data`: ALL slots stay
+     `None` (objcell.zig: all 11 slots null — verified).
+   - `call` / `getiter` / `subscr` / `buffer` stay `None` on int
+     and bool — the originals have no such slots (`make_new` is
+     the type-call path, C12, not a `TypeData` slot).
+e. Print slots (wired, not deferred):
+   - `int_print` (`objint.zig:330`): ignores `kind` (the Zig takes
+     `_ : c_int`), prints the base-10 digits via `int_to_string`
+     (`mp_obj_int_formatted(..., 10, null, 0, 0)`). A non-int value
+     writes nothing (`int_to_string` returns `None` for it).
+   - `bool_print` (`objbool.zig`): ignores `kind` (PY_JSON=0),
+     prints `"True"` / `"False"` unconditionally.
+   - Both match C6's `PrintFn` signature
+     (`fn(&mut CallCtx, Value, PrintKind, &mut dyn fmt::Write)`)
+     directly, so no forcing was needed.
+f. `src/objects/primitives/tests_ops.rs`: the C7 `type_rom_data`
+   test asserted the slots were `None` — updated to assert the
+   wired adapters (fn pointers compared as addresses, via the
+   named fn-pointer types, since fn items lack `Debug` and
+   `assert_eq!` cannot compare them; direct fn-item→integer casts
+   warn, so the casts go through `UnaryOpFn` / `BinaryOpFn` /
+   `PrintFn` first). Cell assertions extended to all 7 slots.
+g. NEW `src/objects/primitives/tests_dispatch.rs` (314 lines):
+   9 dispatch tests with a `SlotFixture` that builds the int/bool
+   type objects from `int_type_data` / `bool_type_data` (slots
+   filled). Borrow note: the fixture uses a free `make_ctx`
+   helper (the C6 `obj_tests.rs` precedent) — a `Fixture::ctx`
+   method would tie the returned lifetime to the whole `&mut self`
+   and block `&fx.types` alongside it; heap-result assertions run
+   the call in a block and read the arena after the context drops.
+
+2. Acceptance
+-------------
+- `cargo test --release --lib --tests`: **353 passed, 0 failed,
+  1 ignored** (baseline 344 + 9 new dispatch tests).
+- `cargo test --release --bins`: **9 passed**.
+- `cargo build --release`: **0 warnings**;
+  `cargo test --release --lib --tests --no-run`: **0 warnings**.
+- No unsafe code (grep clean — the word appears only in a C6 doc
+  comment on `BufferInfo`, untouched here).
+- Every file < 800 lines (max `objint.rs` 737, `obj.rs` 725).
+- Original repo `~/workspace/petitpy-orig` untouched
+  (git status clean).
+- `ops.rs` contains no `UnaryOp` / `BinaryOp` / `BuiltinTypes` /
+  `ExcType` definition (grep 0); `obj.rs` `ExcType` contains
+  `ZeroDivisionError`.
+
+3. The 9 dispatch tests (all in `tests_dispatch.rs`)
+-----------------------------------------------------
+- `dispatch_int_maybe_small_int_fast_path`: INT_MAYBE on a small
+  int returns it via C6's `call_unary` fast path (no slot consulted).
+- `dispatch_int_maybe_heap_int_via_slot`: INT_MAYBE on a heap
+  2**70 reaches the int slot and returns the same value.
+- `dispatch_int_unary_via_slot`: Negative/Bool/Hash on small ints
+  and Negative on heap -(2**70) through `call_unary`.
+- `dispatch_int_binary_add_and_compare`: Add(3,4)=7, Add(2**70,1),
+  Less, Equal through `call_binary`.
+- `dispatch_bool_ops_via_slot`: Bool unary on True, Add(True,True)=2,
+  Multiply(True,3)=3, Less(True,False)=false through the bool slot.
+- `dispatch_nothandled_is_not_implemented`: LEN on int, float rhs
+  in Add, LEN on bool — all `SlotOutcome::NotImplemented`.
+- `dispatch_raise_signals_pyraise`: adapter converts a rich raise
+  (FloorDivide by zero) to `Err(PyError::PyRaise)`, NotHandled the
+  same way, a handled op to `Ok`; `call_binary` maps the raise to
+  `NotImplemented` (see §4).
+- `dispatch_print_int_and_bool`: `obj_print_helper` writes "42"
+  (Str and Repr — kind ignored), "1180591620717411303424" for
+  2**70, "True"/"False"; a plain float type with no print slot
+  falls back to "<float>".
+- `dispatch_cell_slots_stay_none`: `call_unary`/`call_binary` on a
+  cell-typed value find no slot -> `NotImplemented`.
+
+4. Conventions recorded (not bugs — do not "fix" later)
+-------------------------------------------------------
+- Raise data is dropped at the slot boundary: the adapter maps
+  both `NotHandled` and a rich `PrimError` to `Err(PyError::PyRaise)`,
+  and C6's `call_unary`/`call_binary` map that to
+  `SlotOutcome::NotImplemented`. The control flow is the original's;
+  the raise data is not yet preserved. C13 adds `pending_exc` to
+  the VM and resolves it for all lanes at once (C6's
+  `objcore_result.txt` §3b/§3c, same convention).
+- `PrimError` stays int-specific and is NOT merged into C6's
+  `ObjError`; both follow the same (exc_type, message, to_pyerror)
+  shape in their own domains.
+
+5. Deferred to other lanes (NOT dropped)
+-------------------------------------------
+- `int_make_new` / `bool_make_new` into the C12 type-call path
+  (C12 owns it; this lane only filled the op/print slots).
+- `to_bytes` FunBuiltin entry: still needs the bytes type, which
+  the frozen `BuiltinFn` signature cannot carry; C13 wires it when
+  `CallCtx` carries the type registry (C7 result file §d — the
+  registry now rides on `CallCtx`, so C13's wiring is unblocked).
+- Float/complex rhs delegation (C18) and `2 * "ab"`-style
+  `extra_cases` delegation (C14): unchanged from C7's boundaries
+  §b/§c — the int slot still returns `NotHandled` for those, and
+  the dispatch tests pin that behaviour.
+
+6. Files changed
+----------------
+- `src/objects/obj.rs` (+5): `ExcType::ZeroDivisionError`.
+- `src/memory/gc.rs` (+15): `CallCtx.types` + `new()`.
+- `src/objects/obj_tests.rs` (+30/-): `ctx()` helper + 10 sites.
+- `src/objects/obj_ops_tests.rs` (28 lines): 14 `ctx()` sites.
+- `src/objects/primitives/ops.rs` (-225 net): mirrors deleted.
+- `src/objects/primitives/objint.rs` (+61): imports, slot fill,
+  3 adapters.
+- `src/objects/primitives/objbool.rs` (+50): imports, slot fill,
+  3 adapters.
+- `src/objects/primitives/mod.rs` (+30/-): re-exports rewired,
+  `tests_dispatch` registered.
+- `src/objects/primitives/tests.rs` (2 lines): `Fixture::call`.
+- `src/objects/primitives/tests_ops.rs` (+24/-): `type_rom_data`.
+- NEW `src/objects/primitives/tests_dispatch.rs` (314 lines):
+  9 dispatch tests.
+- Net: 10 files changed, +206/-296.
+
+7. Commit
+---------
+One commit: "Lane C7r: wire primitives into C6 slots" (own files by
+path only; `scripts/prims_rewire_brief.md` left untracked, per
+earlier lanes).

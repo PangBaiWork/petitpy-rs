@@ -26,11 +26,13 @@
 //! So int's `base` is `None` and its MRO is `[int]`.
 
 use crate::memory::gc::CallCtx;
+use crate::objects::obj::BuiltinTypes;
 use crate::objects::primitives::ops::{
     arg_as_int, int_from_float, is_exact_int, is_float, new_int_from_bigint,
-    new_int_from_bigint_typed, new_int_from_i64, static_qstr_id, str_bytes_of, BinaryOp,
-    BuiltinTypes, PrimError, PrimOutcome, PrimResult, QstrResolver, UnaryOp,
+    new_int_from_bigint_typed, new_int_from_i64, prim_to_pyresult, static_qstr_id,
+    str_bytes_of, PrimError, PrimOutcome, PrimResult, QstrResolver,
 };
+use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
 use crate::objects::value::{
     BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj, TypeData, Value,
 };
@@ -247,9 +249,11 @@ pub fn int_make_new(
 
 /// `mp_type_int` ROM data. `dict` is the `locals_dict` ref (see
 /// `int_locals_dict`); `mro` is filled with `[self]` by the bootstrap
-/// after allocation. Slots stay `None` here — the rich slot functions
-/// below plug into C6's op-enum signatures once they merge (see the
-/// result file for the exact rewiring).
+/// after allocation. The op slots are the C7r adapters below
+/// (`int_unary_slot` / `int_binary_slot` / `int_print`);
+/// `call` / `getiter` / `subscr` / `buffer` stay `None` — the
+/// original's int type has no such slots (`make_new` is the type-call
+/// path, wired by C12, not a `TypeData` slot).
 pub fn int_type_data(dict: GcRef) -> TypeData {
     TypeData {
         name: static_qstr_id(b"int").expect("MP_QSTR_int is in the static table"),
@@ -257,13 +261,13 @@ pub fn int_type_data(dict: GcRef) -> TypeData {
         base: None,
         mro: Vec::new(),
         dict,
-        unary_op: None,
-        binary_op: None,
+        unary_op: Some(int_unary_slot),
+        binary_op: Some(int_binary_slot),
         call: None,
         getiter: None,
         subscr: None,
         buffer: None,
-        print: None,
+        print: Some(int_print),
     }
 }
 
@@ -481,6 +485,19 @@ pub fn int_unary_op(
     Ok(PrimOutcome::Value(out))
 }
 
+/// Thin adapter to the frozen `UnaryOpFn` slot signature
+/// (`slots.rs`): reads the type registry from `CallCtx.types` and
+/// converts the rich result with `prim_to_pyresult` — a value passes
+/// through, `NotHandled` becomes `Err(PyError::PyRaise)` (the C6
+/// "not implemented" convention: the caller falls through), and a
+/// raise keeps only its `PyError` signal (the raise data is dropped
+/// at the slot boundary — the accepted C6 convention until C13 adds
+/// `pending_exc`).
+pub fn int_unary_slot(ctx: &mut CallCtx<'_>, op: UnaryOp, v: Value) -> PyResult<Value> {
+    let types = ctx.types;
+    prim_to_pyresult(int_unary_op(ctx, types, op, v))
+}
+
 // ── `mp_obj_int_binary_op` (vendor `py/objint_mpz.c`) ───────────────────
 
 /// Binary op on an int (`lhs` is an int; small and heap uniformly).
@@ -622,6 +639,18 @@ pub fn int_binary_op(
     Ok(out)
 }
 
+/// Thin adapter to the frozen `BinaryOpFn` slot signature
+/// (`slots.rs`) — same conversion as `int_unary_slot`.
+pub fn int_binary_slot(
+    ctx: &mut CallCtx<'_>,
+    op: BinaryOp,
+    lhs: Value,
+    rhs: Value,
+) -> PyResult<Value> {
+    let types = ctx.types;
+    prim_to_pyresult(int_binary_op(ctx, types, op, lhs, rhs))
+}
+
 // ── `mp_obj_int_pow3` (vendor `py/objint_mpz.c`) ────────────────────────
 
 /// `pow(base, exp, modulus)`: all three must be ints (`mp_obj_is_int`
@@ -689,4 +718,20 @@ pub fn int_format(
 /// `mp_obj_int_print`: base 10, no prefix, no comma.
 pub fn int_to_string(v: Value, arena: &crate::memory::gc::GcArena) -> Option<String> {
     int_format(v, arena, 10, "", b'a', 0)
+}
+
+/// `mp_obj_int_print` (`objint.zig:330`): ignores `kind` (the Zig
+/// takes `_ : c_int`) and prints the base-10 digits
+/// (`mp_obj_int_formatted(..., 10, null, 0, 0)`). A non-int value
+/// writes nothing (the slot is only invoked for int-typed values;
+/// `int_to_string` returns `None` for anything else).
+pub fn int_print(
+    ctx: &mut CallCtx<'_>,
+    v: Value,
+    _kind: PrintKind,
+    w: &mut dyn std::fmt::Write,
+) {
+    if let Some(s) = int_to_string(v, ctx.arena) {
+        let _ = w.write_str(&s);
+    }
 }

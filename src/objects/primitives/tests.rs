@@ -87,7 +87,7 @@ impl Fixture {
     }
 
     pub(crate) fn call<R>(&mut self, f: impl FnOnce(&mut CallCtx<'_>, &BuiltinTypes) -> R) -> R {
-        let mut ctx = CallCtx::new(&mut self.arena, &mut self.roots);
+        let mut ctx = CallCtx::new(&mut self.arena, &mut self.roots, &self.types);
         f(&mut ctx, &self.types)
     }
 

@@ -1,13 +1,12 @@
 //! Primitives support — op enums, builtin-type refs, error type.
 //!
-//! The C6 lane (`lane/objcore`, merging first) adds `UnaryOp` /
-//! `BinaryOp` / `BuiltinTypes` to `crate::objects::value` and
-//! `ObjError` / `ExcType` to `crate::objects::obj`. This lane's base
-//! (`c7a1a71`) predates them, so they are copied VERBATIM here as
-//! temporary mirrors — same variant names, same discriminants, same
-//! fields — and DELETED at merge, with the imports rewired to C6's
-//! canonical types. Nothing here invents semantics: every value is
-//! traced to the vendor header or the Zig source named in its doc.
+//! The C6 lane's canonical types live in `crate::objects::slots`
+//! (`UnaryOp` / `BinaryOp`) and `crate::objects::obj`
+//! (`BuiltinTypes`, `ExcType`); C7's temporary mirrors of them were
+//! deleted by the C7r rewire (the mirrors were verified verbatim
+//! identical — same variant names, same discriminants, same fields).
+//! Nothing here invents semantics: every value is traced to the
+//! vendor header or the Zig source named in its doc.
 //!
 //! Error model (the C5 `SetupError` / C6 `ObjError` precedent): the
 //! original raises by building an exception object into
@@ -24,234 +23,20 @@
 //! return ("not implemented", the caller falls through exactly as
 //! the original's `NULL` checks do), `Err(e)` is a raise with its
 //! data preserved. The thin adapters to the frozen slot signatures
-//! (`value.rs` `UnaryOpFn` / `BinaryOpFn`, which take no op argument
-//! and no type registry) are NOT writable until C6's signatures land
-//! and C13 grows `CallCtx` with the type registry — see the result
-//! file for the exact rewiring. Until then the `TypeData` slots stay
-//! `None` and the rich functions are the implementation.
+//! (`slots.rs` `UnaryOpFn` / `BinaryOpFn`) live in `objint.rs` /
+//! `objbool.rs` and read the type registry from `CallCtx.types`
+//! (the C13 growth, done early by C7r); they convert with
+//! `prim_to_pyresult`, which drops the raise data at the slot
+//! boundary — the accepted C6 convention until C13 adds
+//! `pending_exc`.
 
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::memory::gc::{GcArena, RootSet};
+use crate::objects::obj::{BuiltinTypes, ExcType};
 use crate::objects::value::{small_int_fits, GcRef, Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::vendor::mpz::BigInt;
 
 // ── Op enums (verbatim mirrors of C6's `value.rs`) ─────────────────────
-
-/// Unary-op codes (vendor `py/runtime0.h:72-88`).
-/// `Positive=0, Negative=1, Invert=2, Not=3, Bool=4, Len=5, Hash=6,
-/// Abs=7, IntMaybe=8, FloatMaybe=9, ComplexMaybe=10, Sizeof=11`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum UnaryOp {
-    Positive = 0,
-    Negative = 1,
-    Invert = 2,
-    Not = 3,
-    Bool = 4,
-    Len = 5,
-    Hash = 6,
-    Abs = 7,
-    IntMaybe = 8,
-    FloatMaybe = 9,
-    ComplexMaybe = 10,
-    Sizeof = 11,
-}
-
-impl UnaryOp {
-    pub fn as_u8(self) -> u8 {
-        self as u8
-    }
-
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(UnaryOp::Positive),
-            1 => Some(UnaryOp::Negative),
-            2 => Some(UnaryOp::Invert),
-            3 => Some(UnaryOp::Not),
-            4 => Some(UnaryOp::Bool),
-            5 => Some(UnaryOp::Len),
-            6 => Some(UnaryOp::Hash),
-            7 => Some(UnaryOp::Abs),
-            8 => Some(UnaryOp::IntMaybe),
-            9 => Some(UnaryOp::FloatMaybe),
-            10 => Some(UnaryOp::ComplexMaybe),
-            11 => Some(UnaryOp::Sizeof),
-            _ => None,
-        }
-    }
-}
-
-/// Binary-op codes (vendor `py/runtime0.h:89-164`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum BinaryOp {
-    Less = 0,
-    More = 1,
-    Equal = 2,
-    LessEqual = 3,
-    MoreEqual = 4,
-    NotEqual = 5,
-    In = 6,
-    Is = 7,
-    ExceptionMatch = 8,
-    InplaceOr = 9,
-    InplaceXor = 10,
-    InplaceAnd = 11,
-    InplaceLshift = 12,
-    InplaceRshift = 13,
-    InplaceAdd = 14,
-    InplaceSubtract = 15,
-    InplaceMultiply = 16,
-    InplaceMatMultiply = 17,
-    InplaceFloorDivide = 18,
-    InplaceTrueDivide = 19,
-    InplaceModulo = 20,
-    InplacePower = 21,
-    Or = 22,
-    Xor = 23,
-    And = 24,
-    Lshift = 25,
-    Rshift = 26,
-    Add = 27,
-    Subtract = 28,
-    Multiply = 29,
-    MatMultiply = 30,
-    FloorDivide = 31,
-    TrueDivide = 32,
-    Modulo = 33,
-    Power = 34,
-    Divmod = 35,
-    Contains = 36,
-    ReverseOr = 37,
-    ReverseXor = 38,
-    ReverseAnd = 39,
-    ReverseLshift = 40,
-    ReverseRshift = 41,
-    ReverseAdd = 42,
-    ReverseSubtract = 43,
-    ReverseMultiply = 44,
-    ReverseMatMultiply = 45,
-    ReverseFloorDivide = 46,
-    ReverseTrueDivide = 47,
-    ReverseModulo = 48,
-    ReversePower = 49,
-    NotIn = 50,
-    IsNot = 51,
-}
-
-impl BinaryOp {
-    pub fn as_u8(self) -> u8 {
-        self as u8
-    }
-
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(BinaryOp::Less),
-            1 => Some(BinaryOp::More),
-            2 => Some(BinaryOp::Equal),
-            3 => Some(BinaryOp::LessEqual),
-            4 => Some(BinaryOp::MoreEqual),
-            5 => Some(BinaryOp::NotEqual),
-            6 => Some(BinaryOp::In),
-            7 => Some(BinaryOp::Is),
-            8 => Some(BinaryOp::ExceptionMatch),
-            9 => Some(BinaryOp::InplaceOr),
-            10 => Some(BinaryOp::InplaceXor),
-            11 => Some(BinaryOp::InplaceAnd),
-            12 => Some(BinaryOp::InplaceLshift),
-            13 => Some(BinaryOp::InplaceRshift),
-            14 => Some(BinaryOp::InplaceAdd),
-            15 => Some(BinaryOp::InplaceSubtract),
-            16 => Some(BinaryOp::InplaceMultiply),
-            17 => Some(BinaryOp::InplaceMatMultiply),
-            18 => Some(BinaryOp::InplaceFloorDivide),
-            19 => Some(BinaryOp::InplaceTrueDivide),
-            20 => Some(BinaryOp::InplaceModulo),
-            21 => Some(BinaryOp::InplacePower),
-            22 => Some(BinaryOp::Or),
-            23 => Some(BinaryOp::Xor),
-            24 => Some(BinaryOp::And),
-            25 => Some(BinaryOp::Lshift),
-            26 => Some(BinaryOp::Rshift),
-            27 => Some(BinaryOp::Add),
-            28 => Some(BinaryOp::Subtract),
-            29 => Some(BinaryOp::Multiply),
-            30 => Some(BinaryOp::MatMultiply),
-            31 => Some(BinaryOp::FloorDivide),
-            32 => Some(BinaryOp::TrueDivide),
-            33 => Some(BinaryOp::Modulo),
-            34 => Some(BinaryOp::Power),
-            35 => Some(BinaryOp::Divmod),
-            36 => Some(BinaryOp::Contains),
-            37 => Some(BinaryOp::ReverseOr),
-            38 => Some(BinaryOp::ReverseXor),
-            39 => Some(BinaryOp::ReverseAnd),
-            40 => Some(BinaryOp::ReverseLshift),
-            41 => Some(BinaryOp::ReverseRshift),
-            42 => Some(BinaryOp::ReverseAdd),
-            43 => Some(BinaryOp::ReverseSubtract),
-            44 => Some(BinaryOp::ReverseMultiply),
-            45 => Some(BinaryOp::ReverseMatMultiply),
-            46 => Some(BinaryOp::ReverseFloorDivide),
-            47 => Some(BinaryOp::ReverseTrueDivide),
-            48 => Some(BinaryOp::ReverseModulo),
-            49 => Some(BinaryOp::ReversePower),
-            50 => Some(BinaryOp::NotIn),
-            51 => Some(BinaryOp::IsNot),
-            _ => None,
-        }
-    }
-}
-
-// ── Builtin type refs (verbatim mirror of C6's `obj.rs`) ───────────────
-
-/// References to the builtin type objects. The rich slot functions
-/// take them as a parameter (the C5/C6 explicit-parameter precedent)
-/// because the type objects are built by C12 / the type-ROM bootstrap
-/// and do not exist yet as a global registry; the VM owns one instance
-/// and passes it down. Only the types this lane names are here.
-/// Temporary mirror — delete at merge, use C6's `BuiltinTypes`.
-#[derive(Clone, Copy, Debug)]
-pub struct BuiltinTypes {
-    pub int: GcRef,
-    pub str_: GcRef,
-    pub bytes: GcRef,
-    pub bool_: GcRef,
-    pub none_type: GcRef,
-    pub float: GcRef,
-    pub complex: GcRef,
-    pub tuple: GcRef,
-    pub list: GcRef,
-    /// `type` itself.
-    pub type_: GcRef,
-}
-
-// ── Error type ──────────────────────────────────────────────────────────
-
-/// The exception type a `PrimError` raises, by name — the type
-/// objects do not exist yet; the VM resolves the name through the
-/// builtins registry when `VmState.pending_exc` lands.
-/// Temporary mirror of C6's `ExcType`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ExcType {
-    TypeError,
-    ValueError,
-    IndexError,
-    OverflowError,
-    ZeroDivisionError,
-}
-
-impl ExcType {
-    pub fn name(self) -> &'static str {
-        match self {
-            ExcType::TypeError => "TypeError",
-            ExcType::ValueError => "ValueError",
-            ExcType::IndexError => "IndexError",
-            ExcType::OverflowError => "OverflowError",
-            ExcType::ZeroDivisionError => "ZeroDivisionError",
-        }
-    }
-}
 
 /// A raise signalled by a primitives function: exactly the data the
 /// original formats into the exception object — the exception type
@@ -362,16 +147,6 @@ pub enum PrimOutcome {
 /// The rich slot-function result: a value, "not handled", or a raise
 /// with its exception data preserved.
 pub type PrimResult = Result<PrimOutcome, PrimError>;
-
-/// Rich unary-op slot: takes the type registry the frozen signature
-/// cannot carry yet. At merge this becomes C6's `UnaryOpFn` once
-/// `CallCtx` carries `BuiltinTypes` (C13).
-pub type PrimUnaryFn =
-    for<'a> fn(&mut CallCtx<'a>, &BuiltinTypes, UnaryOp, Value) -> PrimResult;
-
-/// Rich binary-op slot (same note as `PrimUnaryFn`).
-pub type PrimBinaryFn =
-    for<'a> fn(&mut CallCtx<'a>, &BuiltinTypes, BinaryOp, Value, Value) -> PrimResult;
 
 /// Resolves a qstr id to its bytes. Static ids come from the
 /// generated table; dynamic ids (>= `N_TOTAL`) live in the VM's

@@ -88,12 +88,16 @@ pub struct BuiltinTypes {
 /// The exception type an `ObjError` raises, by name — the type
 /// objects do not exist yet; the VM resolves the name through the
 /// builtins registry when `VmState.pending_exc` lands.
+/// `ZeroDivisionError` added by C7r (the int lane's `PrimError`
+/// needs it: `0 ** -1` and friends raise it — verified on the
+/// reference binary).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExcType {
     TypeError,
     ValueError,
     IndexError,
     OverflowError,
+    ZeroDivisionError,
 }
 
 impl ExcType {
@@ -103,6 +107,7 @@ impl ExcType {
             ExcType::ValueError => "ValueError",
             ExcType::IndexError => "IndexError",
             ExcType::OverflowError => "OverflowError",
+            ExcType::ZeroDivisionError => "ZeroDivisionError",
         }
     }
 }

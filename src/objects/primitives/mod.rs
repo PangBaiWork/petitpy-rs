@@ -9,8 +9,10 @@
 //! no second bignum is written here. The rich functions in this
 //! module take `&BuiltinTypes` explicitly and return `PrimResult`
 //! (see `ops.rs`); the thin adapters to the frozen slot signatures
-//! land when C6's op-enum signatures merge and C13 grows `CallCtx`
-//! with the type registry.
+//! (`int_unary_slot` / `int_binary_slot` / `bool_unary_slot` /
+//! `bool_binary_slot`) read the registry from `CallCtx.types` (the
+//! C13 growth, done early by C7r) and convert with
+//! `prim_to_pyresult`.
 
 pub mod objbool;
 pub mod objcell;
@@ -21,16 +23,24 @@ pub mod ops;
 mod tests;
 
 #[cfg(test)]
+mod tests_dispatch;
+
+#[cfg(test)]
 mod tests_ops;
 
-pub use objbool::{bool_binary_op, bool_make_new, bool_to_string, bool_type_data, bool_unary_op};
+pub use objbool::{
+    bool_binary_op, bool_binary_slot, bool_make_new, bool_print, bool_to_string, bool_type_data,
+    bool_unary_op, bool_unary_slot,
+};
 pub use objcell::{cell_get, cell_set, cell_type_data, new_cell};
 pub use objint::{
-    fun_n_args, int_binary_op, int_format, int_from_bytes, int_from_bytes_builtin,
-    int_locals_dict, int_make_new, int_pow3, int_to_bytes, int_to_string, int_type_data,
-    int_unary_op, parse_int_text,
+    fun_n_args, int_binary_op, int_binary_slot, int_format, int_from_bytes,
+    int_from_bytes_builtin, int_locals_dict, int_make_new, int_pow3, int_print, int_to_bytes,
+    int_to_string, int_type_data, int_unary_op, int_unary_slot, parse_int_text,
 };
-pub use ops::{
-    prim_to_pyresult, BinaryOp, BuiltinTypes, ExcType, PrimError, PrimOutcome, PrimResult,
-    QstrResolver, UnaryOp,
-};
+pub use ops::{prim_to_pyresult, PrimError, PrimOutcome, PrimResult, QstrResolver};
+// Op codes and the builtin-type registry are C6's canonical types
+// (`slots.rs` / `obj.rs`); re-exported here so the tests' `super::*`
+// keeps working.
+pub use crate::objects::obj::{BuiltinTypes, ExcType};
+pub use crate::objects::slots::{BinaryOp, UnaryOp};

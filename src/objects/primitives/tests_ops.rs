@@ -5,6 +5,7 @@
 use super::tests::*;
 use super::*;
 use crate::objects::primitives::ops::static_qstr_id;
+use crate::objects::slots::{BinaryOpFn, PrintFn, UnaryOpFn};
 use crate::objects::value::{Obj, Value};
 use crate::pyerr::PyError;
 use crate::vendor::mpz::BigInt;
@@ -382,14 +383,35 @@ fn type_rom_data() {
     assert_eq!(d.flags, 0);
     assert_eq!(d.base, None);
     assert!(d.mro.is_empty());
-    assert!(d.unary_op.is_none() && d.binary_op.is_none() && d.call.is_none());
+    // C7r: the op slots are wired to the thin adapters; call /
+    // getiter / subscr / buffer stay None (the original's int type
+    // has no such slots). (Fn pointers are compared as addresses:
+    // `assert_eq!` needs `Debug`, which fn items lack.)
+    assert_eq!(d.unary_op.map(|f| f as usize), Some(int_unary_slot as UnaryOpFn as usize));
+    assert_eq!(d.binary_op.map(|f| f as usize), Some(int_binary_slot as BinaryOpFn as usize));
+    assert_eq!(d.print.map(|f| f as usize), Some(int_print as PrintFn as usize));
+    assert!(d.call.is_none() && d.getiter.is_none() && d.subscr.is_none() && d.buffer.is_none());
     let d = bool_type_data(dict);
     assert_eq!(d.name, static_qstr_id(b"bool").unwrap());
     assert_eq!(d.flags, 0x0008);
     assert_eq!(d.base, None);
+    assert_eq!(d.unary_op.map(|f| f as usize), Some(bool_unary_slot as UnaryOpFn as usize));
+    assert_eq!(d.binary_op.map(|f| f as usize), Some(bool_binary_slot as BinaryOpFn as usize));
+    assert_eq!(d.print.map(|f| f as usize), Some(bool_print as PrintFn as usize));
+    assert!(d.call.is_none() && d.getiter.is_none() && d.subscr.is_none() && d.buffer.is_none());
     let d = cell_type_data(dict);
     assert_eq!(d.name, 0);
     assert_eq!(d.flags, 0);
+    // Cell: ALL slots None (objcell.zig: all 11 slots null).
+    assert!(
+        d.unary_op.is_none()
+            && d.binary_op.is_none()
+            && d.call.is_none()
+            && d.getiter.is_none()
+            && d.subscr.is_none()
+            && d.buffer.is_none()
+            && d.print.is_none()
+    );
     // bool is NOT an int subclass: both have base None.
     assert!(int_type_data(dict).base.is_none() && bool_type_data(dict).base.is_none());
 }

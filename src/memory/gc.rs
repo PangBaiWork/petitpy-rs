@@ -111,6 +111,7 @@
 //! freed while its instances survived. `collect_inner` therefore
 //! also marks each live slot's `header.type_`.
 
+use crate::objects::obj::BuiltinTypes;
 use crate::objects::value::{GcRef, Obj, ObjHeader, Value};
 use crate::pyerr::PyResult;
 
@@ -160,14 +161,24 @@ impl RootSet {
 /// plus the roots they must use for every allocation. The VM builds one
 /// per operation from its own arena + roots; C13 grows this struct
 /// into the full `Vm` (the fn-pointer slot types stay unchanged).
+/// `types` is the C13 growth done early by C7r: the thin slot
+/// adapters need the builtin-type registry to call the rich slot
+/// functions, and a `fn` pointer cannot capture it — so it rides on
+/// the context (the C5/C6 explicit-parameter precedent, threaded
+/// through the context instead of every call site).
 pub struct CallCtx<'a> {
     pub arena: &'a mut GcArena,
     pub roots: &'a mut RootSet,
+    pub types: &'a BuiltinTypes,
 }
 
 impl<'a> CallCtx<'a> {
-    pub fn new(arena: &'a mut GcArena, roots: &'a mut RootSet) -> CallCtx<'a> {
-        CallCtx { arena, roots }
+    pub fn new(
+        arena: &'a mut GcArena,
+        roots: &'a mut RootSet,
+        types: &'a BuiltinTypes,
+    ) -> CallCtx<'a> {
+        CallCtx { arena, roots, types }
     }
 
     /// Allocate an object, rooted at this context's roots.

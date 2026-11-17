@@ -153,16 +153,6 @@ mod tests {
     use crate::objects::slots::UnaryOp;
     use crate::objects::value::{Obj, StrData, TypeData, Value};
 
-    fn str_bytes(ctx: &CallCtx, v: Value) -> Vec<u8> {
-        match v {
-            Value::Heap(r) => match ctx.arena.get(r) {
-                Obj::Str(s) => s.bytes.clone(),
-                _ => panic!("expected a heap Str, got {v:?}"),
-            },
-            _ => panic!("expected a heap Str, got {v:?}"),
-        }
-    }
-
     /// The `reversed` call seam is only used for the
     /// `__reversed__` delegation: the token `"rev-list"`
     /// returns the captured list value.
@@ -302,6 +292,9 @@ mod tests {
                 base: None,
                 mro: Vec::new(),
                 dict,
+                attr: None,
+                make_new: None,
+                bases: None,
                 unary_op: Some(len2),
                 binary_op: None,
                 call: None,
@@ -356,6 +349,9 @@ mod tests {
                 base: None,
                 mro: Vec::new(),
                 dict: dict_ref,
+                attr: None,
+                make_new: None,
+                bases: None,
                 unary_op: None,
                 binary_op: None,
                 call: None,

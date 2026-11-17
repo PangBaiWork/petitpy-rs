@@ -27,7 +27,7 @@
 //! `ViperTypeError` is absent (`MICROPY_EMIT_NATIVE = 0`).
 
 use crate::memory::gc::CallCtx;
-use crate::objects::objtype::objexcept::exception_print;
+use crate::objects::objtype::objexcept::{exception_make_new_slot, exception_print};
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{DictData, GcRef, MapData, Obj, TypeData, Value};
 
@@ -77,6 +77,12 @@ pub fn exc_type_data(name: u32, base: Option<GcRef>, mro: Vec<GcRef>, dict: GcRe
         base,
         mro,
         dict,
+        attr: None,
+        // The exception types' `make_new` slot IS
+        // `mp_obj_exception_make_new` (objexcept.zig:316) — the
+        // identity `is_exception_type_obj` compares against.
+        make_new: Some(exception_make_new_slot),
+        bases: None,
         namedtuple_fields: None,
         unary_op: None,
         binary_op: None,

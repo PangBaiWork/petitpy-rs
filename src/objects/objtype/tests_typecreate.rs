@@ -96,6 +96,7 @@ pub(crate) fn native_type_named(fx: &mut Fx, name: &[u8]) -> GcRef {
         bases: None,
         mro: Vec::new(),
         dict,
+        namedtuple_fields: None,
         attr: None,
         make_new: None,
         unary_op: None,

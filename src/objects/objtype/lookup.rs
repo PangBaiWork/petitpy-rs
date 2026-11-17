@@ -149,6 +149,27 @@ pub fn convert_member_lookup(
     let Value::Heap(m) = member else {
         return (member, None);
     };
+    // Payload-based function check: `FunBuiltin` / `FunBc`
+    // values are allocated with header `None` across the tree
+    // (the `fun_builtin_N` type objects do not exist yet — the
+    // bootstrap pattern), so the header-type read below cannot
+    // see their `BINDS_SELF` flag. The payload IS the identity
+    // here (the `is_type_value` precedent in `subclass.rs`): a
+    // builtin function binds `self` unless it was found in an
+    // instance type (where the Zig makes it a staticmethod —
+    // probed: a `FunBuiltin` `__init__` on a user type is
+    // unbound); a bytecode function always binds `self`. This
+    // is what makes `object().__init__` a bound method (probed
+    // on the reference binary) instead of a bare builtin.
+    if matches!(ctx.arena.get(m), Obj::FunBuiltin(_) | Obj::FunBc(_)) {
+        if matches!(ctx.arena.get(m), Obj::FunBuiltin(_)) {
+            match type_data(ctx.arena, type_) {
+                Some(tdata) if tdata.flags & FLAG_INSTANCE_TYPE != 0 => return (member, None),
+                _ => return (member, self_),
+            }
+        }
+        return (member, self_);
+    }
     let Some(mtype) = obj_get_type(ctx.arena, ctx.types, member) else {
         return (member, None);
     };

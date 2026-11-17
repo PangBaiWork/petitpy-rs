@@ -232,12 +232,33 @@ pub struct TypeData {
   `(object,)` 是无父类规则的产物，已核实）。`issubclass` /
   `isinstance` 是 `fun_builtin_2` 对象，住在 `Rom` 上（供
   modbuiltins 安装，Phase D）。
-  **C12b 重叠**：`objobject.zig`（object 类型 + 四个 locals）
-  与 `objexcept.zig` 由 C12b 并行移植，不在本 lane；本 lane 的
-  `object_type_data` 是占位（空 dict + `make_new =
-  instance_make_new`），合流时换成 C12b 的实现并装四个 locals，
-  再复核对象继承路径；`instance_print` 的异常分支要接 C12b 的
-  `mp_obj_is_native_exception_instance`。
+  **C12b 重叠（已合流，2026-11-18）**：`objobject.zig`（object
+  类型 + 四个 locals）与 `objexcept.zig` 由 C12b 并行移植；合流
+  时 `rom.rs` 的占位 `object_type_data` 已删，改用 C12b 的
+  `object_type_data` + `object_locals_dict`（四个 locals），
+  `make_new` 槽为 `object_make_new_slot`（Zig 的
+  `object_make_new`：`(0,0,false)` 校验 + 空白分配）——**不是**
+  `instance_make_new`：装了 locals 后 `__new__` 查找会命中
+  `object.__new__` 并报 "arg must be user-type"（Zig 的
+  `object()` 从不查 `__new__`）。`is_exception_type_obj` 已从
+  print 槽身份改回 make_new 槽身份（`exception_make_new_slot`
+  适配器，`ExcError → PyError`）；`instance_print` 的异常分支
+  已接 `mp_obj_is_native_exception_instance`，`PRINT_EXC_SUBCLASS`
+  由 `exception_print_inner` 的 `is_subclass` 参数承载。
+  **原版 quirks（已在原版二进制上核实，Rust 如实复现）**：
+  `npy_ty_class_lookup` 的父类步进在父类是 `object` 时**停止
+  而不查 `object` 的 dict**（`objtype.zig:886-897`，单继承分支
+  与 C3 分支皆然）——所以子类实例**看不到** object 的 locals：
+  `hasattr(X(), '__init__')` 为 False，`X().__init__` 报
+  AttributeError；只有 `object()` 自身的 `__init__`/`__new__`
+  可达（其类型 dict 被直接查）。不要“修”它。
+  `convert_member_lookup` 的函数判定是 **payload 检查**：
+  `FunBuiltin`/`FunBc` 值在全树以 header `None` 分配
+  （`fun_builtin_N` 类型对象尚未存在），header 读不到
+  `BINDS_SELF` 标志——payload 即身份（`is_type_value` 的先例）：
+  内置函数在非实例类型中绑定 self、在实例类型中为
+  staticmethod（不绑定），字节码函数恒绑定 self；这使
+  `object().__init__` 为 bound method（已核实）。
 - **C12a（2026-11-17）：`VmSeams`（局部缝合，C13 替换）。**
   objtype 的逻辑函数以 `&mut VmSeams` 为参数，缝合 VM 尚未提供
   的五处：`call`（值调用，C10 runner 形状）、`load_maybe`

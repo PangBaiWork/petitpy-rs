@@ -87,7 +87,7 @@
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::{MakeNewFn, PrintFn, PrintKind};
+use crate::objects::slots::{MakeNewFn, PrintKind};
 use crate::objects::value::{ExceptionData, GcRef, Obj, StrData, TraceFrame, Value};
 use crate::pyerr::{PyError, PyResult};
 
@@ -166,6 +166,21 @@ pub fn exception_make_new(
             cause: None,
         }),
     )))
+}
+
+/// `mp_obj_exception_make_new` as a `MakeNewFn` slot (the
+/// exception types' `make_new` — every ROM exception type built
+/// by `exc_type_data` carries this). The `ExcError` maps to
+/// `PyError` via `ExcError::to_pyerror` (the slot-boundary
+/// convention: the raise message is dropped until C13 adds
+/// `pending_exc`, as with every other slot).
+pub fn exception_make_new_slot(
+    ctx: &mut CallCtx,
+    type_: GcRef,
+    args: &[Value],
+    n_kw: usize,
+) -> PyResult<Value> {
+    exception_make_new(ctx, type_, args, n_kw).map_err(ExcError::to_pyerror)
 }
 
 /// `mp_obj_new_exception` (`objexcept.zig:416`): no-arg exception.
@@ -585,7 +600,7 @@ pub fn exception_match(arena: &GcArena, exc: Value, exc_type: Value) -> bool {
 pub fn is_exception_type_obj(arena: &GcArena, type_: GcRef) -> bool {
     match arena.get(type_) {
         Obj::Type(td) => match td.make_new {
-            Some(f) => std::ptr::fn_addr_eq(f, exception_make_new as MakeNewFn),
+            Some(f) => std::ptr::fn_addr_eq(f, exception_make_new_slot as MakeNewFn),
             None => false,
         },
         _ => false,

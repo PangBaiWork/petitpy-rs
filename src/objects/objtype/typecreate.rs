@@ -593,6 +593,7 @@ pub fn mp_obj_new_type(
         bases: bases_field,
         mro: Vec::new(),
         dict: locals_r,
+        namedtuple_fields: None,
         attr: Some(instance_attr),
         make_new: Some(instance_make_new),
         unary_op: Some(instance_unary_op_slot),

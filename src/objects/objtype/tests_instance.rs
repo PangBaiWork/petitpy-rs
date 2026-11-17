@@ -477,6 +477,7 @@ fn getiter_member_and_native_iternest() {
             bases: None,
             mro: vec![object],
             dict: it_dict,
+            namedtuple_fields: None,
             print: None,
             unary_op: None,
             binary_op: None,

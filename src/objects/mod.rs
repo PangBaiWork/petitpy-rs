@@ -3,6 +3,7 @@
 
 pub mod obj;
 pub mod obj_ops;
+pub mod primitives;
 pub mod slots;
 pub mod value;
 

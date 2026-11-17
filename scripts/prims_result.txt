@@ -1,0 +1,111 @@
+Lane C7: primitives int bool cell — RESULT
+Base: master c7a1a71 (lib 286 + bin 9). Branch: lane/prims.
+Commit: one commit for this chunk (see git log).
+
+SOURCES (all read, all 0 test blocks upstream)
+- src/objects/primitives/objint.zig 556 -> src/objects/primitives/objint.rs 689
+  (vendor py/objint.c small-int paths + py/objint_mpz.c full-config heap ops)
+- src/objects/primitives/objbool.zig 83 -> src/objects/primitives/objbool.rs 123
+  (vendor py/objbool.c, full port)
+- src/objects/primitives/objcell.zig 48 -> src/objects/primitives/objcell.rs 55
+  (whole file; only export mp_obj_new_cell)
+- support: src/objects/primitives/ops.rs 583 (op enums, BuiltinTypes,
+  PrimError, helpers), mod.rs 36, tests.rs 394 + tests_ops.rs 459
+- src/objects/mod.rs: +1 line (pub mod primitives;)
+
+ACCEPTANCE
+- cargo test --release --lib --tests: lib 312 passed (286 baseline + 26 new),
+  1 ignored (pre-existing), 0 failed; bins 9 passed. 0 warnings.
+- No unsafe in this lane (grep clean). Max file 689 lines (< 800).
+- Original repo ~/workspace/petitpy-orig untouched (git status clean).
+- Big-int arithmetic: Lane C vendor::mpz::BigInt only, no second bignum.
+
+WHAT IS IMPLEMENTED (rich fns, PrimResult = value / NotHandled / raise)
+- parse_int_text = mp_parse_num_integer + mp_parse_num_base (parsenum.c:71,
+  parsenumbase.c): base range, unichar_isspace = ASCII 0x09-0x0d/0x20,
+  case-insensitive 0x/0o/0b, base-0 leading-0 -> base 1, '_' skipped
+  anywhere (int("_")==0), digit>=base breaks, trailing space then end.
+- int_make_new (sig 0-2, no kwargs), int_unary_op, int_binary_op,
+  int_pow3, int_from_bytes, int_to_bytes, int_format / int_to_string,
+  bool_make_new (sig 0-1), bool_unary_op, bool_binary_op,
+  bool_to_string, new_cell / cell_get / cell_set,
+  int/bool/cell_type_data, int_locals_dict (from_bytes entry only),
+  int_from_bytes_builtin (FunBuiltin body, cls from args[0]).
+- Tests: 26 fns (parse 4, make_new 5, unary 2, binary 4, pow3 1,
+  from/to_bytes 3, bool 2, cell/ROM 3, formatting 1, op ordinals 1).
+
+VERIFIED CORRECTIONS / DIVERGENCES (all probed on the reference binary)
+1. bool is NOT an int subclass (brief premise + design-doc D8 wrong):
+   isinstance(True,int)==False, issubclass(bool,int)==False. Neither
+   type has a parent slot; mp_obj_is_subclass only special-cases object.
+   int/bool/cell base=None, mro=[self]. Bool->int exists only in
+   arithmetic delegation (slots convert to small int 0/1).
+2. mp_arg_check_num_sig is POLLED-ONLY (argcheck.zig:100): make_new never
+   checks it. Branch error wins, else pending TypeError surfaces:
+   int(1,2,3)->ValueError invalid syntax; int("42",10,99)/int(1,x=1)/
+   int(x=1)->TypeError argument num/types mismatch. Same rule in
+   bool_make_new.
+3. int(x, base): base truncated i64 -> c_int (verified: int("42",2**40)==42
+   [base 0], int("ff",2**32+16)==255 [base 16], int("42",2**31)->range err).
+4. int(non-str, base) -> ValueError invalid syntax for integer (NOT
+   TypeError): Zig str_get_data is polled (sets pending TypeError,
+   returns NULL/len 0); make_new does not check NULL; the empty parse
+   overwrites pending_exc. Ported as the observable ValueError.
+5. int("42","10") / int("42",10.0) -> TypeError can't convert to int
+   (float INT_MAYBE is NULL); int("42",2**70) -> OverflowError
+   overflow converting long int to machine word.
+6. pow(2,3,0) -> ValueError divide by zero (NOT ZeroDivisionError);
+   pow(2,3,True) -> TypeError pow() with 3 arguments requires integers
+   (bool excluded); 0**-1 -> ZeroDivisionError divide by zero.
+7. to_bytes: small ints use the Zig clz/slen + mp_binary_set_int path.
+   Heap ints use Lane C as_bytes (vendor mpz_as_bytes verbatim) WITH its
+   quirk: overflow bytes must be 0x00, so negative heap ints need
+   ceil(digits*32/8) bytes, not the minimal length: (-(2**70)).to_bytes
+   (9/10/11) all OverflowError, (12) succeeds (b'\xff\xff\xff\xc0...').
+   DIG_SIZE is 32 on x86-64 (vendor MPZ_DIG_SIZE), not 30.
+8. int("010",0) -> ValueError (base 1); int("010") base 10 -> 10.
+9. from_bytes 4th positional arg ignored (no `signed` support, same TODO
+   as vendor); byteorder is big unless the arg is exactly qstr `little`
+   (a heap Str "little" means big).
+
+BOUNDARIES / DEFERRED (not silently dropped)
+a. Slot registration BLOCKED in this tree: the frozen TypeData slots use
+   C0 no-op signatures and CallCtx carries no type registry, so
+   unary_op/binary_op/call/getiter stay None and make_new/print have no
+   TypeData field. The rich fns are the implementation. At merge (C6
+   FIRST): delete ops.rs mirrors (UnaryOp/BinaryOp/BuiltinTypes/ExcType
+   -> C6's value.rs/obj.rs), rewire PrimUnaryFn/PrimBinaryFn to C6's
+   slot types, fill TypeData slots with int_unary_op/int_binary_op
+   (+bool), wire int_make_new/bool_make_new into the C12 type-call path,
+   int_to_string/bool_to_string into C6's print slot.
+b. Float/complex rhs -> NotHandled: the original delegates DIRECTLY to
+   mp_obj_float_binary_op / mp_obj_complex_binary_op (C18). Reverse
+   dispatch CANNOT cover it (float slot has no REVERSE_ cases).
+   Heap-int OP float/complex needs C18 + direct delegation from this
+   slot. Small-int OP float is fine (C14 runtime fast path).
+c. 2 * "ab" / 2 * [1] -> NotHandled here: the original's extra_cases
+   (objint.c:381) delegates to mp_binary_op(MULTIPLY, rhs, lhs).
+   C14 MUST reproduce that delegation; the reverse-op path alone yields
+   TypeError. (Bool rhs IS handled inside the slot by recursing 0/1.)
+d. int locals_dict has from_bytes only. to_bytes has NO FunBuiltin entry
+   yet: its body needs the bytes type, which the frozen BuiltinFn
+   signature cannot carry; C13 wires it when CallCtx carries the type
+   registry. from_bytes works as a FunBuiltin (cls from args[0]).
+e. bool("") truth depends on C6's qstr-length fix (C0 Value::is_true
+   returns true for every qstr); not tested here, covered at merge.
+   Complex literals are broken in the ORIGINAL (print(4j) ValueError,
+   complex(3,4) panics rc=134) — no end-to-end complex test possible.
+f. C18 vendor-C lane must SKIP the objint_mpz.c functions ported here
+   (unary_op, binary_op, formatted_impl, from/to_bytes_impl, extra_cases,
+   pow3, ctors, get_checked/truncated) to avoid duplication.
+g. Bytearray/memoryview buffer inputs are not covered (C9/C11 own the
+   buffer protocol); str_bytes_of covers Qstr/Str/Bytes payloads only.
+
+ALSO CHANGED (1 file, pre-existing)
+- src/runtime/bc_tests.rs: removed a duplicated `use crate::runtime::bc::*`
+  and an unused `CellData` import (2 warnings under --tests in the base).
+  No test logic touched.
+
+OPEN ITEM (parent): watch cron petitpy-watch-prims still references the
+DEAD first C7 agent id 4c797b53-...; update it to this session or disable
+it on merge.

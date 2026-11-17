@@ -8,4 +8,6 @@ pub mod compiler;
 pub mod memory;
 pub mod objects;
 pub mod pyerr;
+pub mod qstr_table;
+pub mod runtime;
 pub mod vendor;

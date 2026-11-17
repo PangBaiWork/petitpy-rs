@@ -1,0 +1,143 @@
+Lane C1 result — port of the runtime qstr to Rust
+====================================================
+Executor: Lane C1 subagent, worktree ~/workspace/petitpy-rs-qstrrt,
+branch lane/qstr-rt, base master c365309 (C0 Value/Obj interface
+frozen, 203 tests green). One commit for this chunk (see git log):
+"Lane C1: port runtime qstr to Rust".
+
+Source (petitpy devel HEAD df7de3a, read-only ~/workspace/petitpy-orig):
+  src/runtime/qstr.zig — 440 lines, 0 test blocks, std import only.
+
+1:1 mapping (runtime/qstr.zig -> Rust)
+---------------------------------------
+  const qstr = usize            -> crate::qstr_table::Qstr (u16, A1's
+                                   alias; re-exported from runtime::qstr)
+  QstrEntry / ParsedDefs /
+  parseLine / decodeCString /
+  StaticStrings / StaticHashes /
+  StaticLengths                 -> NOT re-implemented. The comptime
+                                   QDEF parse is build.rs + the shared
+                                   table (see below); per brief the
+                                   header is parsed exactly once.
+  N_STATIC / N_MAIN / N_TOTAL   -> crate::qstr_table::{N_STATIC,
+                                   N_MAIN, N_TOTAL} = 228 / 385 / 613.
+                                   The Zig file's header comments claim
+                                   216 / 444 — STALE, not reproduced
+                                   (Lane M's Zig probe + build-time
+                                   asserts prove 385 / 613).
+  DynamicEntry { str, hash, len } -> private DynamicEntry { bytes:
+                                   Vec<u8>, hash: u16, len: u8 } in
+                                   runtime/qstr.rs (owned bytes instead
+                                   of a pointer into chunk storage)
+  dynamic_entries /
+  dynamic_chunks / chunk_used /
+  CHUNK_INIT (128)              -> RuntimeQstr.entries: Vec<DynamicEntry>.
+                                   Chunk slabs dropped: allocation detail
+                                   with no observable behavior (ids,
+                                   bytes, lengths, hashes identical) —
+                                   same call as A1's divergence #4.
+  interp_state (tuple of
+  pointers to the 3 globals)    -> the RuntimeQstr struct itself:
+                                   owned per-interpreter state, movable
+                                   as a value; no separate constant.
+  dynAlloc                      -> dropped with the chunk scheme
+                                   (one Vec allocation per entry).
+  export fn qstr_init           -> RuntimeQstr::reset (safe to call
+                                   multiple times; renumbers from N_TOTAL)
+  export fn qstr_compute_hash   -> crate::qstr_table::qstr_compute_hash
+                                   (djb2, re-exported from runtime::qstr)
+  export fn qstr_find_strn      -> RuntimeQstr::find_strn (empty -> 1,
+                                   len > 255 -> 0, dynamic newest-first,
+                                   then static linear; hash checked
+                                   before length, exactly as the runtime
+                                   Zig file does — the compiler track
+                                   checks length first; both must match
+                                   for a hit, so the order is
+                                   unobservable)
+  export fn qstr_from_strn      -> RuntimeQstr::from_strn (PyResult;
+                                   >255 bytes -> Err(OutOfMemory), NOT
+                                   the Zig @panic — same convention as
+                                   A1's compiler track)
+  export fn qstr_from_str       -> RuntimeQstr::from_str (&str input;
+                                   Zig takes a NUL-terminated C string)
+  export fn qstr_str            -> RuntimeQstr::qstr_str (returns &[u8];
+                                   panics on out-of-range dynamic id,
+                                   mirroring the Zig @panic)
+  export fn npy_qstr_total      -> RuntimeQstr::total (N_TOTAL + dynamic)
+  export fn qstr_len            -> RuntimeQstr::qstr_len
+  export fn qstr_hash           -> RuntimeQstr::qstr_hash
+  export fn qstr_data           -> RuntimeQstr::qstr_data (returns &[u8];
+                                   the length the Zig caller reads via
+                                   len_out is the slice's .len())
+  qstr_dynamic struct           -> NOT ported (declaration-only:
+                                   `extern var dynamic_entries:
+                                   anyopaque`; the comment above it says
+                                   the qstr_total override it belonged
+                                   to was removed)
+
+Static-table sharing (the point of this lane)
+---------------------------------------------
+New shared module `src/qstr_table.rs` holds the single generated
+table: the `include!` of build.rs's `qstr_table.rs` (the ONLY
+include of it in the crate), plus `Qstr`, `N_STATIC`/`N_MAIN`/
+`N_TOTAL`, and `qstr_compute_hash` — moved verbatim from
+`compiler/qstr.rs` (including the ADR history comment on N_MAIN).
+`compiler/qstr.rs` now re-exports them (`pub use` for the public
+names, `pub(crate) use` for GEN_N_* / QSTR_STRINGS / QSTR_HASHES /
+QSTR_LENGTHS), so every existing `compiler::qstr::*` path keeps
+working unchanged; `QSTR_LAST_STATIC` stays in compiler/qstr.rs
+(it is a .mpy encoding boundary, compiler-side; mpy.rs keeps its
+own copy in sync as before). `runtime/qstr.rs` imports from
+`crate::qstr_table` directly — the runtime never imports from the
+compiler. `build.rs` untouched: the header is still parsed exactly
+once, at build time.
+`src/runtime/mod.rs` (new) + `src/lib.rs` (adds `pub mod qstr_table;`
+and `pub mod runtime;`).
+
+Check-script finding: the vendored header INTERLEAVES QDEF0/QDEF1
+lines (62 QDEF0 lines sit after the first QDEF1 line), so id order
+is NOT file order — it is all QDEF0 in file order, then all QDEF1
+in file order, exactly as build.rs collects them. The first version
+of check_qstrrt_table.py parsed in raw file order and failed with
+real-looking mismatches (e.g. runtime[173] `__and__` vs header
+`<setcomp>`); fixed to the statics-then-mains order, then PASS.
+
+Acceptance numbers
+------------------
+- cargo test --release --lib --tests: 215 passed / 0 failed /
+  1 ignored (baseline 203 kept + 12 new runtime tests; the 1
+  ignored is the stale A3 empty-file expectation).
+- scripts/check_qstrrt_table.py: PASS, run twice with identical
+  output — header QDEF0=228 QDEF1=385 total=613; runtime 613
+  entries; compiler 613 entries; runtime vs compiler 613/613
+  identical; both match the independent header parse on every entry.
+- cargo build --release --lib --tests --examples: 0 warnings.
+- No unsafe in any lane file; every file < 800 lines (largest:
+  runtime/qstr.rs 382); pure std, no external crates.
+- Original repo clean (git status empty).
+
+New tests (12, in src/runtime/qstr.rs; the Zig file has 0 test
+blocks, so all are lane tests per the brief): static fingerprint
+228/385/613; find_strn static ids (__init__ 17, __main__ 21,
+print 123, zip 165, {:#b} 612, empty -> 1, miss -> 0); djb2
+matches vendor precomputed hashes; dynamic ids start at 613 and
+dedup; find finds dynamic entries; dynamic accessors round-trip
+(len/str/data/hash); static strings never create dynamic entries;
+total() = 613 + dynamic; reset renumbers from 613; 255 ok /
+256 -> Err(OutOfMemory); out-of-range qstr_str panics
+(#[should_panic]); full static-pool sweep through the runtime
+accessors (613 ids: len/hash/find/re-intern, 0 dynamic entries).
+
+Files (this lane)
+-----------------
+src/qstr_table.rs (new, 76), src/runtime/mod.rs (new, 8),
+src/runtime/qstr.rs (new, 382), examples/qstrrt_dump.rs (new, 47),
+scripts/check_qstrrt_table.py (new, 181),
+scripts/qstrrt_result.txt (this file),
+src/compiler/qstr.rs (modified: moved items -> re-exports only),
+src/lib.rs (modified: +2 pub mod lines).
+NOT committed: scripts/qstrrt_brief.md (the main agent's brief,
+not this lane's file).
+
+Commit: one commit on branch lane/qstr-rt (see git log).
+Message: "Lane C1: port runtime qstr to Rust".

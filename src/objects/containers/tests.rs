@@ -15,6 +15,7 @@ use super::objrange::range_type_data;
 use super::objset::{frozenset_type_data, set_type_data};
 use super::objtuple::tuple_type_data;
 use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::objects::callables::objgenerator::gen_instance_type_data;
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::slots::PrintKind;
 use crate::objects::primitives::objbool::bool_type_data;
@@ -111,6 +112,14 @@ pub(crate) struct Fixture {
     pub(crate) array: GcRef,
     pub(crate) bytearray: GcRef,
     pub(crate) memoryview: GcRef,
+    /// The generator instance type (C10b). Fixture field — not a
+    /// `BuiltinTypes` field — because the callers take the header
+    /// type explicitly, exactly like the array types above. Its
+    /// locals dict is EMPTY here (methods are tested through
+    /// `gen_instance_locals_dict` directly). (The gen_wrap type is
+    /// NOT a fixture field: its tests build it fresh via
+    /// `gen_wrap_type_data`.)
+    pub(crate) gen_instance: GcRef,
 }
 
 impl Fixture {
@@ -149,10 +158,16 @@ impl Fixture {
         );
         let dict_dict = empty_dict(&mut arena, &roots);
         let dict = arena.alloc(None, Obj::Type(dict_type_data(dict_dict)), &roots);
+        let gen_instance_dict = empty_dict(&mut arena, &roots);
+        let gen_instance = arena.alloc(
+            None,
+            Obj::Type(gen_instance_type_data(gen_instance_dict)),
+            &roots,
+        );
         let type_ = make_type(&mut arena, &roots, b"type");
         for t in [
             int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset,
-            range, array, bytearray, memoryview, dict, type_,
+            range, array, bytearray, memoryview, dict, type_, gen_instance,
         ] {
             roots.push(Value::Heap(t));
         }
@@ -180,6 +195,7 @@ impl Fixture {
             array,
             bytearray,
             memoryview,
+            gen_instance,
         }
     }
 

@@ -255,7 +255,7 @@ impl Obj {
             Obj::FunBc(_) | Obj::FunBuiltin(_) => 32,
             Obj::BoundMeth(_) | Obj::Cell(_) | Obj::Super(_) => 16,
             Obj::Closure(c) => c.cells.len() * 4,
-            Obj::Generator(_) => 32,
+            Obj::Generator(_) => 48,
             Obj::Type(t) => t.mro.len() * 4 + 64,
             Obj::Module(_) | Obj::Exception(_) | Obj::Property(_) => 48,
             Obj::Iterator(i) => i.extra.len() * 8 + 16,
@@ -296,7 +296,12 @@ impl Obj {
                 out.extend(c.cells.iter().map(|r| Value::Heap(*r)));
                 out
             }
-            Obj::Generator(g) => vec![Value::Heap(g.fun)],
+            Obj::Generator(g) => {
+                let mut out = vec![Value::Heap(g.fun)];
+                out.extend(g.pend_throw);
+                out.extend(g.stop_value);
+                out
+            }
             Obj::Cell(c) => c.value.into_iter().collect(),
             Obj::Type(t) => {
                 let mut out: Vec<Value> = t.mro.iter().map(|r| Value::Heap(*r)).collect();
@@ -538,11 +543,27 @@ pub enum GenState {
 }
 
 /// Generator (`mp_obj_gen_instance_t`). C10 owns; the frame lives in the
-/// VM (C13).
+/// VM (C13) — `gen_wrap_call` returns it next to the generator handle
+/// and the resume functions take it as a parameter, because
+/// `CodeState` is a `runtime::bc` type and this file must not depend
+/// on `runtime` (that would be a `value` ↔ `bc` module cycle).
+/// The Zig's `pend_exc` tri-state maps onto two fields: `state`
+/// (`Running` == `pend_exc == OBJ_NULL`, the reentrance guard) and
+/// `pend_throw` (`None` == `OBJ_NONE`, `Some(v)` == a queued throw).
+/// `stop_value` is the Rust spelling of the Zig thread
+/// `stop_iteration_arg` (`makeStopIteration`): the generator's return
+/// value on exhaustion — `None` when it returned `None` (the Zig
+/// maps `OBJ_NONE` → `OBJ_NULL`, i.e. "no value"). It is stored
+/// per-generator (not per-thread) so `yield from` reads the right
+/// one; C13's `next()` reads it when building `StopIteration`.
 #[derive(Clone, Debug)]
 pub struct GeneratorData {
     pub fun: GcRef,
     pub state: GenState,
+    /// Queued `.pend_throw()` exception (`None` == no pending throw).
+    pub pend_throw: Option<Value>,
+    /// Return value on exhaustion (`None` == returned `None`).
+    pub stop_value: Option<Value>,
 }
 
 /// Cell (`mp_obj_cell_t`); `None` is an empty cell. C7 owns.

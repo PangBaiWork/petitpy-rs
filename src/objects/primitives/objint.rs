@@ -34,7 +34,7 @@ use crate::objects::primitives::ops::{
 };
 use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
 use crate::objects::value::{
-    BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj, TypeData, Value,
+    wrap_small_int, BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj, TypeData, Value,
 };
 use crate::pyerr::{PyError, PyResult};
 use crate::vendor::mpz::BigInt;
@@ -460,9 +460,14 @@ pub fn int_unary_op(
         },
         UnaryOp::Hash => match val {
             IntVal::Small(n) => Value::SmallInt(n),
-            IntVal::Big(ref z) => {
-                new_int_from_i64(ctx.arena, types, ctx.roots, z.hash_mpz())
-            }
+            // Vendor `objint_mpz.c:147-148`:
+            // `MP_OBJ_NEW_SMALL_INT(mpz_hash(...))` — tag-wrap,
+            // no window check. `new_int_from_i64` would allocate
+            // a heap int for out-of-window hashes, so
+            // `hash(2**62)` came back `2**62` instead of
+            // `-(2**62)` (C9b follow-up, probed on the reference
+            // binary 2026-11-17).
+            IntVal::Big(ref z) => Value::SmallInt(wrap_small_int(z.hash_mpz())),
         },
         UnaryOp::Positive => v,
         UnaryOp::Negative => match val {

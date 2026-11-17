@@ -62,6 +62,24 @@ fn unary_ops_big_window_edges() {
     assert_eq!(v, Value::SmallInt(9));
 }
 
+/// C9b follow-up: the vendor tag-wraps the int hash with no
+/// window check (`objint_mpz.c:147-148`), so `hash(2**62)` is
+/// `-(2**62)` — a small int — not a heap int `2**62` (probed
+/// on the reference binary 2026-11-17).
+#[test]
+fn int_hash_tag_wrap() {
+    let mut fx = Fixture::new();
+    let big = fx.heap_int(pow2(62));
+    let v = unary_val(&mut fx, UnaryOp::Hash, big);
+    assert_eq!(v, Value::SmallInt(-(1i64 << 62)));
+    let big = fx.heap_int(pow2(62) - BigInt::from_int(1));
+    let v = unary_val(&mut fx, UnaryOp::Hash, big);
+    assert_eq!(v, Value::SmallInt((1i64 << 62) - 1));
+    let big = fx.heap_int(-pow2(62));
+    let v = unary_val(&mut fx, UnaryOp::Hash, big);
+    assert_eq!(v, Value::SmallInt(-(1i64 << 62)));
+}
+
 // ── binary ──────────────────────────────────────────────────────────────
 
 fn binary(fx: &mut Fixture, op: BinaryOp, lhs: Value, rhs: Value) -> PrimResult {

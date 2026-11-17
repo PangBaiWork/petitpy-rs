@@ -30,6 +30,16 @@ pub fn small_int_fits(n: i64) -> bool {
     (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&n)
 }
 
+/// `mirrors.newSmallInt(n)`: tag without a window check —
+/// `((n << 1) | 1)` as a word, read back as a small int.
+/// The result always lands in the 62-bit window.
+/// (Vendor `MP_OBJ_NEW_SMALL_INT` does the same tag-wrap with
+/// no window check — e.g. `objint_mpz.c:147-148` returns the
+/// int hash through it, so `hash(2**62) == -(2**62)`.)
+pub fn wrap_small_int(n: i64) -> i64 {
+    (((n as u64) << 1) | 1) as i64 >> 1
+}
+
 /// A Python value.
 ///
 /// Immediates are inline (like the Zig `Obj = usize` immediates);

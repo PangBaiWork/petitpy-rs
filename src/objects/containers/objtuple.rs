@@ -81,12 +81,9 @@ use crate::pyerr::{PyError, PyResult};
 /// the module docs; Rust uses 0 until C12 lands the singleton.
 pub const TUPLE_HASH_SEED: i64 = 0;
 
-/// `mirrors.newSmallInt(n)`: tag without a window check —
-/// `((n << 1) | 1)` as a word, read back as a small int.
-/// The result always lands in the 62-bit window.
-pub fn wrap_small_int(n: i64) -> i64 {
-    (((n as u64) << 1) | 1) as i64 >> 1
-}
+/// `mirrors.newSmallInt(n)` — re-exported from `crate::objects::value`
+/// (single definition; the tuple hash and the int hash both use it).
+pub use crate::objects::value::wrap_small_int;
 
 /// Errors from the tuple operations (the C9a `DictError`
 /// shape: `exc_name()` for the VM's pending-exception wiring,

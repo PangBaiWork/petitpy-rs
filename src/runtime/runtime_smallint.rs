@@ -16,25 +16,19 @@ use crate::objects::slots::BinaryOp;
 use crate::objects::value::{wrap_small_int, Obj, Value, SMALL_INT_MAX, SMALL_INT_MIN};
 use crate::runtime::runtime::RtError;
 use crate::runtime::runtime_ops::binop_unsupported;
+use crate::support::smallint::{
+    small_int_floor_divide as floored_div, small_int_modulo as floored_mod,
+};
 use crate::vendor::mpz::BigInt;
 
-/// Floored division / modulo (Zig `@divFloor` / `@mod`,
-/// Python `//` / `%`): the quotient rounds toward -inf and the
-/// remainder takes the divisor's sign. Rust's `/` and `%`
-/// truncate toward zero; `div_euclid`/`rem_euclid` are
-/// Euclidean (remainder always non-negative) — both wrong for
-/// a negative divisor. Small ints cannot overflow here
-/// (`|lv| <= 2**62`, `|rv| >= 1`).
-fn floored_div(a: i64, b: i64) -> i64 {
-    let q = a / b;
-    let r = a % b;
-    if r != 0 && (r < 0) != (b < 0) { q - 1 } else { q }
-}
-
-fn floored_mod(a: i64, b: i64) -> i64 {
-    let r = a % b;
-    if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
-}
+/// The two canonical small-int functions live in
+/// `crate::support::smallint` (`support/smallint.zig`) and are
+/// imported above as `floored_div` / `floored_mod` (C16
+/// unification — the local copies C14 hand-rolled here were a
+/// second implementation of the same two functions; the Zig's
+/// numerator-adjustment form and C14's quotient-adjustment form
+/// agree on every in-window input, and the canonical Zig-faithful
+/// form is now the single home).
 
 /// Force a heap int (the Zig's `mp_obj_new_int_from_ll` in the
 /// `go_big` arms — `Value::int` would return the same small int,

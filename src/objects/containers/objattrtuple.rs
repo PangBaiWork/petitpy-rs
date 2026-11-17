@@ -134,5 +134,6 @@ pub fn attrtuple_type_data(dict: GcRef) -> TypeData {
         make_new: None,
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
     }
 }

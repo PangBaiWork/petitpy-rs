@@ -337,3 +337,100 @@ pub enum PrintKind {
 /// original (void): sink errors are ignored, as the original ignores
 /// `mp_printf`'s return.
 pub type PrintFn = for<'a> fn(&mut CallCtx<'a>, Value, PrintKind, &mut dyn fmt::Write);
+
+// ── Stream protocol (`mp_stream_p_t`, vendor `py/stream.h`) ─────────────
+// Ported by Lane C16 (`support/stream.zig`). The vtable lives on
+// `TypeData.protocol` (added by this lane); the three fn pointers
+// are `Option` because a backend may implement only part of the
+// protocol (`get_stream_raise` checks the requested subset).
+
+/// `MpStreamSeek` (`mp_stream_seek`'s in/out struct, vendor
+/// `py/stream.h`): the seek target in, the new absolute offset
+/// out. The Zig passes `&seek_s` as the ioctl arg; Rust passes
+/// `IoctlArg::Seek(&mut SeekState)` (no raw pointer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeekState {
+    pub offset: i64,
+    pub whence: i32,
+    /// Filled by the backend with the new absolute offset.
+    pub result: i64,
+}
+
+impl SeekState {
+    pub fn new(offset: i64, whence: i32) -> SeekState {
+        SeekState {
+            offset,
+            whence,
+            result: 0,
+        }
+    }
+}
+
+/// The `ioctl` argument: the Zig's `usize arg` is either 0, a
+/// pointer to `MpStreamSeek`, or an arbitrary caller value
+/// (`streamIoctl` passes a buffer pointer or a truncated int).
+/// Rust spells the three shapes out instead of smuggling a
+/// pointer through a `usize`.
+#[derive(Debug)]
+pub enum IoctlArg<'a> {
+    /// `arg == 0` (`MP_STREAM_FLUSH`, `MP_STREAM_CLOSE`).
+    None,
+    /// `MP_STREAM_SEEK`: `&seek_s` (see `SeekState`).
+    Seek(&'a mut SeekState),
+    /// `streamIoctl`'s arbitrary value: a buffer pointer
+    /// (as an address) or a truncated int.
+    Raw(usize),
+}
+
+/// `fn(&mut CallCtx, Value, &mut [u8]) -> PyResult<usize>` — the
+/// `read` slot (`mp_stream_p_t.read`). Returns the bytes read
+/// (`0` = EOF / nothing available); `Err` = the Zig's
+/// `MP_STREAM_ERROR` + `errcode` — the backend records the
+/// `OSError` itself (via `CallCtx::record_*`) before returning
+/// `Err(PyError::PyRaise)`. The Zig's non-blocking path
+/// (`isNonblockingError`) is hard-coded `false` under MINIMUM
+/// ROM level, so there is no "would block" outcome to carry.
+pub type StreamReadFn = for<'a> fn(&mut CallCtx<'a>, Value, &mut [u8]) -> PyResult<usize>;
+
+/// `fn(&mut CallCtx, Value, &[u8]) -> PyResult<usize>` — the
+/// `write` slot (`mp_stream_p_t.write`). Returns the bytes
+/// written; `Err` as for `StreamReadFn`.
+pub type StreamWriteFn = for<'a> fn(&mut CallCtx<'a>, Value, &[u8]) -> PyResult<usize>;
+
+/// `fn(&mut CallCtx, Value, u32, IoctlArg) -> PyResult<usize>` —
+/// the `ioctl` slot (`mp_stream_p_t.ioctl`). The `u32` is the
+/// request (`MP_STREAM_FLUSH` / `MP_STREAM_SEEK` /
+/// `MP_STREAM_CLOSE` / a caller value); returns the request's
+/// result (`0` for flush/close, the new offset is carried in
+/// `SeekState.result` for seek); `Err` as for `StreamReadFn`.
+pub type StreamIoctlFn =
+    for<'a> fn(&mut CallCtx<'a>, Value, u32, IoctlArg<'_>) -> PyResult<usize>;
+
+/// The stream protocol vtable (`mp_stream_p_t`, vendor
+/// `py/stream.h:43`): read / write / ioctl plus the text flag
+/// (`is_text`: a text stream's `read` returns `str`, a binary
+/// stream's returns `bytes`). `Copy` so `get_stream_raise`
+/// can hand it out by value without arena-borrow conflicts.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamP {
+    pub read: Option<StreamReadFn>,
+    pub write: Option<StreamWriteFn>,
+    pub ioctl: Option<StreamIoctlFn>,
+    pub is_text: bool,
+}
+
+impl StreamP {
+    pub fn new(
+        read: Option<StreamReadFn>,
+        write: Option<StreamWriteFn>,
+        ioctl: Option<StreamIoctlFn>,
+        is_text: bool,
+    ) -> StreamP {
+        StreamP {
+            read,
+            write,
+            ioctl,
+            is_text,
+        }
+    }
+}

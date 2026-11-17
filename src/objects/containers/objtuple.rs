@@ -643,6 +643,7 @@ pub fn tuple_type_data(dict: GcRef) -> TypeData {
         make_new: Some(crate::objects::objtype::make_new::tuple_make_new_slot),
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
     }
 }
 

@@ -84,6 +84,7 @@ pub fn exc_type_data(name: u32, base: Option<GcRef>, mro: Vec<GcRef>, dict: GcRe
         make_new: Some(exception_make_new_slot),
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
         unary_op: None,
         binary_op: None,
         call: None,

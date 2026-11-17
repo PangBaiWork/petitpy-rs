@@ -47,6 +47,7 @@ fn plain_type_data(name: u32, flags: u16, dict: GcRef) -> TypeData {
         make_new: None,
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
     }
 }
 

@@ -161,6 +161,7 @@ pub fn enumerate_type_data(dict: GcRef) -> TypeData {
         buffer: None,
         print: None,
         namedtuple_fields: None,
+        protocol: None,
     }
 }
 

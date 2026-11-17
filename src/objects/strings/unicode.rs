@@ -84,6 +84,14 @@ pub fn unichar_islower(c: u32) -> bool {
     c < 128 && (at(c) & FL_LOWER) != 0
 }
 
+/// `unichar_isident` (`unicode.zig:137-144`): ASCII identifier
+/// character — alpha, digit, or `_`. This was the ONE `unicode.zig`
+/// function missing from the C8a port (the C8a `unicode.rs` had
+/// the other 10); added by Lane C16.
+pub fn unichar_isident(c: u32) -> bool {
+    c < 128 && ((at(c) & (FL_ALPHA | FL_DIGIT)) != 0 || c == '_' as u32)
+}
+
 /// `unichar_isalnum` (`unicode.zig`): ASCII alpha-or-digit.
 /// (`objstr.zig` defines its own `unichar_isalnum_` as
 /// `isalpha || isdigit` — the same predicate; this one is used.)

@@ -17,7 +17,7 @@ use crate::memory::gc::{GcArena, RootSet};
 use crate::objects::containers::map_set::{set_items, MpSet};
 use crate::objects::slots::{
     AttrFn, BinaryOpFn, BufferFn, BuiltinFn, BuiltinKwFn, CallFn, GetIterFn, MakeNewFn,
-    PrintFn, SubscrFn, UnaryOpFn,
+    PrintFn, StreamP, SubscrFn, UnaryOpFn,
 };
 use crate::pyerr::PyResult;
 use crate::vendor::mpz::BigInt;
@@ -662,6 +662,12 @@ pub struct TypeData {
     /// The field names are qstr ids, not `Value`s, so they need no
     /// GC tracing (see `children()`).
     pub namedtuple_fields: Option<Vec<u32>>,
+    /// Stream-protocol vtable (`mp_obj_type_t.protocol`,
+    /// `mp_stream_p_t`). C16 adds it (D5: slots are added as
+    /// lanes need them). `Some` only for stream types;
+    /// `StreamP` holds only fn pointers + a bool, so it needs
+    /// no GC tracing (see `children()`).
+    pub protocol: Option<StreamP>,
 }
 
 /// Module object (`mp_obj_module_t`). C12 owns.

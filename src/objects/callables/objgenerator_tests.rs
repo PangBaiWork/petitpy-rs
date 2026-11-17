@@ -175,6 +175,7 @@ pub(crate) fn exc_type(fx: &mut Fixture, name: &str, mro: Vec<crate::objects::va
             make_new: None,
             bases: None,
             namedtuple_fields: None,
+            protocol: None,
             unary_op: None,
             binary_op: None,
             call: None,

@@ -8,35 +8,36 @@ use super::Lexer;
 use super::Unichar;
 
 // ── Free predicates on a single character ─────────────────────────────────
+//
+// These five delegate to the canonical ASCII predicates in
+// `crate::objects::strings::unicode` (`support/unicode.zig`) —
+// the hand-rolled range checks here were a second copy of the
+// same table (C16 unification; the sets are identical, verified
+// by `support::tests::unicode_full_ascii_table`). `is_letter`
+// / `is_head_of_identifier` / `is_tail_of_identifier` stay:
+// they are `lexer.zig`'s OWN predicates (the `>= 0x80`
+// identifier rule is the lexer's, not `unichar_isident`'s).
+// `xdigit_value` now wraps like the Zig's `-%` (the old plain
+// `-` panicked on underflow in debug builds).
 
-/// ASCII-only: `ch < 128 and (ch == ' ' or (ch >= 9 and ch <= 13))`.
 pub(crate) fn is_space(ch: Unichar) -> bool {
-    ch < 128 && (ch == b' ' as Unichar || (9..=13).contains(&ch))
+    crate::objects::strings::unicode::unichar_isspace(ch)
 }
 
 pub(crate) fn is_alpha(ch: Unichar) -> bool {
-    ch < 128 && ((b'A' as Unichar..=b'Z' as Unichar).contains(&ch) || (b'a' as Unichar..=b'z' as Unichar).contains(&ch))
+    crate::objects::strings::unicode::unichar_isalpha(ch)
 }
 
 pub(crate) fn is_digit(ch: Unichar) -> bool {
-    (b'0' as Unichar..=b'9' as Unichar).contains(&ch)
+    crate::objects::strings::unicode::unichar_isdigit(ch)
 }
 
 pub(crate) fn is_xdigit(ch: Unichar) -> bool {
-    is_digit(ch)
-        || (b'A' as Unichar..=b'F' as Unichar).contains(&ch)
-        || (b'a' as Unichar..=b'f' as Unichar).contains(&ch)
+    crate::objects::strings::unicode::unichar_isxdigit(ch)
 }
 
 pub(crate) fn xdigit_value(ch: Unichar) -> Unichar {
-    // Mirrors the Zig bit trick: clear the 0x20 bit (fold case) then
-    // subtract ('A' - ('9' + 1)) == 7.
-    let mut n: Unichar = ch - b'0' as Unichar;
-    if n > 9 {
-        n &= !(b'a' - b'A') as Unichar;
-        n -= (b'A' - (b'9' + 1)) as Unichar;
-    }
-    n
+    crate::objects::strings::unicode::unichar_xdigit_value(ch)
 }
 
 // ── Lexer predicates on the 3-char lookahead ──────────────────────────────

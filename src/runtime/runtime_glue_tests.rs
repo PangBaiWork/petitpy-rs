@@ -199,6 +199,7 @@ fn subclass_dict_type(fx: &mut Fixture) -> crate::objects::value::GcRef {
             make_new: None,
             bases: Some(bases),
             namedtuple_fields: None,
+            protocol: None,
         }),
         &fx.roots,
     )

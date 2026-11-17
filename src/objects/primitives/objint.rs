@@ -44,8 +44,10 @@ use crate::vendor::mpz::BigInt;
 /// ASCII whitespace per `unichar_isspace` (vendor `py/unicode.c:119-121`):
 /// `c < 128 && FL_SPACE` — exactly `0x09..=0x0d` and `0x20`. The
 /// parse works on raw bytes, so non-ASCII bytes are never space.
+/// Delegates to the canonical predicate (C16 unification — this
+/// was a second copy of the same table).
 fn is_space(b: u8) -> bool {
-    matches!(b, 0x09..=0x0d | 0x20)
+    crate::objects::strings::unicode::unichar_isspace(b as u32)
 }
 
 /// `mp_parse_num_base` (vendor `py/parsenumbase.c`): strip an
@@ -272,6 +274,7 @@ pub fn int_type_data(dict: GcRef) -> TypeData {
         make_new: Some(crate::objects::objtype::make_new::int_make_new_slot),
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
     }
 }
 

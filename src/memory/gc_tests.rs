@@ -345,6 +345,7 @@ fn header_type_is_traced() {
             make_new: None,
             bases: None,
             namedtuple_fields: None,
+            protocol: None,
         }),
         &roots,
     );

@@ -147,7 +147,7 @@ pub struct TypeData {
   实现过槽，故不破坏任何已有代码。
 - **C10 修正（2026-11-17）：`CallFn` 带 `n_args`/`n_kw`。** C0 的
   `CallFn = fn(&mut CallCtx, Value, &[Value])` 无法表达原版调用
-  协议——vendor `mp_call_function_t`（`py/obj.h`）是
+  协议——vendor `mp_call_fun_t`（`py/obj.h:600`）是
   `call(self, n_args, n_kw, args)`，其中 `args` 为 `n_args` 个
   位置参数后跟 `2 * n_kw` 个 `(name, value)` 关键字对。没有
   `n_kw`，槽无法拆分切片（关键字参数会被误读为位置参数），

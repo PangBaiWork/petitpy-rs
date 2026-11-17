@@ -13,7 +13,10 @@
 //! - `TypeData` — types are heap objects (`Obj::Type`); method slots are
 //!   Rust fn pointers, one per `mp_obj_type_t` slot.
 
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::memory::gc::{GcArena, RootSet};
+use crate::objects::slots::{
+    BinaryOpFn, BufferFn, BuiltinFn, CallFn, GetIterFn, PrintFn, SubscrFn, UnaryOpFn,
+};
 use crate::pyerr::PyResult;
 use crate::vendor::mpz::BigInt;
 
@@ -128,15 +131,30 @@ impl Value {
         }
     }
 
-    /// Truth testing (`mp_obj_is_true`). Immediates + heap primitives
-    /// here; `__bool__`/`__len__` dispatch on user objects is the
-    /// C6 (OBJ-CORE) lane's.
+    /// Truth testing (`mp_obj_is_true`) — fast path for non-instance
+    /// values (payload rules: numbers by value, strings/collections
+    /// by emptiness). The full dispatch (`__bool__`/`__len__` slots)
+    /// is `obj::obj_is_true`; this stays as the primitive fast path
+    /// and agrees with it for every value representable today (no
+    /// instance variant exists yet).
     pub fn is_true(&self, arena: &GcArena) -> PyResult<bool> {
         match self {
             Value::None => Ok(false),
             Value::Bool(b) => Ok(*b),
             Value::SmallInt(n) => Ok(*n != 0),
-            Value::Qstr(_) => Ok(true),
+            Value::Qstr(id) => {
+                // C6 fix (design doc: "C6 lane 补全"): a qstr's truth
+                // follows its LENGTH, like any str — `bool("")` is
+                // False on the reference binary. Static ids read the
+                // generated length table; dynamic ids (>= N_TOTAL)
+                // are never empty (`RuntimeQstr::from_strn` maps ""
+                // to the static empty qstr, id 1), so they are true.
+                if (*id as usize) < crate::qstr_table::QSTR_LENGTHS.len() {
+                    Ok(crate::qstr_table::QSTR_LENGTHS[*id as usize] != 0)
+                } else {
+                    Ok(true)
+                }
+            }
             Value::Heap(r) => match arena.get(*r) {
                 Obj::Float(f) => Ok(*f != 0.0),
                 Obj::Int(z) => Ok(!z.is_zero()),
@@ -434,6 +452,13 @@ pub struct TypeData {
     pub binary_op: Option<BinaryOpFn>,
     pub call: Option<CallFn>,
     pub getiter: Option<GetIterFn>,
+    /// Subscript slot (`mp_subscr`). C6 adds it (design doc D5:
+    /// "其余槽位（subscr、buffer、print 等）按 lane 需要增补").
+    pub subscr: Option<SubscrFn>,
+    /// Buffer-protocol slot (`get_buffer`). C6 adds it (D5).
+    pub buffer: Option<BufferFn>,
+    /// Print slot (`mp_print_t`). C6 adds it (D5).
+    pub print: Option<PrintFn>,
 }
 
 /// Module object (`mp_obj_module_t`). C12 owns.
@@ -443,11 +468,19 @@ pub struct ModuleData {
     pub dict: GcRef,
 }
 
-/// One traceback frame (file/name as qstr ids). C6 owns the rendering.
+/// One traceback frame. `name` is the FILE qstr id, `line` the source
+/// line (stored but not printed in this config — see
+/// `obj::print_exception`), `block` the enclosing block/function name
+/// qstr (`None` = MP_QSTRnull, i.e. no `, in <block>` suffix). Frames
+/// are stored in ADD order (innermost first — the VM appends while
+/// unwinding, as `mp_obj_exception_add_traceback` does); the renderer
+/// iterates in reverse ("most recent call last"). C6 owns the
+/// rendering.
 #[derive(Clone, Debug)]
 pub struct TraceFrame {
     pub name: u32,
     pub line: u32,
+    pub block: Option<u32>,
 }
 
 /// Exception instance (`mp_obj_exception_t`). C6 owns.
@@ -456,6 +489,12 @@ pub struct ExceptionData {
     pub type_: GcRef,
     pub args: Vec<Value>,
     pub traceback: Vec<TraceFrame>,
+    /// The `__cause__` recorded by `raise ... from` (`None` = no cause
+    /// slot set, i.e. the Zig `cause == 0`; `Some(Value::None)` =
+    /// explicitly `__cause__ is None`). C6 adds it: the Zig
+    /// `npy_exception_get_cause` reads a cause slot on the native
+    /// exception (`objexcept.zig:273`).
+    pub cause: Option<Value>,
 }
 
 /// Property object. C9 owns.
@@ -501,18 +540,10 @@ pub struct AttrTupleData {
     pub items: Vec<Value>,
 }
 
-// ── Method-slot fn types (mirror `mp_obj_type_t` slots) ─────────────
+// ── Method-slot fn types (op codes + slot fn pointers) ───────────────
+// Live in `slots.rs` (moved out of this file so it stays under the
+// 800-line cap); `TypeData` below refers to them by name.
 
-/// `fn(&mut CallCtx, Value) -> PyResult<Value>` — unary-op slot.
-pub type UnaryOpFn = for<'a> fn(&mut CallCtx<'a>, Value) -> PyResult<Value>;
-/// `fn(&mut CallCtx, Value, Value) -> PyResult<Value>` — binary-op slot.
-pub type BinaryOpFn = for<'a> fn(&mut CallCtx<'a>, Value, Value) -> PyResult<Value>;
-/// `fn(&mut CallCtx, Value, &[Value]) -> PyResult<Value>` — call slot.
-pub type CallFn = for<'a> fn(&mut CallCtx<'a>, Value, &[Value]) -> PyResult<Value>;
-/// `fn(&mut CallCtx, Value) -> PyResult<Value>` — getiter slot.
-pub type GetIterFn = for<'a> fn(&mut CallCtx<'a>, Value) -> PyResult<Value>;
-/// Built-in function body.
-pub type BuiltinFn = for<'a> fn(&mut CallCtx<'a>, &[Value]) -> PyResult<Value>;
 
 /// Unused placeholder for slot types not yet needed; keeps the
 /// `PyError` import used in this module's doc examples.
@@ -576,6 +607,18 @@ mod tests {
         assert!(Value::Bool(true).is_true(&arena).unwrap());
         assert!(!Value::SmallInt(0).is_true(&arena).unwrap());
         assert!(Value::SmallInt(-1).is_true(&arena).unwrap());
-        assert!(Value::Qstr(0).is_true(&arena).unwrap());
+        // Qstr(0) is MP_QSTRnull and Qstr(1) is MP_QSTR_ — the
+        // generated table holds "" at both ids (LENGTHS[0] ==
+        // LENGTHS[1] == 0), so both are falsy, like bool("") on the
+        // reference binary; a non-empty static qstr is truthy.
+        // (C6 corrects the old assertion, which was written against
+        // the pre-fix arm that returned true for every qstr.)
+        assert!(!Value::Qstr(0).is_true(&arena).unwrap());
+        assert!(!Value::Qstr(1).is_true(&arena).unwrap());
+        let int_id = crate::qstr_table::QSTR_STRINGS
+            .iter()
+            .position(|s| *s == b"int")
+            .unwrap() as u32;
+        assert!(Value::Qstr(int_id).is_true(&arena).unwrap());
     }
 }

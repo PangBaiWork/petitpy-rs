@@ -1,0 +1,205 @@
+Lane C6: port objects obj core to Rust — result
+================================================
+Worktree ~/workspace/petitpy-rs-objcore, branch lane/objcore, base master 34da456.
+Source: petitpy src/objects/obj.zig (835 lines, 0 test blocks, ~21 export fns).
+Full config only; nano branches NOT ported (listed in §7).
+
+1. Deliverables
+---------------
+src/objects/obj.rs (720 lines) — slot-dispatch core + int/float/complex
+  extraction + len + truth + callable + id + ObjError/BuiltinTypes.
+src/objects/obj_ops.rs (529 lines) — equality, type name/print,
+  array/index/subscript/buffer, exception printing, slot-call wrappers.
+src/objects/slots.rs (283 lines) — the method-slot contract (UnaryOp /
+  BinaryOp enums with vendor discriminants, UnaryOpFn/BinaryOpFn/CallFn/
+  GetIterFn/BuiltinFn, SubscrArg/SubscrFn, BufferInfo/BufferFn,
+  PrintKind/PrintFn). Moved out of value.rs so value.rs stays under the
+  cap; shapes unchanged (C0 D5), only the module changed.
+src/objects/obj_tests.rs (511 lines, 17 tests) + src/objects/obj_ops_tests.rs
+  (396 lines, 15 tests) — shared harness (stub builtin types + slot stubs)
+  lives in obj_tests.rs, imported by obj_ops_tests.rs.
+src/objects/mod.rs — pub mod obj / obj_ops / slots (+ test mods).
+src/objects/value.rs (581 -> 624 lines) — TypeData gains subscr/buffer/
+  print slots (D5 sanctions adding slots per lane); TraceFrame gains
+  block: Option<u32>; ExceptionData gains cause: Option<Value>;
+  Value::is_true Qstr arm now length-based (see §5); the slot section
+  moved to slots.rs.
+src/runtime/bc_tests.rs — 2-line cleanup only: removed a duplicated
+  `use crate::runtime::bc::*;` and an unused `CellData` import. These
+  were pre-existing test-profile warnings in the C5 file (they do not
+  show under `cargo build`, only under `cargo test`); removed so the
+  0-warning gate holds on the test build too.
+
+2. Acceptance
+-------------
+cargo test --release --lib --tests: 289 passed, 0 failed, 1 ignored
+  (baseline 257 + 32 new obj-core tests: 17 obj_tests + 15 obj_ops_tests).
+cargo test --release --bins: 9 passed.
+cargo build --release: 0 warnings. cargo test build: 0 warnings.
+No unsafe code (one occurrence of the word "unsafe" in a doc comment
+on BufferInfo, moved with it from value.rs).
+petitpy-orig clean (git status empty).
+Every file < 800 lines (720/529/511/396/283/624/12).
+
+3. Design decisions (all in code comments too)
+----------------------------------------------
+a. C0 slot signatures were missing the op parameter. The frozen
+   UnaryOpFn/BinaryOpFn took no op, but the original's slots are
+   mp_unary_op(op, arg) / mp_binary_op(op, lhs, rhs) — len needs LEN,
+   is_true needs BOOL, equal needs EQUAL/NOT_EQUAL. Fixed by adding
+   UnaryOp (12 variants, 0-11) and BinaryOp (52 variants, 0-51) enums
+   with vendor discriminants + as_u8/from_u8, and changing the slot
+   types to fn(&mut CallCtx, UnaryOp, Value) /
+   fn(&mut CallCtx, BinaryOp, Value, Value). Verified by grep that NO
+   lane had implemented a slot yet (only definitions + TypeData fields
+   existed), so nothing breaks. Design doc D5 explicitly sanctions
+   adding slots per lane need.
+b. Error model follows C5's SetupError precedent: ObjError carries
+   (exception type, TERSE message literal) for the 12 Zig raise
+   helpers + OutOfMemory; public fns return Result<T, ObjError>;
+   exc_type() / message() / to_pyerror() converters. VmState.pending_exc
+   does not exist until C13/C14 (D7), so the VM maps ObjError to
+   pending_exc later.
+c. Slot outcomes: a slot returning Err(PyError::PyRaise) is the Zig
+   NULL return = "not implemented" -> caller falls through exactly as
+   the original's NULL checks do. Err(PyError::OutOfMemory) propagates.
+   (The Zig distinguishes the two via the pending_exc global; until
+   CallCtx gains pending_exc in C13, a slot's own raise data is dropped
+   together with its "not implemented" — control flow is the original's,
+   raise data is not yet preserved.)
+d. get_int_maybe is tri-state Result<Option<i64>, ObjError> so an
+   Overflow is preserved while plain "not an int" raises IntConversion
+   (mirrors the Zig pending_exc == 0 check in mpObjGetIntImpl).
+e. BuiltinTypes registry passed explicitly (C5 precedent) — type
+   objects are built by C12 and do not exist as a global yet; tests
+   build stub Type objects. obj_get_type returns Option<GcRef> (None
+   only while bootstrapping).
+f. Dynamic qstrs (>= N_TOTAL) cannot be resolved in obj.rs (bytes live
+   in the VM's RuntimeQstr pool; objects->runtime import would be a
+   layering inversion). Static ids resolve via QSTR_STRINGS/LENGTHS.
+   obj_print_exception takes an explicit resolver closure
+   (&dyn Fn(u32) -> &[u8]) because traceback file names are dynamic in
+   practice (a file path interned at load time). len/str_equal's dynamic
+   cases are documented gaps; the pool arrives via CallCtx in C13.
+g. mp_obj_malloc_helper has no Rust counterpart — CallCtx::alloc is the
+   equivalent; noted as subsumed.
+
+4. Key findings (all verified against the original by source read
+   and/or reference-binary probe)
+---------------------------------------------------------------
+- isExactType returns FALSE for small ints (mp_mirrors.zig:536-539:
+  isObj requires low 2 bits 0). So getUintImpl/getLlImpl call the
+  RUNTIME mp_unary_op(INT_MAYBE, arg) even for small ints — and the
+  runtime's small-int fast path (runtime.zig:355-362) returns the
+  small int itself. Therefore call_unary has the same fast path for
+  INT_MAYBE (see §5, first bug). LEN/BOOL do NOT get the fast path:
+  mp_obj_len_maybe / mp_obj_is_true call the TYPE's slot directly
+  (obj.zig:421-429, 468-490).
+- Bool's unary_op (objbool.zig:38-42) delegates every op except LEN to
+  mp_unary_op on the small int 0/1 — so get_uint/get_ll on a Bool go
+  through the slot in the Zig; the Rust code returns 0/1 directly
+  (identical result; the bool slot is fixed by objbool.zig).
+- Qstr(0) is MP_QSTRnull and Qstr(1) is MP_QSTR_ — the generated table
+  holds "" at BOTH ids (LENGTHS[0] == LENGTHS[1] == 0). bool("") is
+  False on the reference binary. See §5, second bug.
+- Compiler-lane discrepancy (FLAG, out of C6 scope):
+  compiler::emit::consts defines MP_BINARY_OP_NOT_IN=35 / IS_NOT=36,
+  but vendor runtime0.h gives NOT_IN=50 / IS_NOT=51 (DIVMOD=35,
+  CONTAINS=36, REVERSE_*=37..49). The compiler's values never reach
+  bytecode (emit.rs:544 converts NOT_IN->IN + UNARY NOT before
+  emitting), so Phase B's 552/552 stands; C6's BinaryOp uses the
+  vendor values. Do NOT fix the compiler in this lane.
+- "a" == b"a" -> False + stderr `Warning: Comparison between bytes
+  and str` (feature_warning ON in full) — reproduced via eprintln! in
+  obj_equal (C13/C14 print machinery may centralise it later).
+- Traceback has NO line numbers in this config
+  (MICROPY_ENABLE_SOURCE_LINE off at ROM_LEVEL_MINIMUM,
+  mpconfig.h:908-909) — verified on the binary
+  (` File "<stdin>", in <module>`); traceback prints oldest-first
+  (frames stored innermost-first, renderer iterates in reverse);
+  cause chain prints cause first, then
+  "\nThe above exception was the direct cause of the following
+  exception:\n\n", then the outer exception; depth cap 16.
+- Reference-binary probes (all verbatim): id(5)=11, id(True)=30,
+  id(False)=14, id(None)=6, id(0)=1, id(-1)=-1; bool("")=False,
+  bool("x")=True, bool(0.0)=False, bool(())=bool([])=bool({})=False;
+  1 == "1" -> False, 1 == 1.0 -> True; len(5) -> TypeError "object
+  has no len"; (1,2)[5] -> IndexError "index out of range";
+  "abc"[1.0] -> TypeError "indices must be integers"; 5[0] ->
+  TypeError "object isn't subscriptable"; del (1,2)[0] -> TypeError
+  "object doesn't support item deletion"; (1,2)[0]=3 -> TypeError
+  "object doesn't support item assignment"; int([]) -> TypeError
+  "can't convert to int"; float([]) -> TypeError "can't convert to
+  float"; [1][2**70] -> OverflowError "overflow converting long int
+  to machine word"; complex([]) CRASHES the reference binary
+  (known complex-runtime breakage — message taken from the Zig source
+  literal, not the binary); bool(0j)/print(4j) fail with ValueError
+  "invalid syntax for number".
+- get_int_truncated for bignums = BigInt::hash_mpz() (vendor
+  objint_mpz.c:420-428 calls mpz_hash); get_ll uses as_bytes
+  (big_endian, as_signed=is_neg) with the return ignored (silent
+  truncation); -2^63 BigInt is rejected by as_int_checked (C overflow
+  check quirk, ported exactly — pinned by test).
+- len fast path under STR_UNICODE=1: only bytes take it
+  (isStrOrBytesForLen); str goes through the type's LEN slot (C8).
+- mp_obj_id is pure: immediates -> tagged word as int; heap -> arena
+  slot index (D3). All cases fit in a small int, never allocates.
+
+5. Bugs found by the tests (both fixed in-lane)
+------------------------------------------------
+- get_uint/get_ll on small ints raised IntConversion: my first version
+  called the INT_MAYBE slot for any non-exact-int, but the stub int
+  type has no slot. Root cause above (§4): the Zig relies on the
+  runtime mp_unary_op small-int fast path, not the type's slot. Fix:
+  call_unary now returns the small int itself for INT_MAYBE before
+  consulting the slot (runtime.zig:355-362). Tests
+  get_int_truncated_and_uint_and_ll pass.
+- C0 test truth_table_primitives asserted Value::Qstr(0).is_true()
+  is TRUE. Wrong: Qstr(0) is "" (see §4), and bool("") is False on
+  the reference binary. The C0 test was written against the pre-fix
+  arm that returned true for every qstr. Corrected the test in
+  value.rs to assert Qstr(0)/Qstr(1) falsy and Qstr("int") truthy,
+  with the evidence in the comment. No behaviour change in this fix
+  beyond the test — the length-based arm (added earlier in this lane)
+  was already correct.
+- value.rs grew 581 -> 890 lines from the C6 slot additions (over the
+  cap). Fixed by moving the slot contract to src/objects/slots.rs
+  (value.rs back to 624 lines; shapes unchanged).
+
+6. Test notes
+-------------
+- 32 new tests; the fixture builds stub builtin types by hand (C12
+  owns the real type ROM). Slots that must allocate a typed heap
+  object (__float__/__complex__ stubs) read the builtin type refs
+  from a thread-local the fixture installs (slots are plain fn
+  pointers and cannot capture anything).
+- obj_print (stdout) is not unit-tested (stdout capture); its helper
+  obj_print_helper is tested directly (fallback "<float>" + slot
+  "PRINTED").
+
+7. Deferred to other lanes (NOT dropped — implement there)
+-----------------------------------------------------------
+- list[str] / __class_getitem__ branch of mp_obj_subscr: needs
+  runtime.typingCall (C14/C15). C6 implements the condition check but
+  routes to the fallthrough raises; do NOT pin list[str] in a test
+  until C14 lands it.
+- nativeBase step of mp_obj_get_float_maybe + the instance-call nuance
+  of mp_obj_is_callable: need the instance representation (C12 — no
+  Instance variant exists in the frozen Obj enum yet). is_callable
+  over-approximates (any call slot counts) until C12 refines it.
+- Dynamic-qstr byte/length resolution in len/str_equal (see §3f);
+  the pool arrives via CallCtx in C13.
+- The standalone runtime mp_unary_op / mp_binary_op (full versions
+  with raise paths) belong to C14/C15; obj.rs only has the MAYBE-only
+  call_unary/call_binary helpers + the thin obj_unary_op/obj_binary_op
+  wrappers for the VM.
+- Nano branches NOT ported (full config only): longint_none paths in
+  intGetChecked, nano-only get_int_maybe bool/small-int/int comment
+  branches, mp_obj_malloc_helper's _with_finaliser_helper variant
+  (MICROPY_ENABLE_FINALISER off in both configs, no callers), the
+  nano pythonPrinter arm (full uses mp_sys_stdout_print).
+
+8. Commit
+---------
+One commit: "Lane C6: port objects obj core to Rust" (own files by
+path only; scripts/objcore_brief.md left untracked, per earlier lanes).

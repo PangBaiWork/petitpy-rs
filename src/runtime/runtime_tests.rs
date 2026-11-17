@@ -242,6 +242,7 @@ impl Env {
             mro,
             dict,
             namedtuple_fields: None,
+            protocol: None,
             print: None,
             unary_op: None,
             binary_op: None,

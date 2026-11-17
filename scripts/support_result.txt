@@ -1,0 +1,134 @@
+Lane C16: support — stream/unicode/readline/output/errno/smallint/qstr_hash
+================================================================================
+Worktree: ~/workspace/petitpy-rs-support, branch lane/support, base master 9091ad8
+Executor baseline (verified at dispatch): lib 1050 passed, 0 failed, 3 ignored; bins 9/9.
+
+ACCEPTANCE — VERIFIED BY THE EXECUTOR (full suite re-run after the final edit)
+  cargo test --release --lib:  1092 passed, 0 failed, 3 ignored   (1050 + 42 new)
+  cargo test --release --bins: 9 passed, 0 failed
+  cargo build --release: clean, 0 warnings
+  No unsafe. Every file < 800 lines (see the split note below).
+  Original repo ~/workspace/petitpy-orig untouched (git status clean, HEAD df7de3a).
+
+NEW TESTS: 42 (7 in src/support/tests.rs + 35 stream tests)
+  tests.rs (7): smallint grid (divmod identity + remainder sign), errno ENOENT
+    read-back, output sink routing, readline lines/EOF/long-line, repl_read_line
+    (stderr prompt, count-includes-\n, buf_max cap), qstr_hash formula
+    (hand-computed + zero-bump), unicode full 128-entry ASCII table.
+  stream_tests.rs (10): readall binary/text/trickle-chunks, read fixed +
+    read(-1), read(-5) MemoryError, read(0) empty, read1 ONCE with trickle,
+    text read(3) counts chars, text split-multibyte-char, read1 text ignores ONCE.
+  stream_tests_b.rs (25): readinto basic/max_len/off+max_len/readinto1/
+    non-buffer TypeError/memoryview write-through, write basic+loop/write1
+    ONCE/write off+max_len/write_adaptor, readline basic/max/True-False-None
+    quirks/heap-int MemoryError, readlines, unbuffered_iter, seek+tell
+    (SET/CUR/END), seek(-1) EINVAL, flush/close/__exit__, ioctl round-trip
+    (int + buffer-pointer), no-protocol OSError, missing-direction OSError,
+    failing-backend OSError(5/6/7), is_nonblocking_error false,
+    STREAM_METHODS table shape, get_stream resolution.
+
+FILES
+  New (src/support/):
+    mod.rs (32) — module map + overlap table (what lives elsewhere).
+    smallint.rs (44) — mp_small_int_modulo / mp_small_int_floor_divide (verbatim).
+    errno.rs (20) — errno() via std::io::Error::last_os_error (no libc).
+    output.rs (45) — output::write + OutputSink trait (fd 1→stdout, 2→stderr).
+    readline.rs (106) — readline + npy_repl_read_line (BufRead/Write seams).
+    stream.rs (398) — protocol core: resolution, mp_stream_rw loop,
+      mp_stream_write/adaptor/close/seek, streamReadall, streamReadGeneric.
+    stream_methods.rs (523) — readinto/write generic, readline/readlines/
+      iter, the 14 builtin bodies, STREAM_METHODS table.
+    stream_fixture.rs (306, cfg(test)) — fake backends + Sfx fixture.
+    stream_tests.rs (155), stream_tests_b.rs (546), tests.rs (286).
+  Modified:
+    src/lib.rs (+1: pub mod support).
+    src/objects/slots.rs — StreamP vtable + SeekState + IoctlArg + 3 fn types
+      (StreamReadFn/WriteFn/IoctlFn); slot types live here so value.rs does
+      not depend on support/ (no objects↔support cycle).
+    src/objects/value.rs — TypeData.protocol: Option<StreamP>; 854 → 860
+      lines (+6: the field + doc). Pre-existing cap debt, recorded not carried.
+    src/objects/strings/unicode.rs — added unichar_isident (the one missing fn).
+    src/compiler/lexer/chars.rs — is_space/is_alpha/is_digit/is_xdigit/
+      xdigit_value now delegate to unicode.rs (was a second copy; the
+      is_head/is_tail_of_identifier lexer.zig predicates stay).
+    src/objects/primitives/objint.rs — private byte is_space delegates to
+      unichar_isspace (its own doc comment already cited it).
+    src/runtime/runtime_smallint.rs — floored_div/floored_mod now import the
+      canonical support::smallint fns (was a THIRD copy, quotient-adjusted).
+    46 files — protocol: None sweep (58 TypeData literals, script-inserted
+      after namedtuple_fields; compiler-verified: no literal lacks the field).
+  Split (both halves were over the 800 cap as first written):
+    stream.rs 897 → stream.rs 398 + stream_methods.rs 523.
+    stream_tests.rs 981 → stream_fixture.rs 306 + stream_tests.rs 155 +
+      stream_tests_b.rs 546.
+
+OVERLAP TABLES (brief's "already ported, map + test only")
+  qstr_hash.zig → qstr_table::qstr_compute_hash (C1). VERIFIED ONLY: formula
+    test with hand-computed values (""→5381, "a"→46532, 16-bit mask, zero→1);
+    no second implementation.
+  unicode.zig → objects::strings::unicode (C8a). 10/11 fns already there;
+    added unichar_isident. ATTR table verified BYTE-IDENTICAL to the Zig
+    (128 entries, reconstructed from the FL_*/AT_* symbols by script).
+    Lexer + objint duplicates unified (above); objstr already used unichar_*.
+  smallint.zig → support::smallint (canonical, this lane); C14's copy
+    unified by delegation (above). Grid test proves the two forms agree.
+  stream.zig → NEW (no prior port).
+  output.zig vs C8c mpprint: output::write IS the same operation as
+    MP_PLAT_PRINT (fd 1) / MP_STDERR_PRINT (fd 2); mpprint NOT rewired
+    (its tests pin it) — behaviour identical, documented in output.rs.
+  readline.zig → NEW. input() wiring is D1's; REPL loop is Phase E's.
+
+FINDINGS (all verified against the original source; probes where noted)
+  - isNonblockingError is literally `return false` (MICROPY_STREAMS_NON_BLOCK=0
+    under MINIMUM ROM level) — every non-blocking branch in stream.zig is dead
+    code, so backends return PyResult<usize> (Err = MP_STREAM_ERROR + errcode).
+  - mp_get_stream_raise: the Zig @panics when the type lacks the protocol;
+    vendor C raises OSError("stream operation not supported") — Rust follows C.
+  - streamReadGeneric's TEXT branch passes MP_STREAM_RW_READ, NOT the caller's
+    flags — read1 on a text stream loops exactly like read (tested).
+  - streamReadintoWriteGeneric buffer flags are CROSSED: WRITE reads FROM the
+    buffer (MP_BUFFER_READ), READ writes INTO it (MP_BUFFER_WRITE).
+  - Vendor mp_obj_str_get_buffer refuses BUFFER_WRITE ("can't write to a
+    string") — so readinto into str/bytes is TypeError on the reference too;
+    write-back targets are only Array (bytearray / memoryview, tested incl.
+    view-through via the source chain, free*sz per hop).
+  - streamUnbufferedReadline's max_size is mirrors.smallIntValue — a RAW
+    tag-unshift, not a conversion: SmallInt→itself, True(30)→15, False(14)→7,
+    None(6)→3, qstr ((q<<3)|2)→4q+1, heap object→huge pointer-shifted number
+    whose vstr_init fails with MemoryError (all tested).
+  - read1 / write1 / readinto1 are NOT static qstrs — absent from
+    qstrdefs.generated.h too (the original interns them dynamically at type
+    setup). D must resolve those three via the runtime pool; the other 11
+    STREAM_METHODS names are static (asserted in the table test).
+  - read(sz): sz==-1 → readall; sz<-1 → MemoryError (vstr_init_len);
+    read(0) → empty. mp_stream_rw: 0 return = EOF/no-progress; ONCE returns
+    the first call's count. mp_stream_seek returns the offset via SeekState,
+    not the ioctl return. streamReadall calls stream_p.read DIRECTLY in
+    256-byte chunks (not mp_stream_rw).
+  - Huge vstr allocations go through try_reserve_exact/try_reserve so they
+    fail with OutOfMemory instead of aborting (Vec::with_capacity would abort).
+  - Two failures hit during the lane, both fixed in-lane: (a) the table test
+    asserted all 14 names static — read1 is genuinely dynamic (finding above,
+    not a bug); (b) the readinto off/max_len expectation miscounted the
+    5-byte destination ("he_ll", not "he_ll_") — test bug, implementation was
+    already correct.
+
+NOT PORTED (per the brief — D / Phase E own these)
+  - No file/socket backends (D's modio/file_io). No input() builtin (D1).
+    No REPL loop (Phase E). npy_repl_continue NOT ported: it delegates to the
+    extern mp_repl_continue_with_input (main.zig repl logic — Phase E).
+  - output::write ignores fds other than 1/2 (no safe std API for an arbitrary
+    fd; the only in-tree caller, file_io.zig:169, passes 1 or 2).
+  - full_stubs / mpstate / scheduler are C15b's scope, not this lane's.
+  - A buffer provider unknown to buffer_bytes/resolve_buffer_root would get a
+    defensive BufferProtocol error (no such provider exists today).
+
+HANDOVER (for the main agent / D lanes)
+  - Build stream locals dicts from STREAM_METHODS (C15a DICT_METHODS shape);
+    intern read1/write1/readinto1 via the runtime pool (see above).
+  - Set TypeData.protocol on stream types (file / socket / string-IO).
+  - input() calls readline::readline (prompt → stdout); the REPL calls
+    readline::repl_read_line (prompt → stderr, count includes '\n').
+  - Known cap debt: value.rs 860 (was 854 at master, +6 this lane), map.rs 860
+    (untouched by this lane). Both pre-date C16; a future lane must split one
+    of them before adding fields there.

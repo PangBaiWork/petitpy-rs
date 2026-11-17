@@ -405,6 +405,7 @@ pub fn deque_type_data(dict: GcRef, name: u32) -> TypeData {
         buffer: None,
         print: None,
         namedtuple_fields: None,
+        protocol: None,
     }
 }
 

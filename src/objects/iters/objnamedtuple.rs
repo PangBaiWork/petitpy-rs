@@ -82,6 +82,7 @@ pub fn new_namedtuple_type(
         buffer: None,
         print: Some(namedtuple_print),
         namedtuple_fields: Some(field_ids),
+        protocol: None,
     };
     Ok(Value::Heap(ctx.alloc(None, Obj::Type(data))))
 }

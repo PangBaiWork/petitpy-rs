@@ -427,6 +427,7 @@ pub fn str_type_data(name: u32, dict: GcRef) -> TypeData {
         make_new: Some(crate::objects::objtype::make_new::str_make_new_slot),
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
     }
 }
 
@@ -452,6 +453,7 @@ pub fn bytes_type_data(name: u32, dict: GcRef) -> TypeData {
         make_new: Some(crate::objects::objtype::make_new::bytes_make_new_slot),
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
     }
 }
 

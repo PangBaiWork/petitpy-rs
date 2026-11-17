@@ -327,6 +327,7 @@ fn tuple_subclass(fx: &mut Fx) -> GcRef {
             mro: Vec::new(),
             dict,
             namedtuple_fields: None,
+            protocol: None,
             unary_op: None,
             binary_op: None,
             call: None,

@@ -81,6 +81,7 @@ fn make_type_with_print(
         make_new: None,
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
     };
     arena.alloc(None, Obj::Type(data), roots)
 }
@@ -104,6 +105,7 @@ pub(crate) fn make_type(arena: &mut GcArena, roots: &RootSet, name: &[u8]) -> Gc
         make_new: None,
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
     };
     arena.alloc(None, Obj::Type(data), roots)
 }

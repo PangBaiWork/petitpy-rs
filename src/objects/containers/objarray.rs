@@ -736,6 +736,7 @@ fn array_type_data_inner(
         make_new: Some(make_new),
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
     }
 }
 

@@ -303,6 +303,7 @@ mod tests {
                 buffer: None,
                 print: None,
                 namedtuple_fields: None,
+                protocol: None,
             }),
             &fx.roots,
         );
@@ -360,6 +361,7 @@ mod tests {
                 buffer: None,
                 print: None,
                 namedtuple_fields: None,
+                protocol: None,
             }),
             &fx.roots,
         );

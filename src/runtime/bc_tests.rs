@@ -46,6 +46,7 @@ fn plain_type(arena: &mut GcArena, roots: &RootSet, name: &[u8]) -> GcRef {
             buffer: None,
             print: None,
             namedtuple_fields: None,
+            protocol: None,
             attr: None,
             make_new: None,
             bases: None,

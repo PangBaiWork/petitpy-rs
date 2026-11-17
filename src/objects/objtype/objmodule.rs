@@ -81,6 +81,7 @@ pub fn module_type_data(dict: GcRef, object: GcRef) -> TypeData {
         make_new: None,
         bases: None,
         namedtuple_fields: None,
+        protocol: None,
         unary_op: None,
         binary_op: None,
         call: None,

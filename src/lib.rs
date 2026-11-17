@@ -11,4 +11,5 @@ pub mod objects;
 pub mod pyerr;
 pub mod qstr_table;
 pub mod runtime;
+pub mod support;
 pub mod vendor;

@@ -452,7 +452,12 @@ fn type_rom_data() {
 #[test]
 fn int_locals_dict_has_from_bytes() {
     let mut fx = Fixture::new();
-    let dict_ref = fx.call(|ctx, _t| int_locals_dict(ctx));
+    // The fixture has no `fun_builtin_var` (it lives on
+    // `VmTypes`, not `BuiltinTypes`); a fresh type named
+    // `function` stands in for it here.
+    let fun_builtin_var = make_type(&mut fx.arena, &fx.roots, b"function");
+    let classmethod = fx.types.classmethod;
+    let dict_ref = fx.call(|ctx, _t| int_locals_dict(ctx, fun_builtin_var, classmethod));
     let entries = match fx.arena.get(dict_ref) {
         Obj::Dict(d) => d.map.entries.clone(),
         _ => panic!("not a dict"),
@@ -461,14 +466,28 @@ fn int_locals_dict_has_from_bytes() {
     assert_eq!(entries.len(), 2);
     let from_bytes_id = static_qstr_id(b"from_bytes").unwrap();
     assert_eq!(entries[0].key, Some(Value::Qstr(from_bytes_id)));
+    // C18b: `from_bytes` is a classmethod object wrapping the
+    // `FunBuiltin` (the original's `MpObjStaticClassMethod`,
+    // `objint.zig:431-438`) — the header type is `classmethod`,
+    // so it prints `<classmethod>`.
     let (name, n_args, func) = match entries[0].value {
-        Value::Heap(r) => match fx.arena.get(r) {
-            Obj::FunBuiltin(f) => {
-                let fp: crate::objects::slots::BuiltinFn = f.func;
-                (f.name, f.n_args, fp as usize)
+        Value::Heap(r) => {
+            assert_eq!(fx.arena.header(r).type_, Some(classmethod));
+            match fx.arena.get(r) {
+                Obj::StaticClassMethod(d) => match d.fun {
+                    Value::Heap(fr) => match fx.arena.get(fr) {
+                        Obj::FunBuiltin(f) => {
+                            assert_eq!(fx.arena.header(fr).type_, Some(fun_builtin_var));
+                            let fp: crate::objects::slots::BuiltinFn = f.func;
+                            (f.name, f.n_args, fp as usize)
+                        }
+                        _ => panic!("classmethod does not wrap a builtin"),
+                    },
+                    _ => panic!("classmethod fun is not heap"),
+                },
+                _ => panic!("from_bytes is not a classmethod object"),
             }
-            _ => panic!("not a builtin"),
-        },
+        }
         _ => panic!("not heap"),
     };
     assert_eq!(name, from_bytes_id);
@@ -478,19 +497,81 @@ fn int_locals_dict_has_from_bytes() {
     let to_bytes_id = static_qstr_id(b"to_bytes").unwrap();
     assert_eq!(entries[1].key, Some(Value::Qstr(to_bytes_id)));
     let (name2, n_args2, func2) = match entries[1].value {
-        Value::Heap(r) => match fx.arena.get(r) {
-            Obj::FunBuiltin(f) => {
-                let fp: crate::objects::slots::BuiltinFn = f.func;
-                (f.name, f.n_args, fp as usize)
+        Value::Heap(r) => {
+            // `to_bytes` is a plain builtin with the var
+            // function type as its header, so it prints
+            // `<function>`.
+            assert_eq!(fx.arena.header(r).type_, Some(fun_builtin_var));
+            match fx.arena.get(r) {
+                Obj::FunBuiltin(f) => {
+                    let fp: crate::objects::slots::BuiltinFn = f.func;
+                    (f.name, f.n_args, fp as usize)
+                }
+                _ => panic!("not a builtin"),
             }
-            _ => panic!("not a builtin"),
-        },
+        }
         _ => panic!("not heap"),
     };
     assert_eq!(name2, to_bytes_id);
     assert_eq!(n_args2, fun_n_args(1, 4));
     let expected_fn2: crate::objects::slots::BuiltinFn = int_to_bytes_builtin;
     assert_eq!(func2, expected_fn2 as usize);
+}
+
+// ── from_bytes classmethod binding (C18b) ───────────────────────────────
+
+#[test]
+fn int_from_bytes_classmethod_binding() {
+    // The `int_locals_dict` fix stores `from_bytes` as a
+    // classmethod object wrapping the `FunBuiltin`. The VM
+    // cannot call it end-to-end yet (type-object attribute
+    // lookup is blocked — see the ignored
+    // `int_from_bytes_e2e_after_classmethod_wrap` test), so
+    // the binding is verified here at `CallCtx` level:
+    // `convert_member_lookup` must return the inner builtin
+    // with the int type bound as `args[0]`, and calling it
+    // must give the right value.
+    use crate::objects::objtype::lookup::convert_member_lookup;
+    let mut fx = Fixture::new();
+    let fun_builtin_var = make_type(&mut fx.arena, &fx.roots, b"function");
+    let classmethod = fx.types.classmethod;
+    let int = fx.types.int;
+    let dict_ref = fx.call(|ctx, _t| int_locals_dict(ctx, fun_builtin_var, classmethod));
+    let member = match fx.arena.get(dict_ref) {
+        Obj::Dict(d) => d.map.entries[0].value,
+        _ => panic!("not a dict"),
+    };
+    let (func, bound) = fx.call(|ctx, _t| {
+        convert_member_lookup(ctx, Some(Value::Heap(int)), int, member)
+    });
+    assert_eq!(bound, Some(Value::Heap(int)));
+    let buf = fx.heap_bytes(b"\x01\x00");
+    // The builtin only tests for the `little` qstr; any other
+    // value means big-endian (`"big"` is not a static qstr).
+    let big = Value::None;
+    let little = Value::Qstr(static_qstr_id(b"little").unwrap());
+    let v = fx.call(|ctx, _t| {
+        let f = match ctx.arena.get(match func {
+            Value::Heap(r) => r,
+            _ => panic!("bound func is not heap"),
+        }) {
+            Obj::FunBuiltin(f) => f.func,
+            _ => panic!("bound func is not a builtin"),
+        };
+        f(ctx, &[Value::Heap(int), buf, big]).unwrap()
+    });
+    assert_eq!(v, Value::SmallInt(256));
+    let v2 = fx.call(|ctx, _t| {
+        let f = match ctx.arena.get(match func {
+            Value::Heap(r) => r,
+            _ => panic!("bound func is not heap"),
+        }) {
+            Obj::FunBuiltin(f) => f.func,
+            _ => panic!("bound func is not a builtin"),
+        };
+        f(ctx, &[Value::Heap(int), buf, little]).unwrap()
+    });
+    assert_eq!(v2, Value::SmallInt(1));
 }
 
 // ── formatting ──────────────────────────────────────────────────────────

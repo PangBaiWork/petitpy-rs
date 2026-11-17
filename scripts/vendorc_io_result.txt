@@ -1,0 +1,449 @@
+Lane C18b: vendor C — modio / objstringio / builtinhelp / warning
+=================================================================
+Worktree ~/workspace/petitpy-rs-vendorc-io, branch lane/vendorc-io,
+base master aaded5b (C17 merged). One commit, no merge (stop for
+main-agent verification).
+
+Acceptance (verified in-tree by the executor 2026-11-18)
+---------------------------------------------------------
+- cargo test --release --lib: 1211 passed, 0 failed, 4 ignored
+  (baseline 1168 + 43 new: 25 objstringio + 13 builtinhelp + 4
+  warning + 1 int_from_bytes_classmethod_binding; the 4 ignored
+  are 3 pre-existing + 1 new, see §4).
+- cargo test --release --bins: 9 passed.
+- 0 warnings (cargo build --release --lib --tests).
+- No unsafe in any new/changed file (grep).
+- check_compile_mpy.py: PASS (552/552 byte-identical, 0 failures).
+- Every file < 800 lines except src/objects/value.rs (886,
+  recorded cap debt — was 860 at master; +26 for the
+  `Obj::StringIo` variant + `heap_bytes` arm, structurally
+  forced like C16's +6).
+
+§1. Scope: what was ported, and where it lives
+-----------------------------------------------
+Originals (all read-only in ~/workspace/petitpy-orig):
+  vendor py/modio.c (232 lines), py/objstringio.c (269),
+  py/builtinhelp.c (175), py/warning.c (56).
+Config gates verified in port/mpconfigport.h + vendor
+py/mpconfig.h + build.zig (full config): MICROPY_PY_IO=1,
+MICROPY_PY_IO_IOBASE=1, MICROPY_PY_IO_BYTESIO=1,
+MICROPY_CPYTHON_COMPAT=1 (line 177 — the closed check is LIVE),
+MICROPY_PY_BUILTINS_HELP=1 (175),
+MICROPY_PY_BUILTINS_HELP_MODULES=1 (278), MICROPY_WARNINGS=1
+(338, gated on PETITPY_FEATURE_WARNING, default on under full),
+MICROPY_ENABLE_EXTERNAL_IMPORT=0 (ROM_LEVEL is MINIMUM).
+MICROPY_PY_IO_BUFFEREDWRITER is NOT enabled (comment at
+mpconfigport.h:375; the oracle's io_buffered_writer.out prints
+SKIP) — BufferedWriter was NOT ported (dead config block).
+
+Types (modio.c:206 module table: __name__, open [D's file_io],
+IOBase, StringIO, BytesIO):
+  Obj::StringIo(StringIoData { buf: Vec<u8>, pos: usize,
+  closed: bool }) — src/objects/value.rs (variant + struct;
+  heap_bytes arm at :284; children() needs no arm — no Value
+  children). Simplified from the brief: NO is_text / fixed /
+  ref_obj fields. is_text comes from the header type's stream
+  protocol (MRO walk, §2); fixed/ref_obj are unnecessary —
+  str/bytes are immutable and a bytearray arg takes the C's
+  copy path (probed: no aliasing), so Rust clones eagerly.
+  src/objects/containers/objstringio.rs (495 lines):
+    MAX_ALLOC = 16 MiB (:65) — src/memory/gc.zig:69.
+    StringIoError (+ TypedRaise) — OutOfMemory renders as
+      malloc_fail ("memory allocation failed"), NOT the bare
+      arena-OOM signal ("out of memory"): record_typed only
+      records name+message when the signal is PyRaise, and the
+      C's vstr failure is m_malloc_fail (raise.zig:83-90).
+    stringio_make_new (:194) — objstringio.c:180-212. Only
+      POSITIONAL args are read (n_pos = args.len() - 2*n_kw,
+      the flat layout — a kwargs-only call reads nothing, so
+      StringIO(initial_value="x") -> ''; extra positionals
+      ignored). int arg: exact-int only (NOT obj_get_int_maybe
+      — bool is NOT int here, probed StringIO(True) ->
+      TypeError); negative wraps via `as usize` then the
+      MAX_ALLOC check -> MemoryError. Buffer arg copied, pos 0.
+    iobase_make_new (:248) — modio.c:46-52. Fresh empty
+      StringIo payload per call (DIVERGENCE from the C's
+      static singleton, CPython-compatible; observable only
+      via `is`).
+    stringio_slot (:275) — closed check first, ValueError
+      "I/O operation on closed file" (check_stringio_is_open,
+      objstringio.c:40-45).
+    stringio_is_text (:299) — via get_stream MRO walk (§2).
+    stringio_read (:307) — objstringio.c:59-70, EOF -> 0.
+    stringio_write (:327) — objstringio.c:81-107. Zero-filled
+      hole on seek-past-EOF write; pos overflow -> OSError
+      EFBIG; growth past MAX_ALLOC -> malloc_fail. (The
+      reservation runs before the payload borrow is held, so
+      the raise can record without a borrow conflict.)
+    stringio_ioctl (:384) — objstringio.c:110-159. SEEK SET /
+      CUR / END (negative CUR/END past 0 clamps to 0; positive
+      overflow -> EINVAL); FLUSH -> 0; CLOSE drops buf + sets
+      closed, pos NOT reset; SEEK_END on a CLOSED StringIO
+      raises ValueError (the C SEGFAULTS here — NULL vstr
+      deref, objstringio.c:124 — see §3); other -> EINVAL.
+    stringio_print (:455) — objstringio.c:48-53.
+      "<io.StringIO 0x{slot:x}>" / "<io.BytesIO 0x{slot:x}>",
+      slot = arena index (fun_bc_print precedent), text-ness
+      via MRO so a subclass prints as its base (probed).
+    stringio_getvalue (:477) — objstringio.c:165-171, str vs
+      bytes by is_text (STREAM_TO_CONTENT_TYPE is exact
+      identity in the C; the MRO walk makes subclasses behave
+      as their base, probed).
+    identity_builtin (:493) — returns args[0], for __enter__.
+  src/objects/containers/objstringio_iobase.rs (176 lines):
+    rt_error (:26) — RtError -> PyError (opmethods.rs:149
+      idiom: record by name/message first).
+    iobase_read_write (:57) — modio.c:54-75. load_method_maybe
+      + call_method_n_kw with a fresh bytearray over the
+      buffer; missing method -> AttributeError "no attribute
+      'readinto'/'write'"; None -> OSError(EAGAIN); int >= 0
+      -> count (clamped to size); int < 0 -> OSError(-ret);
+      non-int -> obj_get_int error. Read copies back bounded
+      by the bytearray's actual data.len().
+    iobase_read (:127) / iobase_write (:133) — wrappers.
+    iobase_ioctl (:144) — modio.c:77-91. load `ioctl`, call
+      with (request, 0) as ints (arg is the seek-struct
+      pointer in C, meaningless to a Python override); NO None
+      branch; negative -> OSError(-ret).
+  src/objects/containers/objstringio_types.rs (272 lines):
+    STRINGIO_LOCALS (:36) — the 11-entry table,
+      objstringio.c:217-229, in C order: read 1-2, readinto
+      2-3, readline 1-2, write 2-4, seek 2-3, tell 1-1, flush
+      1-1, close 1-1, getvalue 1-1, __enter__ 1-1 (identity),
+      __exit__ 4-4 (C16 stream_exit). NOT the 14-entry
+      STREAM_METHODS: no read1/write1/readinto1/readlines/
+      ioctl — all AttributeError on a StringIO (probed).
+    stringio_type_data (:160) / bytesio_type_data (:171) —
+      flags FLAG_ITER_IS_STREAM, make_new, print, protocol
+      Some (is_text true / false), shared locals dict.
+    iobase_type_data (:185) — flags 0, NO print, empty dict,
+      make_new, protocol Some (is_text false).
+    build_io_module (:223) — allocates the three types +
+      module ({__name__: "io", open, IOBase, StringIO,
+      BytesIO} in C table order). `open` is a parameter
+      (D's file_io); tests pass a bare-PyRaise stub.
+      Registration into VmState.builtin_modules is D1's —
+      the builder only returns the module.
+  src/objects/objtype/make_new.rs: stringio_make_new_slot +
+    iobase_make_new_slot (one adapter serves both StringIO
+    and BytesIO, as in the C; errors via ctx.record_typed,
+    the C13b pattern).
+
+help() — src/runtime/builtinhelp.rs (221 lines):
+  HELP_DEFAULT_TEXT (:51) — mp_help_default_text verbatim
+    (builtinhelp.c:38-51).
+  call_help_ctx (:63) — intercepted in call_function_ctx by
+    GcRef identity (the C15a eval/exec pattern):
+    VmState.help_builtin (vm.rs), bound as "help" sig (0,1)
+    in build_builtins (vm_call.rs). n_args > 1 or n_kw != 0
+    -> TypeError "argument num/types mismatch" (sig (0,1)).
+    0 args -> default text; 1 arg -> print_obj, except a
+    str equal to "modules" -> print_modules. Output via
+    MP_PLAT_PRINT (fd 1), collected into one String first.
+  is_modules_arg (:89) — VALUE-based, probed: any str
+    (Qstr or heap Str) whose bytes are exactly b"modules"
+    (a computed "mod"+"ules" and a function's return both
+    trigger it); bytes do NOT match; "modules " does NOT.
+  print_modules — builtin + extensible + frozen names,
+    sorted bytewise, column-first, 4 columns, width 18,
+    gap rule (gap = 18 - len, min 1), NO "Plus any modules
+    on the filesystem" line (ENABLE_EXTERNAL_IMPORT=0).
+    Whether __main__ appears depends on D1's
+    builtin_modules contents (Zig's comes from modmain.zig).
+  print_obj — "object {obj PRINT_STR} is of type
+    {type-name}\n" then one " {name PRINT_STR} --
+    {value PRINT_STR}\n" per map entry. Map = a module's
+    globals, a type object's OWN locals dict, else the
+    object's type's locals dict. Iteration is
+    MapData.entries order (insertion order) — documented
+    divergence from the C's raw hash-table order for
+    hash-ordered module globals dicts; same set/order for
+    ROM locals dicts. NOTE: for an empty string the C's
+    "object " + "" + " is of type …" has TWO spaces
+    (verified with cat -A) — the implementation is faithful,
+    the summary's one-space rendering was a collapse.
+  FrozenTable::names() added (src/runtime/frozen_modules.rs)
+    for the frozen side of the list.
+
+mp_warning — src/runtime/warning.rs (43 lines):
+  format_warning(category, msg) — "{category or \"Warning\"}:
+    {msg}\n" (pure, testable).
+  mp_warning(category, msg) — warning.c:36-46, NULL category
+    -> "Warning"; writes via MP_STDERR_PRINT (fd 2).
+  mp_emitter_warning(pass, msg) — warning.c:52, only fires
+    when pass == MP_PASS_CODE_SIZE (3, py/emit.h:45); no Rust
+    caller exists yet (no call sites in the Zig either except
+    the code-size pass).
+  Rewire: src/objects/obj_ops.rs::warn_str_bytes_cmp now
+    calls mp_warning(None, "Comparison between bytes and
+    str"); the eprintln! and the "until the print machinery
+    centralises stderr" comment are gone (the centralisation
+    it was waiting for now exists).
+
+§2. C16 stream-protocol wiring points
+--------------------------------------
+- StreamP / StreamReadFn / StreamWriteFn / StreamIoctlFn:
+  src/objects/slots.rs:393-436 (unchanged).
+- get_stream (src/support/stream.rs:108) now walks the MRO —
+  header type first, then td.mro — returning the first Some
+  protocol. Rationale in code: the C copies the base type's
+  slots into a subclass type at creation (mp_obj_new_type,
+  vendor py/objtype.c), so a subclass instance resolves the
+  base's protocol; Rust user types do not inherit `protocol`
+  (typecreate sets None), so the walk emulates it. Verified
+  by stringio_subclass_mro_print_getvalue (both StringIO and
+  BytesIO subclasses print/getvalue as their base).
+- MP_EAGAIN = 11 and MP_EFBIG = 27 added next to MP_EINVAL =
+  22 in src/support/stream.rs (iobase None -> EAGAIN;
+  stringio_write pos overflow -> EFBIG).
+- stream_read_builtin / stream_write_builtin /
+  stream_readinto_builtin /
+  stream_unbuffered_readline_builtin / stream_close_builtin
+  / stream_exit_builtin / stream_seek_builtin /
+  stream_tell_builtin / stream_flush_builtin made pub(crate)
+  in src/support/stream_methods.rs so the 11-entry StringIO
+  table reuses them (were private).
+- locals_dict_from_entries (src/runtime/vm_types.rs:91)
+  made pub(crate); used by build_io_module (all 11 names are
+  static qstrs, so its panic-on-non-static-names is fine).
+- The 8 stream methods in STRINGIO_LOCALS are C16's
+  STREAM_METHODS bodies — no read/write loop was rewritten.
+- Iteration: the VM's iternext_allow_raise_ctx
+  (src/runtime/vm_rt_iter.rs:155) gained a stream branch
+  BEFORE the __next__ path — if the header type's flags have
+  FLAG_ITER_IS_STREAM, call C16's stream_unbuffered_iter
+  (Ok(Some(v)) -> v, Ok(None) -> StopIteration, Err -> the
+  recorded exception). The flag is read on the header type
+  only, matching getiter's FLAG_ITER_IS_ITERNEXT check — a
+  user subclass does NOT inherit the flag (C12a's typecreate
+  inherits only HAS_SPECIAL_ACCESSORS), so subclass
+  iteration stays a typecreate item (corpus
+  io_stringio_base.py iterates a StringIO subclass — Phase E
+  gate, not this lane's).
+
+§3. Probe results (reference binary
+~/workspace/petitpy-orig/zig-out/bin/petitpy, 2026-11-18)
+---------------------------------------------------------
+- io.StringIO / io.BytesIO / io.IOBase exist; BufferedWriter
+  absent. repr(io.StringIO()) = "<io.StringIO 0x...>";
+  repr(io.IOBase()) = "<IOBase>" (no print slot).
+  io.IOBase() is io.IOBase() == True (C singleton).
+- getvalue types: StringIO("foo")/StringIO(b"abc") -> str;
+  BytesIO("abc") -> bytes; StringIO(123) -> ''.
+- Copy-on-write confirmed for bytearray args (mutating the
+  bytearray afterwards does not change getvalue); same for
+  BytesIO. StringIO(b"foobar") does not alias the source.
+- Closed (CPYTHON_COMPAT=1): getvalue/read/write/readline ->
+  ValueError "I/O operation on closed file"; seek/tell/flush
+  still work (seek -> new pos, tell -> current pos, flush ->
+  None); pos is NOT reset by close (tell after close with
+  pos=2 -> 2). Double close -> None both times.
+- ORIGINAL CRASHES (Rust raises instead — intentional
+  divergences, all covered by tests):
+  (a) seek(0, 2) after close -> segfault rc=134 (NULL vstr
+      deref, objstringio.c:124); Rust raises the closed
+      ValueError (test closed_seek_end_is_value_error).
+  (b) read(-5) -> abort rc=134 (Zig intCast panic,
+      stream.zig:303); Rust already gives MemoryError per
+      C16 — kept.
+  (c) readinto("xx") (str target) -> abort rc=134 (GPF in
+      stringio_read memcpy, objstringio.c:65). THIS FALSIFIES
+      C16's claim that readinto-into-str is TypeError on the
+      reference; Rust keeps C16's TypeError.
+- StringIO(initial_value="x") -> '' (kwargs IGNORED);
+  StringIO("a", "b") -> "a" (extra positionals ignored);
+  StringIO(-5) -> MemoryError "memory allocation failed"
+  (clean rc=1); StringIO(True)/StringIO(3.5)/StringIO([1])
+  -> TypeError "object with buffer protocol required" (bool
+  is NOT int here).
+- Size boundary is exactly 16 MiB (gc.zig:69 MAX_ALLOC):
+  StringIO(2**24) ok, StringIO(2**24+1) fails;
+  StringIO(2**40)/StringIO(2**30) -> MemoryError;
+  StringIO(2**70) -> OverflowError "overflow converting
+  long int to machine word".
+- Unicode: write("é") round-trips raw UTF-8; read(-1) ->
+  full content; readline(2) on "ab\ncd\n" -> 'ab'; iter over
+  StringIO("a\nb\n") -> ['a\n', 'b\n']; seek(5) past EOF on
+  "ab" then write "c" -> 'ab\x00\x00\x00c' (zero hole).
+- Seek edges: seek(-1) -> OSError [Errno 22] EINVAL;
+  seek(-5,1)/seek(-100,2) -> 0; seek(5,9) -> 5 (unknown
+  whence -> ref 0 in C); seek(2**70) -> OverflowError.
+- StringIO has NO read1/write1/readinto1/readlines/ioctl/
+  closed/seekable/readable/writable attributes (all
+  AttributeError). Its locals dict is exactly the 11-entry
+  table (objstringio.c:217-229). __enter__ returns self;
+  __exit__ is mp_stream___exit___obj. io.IOBase().readinto/
+  .write/.readline/.closed/.ioctl are all AttributeError;
+  .read() is AttributeError too (read is not a method on
+  IOBase — delegation is only reachable via the stream
+  protocol, not via a Python .read call; a subclass
+  overriding readinto still gets AttributeError on .read(3)).
+- help() (no arg) prints mp_help_default_text verbatim.
+  help(1) -> "object 1 is of type int" + from_bytes /
+  to_bytes. help(len) -> "object <function> is of type
+  function", no members. help("") -> "object  is of type
+  str" (TWO spaces — see §1). help(io.StringIO) ->
+  "object <class 'StringIO'> is of type type" + the 11
+  methods. help(1, 2) -> TypeError "argument num/types
+  mismatch". help("modules") -> 21 modules sorted,
+  column-first, 4 columns, width 18 (__main__, _json,
+  _subprocess, array, builtins, collections, errno, gc, grp,
+  io, math, micropython, os, pwd, re, select, signal,
+  socket, struct, sys, time), NO "Plus any modules on the
+  filesystem" line. help(int) -> from_bytes --
+  <classmethod>, to_bytes -- <function>. help(io) ->
+  "object <module 'io'> is of type module" + __name__ --
+  io, open -- <function>, IOBase/StringIO/BytesIO --
+  <class '…'>.
+- help "modules" is VALUE-based: "mod"+"ules" and a
+  function's return value both list modules; b"modules"
+  and "modules " do not.
+- Subclasses: class S(io.StringIO) -> type(S("hi").
+  getvalue()) is str, read() is str, S().write("xy") == 2,
+  repr(S()) is "<io.StringIO 0x...>", type(S()) is S,
+  S.__mro__ is (S, StringIO, object), s.__dict__ is {}.
+  Same for class B(io.BytesIO) -> "<io.BytesIO 0x...>" / b'hi'.
+- Warnings: "a" == b"a" -> False + 1 stderr line;
+  "a" != b"a" -> True + 1 line; b"a" == "a" -> False + 1
+  line; "a" == "a" -> no warning. Stderr text exactly
+  "Warning: Comparison between bytes and str".
+
+Two real bugs found by the tests, both fixed in-lane:
+1. Qstr buffer protocol — write("str") failed with
+   TypeError "object with buffer protocol required" while
+   write(b"bytes") worked. Root cause: string literals load
+   as Value::Qstr, not heap Str (load_const_str in
+   src/compiler/emit/emit.rs:317 emits MP_BC_LOAD_CONST_STRING
+   with a qstr, like MicroPython where a string const IS a
+   qstr), and the buffer protocol only handled heap Str/Bytes.
+   Fix: str_get_buffer (src/objects/strings/
+   objstr_methods_c.rs) now handles Value::Qstr via
+   ctx.pool.qstr_str (pool-owned slice — static table or
+   leaked Box — so the raw pointer in BufferInfo stays
+   valid); buffer_bytes (src/objects/containers/binary.rs)
+   handles Value::Qstr the same way. This fixes the buffer
+   protocol for ALL Qstr values, not just StringIO.
+2. Stream iteration — `for line in StringIO` raised
+   TypeError "object not an iterator". Root cause: the C's
+   mp_iternext (vendor py/runtime.c:1359-1415) gives stream
+   types mp_stream_unbuffered_iter when
+   TYPE_HAS_ITERNEXT(type) (MP_TYPE_FLAG_ITER_IS_STREAM =
+   ITER_IS_ITERNEXT | ITER_IS_CUSTOM, vendor py/obj.h:
+   556-576). C16 ported stream_unbuffered_iter but nothing
+   wired it into the VM's iternext. Fix: the stream branch
+   in iternext_allow_raise_ctx (see §2).
+
+A third fix, required by help(int):
+3. int.from_bytes printed `<>` (and to_bytes too). Root
+   cause: C7's int_locals_dict allocated both FunBuiltins
+   with a None header ("the dict/builtin-function types do
+   not exist yet" — STALE: build_vm_types builds
+   fun_builtin_var FIRST), and obj_get_type_str returns ""
+   for a None header, so the default print rendered `<>`.
+   The original stores from_bytes as a classmethod object
+   (int_from_bytes_obj: MpObjStaticClassMethod, base.type =
+   mp_type_classmethod, objint.zig:431-438). Fix:
+   - int_locals_dict(ctx, fun_builtin_var, classmethod):
+     both FunBuiltins take Some(fun_builtin_var); from_bytes
+     is wrapped in Obj::StaticClassMethod with header Some
+     (classmethod) — prints <classmethod>, binds the class
+     as args[0] (convert_member_lookup's classmethod branch).
+   - build_vm_types: staticmethod/classmethod creation moved
+     before the int dict (they only need empty_dict + their
+     *_type_data; nothing between uses them); the old comment
+     updated. C7's int_locals_dict_has_from_bytes updated to
+     the new shape (header assertions) + new
+     int_from_bytes_classmethod_binding (CallCtx-level: the
+     wrap binds int as args[0], from_bytes gives 256/1).
+   - The e2e call int.from_bytes(...) is BLOCKED on the
+     type-object attribute lookup gap (see §4) and is
+     #[ignore]d with the reason; the to_bytes e2e half
+     (instance lookup) passes.
+
+§4. Not done (with owners)
+---------------------------
+- File/socket backends (mp_builtin_open_obj / file_io,
+  socket streams): D's scope (modio.c's `open` entry is a
+  parameter of build_io_module; D1 registers the module).
+- Module registration into VmState.builtin_modules: D1's
+  (build_io_module only returns the module; tests register
+  it the way D1 will).
+- IOBase FunBc delegation gap: FunBuiltin overrides work
+  end-to-end through iobase_read_write (load_method_maybe +
+  call_method_n_kw). A FunBc (user-defined Python) override
+  CANNOT run from a StreamP fn — fun_bc_call_slot is a bare
+  PyRaise stub and CallCtx has no VmState; the stub's PyRaise
+  propagates (no invented error). Same gap class as C13b's
+  FunBc __init__ and the collect_iterable FunBc gap. Owner:
+  needs a VM-seam-aware path. Corpus io_iobase.py is a
+  Phase E gate, not this lane's — it additionally needs
+  print(file=...) wiring (D's sys.stdout work; print_impl
+  ignores file= today).
+- Subclass make_new / flag inheritance: a user subclass of
+  StringIO/BytesIO does not inherit make_new or
+  FLAG_ITER_IS_STREAM (typecreate sets protocol None and
+  inherits only HAS_SPECIAL_ACCESSORS) — the MRO protocol
+  walk covers print/getvalue/read/write, but subclass
+  iteration and subclass construction through the VM's type
+  call are typecreate items. Owner: C12a/typecreate.
+- print(file=...) -> D (sys.stdout).
+- help() module-order divergence for hash-ordered globals
+  dicts: print_obj iterates MapData.entries (insertion
+  order); the C iterates the raw hash table. Same set,
+  possibly different order for user-module globals; ROM
+  locals dicts are ordered, so their order matches.
+- Type-object attribute lookup gap (PRE-EXISTING, exposed
+  by this lane): `int.from_bytes(...)`, `str(int.from_bytes)`,
+  `C.x` for a user class all raise AttributeError "no
+  attribute '…'". The VM's LOAD_METHOD uses
+  load_method_maybe_ctx (vm_rt_name.rs), which looks the
+  attr up in `type`'s dict instead of the type's OWN dict
+  and never consults the generic TypeData.attr slot. The
+  original routes this through the `type` type's attr slot
+  (mp_obj_type_attr); fixing it needs that port + switching
+  VM dispatch to C14's loader (vm_tests_b.rs:442 documents
+  the pending C14 rewrite). Same class as C13b's ignored
+  makenew_class_attr_on_class. The e2e test
+  int_from_bytes_e2e_after_classmethod_wrap is #[ignore]d
+  with this reason (1 of the 4 ignored); the wrap itself is
+  verified at CallCtx level (see §3 item 3).
+- help() "modules" list: __main__ appears only if D1 puts
+  it in builtin_modules (Zig's comes from modmain.zig).
+- mp_emitter_warning has no Rust caller yet (no call sites
+  in the Zig either except the code-size pass).
+
+Files (new / changed)
+---------------------
+New:
+  src/objects/containers/objstringio.rs (495)
+  src/objects/containers/objstringio_iobase.rs (176)
+  src/objects/containers/objstringio_types.rs (272)
+  src/objects/containers/objstringio_tests.rs (623)
+  src/objects/containers/objstringio_tests_ctx.rs (472)
+  src/runtime/builtinhelp.rs (221)
+  src/runtime/builtinhelp_tests.rs (364)
+  src/runtime/warning.rs (43)
+  src/runtime/warning_tests.rs (71)
+Changed:
+  src/objects/value.rs (+26: Obj::StringIo, heap_bytes arm)
+  src/objects/containers/binary.rs (Qstr in buffer_bytes)
+  src/objects/containers/mod.rs (3 new modules + ctx tests)
+  src/objects/obj_ops.rs (warn_str_bytes_cmp -> mp_warning)
+  src/objects/objtype/make_new.rs (+2 slots)
+  src/objects/primitives/objint.rs (int_locals_dict signature
+    + classmethod wrap; import StaticClassMethodData)
+  src/objects/primitives/tests_ops.rs (dict test updated +
+    int_from_bytes_classmethod_binding)
+  src/objects/strings/objstr_methods_c.rs (Qstr in
+    str_get_buffer)
+  src/runtime/frozen_modules.rs (FrozenTable::names)
+  src/runtime/mod.rs (warning + builtinhelp + 2 test mods)
+  src/runtime/vm.rs (VmState.help_builtin + bind "help")
+  src/runtime/vm_call.rs (help interception by GcRef identity)
+  src/runtime/vm_rt_iter.rs (+28: stream iternext branch)
+  src/runtime/vm_types.rs (staticmethod/classmethod moved
+    before int dict; locals_dict_from_entries pub(crate))
+  src/support/stream.rs (+33: MRO walk in get_stream,
+    MP_EAGAIN / MP_EFBIG)
+  src/support/stream_methods.rs (9 stream fns pub(crate))
+Cap debt: value.rs 886 (was 860). All other files < 800.

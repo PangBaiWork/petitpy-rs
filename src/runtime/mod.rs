@@ -37,6 +37,7 @@
 
 pub mod argcheck;
 pub mod bc;
+pub mod builtinhelp;
 pub mod builtinevex;
 pub mod builtinimport;
 pub mod code_store;
@@ -73,13 +74,18 @@ pub mod vm_rt;
 pub mod vm_rt_iter;
 pub mod vm_rt_name;
 pub mod vm_types;
+pub mod warning;
 
 #[cfg(test)]
 mod argcheck_tests;
 #[cfg(test)]
 mod bc_tests;
 #[cfg(test)]
+mod builtinhelp_tests;
+#[cfg(test)]
 mod import_tests;
+#[cfg(test)]
+mod warning_tests;
 #[cfg(test)]
 mod vm_tests;
 #[cfg(test)]

@@ -23,6 +23,13 @@ pub(crate) mod objproperty_tests;
 pub mod objrange;
 #[cfg(test)]
 pub(crate) mod objrange_tests;
+pub mod objstringio;
+pub mod objstringio_iobase;
+pub mod objstringio_types;
+#[cfg(test)]
+pub(crate) mod objstringio_tests;
+#[cfg(test)]
+pub(crate) mod objstringio_tests_ctx;
 pub mod objset;
 pub mod objset_methods;
 pub mod objslice;

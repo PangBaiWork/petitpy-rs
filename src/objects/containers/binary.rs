@@ -570,6 +570,13 @@ pub fn array_item_size(typecode: u8) -> Result<usize, BinaryError> {
 /// stored, never dereferenced); every byte READ goes through
 /// here.
 pub fn buffer_bytes(ctx: &CallCtx, value: Value) -> Option<(Vec<u8>, u8)> {
+    // String literals load as `Value::Qstr` (see
+    // `str_get_buffer`); the C's `mp_get_buffer` succeeds on
+    // them, so read the bytes from the pool (cloned — this
+    // fn returns owned bytes).
+    if let Value::Qstr(id) = value {
+        return Some((ctx.pool.qstr_str(id as u16).to_vec(), b'B'));
+    }
     let Value::Heap(r) = value else {
         return None;
     };

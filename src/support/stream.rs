@@ -52,7 +52,7 @@ use crate::objects::slots::{
     IoctlArg, SeekState, StreamIoctlFn, StreamP, StreamReadFn, StreamWriteFn,
 };
 use crate::objects::strings::objstr_a::{new_bytes, new_str};
-use crate::objects::value::{Obj, Value};
+use crate::objects::value::{GcRef, Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 
 // ── Constants (`stream.zig` top) ─────────────────────────────────────────
@@ -89,6 +89,14 @@ pub const SEEK_END: i32 = 2;
 /// negative offset.
 pub const MP_EINVAL: i32 = 22;
 
+/// `MP_EAGAIN` (11): `iobase_read_write` when the `readinto` /
+/// `write` method returns `None` (vendor `py/modio.c`).
+pub const MP_EAGAIN: i32 = 11;
+
+/// `MP_EFBIG` (27): `stringio_write` when the new position
+/// overflows `mp_uint_t` (vendor `py/objstringio.c`).
+pub const MP_EFBIG: i32 = 27;
+
 /// `DEFAULT_BUFFER_SIZE` (256): `streamReadall`'s chunk size.
 pub const DEFAULT_BUFFER_SIZE: usize = 256;
 
@@ -99,10 +107,27 @@ pub const DEFAULT_BUFFER_SIZE: usize = 256;
 /// with `.?` and panics; Rust returns `None`).
 pub fn get_stream(ctx: &CallCtx, stream: Value) -> Option<StreamP> {
     let t = obj_get_type(ctx.arena, ctx.types, stream)?;
-    match ctx.arena.get(t) {
-        Obj::Type(td) => td.protocol,
-        _ => None,
+    // The C copies the base type's slots into a subclass type at
+    // creation (`mp_obj_new_type`, vendor `py/objtype.c`), so a
+    // subclass instance resolves the base's protocol; Rust user
+    // types do not inherit `protocol` (`typecreate` sets `None`),
+    // so walk the MRO here instead — `class S(io.StringIO)` must
+    // `read()` like a `StringIO` (probed 2026-11-18: `S("hello")`
+    // `.read()` returns `'hello'`). The header type itself is
+    // checked first (ROM types carry the protocol directly; their
+    // `mro` may be empty).
+    let mut chain: Vec<GcRef> = vec![t];
+    if let Obj::Type(td) = ctx.arena.get(t) {
+        chain.extend(td.mro.iter().copied());
     }
+    for cand in chain {
+        if let Obj::Type(td) = ctx.arena.get(cand) {
+            if let Some(p) = td.protocol {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// `mp_get_stream_raise` (`py/stream.c:75`): the protocol, or

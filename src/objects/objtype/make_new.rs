@@ -44,6 +44,7 @@ use crate::objects::containers::objproperty::property_make_new;
 use crate::objects::containers::objrange::range_make_new;
 use crate::objects::containers::objset::set_make_new;
 use crate::objects::containers::objslice::slice_make_new;
+use crate::objects::containers::objstringio::{iobase_make_new, stringio_make_new};
 use crate::objects::containers::objtuple::tuple_make_new;
 use crate::objects::iters::objdeque::deque_make_new;
 use crate::objects::iters::objenumerate::enumerate_make_new;
@@ -384,4 +385,29 @@ pub fn bytearray_make_new_slot(
     let (pos, kwargs) = split_kwargs(ctx, args, n_kw)?;
     bytearray_make_new(ctx, array_type, type_, pos, &kwargs)
         .map_err(|e| ctx.record_typed(e))
+}
+
+/// `StringIO` / `BytesIO` (`objstringio.rs`): direct, error
+/// mapping only — one adapter serves both types (the C uses
+/// the same `stringio_make_new` for both, `objstringio.c:241
+/// / 252`).
+pub fn stringio_make_new_slot(
+    ctx: &mut CallCtx,
+    type_: GcRef,
+    args: &[Value],
+    n_kw: usize,
+) -> PyResult<Value> {
+    stringio_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
+}
+
+/// `IOBase` (`objstringio.rs`): direct, error mapping only
+/// (the C returns the static singleton, `modio.c:46-52`;
+/// the Rust `iobase_make_new` allocates fresh instead).
+pub fn iobase_make_new_slot(
+    ctx: &mut CallCtx,
+    type_: GcRef,
+    args: &[Value],
+    n_kw: usize,
+) -> PyResult<Value> {
+    iobase_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
 }

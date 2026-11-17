@@ -95,6 +95,14 @@ pub fn call_function_ctx(
             ctx, state, n_args, n_kw, args,
         );
     }
+    // The `help` builtin is intercepted the same way (C18b):
+    // the `"modules"` path needs the VM's module registries,
+    // which a `FunBuiltin` slot cannot see.
+    if fun == state.help_builtin {
+        return crate::runtime::builtinhelp::call_help_ctx(
+            ctx, state, n_args, n_kw, args,
+        );
+    }
     match fun {
         Value::Heap(r) => match ctx.arena.get(r) {
             Obj::FunBc(_) => call_fun_bc_ctx(ctx, state, r, n_args, n_kw, args),

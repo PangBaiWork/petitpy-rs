@@ -43,6 +43,9 @@ pub enum StrExc {
     IndexError,
     NotImplementedError,
     OverflowError,
+    /// Added by the main agent at the C8a merge (C7r added this variant
+    /// to C6's `ExcType`; the `StrError::Obj` mapping must cover it).
+    ZeroDivisionError,
 }
 
 impl StrExc {
@@ -53,6 +56,7 @@ impl StrExc {
             StrExc::IndexError => "IndexError",
             StrExc::NotImplementedError => "NotImplementedError",
             StrExc::OverflowError => "OverflowError",
+            StrExc::ZeroDivisionError => "ZeroDivisionError",
         }
     }
 }
@@ -138,6 +142,9 @@ impl StrError {
                 Some(crate::objects::obj::ExcType::OverflowError) => {
                     Some(StrExc::OverflowError)
                 }
+                Some(crate::objects::obj::ExcType::ZeroDivisionError) => {
+                    Some(StrExc::ZeroDivisionError)
+                }
                 None => None,
             },
         }
@@ -183,35 +190,7 @@ impl From<ObjError> for StrError {
     }
 }
 
-// ── installed types + pending error (thread-locals) ────────────────────
-
-// The builtin type refs, installed once by the VM (C13) at startup
-// and by test fixtures. Slot functions have frozen signatures
-// (`fn(&mut CallCtx, …)`) with no `&BuiltinTypes` parameter, so —
-// following the C6 test-harness precedent (`TEST_TYPES` in
-// `obj_tests.rs`) — they read the refs from here. Method functions
-// take `types` explicitly and never touch this cell. When C13 grows
-// `CallCtx` (design doc D5/D7), this cell is replaced by the
-// `CallCtx`-carried refs; until then a slot that finds nothing
-// installed returns `PyRaise` with no pending error (i.e.
-// "not implemented" — the honest fallback).
-// (A `///` doc comment on the `thread_local!` block itself is an
-// "unused doc comment" — the docs live on this comment instead.)
-thread_local! {
-    static INSTALLED_TYPES: std::cell::Cell<Option<BuiltinTypes>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Install the builtin type refs for the slot functions (and the
-/// `BuiltinFn` wrappers in `objstr_methods_b.rs`).
-pub fn install_builtin_types(types: BuiltinTypes) {
-    INSTALLED_TYPES.with(|c| c.set(Some(types)));
-}
-
-/// The installed builtin type refs, if any.
-pub(crate) fn installed_types() -> Option<BuiltinTypes> {
-    INSTALLED_TYPES.with(|c| c.get())
-}
+// ── pending error (thread-local) ────────────────────────────────────────
 
 // The pending str/bytes raise, as `(exception type, TERSE message)`.
 //

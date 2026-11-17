@@ -460,10 +460,8 @@ macro_rules! builtin_method {
             if args.is_empty() {
                 return Err(PyError::PyRaise);
             }
-            let Some(types) = installed_types() else {
-                return Err(PyError::PyRaise);
-            };
-            $f(ctx, &types, args).map_err(slot_raise)
+            let types = ctx.types;
+            $f(ctx, types, args).map_err(slot_raise)
         }
     };
 }

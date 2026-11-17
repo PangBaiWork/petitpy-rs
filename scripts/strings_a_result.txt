@@ -3,7 +3,13 @@
 - 工作区：`~/workspace/petitpy-rs-strings`，分支 `lane/strings-a`，基线 master `dda16a5`
 - 原项目：`~/workspace/petitpy-orig`，devel HEAD `df7de3a`（只读，未修改；`git status` 干净）
 - 状态：代码 + 测试全部完成，待主 agent 独立验证后合并（合并顺序：C7 先，C8a 后）
-- Commit: `74d0c36` "Lane C8a: port objstr part 1 to Rust"（11 files, +4046）——注：此 hash 为 amend 前的 HEAD；最终 HEAD hash 见 lane 执行者的最终报告（文件内容含自身 hash，无法在一次提交内自洽；主 agent 合并时可顺手改此行）
+- Commit: `0ecd2ab` "Lane C8a: port objstr part 1 to Rust"（11 files, +4046）——注：此 hash 由主 agent 在合并时修正（原文件写的是 amend 前的 `74d0c36`；文件内容含自身 hash，无法在一次提交内自洽）
+
+## 主 agent 合并时集成修正（commit `f8f060b` 合并后 + 本文件同批修正）
+
+- `objstr_tests.rs:146`：`CallCtx::new` 由 2 参改为 3 参（C7r 给 CallCtx 加了 `types` 字段；本 lane 切自 C7r 之前的主线，旧调用编译失败）——`CallCtx::new(&mut self.arena, &mut self.roots, &self.types)`。
+- `objstr_a.rs` 的 `StrError::Obj` 映射：C7r 给 C6 的 `ExcType` 加了 `ZeroDivisionError`，本 lane 的穷举 match 未覆盖——`StrExc` 新增 `ZeroDivisionError` 变体 + `name()` 分支 + 映射分支。
+- **`INSTALLED_TYPES` thread-local 已删**（本 lane 的设计决策改为按 C7r 方向走）：3 处生产调用（`builtin_method!` 宏、methods_c 的 `str_binary_op` / `str_subscr`）改为 `let types = ctx.types;` 后传 `types`（C7r 的 `int_unary_slot` 同款写法）；`install_builtin_types` / `installed_types` / `INSTALLED_TYPES` 全部删除；fixture 的 `install_builtin_types(types)` 调用删除。`PENDING_STR_ERROR` cell 保留（待 C13 的 `VmState.pending_exc` 替换）。C8b 的交界面相应调整：不再从本 lane import `INSTALLED_TYPES` / `install_builtin_types` / `installed_types()`，其余 prelude 导出不变。
 
 ## 验收数字
 

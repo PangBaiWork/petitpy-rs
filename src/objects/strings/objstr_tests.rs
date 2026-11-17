@@ -133,7 +133,6 @@ impl Fx {
             list: mk_plain(&mut arena, b"list"),
             type_,
         };
-        install_builtin_types(types);
         clear_pending_str_error();
         Fx {
             arena,
@@ -143,7 +142,7 @@ impl Fx {
     }
 
     pub(crate) fn ctx(&mut self) -> CallCtx<'_> {
-        CallCtx::new(&mut self.arena, &mut self.roots)
+        CallCtx::new(&mut self.arena, &mut self.roots, &self.types)
     }
 
     pub(crate) fn s(&mut self, data: &[u8]) -> Value {

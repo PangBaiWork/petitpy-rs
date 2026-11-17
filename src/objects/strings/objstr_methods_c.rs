@@ -11,8 +11,8 @@
 //! The slot functions (`str_binary_op`, `str_subscr`,
 //! `bytes_subscr`, `str_unary_op`, `str_get_buffer`) have the
 //! frozen C6 signatures (`fn(&mut CallCtx, …) -> PyResult<…>`),
-//! so they resolve `&BuiltinTypes` through the `INSTALLED_TYPES`
-//! thread-local (`objstr_a.rs`) and record specific raises in the
+//! so they resolve `&BuiltinTypes` from `ctx.types` (the C7r
+//! CallCtx-carried registry) and record specific raises in the
 //! `PENDING_STR_ERROR` cell before returning `PyRaise` — see that
 //! file for the contract. The `*_inner` helpers take `types`
 //! explicitly and return `SlotResult` (`None` = the original
@@ -192,10 +192,8 @@ pub fn str_binary_op(
     lhs: Value,
     rhs: Value,
 ) -> PyResult<Value> {
-    let Some(types) = installed_types() else {
-        return Err(PyError::PyRaise);
-    };
-    match binary_op_inner(ctx, &types, op, lhs, rhs) {
+    let types = ctx.types;
+    match binary_op_inner(ctx, types, op, lhs, rhs) {
         None => Err(PyError::PyRaise),
         Some(Ok(v)) => Ok(v),
         Some(Err(e)) => Err(slot_raise(e)),
@@ -351,10 +349,8 @@ pub fn str_subscr(
     index: Value,
     arg: SubscrArg,
 ) -> PyResult<Value> {
-    let Some(types) = installed_types() else {
-        return Err(PyError::PyRaise);
-    };
-    match subscr_inner(ctx, &types, base, index, arg) {
+    let types = ctx.types;
+    match subscr_inner(ctx, types, base, index, arg) {
         None => Err(PyError::PyRaise),
         Some(Ok(v)) => Ok(v),
         Some(Err(e)) => Err(slot_raise(e)),

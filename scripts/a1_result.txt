@@ -1,0 +1,138 @@
+# Result — petitpy-rs Phase A1: qstr + grammar_data
+
+## Headline
+DONE. First code chunk of petitpy-rs: `src/compiler/qstr.rs` (port of
+qstr.zig) + `src/compiler/grammar_data.rs` (port of grammar_data.zig),
+lib+bin restructure, build.rs qstr codegen, 16/16 Rust tests pass,
+`cargo build --release` with ZERO warnings, no unsafe, every .rs file
+< 800 lines. One commit.
+
+## Baseline (original, measured this session)
+- `zig build unit-compiler` in petitpy-orig: 16/16 steps, 97/98 tests
+  passed (1 skipped); `compiler-qstr` 9/9 pass. No source changes in
+  petitpy-orig (git status clean after the run).
+- `zig-out/bin/qstr-test` (the qstr_test.zig differential CLI) cannot run
+  in this checkout: mpy-cross is not built / not on PATH (infra error,
+  exit 2). See "qstr_test.zig" below.
+
+## Files ported / created
+| File | Lines | Source |
+|---|---|---|
+| src/compiler/qstr.rs | 576 | qstr.zig (598), incl. all 9 unit tests + 2 extra |
+| src/compiler/grammar_data.rs | 448 | grammar_data.zig (1,083), generated |
+| src/compiler/mod.rs | 7 | new (module layout) |
+| src/lib.rs | 8 | new (lib+bin restructure) |
+| src/main.rs | 10 | skeleton, updated comment |
+| src/pyerr.rs | 40 | new, minimal PyError (see below) |
+| build.rs | 233 | new (qstr table codegen) |
+| vendor/qstrdefs.generated.h | 615 | verbatim copy of orig header (SHA-256 c7011306…) |
+| vendor/README.md | — | provenance note |
+| scripts/gen_grammar_data.py | — | generator for grammar_data.rs |
+| scripts/check_grammar_data.py | — | dump-and-diff verifier |
+| scripts/a1_result.txt | — | this file |
+
+## How the qstr table is reproduced (load-bearing)
+- The vendored header is a byte-identical copy of
+  petitpy-orig's `vendor/micropython_embed/genhdr/qstrdefs.generated.h`
+  (orig HEAD df7de3a; SHA-256 verified equal after copy).
+- `build.rs` parses the header at build time (same grammar as the Zig
+  comptime parser in qstr.zig: QDEF0/QDEF1 lines, hash/len/string with
+  C-escape decoding, declared-len check) and emits `OUT_DIR/qstr_table.rs`
+  with QSTR_STRINGS / QSTR_HASHES / QSTR_LENGTHS plus GEN_N_STATIC /
+  GEN_N_MAIN. Ids are file order, exactly as the vendor MP_QSTR_* enum.
+- Numbering CANNOT drift: build.rs panics if QDEF0 != 228 or QDEF1 != 385;
+  qstr.rs has compile-time asserts tying N_STATIC/N_MAIN to the generated
+  counts; and the Rust test `generated_table_matches_vendored_header`
+  independently re-parses the vendored header and compares all 613 entries.
+- Counts: N_STATIC 228, N_MAIN 385, N_TOTAL 613, QSTR_LAST_STATIC 165.
+
+## Tests (cargo test --release --lib --tests: 16 passed, 0 failed)
+Ported from the 9 `test` blocks in qstr.zig (the acceptance bar):
+ 1. comptime_pool_fingerprint_matches_vendor (228/385/613)
+ 2. well_known_qstr_ids_match_vendor — 26 ids pinned (Zig pins 7; this
+    port pins 26 incl. first/last + module names: builtins 63, sys 589,
+    os 511, math 489, io 462, time 596, gc 427, struct 584, array 355,
+    collections 376, re 539, socket 564, _json 334, {:#b} 612)
+ 3. djb2_runtime_hashes_match_vendor_precomputed (3 vectors)
+ 4. find_strn_empty_miss_static_hit
+ 5. from_strn_new_entry_gets_n_total_and_dedups
+ 6. accessors_dynamic_round_trip
+ 7. reset_dynamic_ids_renumber_from_n_total
+ 8. qstr_to_entry_static_cutoff_and_new_fallback
+ 9. long_string_255_ok_256_rejected (255 ok, 256 -> OutOfMemory)
+From grammar_data (generated file's own tests):
+ 10. tables_have_num_rules_entries (183 rules, combined 467)
+ 11. rule_id_constants_spot_check
+ 12. rule_act_spot_check
+ 13. every_rule_arg_slice_is_in_bounds
+ 14. get_rule_arg_spot_check (incl. the rule 1/2 overlap)
+Plus 2 extra-evidence tests (own, NOT part of the Zig bar):
+ 15. full_static_pool_self_consistent — every static id: len/hash match
+     djb2, find_strn returns its own id, re-intern returns the same id
+     (id 0 MP_QSTRnull exempt from the hash check: vendor records hash 0
+     for it by definition, 0 being the "hash not computed" sentinel,
+     while djb2("") is 5381; empty input short-circuits to id 1, so id
+     0's hash is never consulted)
+ 16. generated_table_matches_vendored_header — full 613-entry re-parse
+     comparison against the vendored header
+
+## grammar_data verification (dump-and-diff, not eyeballing)
+- `scripts/check_grammar_data.py`: PASS — all 1,030 values identical
+  (scalars 14, RULE_* 183, rule_act 183, combined 467, offset 183).
+- Structural finding (verified against vendor py/parse.c:1098-1099):
+  `get_rule_arg(id)` returns a pointer/slice at the rule's offset and
+  the caller reads `rule_act(id) & RULE_ACT_ARG_MASK` entries. Rule
+  spans are NOT a contiguous partition: 35 rules overlap the next rule's
+  span by one entry or leave a one-entry gap (vendor RULE_PADDING enum
+  construction). The port preserves this verbatim; the only invariant
+  asserted is that every [offset, offset+count) lies inside the combined
+  table, and the last rule's span ends exactly at 467.
+- The Zig file's `// RULE_x` comments sit on the SECOND entry of some
+  rules' spans (e.g. funcdef's span starts at 0x101a, the commented
+  line, while the previous rule's span ends at 0x2044 one entry earlier);
+  the test expectations follow the offset table, not the comments.
+
+## qstr_test.zig — NOT ported yet (deferred to Phase B, by design)
+- qstr_test.zig is a differential CLI program, not a unit-test file: it
+  needs `mpy.zig` (read .mpy) + a built mpy-cross binary. Neither exists
+  in the Rust port yet (mpy is Phase B) and mpy-cross is not built in
+  this checkout. Porting it now is impossible, not skipped.
+- Its assertions are covered in stronger form by tests 15–16 above:
+  every static id resolves to non-empty bytes with self-consistent
+  len/hash and re-interns to the same id; every .new literal interns
+  to id > QSTR_LAST_STATIC and dedups (covered by tests 5/8/15).
+- When mpy.zig lands (Phase B), the qstr_test.zig flow should be
+  re-implemented as a Rust integration check against mpy-cross output.
+
+## Divergences from the Zig original (all deliberate, documented in code)
+- Dynamic entries are owned `Vec<u8>` (no 128-byte chunk slabs, no
+  trailing NUL): chunk layout is an allocation detail with no observable
+  behavior; ids/bytes/lengths/hashes are identical.
+- `QstrEntry` is defined in qstr.rs (moves to mpy.rs in Phase B); the
+  Zig original likewise defines the conversion in qstr.zig.
+- `get_rule_arg` returns `&[u16]` of length `rule_act & 0x0f` instead of
+  a raw `[*]const u16` pointer (vendor parse.c reads exactly that many).
+- `PyError` is a minimal enum (`PyRaise`, `OutOfMemory`) + `PyResult<T>`
+  alias; the full taxonomy/pending_exc transport comes with the runtime.
+- RULE_* constants keep exact Zig/vendor names, so
+  `#![allow(non_upper_case_globals)]` is set on grammar_data.rs with a
+  justification comment (renaming would break line-by-line checkability).
+  This was the only warning source (183 warnings before the allow, 0 after).
+
+## What did NOT port cleanly
+- Nothing in scope failed to port. Two self-inflicted mistakes during the
+  work, both caught by tests before commit:
+  a) build.rs used `decoded.len` (field) instead of `decoded.len()`.
+  b) A spot-check expectation for RULE_funcdef was written from the Zig
+     file's misleading `// RULE_funcdef` comment line (0x2044) instead of
+     the offset table (0x101a); the test caught it, and the offset table
+     (verified by dump-and-diff) was confirmed correct.
+
+## Acceptance checklist
+- cargo test --release --lib --tests: 16 passed, 0 failed.
+- Qstr numbering: 26 ids asserted + full 613-entry header comparison.
+- cargo build --release: clean, 0 warnings.
+- No new unsafe (grep: none). Pure Rust std, no external crates.
+- Every .rs file < 800 lines (max qstr.rs 576, grammar_data.rs 448).
+- petitpy-orig untouched (read-only; git status clean after baseline run).
+- Commit: one commit for this chunk (see git log).

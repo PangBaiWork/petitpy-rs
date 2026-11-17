@@ -1,0 +1,581 @@
+//! Value / Obj — the native Rust value model (C0, frozen interface).
+//!
+//! Port of the *semantics* of `src/objects/obj.zig` + `src/mp_mirrors.zig`
+//! (REPR_A tagging, `MpObjBase`, type ROMs). The C layout itself is NOT
+//! ported: there is no vendor C left to mirror, so values are native
+//! Rust. See `docs/value-obj-design.md` (D1–D8) for the frozen decisions.
+//!
+//! Layout:
+//! - `Value` — Copy enum: immediates inline, heap objects by `GcRef`.
+//! - `GcRef` — arena slot index (stable: the GC never moves objects).
+//! - `Obj` — every object kind as a variant. Variant set frozen; each
+//!   variant's payload struct is owned by its lane and may evolve.
+//! - `TypeData` — types are heap objects (`Obj::Type`); method slots are
+//!   Rust fn pointers, one per `mp_obj_type_t` slot.
+
+use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::pyerr::PyResult;
+use crate::vendor::mpz::BigInt;
+
+/// Small-int window (REPR_A, 62 bits; `mp_mirrors.zig:548-551`).
+pub const SMALL_INT_BITS: u8 = 63;
+pub const SMALL_INT_MAX: i64 = (1i64 << 62) - 1;
+pub const SMALL_INT_MIN: i64 = -(1i64 << 62);
+
+/// Whether `n` fits in a small int (`MP_SMALL_INT_FITS`).
+pub fn small_int_fits(n: i64) -> bool {
+    (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&n)
+}
+
+/// A Python value.
+///
+/// Immediates are inline (like the Zig `Obj = usize` immediates);
+/// heap objects live in the `GcArena` and are named by `GcRef`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Value {
+    /// 62-bit small int (`(n << 1) | 1` in Zig).
+    SmallInt(i64),
+    Bool(bool),
+    None,
+    /// Interned string immediate (`(q << 3) | 2` in Zig); `u32` is the
+    /// qstr id, shared with the compiler qstr table (A1).
+    Qstr(u32),
+    /// Heap object handle.
+    Heap(GcRef),
+}
+
+/// Arena slot index. Stable for the object's lifetime: mark-sweep never
+/// moves objects, so a `GcRef` stays valid until the object is collected
+/// (and no live `Value` may point at a collected slot — see `RootSet`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GcRef(pub u32);
+
+impl Value {
+    pub fn none() -> Value {
+        Value::None
+    }
+
+    pub fn new_bool(b: bool) -> Value {
+        Value::Bool(b)
+    }
+
+    pub fn qstr(id: u32) -> Value {
+        Value::Qstr(id)
+    }
+
+    pub fn heap(r: GcRef) -> Value {
+        Value::Heap(r)
+    }
+
+    /// Small int when `n` fits the 62-bit window, else `None`
+    /// (the caller allocates a heap `Int(BigInt)` instead).
+    pub fn small_int(n: i64) -> Option<Value> {
+        if small_int_fits(n) {
+            Some(Value::SmallInt(n))
+        } else {
+            None
+        }
+    }
+
+    /// Integer value: small int in-window, heap `Int(BigInt)` out of
+    /// window (mirrors `objint.c`'s small/mpz split; `type_` is the
+    /// int type object, `None` while bootstrapping).
+    pub fn int(arena: &mut GcArena, type_: Option<GcRef>, roots: &RootSet, n: i64) -> Value {
+        match Value::small_int(n) {
+            Some(v) => v,
+            None => Value::Heap(arena.alloc(type_, Obj::Int(BigInt::from_int(n)), roots)),
+        }
+    }
+
+    pub fn is_small_int(&self) -> bool {
+        matches!(self, Value::SmallInt(_))
+    }
+
+    pub fn is_qstr(&self) -> bool {
+        matches!(self, Value::Qstr(_))
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, Value::None)
+    }
+
+    pub fn is_bool(&self) -> bool {
+        matches!(self, Value::Bool(_))
+    }
+
+    pub fn is_heap(&self) -> bool {
+        matches!(self, Value::Heap(_))
+    }
+
+    pub fn as_small_int(&self) -> Option<i64> {
+        match self {
+            Value::SmallInt(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn as_qstr(&self) -> Option<u32> {
+        match self {
+            Value::Qstr(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    pub fn as_heap(&self) -> Option<GcRef> {
+        match self {
+            Value::Heap(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// Truth testing (`mp_obj_is_true`). Immediates + heap primitives
+    /// here; `__bool__`/`__len__` dispatch on user objects is the
+    /// C6 (OBJ-CORE) lane's.
+    pub fn is_true(&self, arena: &GcArena) -> PyResult<bool> {
+        match self {
+            Value::None => Ok(false),
+            Value::Bool(b) => Ok(*b),
+            Value::SmallInt(n) => Ok(*n != 0),
+            Value::Qstr(_) => Ok(true),
+            Value::Heap(r) => match arena.get(*r) {
+                Obj::Float(f) => Ok(*f != 0.0),
+                Obj::Int(z) => Ok(!z.is_zero()),
+                Obj::Complex { re, im } => Ok(*re != 0.0 || *im != 0.0),
+                Obj::Str(s) => Ok(!s.bytes.is_empty()),
+                Obj::Bytes(b) => Ok(!b.bytes.is_empty()),
+                Obj::Tuple(t) => Ok(!t.is_empty()),
+                Obj::List(l) => Ok(!l.items.is_empty()),
+                Obj::Dict(d) => Ok(!d.map.entries.is_empty()),
+                Obj::Set(s) => Ok(!s.items.is_empty()),
+                _ => Ok(true),
+            },
+        }
+    }
+}
+
+/// Header of every heap object: its type (a `GcRef` to an `Obj::Type`
+/// slot) plus GC flags. `type_` is `None` only while bootstrapping the
+/// very first type objects (in MicroPython `mp_type_type`'s type is
+/// itself — the same circularity, resolved at startup).
+#[derive(Clone, Copy, Debug)]
+pub struct ObjHeader {
+    pub type_: Option<GcRef>,
+    pub flags: u8,
+}
+
+impl ObjHeader {
+    pub const FLAG_MARK: u8 = 0x01;
+    pub const FLAG_FINALISER: u8 = 0x02;
+
+    pub fn new(type_: Option<GcRef>) -> ObjHeader {
+        ObjHeader { type_, flags: 0 }
+    }
+}
+
+/// A heap object. Variant set frozen (`docs/value-obj-design.md` D4);
+/// payload structs are lane-owned and may evolve.
+#[derive(Clone, Debug)]
+pub enum Obj {
+    Float(f64),
+    Int(BigInt),
+    Complex { re: f64, im: f64 },
+    Str(StrData),
+    Bytes(BytesData),
+    Tuple(Vec<Value>),
+    List(ListData),
+    Dict(DictData),
+    Set(SetData),
+    Array(ArrayData),
+    Range(RangeData),
+    Slice(SliceData),
+    FunBc(FunBcData),
+    FunBuiltin(FunBuiltinData),
+    BoundMeth(BoundMethData),
+    Closure(ClosureData),
+    Generator(GeneratorData),
+    Cell(CellData),
+    Type(TypeData),
+    Module(ModuleData),
+    Exception(ExceptionData),
+    Property(PropertyData),
+    Super(SuperData),
+    Iterator(IteratorData),
+    Deque(DequeData),
+    NamedTuple(NamedTupleData),
+    AttrTuple(AttrTupleData),
+    Map(MapData),
+}
+
+impl Obj {
+    /// Rough heap footprint in bytes (GC accounting; C4 refines this to
+    /// the original's block accounting).
+    pub fn heap_bytes(&self) -> usize {
+        const HDR: usize = 16;
+        HDR + match self {
+            Obj::Float(_) | Obj::Complex { .. } | Obj::Range(_) => 16,
+            Obj::Int(z) => z.num_digits() * 4,
+            Obj::Str(s) => s.bytes.len(),
+            Obj::Bytes(b) => b.bytes.len(),
+            Obj::Tuple(t) => t.len() * 8,
+            Obj::List(l) => l.items.len() * 8,
+            Obj::Dict(d) => d.map.entries.len() * 16,
+            Obj::Set(s) => s.items.len() * 8,
+            Obj::Array(a) => a.items.len() * 8,
+            Obj::Slice(_) => 24,
+            Obj::FunBc(_) | Obj::FunBuiltin(_) => 32,
+            Obj::BoundMeth(_) | Obj::Cell(_) | Obj::Super(_) => 16,
+            Obj::Closure(c) => c.cells.len() * 4,
+            Obj::Generator(_) => 32,
+            Obj::Type(t) => t.mro.len() * 4 + 64,
+            Obj::Module(_) | Obj::Exception(_) | Obj::Property(_) => 48,
+            Obj::Iterator(i) => i.extra.len() * 8 + 16,
+            Obj::Deque(d) => d.items.len() * 8,
+            Obj::NamedTuple(n) => n.items.len() * 8,
+            Obj::AttrTuple(a) => a.items.len() * 8,
+            Obj::Map(m) => m.entries.len() * 16,
+        }
+    }
+
+    /// Child `Value`s this object keeps alive (GC tracing). Lanes extend
+    /// this when they fill in a payload; a payload left as a leaf here
+    /// must hold no `Value`/`GcRef` children.
+    pub fn children(&self) -> Vec<Value> {
+        match self {
+            Obj::Tuple(t) => t.clone(),
+            Obj::List(l) => l.items.clone(),
+            Obj::Dict(d) => {
+                let mut out = Vec::with_capacity(d.map.entries.len() * 2);
+                for (k, v) in &d.map.entries {
+                    out.push(*k);
+                    out.push(*v);
+                }
+                out
+            }
+            Obj::Set(s) => s.items.clone(),
+            Obj::Array(a) => a.items.clone(),
+            Obj::Slice(s) => [s.start, s.stop, s.step].into_iter().flatten().collect(),
+            Obj::BoundMeth(b) => vec![b.func, b.self_],
+            Obj::Closure(c) => {
+                let mut out = vec![Value::Heap(c.fun)];
+                out.extend(c.cells.iter().map(|r| Value::Heap(*r)));
+                out
+            }
+            Obj::Generator(g) => vec![Value::Heap(g.fun)],
+            Obj::Cell(c) => c.value.into_iter().collect(),
+            Obj::Type(t) => {
+                let mut out: Vec<Value> = t.mro.iter().map(|r| Value::Heap(*r)).collect();
+                if let Some(b) = t.base {
+                    out.push(Value::Heap(b));
+                }
+                out.push(Value::Heap(t.dict));
+                out
+            }
+            Obj::Module(m) => vec![Value::Heap(m.dict)],
+            Obj::Exception(e) => {
+                let mut out = vec![Value::Heap(e.type_)];
+                out.extend(e.args.iter().copied());
+                out
+            }
+            Obj::Property(p) => vec![p.getter, p.setter, p.deleter],
+            Obj::Super(s) => vec![Value::Heap(s.type_), s.obj],
+            Obj::Iterator(i) => {
+                let mut out = vec![i.source];
+                out.extend(i.extra.iter().copied());
+                out
+            }
+            Obj::Deque(d) => d.items.clone(),
+            Obj::NamedTuple(n) => {
+                let mut out = vec![Value::Heap(n.type_)];
+                out.extend(n.items.iter().copied());
+                out
+            }
+            Obj::AttrTuple(a) => a.items.clone(),
+            Obj::Map(m) => {
+                let mut out = Vec::with_capacity(m.entries.len() * 2);
+                for (k, v) in &m.entries {
+                    out.push(*k);
+                    out.push(*v);
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+// ── Payload structs (lane-owned; simple initial forms) ─────────────
+
+/// Dynamic string bytes (UTF-8 under `STR_UNICODE=1`). C8 owns.
+#[derive(Clone, Debug)]
+pub struct StrData {
+    pub bytes: Vec<u8>,
+}
+
+/// Bytes object. C8 owns.
+#[derive(Clone, Debug)]
+pub struct BytesData {
+    pub bytes: Vec<u8>,
+}
+
+/// List object. C9 owns.
+#[derive(Clone, Debug)]
+pub struct ListData {
+    pub items: Vec<Value>,
+}
+
+/// Low-level key/value map (`mp_map_t`). C9 owns.
+#[derive(Clone, Debug)]
+pub struct MapData {
+    pub entries: Vec<(Value, Value)>,
+}
+
+/// Dict object (a map). C9 owns.
+#[derive(Clone, Debug)]
+pub struct DictData {
+    pub map: MapData,
+}
+
+/// Set object. C9 owns.
+#[derive(Clone, Debug)]
+pub struct SetData {
+    pub items: Vec<Value>,
+}
+
+/// Array object (`array` module type). C9 owns.
+#[derive(Clone, Debug)]
+pub struct ArrayData {
+    pub typecode: u8,
+    pub items: Vec<Value>,
+}
+
+/// Range object. C9 owns.
+#[derive(Clone, Debug)]
+pub struct RangeData {
+    pub start: i64,
+    pub stop: i64,
+    pub step: i64,
+}
+
+/// Slice object; bounds are `None` or int values. C9 owns.
+#[derive(Clone, Debug)]
+pub struct SliceData {
+    pub start: Option<Value>,
+    pub stop: Option<Value>,
+    pub step: Option<Value>,
+}
+
+/// Bytecode function (`mp_obj_fun_bc_t`). `code` is an index into the
+/// VM's code store (owned by C13); the VM roots the store. C10 owns.
+#[derive(Clone, Debug)]
+pub struct FunBcData {
+    pub name: u32,
+    pub n_args: u16,
+    pub code: usize,
+}
+
+/// Built-in function (`mp_obj_fun_builtin_t`). C10 / D1 own the registry.
+#[derive(Clone, Debug)]
+pub struct FunBuiltinData {
+    pub name: u32,
+    pub n_args: u16,
+    pub func: BuiltinFn,
+}
+
+/// Bound method (`mp_obj_bound_meth_t`). C10 owns.
+#[derive(Clone, Debug)]
+pub struct BoundMethData {
+    pub func: Value,
+    pub self_: Value,
+}
+
+/// Closure (`mp_obj_closure_t`). C10 owns.
+#[derive(Clone, Debug)]
+pub struct ClosureData {
+    pub fun: GcRef,
+    pub cells: Vec<GcRef>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GenState {
+    New,
+    Suspended,
+    Running,
+    Closed,
+}
+
+/// Generator (`mp_obj_gen_instance_t`). C10 owns; the frame lives in the
+/// VM (C13).
+#[derive(Clone, Debug)]
+pub struct GeneratorData {
+    pub fun: GcRef,
+    pub state: GenState,
+}
+
+/// Cell (`mp_obj_cell_t`); `None` is an empty cell. C7 owns.
+#[derive(Clone, Debug)]
+pub struct CellData {
+    pub value: Option<Value>,
+}
+
+/// A type object (`mp_obj_type_t`). C12 owns.
+#[derive(Clone, Debug)]
+pub struct TypeData {
+    /// Type name (qstr id).
+    pub name: u32,
+    /// `mp_obj_type_t.flags`.
+    pub flags: u16,
+    /// Base class (`Obj::Type` slot), if any.
+    pub base: Option<GcRef>,
+    /// C3 linearization (type slots, self first).
+    pub mro: Vec<GcRef>,
+    /// Type dict (`Obj::Dict` slot).
+    pub dict: GcRef,
+    pub unary_op: Option<UnaryOpFn>,
+    pub binary_op: Option<BinaryOpFn>,
+    pub call: Option<CallFn>,
+    pub getiter: Option<GetIterFn>,
+}
+
+/// Module object (`mp_obj_module_t`). C12 owns.
+#[derive(Clone, Debug)]
+pub struct ModuleData {
+    pub name: u32,
+    pub dict: GcRef,
+}
+
+/// One traceback frame (file/name as qstr ids). C6 owns the rendering.
+#[derive(Clone, Debug)]
+pub struct TraceFrame {
+    pub name: u32,
+    pub line: u32,
+}
+
+/// Exception instance (`mp_obj_exception_t`). C6 owns.
+#[derive(Clone, Debug)]
+pub struct ExceptionData {
+    pub type_: GcRef,
+    pub args: Vec<Value>,
+    pub traceback: Vec<TraceFrame>,
+}
+
+/// Property object. C9 owns.
+#[derive(Clone, Debug)]
+pub struct PropertyData {
+    pub getter: Value,
+    pub setter: Value,
+    pub deleter: Value,
+}
+
+/// Super object (`mp_obj_super_t`). C12 owns.
+#[derive(Clone, Debug)]
+pub struct SuperData {
+    pub type_: GcRef,
+    pub obj: Value,
+}
+
+/// Generic iterator state; specific iterators (enumerate/zip/filter/…)
+/// are C11's and may grow this struct. C11 owns.
+#[derive(Clone, Debug)]
+pub struct IteratorData {
+    pub source: Value,
+    pub index: usize,
+    pub extra: Vec<Value>,
+}
+
+/// Deque object. C11 owns.
+#[derive(Clone, Debug)]
+pub struct DequeData {
+    pub items: Vec<Value>,
+}
+
+/// Named-tuple instance. C11 owns.
+#[derive(Clone, Debug)]
+pub struct NamedTupleData {
+    pub type_: GcRef,
+    pub items: Vec<Value>,
+}
+
+/// Attribute tuple (`mp_obj_attrtuple_t`). C9 owns.
+#[derive(Clone, Debug)]
+pub struct AttrTupleData {
+    pub items: Vec<Value>,
+}
+
+// ── Method-slot fn types (mirror `mp_obj_type_t` slots) ─────────────
+
+/// `fn(&mut CallCtx, Value) -> PyResult<Value>` — unary-op slot.
+pub type UnaryOpFn = for<'a> fn(&mut CallCtx<'a>, Value) -> PyResult<Value>;
+/// `fn(&mut CallCtx, Value, Value) -> PyResult<Value>` — binary-op slot.
+pub type BinaryOpFn = for<'a> fn(&mut CallCtx<'a>, Value, Value) -> PyResult<Value>;
+/// `fn(&mut CallCtx, Value, &[Value]) -> PyResult<Value>` — call slot.
+pub type CallFn = for<'a> fn(&mut CallCtx<'a>, Value, &[Value]) -> PyResult<Value>;
+/// `fn(&mut CallCtx, Value) -> PyResult<Value>` — getiter slot.
+pub type GetIterFn = for<'a> fn(&mut CallCtx<'a>, Value) -> PyResult<Value>;
+/// Built-in function body.
+pub type BuiltinFn = for<'a> fn(&mut CallCtx<'a>, &[Value]) -> PyResult<Value>;
+
+/// Unused placeholder for slot types not yet needed; keeps the
+/// `PyError` import used in this module's doc examples.
+#[allow(dead_code)]
+fn _assert_pyresult(_: PyResult<Value>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::gc::{GcArena, RootSet};
+
+    #[test]
+    fn small_int_window_boundaries() {
+        // Mirrors mp_mirrors.zig:548-551.
+        assert_eq!(SMALL_INT_MAX, (1i64 << 62) - 1);
+        assert_eq!(SMALL_INT_MIN, -(1i64 << 62));
+        assert!(small_int_fits(0));
+        assert!(small_int_fits(SMALL_INT_MAX));
+        assert!(small_int_fits(SMALL_INT_MIN));
+        assert!(!small_int_fits(SMALL_INT_MAX + 1));
+        assert!(!small_int_fits(SMALL_INT_MIN - 1));
+        assert_eq!(Value::small_int(5), Some(Value::SmallInt(5)));
+        assert_eq!(Value::small_int(1i64 << 62), None);
+    }
+
+    #[test]
+    fn immediates_identity() {
+        // Mirrors the OBJ_* constants (mp_mirrors.zig:492-497).
+        assert_eq!(Value::none(), Value::None);
+        assert_eq!(Value::new_bool(true), Value::Bool(true));
+        assert_ne!(Value::new_bool(true), Value::new_bool(false));
+        assert_ne!(Value::none(), Value::new_bool(false));
+        assert_eq!(Value::qstr(42), Value::Qstr(42));
+        assert!(Value::Qstr(7).is_qstr());
+        assert!(Value::SmallInt(-3).is_small_int());
+        assert!(Value::None.is_none());
+        assert!(!Value::SmallInt(0).is_none());
+    }
+
+    #[test]
+    fn int_out_of_window_goes_to_heap() {
+        let mut arena = GcArena::new();
+        let roots = RootSet::new();
+        let big = 1i64 << 62;
+        let v = Value::int(&mut arena, None, &roots, big);
+        assert!(v.is_heap());
+        match arena.get(v.as_heap().unwrap()) {
+            // 2^62 fits in i64 (just outside the 62-bit small-int window).
+            Obj::Int(z) => assert_eq!(z.as_int_checked(), Some(1i64 << 62)),
+            other => panic!("expected Int, got {:?}", other),
+        }
+        let small = Value::int(&mut arena, None, &roots, 7);
+        assert_eq!(small, Value::SmallInt(7));
+    }
+
+    #[test]
+    fn truth_table_primitives() {
+        let arena = GcArena::new();
+        assert!(!Value::None.is_true(&arena).unwrap());
+        assert!(!Value::Bool(false).is_true(&arena).unwrap());
+        assert!(Value::Bool(true).is_true(&arena).unwrap());
+        assert!(!Value::SmallInt(0).is_true(&arena).unwrap());
+        assert!(Value::SmallInt(-1).is_true(&arena).unwrap());
+        assert!(Value::Qstr(0).is_true(&arena).unwrap());
+    }
+}

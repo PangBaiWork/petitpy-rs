@@ -74,6 +74,9 @@ pub(crate) fn wrap_gen(
                 name: name_id,
                 n_args: n_pos as u16,
                 code: 0,
+                def_pos: Vec::new(),
+                def_kw: None,
+                context: None,
             }),
         );
         let empty_tuple = ctx.alloc(None, Obj::Tuple(Vec::new()));
@@ -121,6 +124,9 @@ pub(crate) fn try_wrap_gen(
                 name: name_id,
                 n_args: n_pos as u16,
                 code: 0,
+                def_pos: Vec::new(),
+                def_kw: None,
+                context: None,
             }),
         );
         let empty_tuple = ctx.alloc(None, Obj::Tuple(Vec::new()));

@@ -648,7 +648,13 @@ pub fn gen_instance_print(
 /// returns `PyRaise` (not implemented, the C6 slot convention).
 /// The real constructor is `gen_wrap_call` (explicit
 /// code/qstr-table/extra-args parameters).
-pub fn gen_wrap_call_slot(ctx: &mut CallCtx, _self: Value, _args: &[Value]) -> PyResult<Value> {
+pub fn gen_wrap_call_slot(
+    ctx: &mut CallCtx,
+    _self: Value,
+    _n_args: usize,
+    _n_kw: usize,
+    _args: &[Value],
+) -> PyResult<Value> {
     let _ = ctx;
     Err(PyError::PyRaise)
 }
@@ -771,6 +777,8 @@ pub fn gen_instance_locals_dict(ctx: &mut CallCtx) -> GcRef {
                 name: id,
                 n_args,
                 func,
+                // Fixed-arity builtins: no keyword parameters (C10a).
+                kw_func: None,
             }),
         );
         entries.push((Value::Qstr(id), Value::Heap(fun)));

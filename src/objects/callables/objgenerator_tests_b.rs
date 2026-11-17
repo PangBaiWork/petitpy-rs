@@ -333,6 +333,9 @@ fn builtin_stubs_and_wrap_slot_are_not_implemented() {
             name: 0,
             n_args: 0,
             code: 0,
+            def_pos: Vec::new(),
+            def_kw: None,
+            context: None,
         })))
     };
     let mut ctx = fx.ctx();
@@ -357,7 +360,7 @@ fn builtin_stubs_and_wrap_slot_are_not_implemented() {
     );
     // The gen_wrap type's call slot is the same story.
     assert_eq!(
-        call(&mut ctx, fun, &[]).unwrap_err(),
+        call(&mut ctx, fun, 0, 0, &[]).unwrap_err(),
         crate::pyerr::PyError::PyRaise
     );
 }

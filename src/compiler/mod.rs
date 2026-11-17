@@ -4,4 +4,5 @@
 //! `grammar_data`; the lexer/parser/compiler follow in A2/A3.
 
 pub mod grammar_data;
+pub mod lexer;
 pub mod qstr;

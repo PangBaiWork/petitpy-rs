@@ -10,6 +10,7 @@
 //! OBJECT (built via `exc_from_typed` / `exc_from_pyerror` /
 //! `exc_from_gen_error` from `vm_ops`).
 
+use crate::compiler::parser::InputKind;
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objfun::{call_fun_builtin, fun_bc_prepare_call};
 use crate::objects::callables::objgenerator::gen_wrap_call;
@@ -44,6 +45,35 @@ pub fn call_function_ctx(
     // needs the VM's `iternext` seams — see `call_next`).
     if fun == state.next_builtin {
         return call_next_ctx(ctx, state, n_args, args);
+    }
+    // The `eval`/`exec`/`compile` builtins are intercepted the
+    // same way (C15a): they need the VM's globals/locals and
+    // code registration, which a `FunBuiltin` slot cannot see.
+    // (`eval` is `EvalInput`, `exec` is `FileInput` —
+    // `compile_glue`'s mode table; the two differ only in
+    // whether the body value is returned.)
+    if fun == state.eval_builtin {
+        return crate::runtime::builtinevex::call_eval_exec_ctx(
+            ctx,
+            state,
+            InputKind::EvalInput,
+            n_args,
+            n_kw,
+            args,
+        );
+    }
+    if fun == state.exec_builtin {
+        return crate::runtime::builtinevex::call_eval_exec_ctx(
+            ctx,
+            state,
+            InputKind::FileInput,
+            n_args,
+            n_kw,
+            args,
+        );
+    }
+    if fun == state.compile_builtin {
+        return crate::runtime::builtinevex::call_compile_ctx(ctx, state, n_args, n_kw, args);
     }
     match fun {
         Value::Heap(r) => match ctx.arena.get(r) {

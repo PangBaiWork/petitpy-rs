@@ -252,25 +252,25 @@ impl QstrContext {
         self.entries[idx].hash
     }
 
-    /// Boundary helper for the .mpy emitter (moves to `mpy.rs` when that
-    /// module is ported; defined here because the Zig original defines
-    /// the conversion in qstr.zig).
+    /// Boundary helper for the .mpy emitter.
     ///
     /// Encoding rule (vendor persistentcode.c:574): ids
     /// <= QSTR_LAST_STATIC are emitted as `.static` (cheap vlen
-    /// reference); everything else is `.new` (inline bytes). For
-    /// dynamic ids the bytes live in the context, so the returned
-    /// slice borrows from this context.
-    pub fn to_entry(&self, id: Qstr) -> QstrEntry<'_> {
+    /// reference); everything else is `.new` (inline bytes). Returns
+    /// the owned `mpy::QstrEntry` (the type moved to `mpy.rs` with the
+    /// .mpy port — the Zig original defines it as `mpy.QstrEntry` too,
+    /// and `qstr.zig` only holds the conversion); the `.new` bytes are
+    /// copied because the owned form outlives this context's borrow.
+    pub fn to_entry(&self, id: Qstr) -> super::mpy::QstrEntry {
         if id <= QSTR_LAST_STATIC {
-            return QstrEntry::Static(id);
+            return super::mpy::QstrEntry::Static(id);
         }
         if id < N_TOTAL {
-            return QstrEntry::New(QSTR_STRINGS[id as usize]);
+            return super::mpy::QstrEntry::New(QSTR_STRINGS[id as usize].to_vec());
         }
         let idx = (id - N_TOTAL) as usize;
         assert!(idx < self.entries.len(), "dynamic qstr id out of range");
-        QstrEntry::New(&self.entries[idx].bytes)
+        super::mpy::QstrEntry::New(self.entries[idx].bytes.clone())
     }
 }
 
@@ -280,18 +280,10 @@ impl Default for QstrContext {
     }
 }
 
-/// One entry of a .mpy file's qstr table (mirrors `mpy.QstrEntry`).
-///
-/// The enum lives here until `mpy.rs` is ported (Phase B); the Zig
-/// original likewise defines the conversion in qstr.zig.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QstrEntry<'a> {
-    /// Cheap vlen reference to a compile-time qstr id.
-    Static(Qstr),
-    /// Inline bytes (compile-time qstr above the static cutoff, or a
-    /// dynamic qstr).
-    New(&'a [u8]),
-}
+/// One entry of a .mpy file's qstr table — re-exported from `mpy.rs`,
+/// where the type lives (it is `mpy.QstrEntry` in the Zig original too).
+/// Kept here so existing `qstr::QstrEntry` paths keep working.
+pub use super::mpy::QstrEntry;
 
 #[cfg(test)]
 mod tests {
@@ -418,12 +410,15 @@ mod tests {
         // QSTR_LAST_STATIC < id < N_TOTAL -> .new (inline static bytes)
         let above = QSTR_LAST_STATIC + 5;
         let e_above = ctx.to_entry(above);
-        assert_eq!(QstrEntry::New(QSTR_STRINGS[above as usize]), e_above);
+        assert_eq!(
+            QstrEntry::New(QSTR_STRINGS[above as usize].to_vec()),
+            e_above
+        );
 
         // dynamic -> .new (inline dynamic bytes)
         let dyn_id = ctx.from_strn(b"dynamic_q").unwrap();
         let e_dyn = ctx.to_entry(dyn_id);
-        assert_eq!(QstrEntry::New(b"dynamic_q"), e_dyn);
+        assert_eq!(QstrEntry::New(b"dynamic_q".to_vec()), e_dyn);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{
     BytesData, DictData, GcRef, MapData, Obj, StrData, TypeData, Value,
 };
+use crate::runtime::qstr::RuntimeQstr;
 use crate::vendor::mpz::BigInt;
 
 pub(crate) fn static_resolver(id: u32) -> Option<Vec<u8>> {
@@ -23,13 +24,14 @@ pub(crate) struct Fixture {
     pub(crate) arena: GcArena,
     pub(crate) roots: RootSet,
     pub(crate) types: BuiltinTypes,
+    pub(crate) pool: RuntimeQstr,
 }
 
 pub(crate) fn empty_dict(arena: &mut GcArena, roots: &RootSet) -> GcRef {
     arena.alloc(
         None,
         Obj::Dict(DictData {
-            map: MapData { entries: Vec::new() },
+            map: MapData::new(),
         }),
         roots,
     )
@@ -67,8 +69,9 @@ impl Fixture {
         let complex = make_type(&mut arena, &roots, b"complex");
         let tuple = make_type(&mut arena, &roots, b"tuple");
         let list = make_type(&mut arena, &roots, b"list");
+        let dict = make_type(&mut arena, &roots, b"dict");
         let type_ = make_type(&mut arena, &roots, b"type");
-        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, type_] {
+        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, dict, type_] {
             roots.push(Value::Heap(t));
         }
         let types = BuiltinTypes {
@@ -81,13 +84,14 @@ impl Fixture {
             complex,
             tuple,
             list,
+            dict,
             type_,
         };
-        Fixture { arena, roots, types }
+        Fixture { arena, roots, types, pool: RuntimeQstr::new() }
     }
 
     pub(crate) fn call<R>(&mut self, f: impl FnOnce(&mut CallCtx<'_>, &BuiltinTypes) -> R) -> R {
-        let mut ctx = CallCtx::new(&mut self.arena, &mut self.roots, &self.types);
+        let mut ctx = CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool);
         f(&mut ctx, &self.types)
     }
 

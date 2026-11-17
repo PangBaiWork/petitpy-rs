@@ -28,7 +28,7 @@ fn get_type_str_names() {
 #[test]
 fn equal_reflexive_and_small_ints() {
     let mut fx = Fixture::new();
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     assert_eq!(
         obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, Value::SmallInt(5), Value::SmallInt(5)).unwrap(),
         Value::Bool(true)
@@ -68,7 +68,7 @@ fn equal_str_fast_path() {
             bytes: b"str".to_vec(),
         }),
     );
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     assert!(obj_equal(&mut ctx, &fx.types, a, b).unwrap());
     assert!(!obj_equal(&mut ctx, &fx.types, a, c).unwrap());
     assert!(obj_equal(&mut ctx, &fx.types, q, h).unwrap());
@@ -92,7 +92,7 @@ fn equal_via_slot_and_neq_first() {
     );
     let v1 = fx.value_of(t, Obj::Float(1.0));
     let v2 = fx.value_of(t, Obj::Float(2.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     assert_eq!(
         obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, v1, v2).unwrap(),
         Value::Bool(true)
@@ -119,7 +119,7 @@ fn equal_not_equal_without_neq_test_inverts_equal() {
     );
     let v1 = fx.value_of(t, Obj::Float(1.0));
     let v2 = fx.value_of(t, Obj::Float(2.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     // Equal says true → NOT_EQUAL is false.
     assert_eq!(
         obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::NotEqual, v1, v2).unwrap(),
@@ -154,7 +154,7 @@ fn equal_reflexive_flag_goes_to_slot() {
         None,
     );
     let w = fx.value_of(t2, Obj::Float(1.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     assert_eq!(
         obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, v, v).unwrap(),
         Value::Bool(false)
@@ -173,7 +173,7 @@ fn equal_cross_type_flag_skips_dispatch() {
     let t = fx.slotted_type("float", 0, None, Some(eq_true_slot), None, None, None, None);
     let v = fx.value_of(t, Obj::Float(1.0));
     let f = fx.value_of(fx.types.float, Obj::Float(1.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     assert!(!obj_equal(&mut ctx, &fx.types, v, f).unwrap());
 }
 
@@ -185,7 +185,7 @@ fn print_helper_fallback_and_slot() {
     let f = fx.value_of(fx.types.float, Obj::Float(1.5));
     let t = fx.slotted_type("float", 0, None, None, None, None, Some(print_marker_slot), None);
     let v = fx.value_of(t, Obj::Float(1.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     let mut s = String::new();
     obj_print_helper(&mut ctx, &fx.types, f, PrintKind::Repr, &mut s);
     assert_eq!(s, "<float>");
@@ -209,7 +209,7 @@ fn get_array_tuple_list_and_errors() {
             items: vec![Value::SmallInt(3)],
         }),
     );
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     assert_eq!(
         obj_get_array(&mut ctx, &fx.types, tup).unwrap(),
         vec![Value::SmallInt(1), Value::SmallInt(2)]
@@ -236,7 +236,7 @@ fn get_index_wrap_clamp_and_errors() {
             bytes: b"x".to_vec(),
         }),
     );
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     assert_eq!(get_index(&mut ctx, &fx.types, 5, Value::SmallInt(2), false).unwrap(), 2);
     assert_eq!(get_index(&mut ctx, &fx.types, 5, Value::SmallInt(-1), false).unwrap(), 4);
     assert_eq!(get_index(&mut ctx, &fx.types, 5, Value::SmallInt(7), true).unwrap(), 5);
@@ -261,7 +261,7 @@ fn subscr_via_slot_and_fallthrough_raises() {
     let mut fx = Fixture::new();
     let t = fx.slotted_type("float", 0, None, None, Some(subscr_echo_slot), None, None, None);
     let v = fx.value_of(t, Obj::Float(1.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     assert_eq!(
         obj_subscr(&mut ctx, &fx.types, v, Value::SmallInt(7), SubscrArg::Get).unwrap(),
         Value::SmallInt(7)
@@ -288,7 +288,7 @@ fn identity_and_binary_unary_wrappers() {
     assert_eq!(identity(Value::SmallInt(4)), Value::SmallInt(4));
     let t = fx.slotted_type("float", 0, Some(len3_slot), Some(eq_true_slot), None, None, None, None);
     let v = fx.value_of(t, Obj::Float(1.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     assert_eq!(obj_unary_op(&mut ctx, &fx.types, UnaryOp::Len, v).unwrap(), Value::SmallInt(3));
     assert_eq!(
         obj_binary_op(&mut ctx, &fx.types, BinaryOp::Equal, v, v).unwrap(),
@@ -305,7 +305,7 @@ fn get_buffer_slot_and_fallbacks() {
     let t = fx.slotted_type("float", 0, None, None, None, Some(buffer_ok_slot), None, None);
     let v = fx.value_of(t, Obj::Float(1.0));
     let f = fx.value_of(fx.types.float, Obj::Float(1.0));
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     let mut info = BufferInfo::empty();
     assert!(get_buffer(&mut ctx, &fx.types, v, &mut info, BUFFER_READ).unwrap());
     assert_eq!(info.len, 3);
@@ -360,7 +360,7 @@ fn exc_value(fx: &mut Fixture, type_name: &str, cause: Option<Value>, frames: Ve
 fn print_exception_simple() {
     let mut fx = Fixture::new();
     let e = exc_value(&mut fx, "ValueError", None, vec![]);
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     let mut s = String::new();
     obj_print_exception(&mut ctx, &fx.types, e, &static_resolve, &mut s);
     assert_eq!(s, "<ValueError>\n");
@@ -380,7 +380,7 @@ fn print_exception_cause_chain_and_traceback() {
         block: Some(qstr_id(b"int")),
     };
     let outer = exc_value(&mut fx, "TypeError", Some(inner), vec![frame]);
-    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types);
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
     let mut s = String::new();
     obj_print_exception(&mut ctx, &fx.types, outer, &static_resolve, &mut s);
     // Cause first, then the separator, then the oldest-first

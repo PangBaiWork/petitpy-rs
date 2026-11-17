@@ -328,9 +328,7 @@ pub fn int_locals_dict(ctx: &mut CallCtx<'_>) -> GcRef {
     ctx.alloc(
         None,
         Obj::Dict(DictData {
-            map: MapData {
-                entries: vec![(Value::Qstr(from_bytes_id), Value::Heap(fun))],
-            },
+            map: MapData::from_pairs(vec![(Value::Qstr(from_bytes_id), Value::Heap(fun))]),
         }),
     )
 }

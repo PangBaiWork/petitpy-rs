@@ -163,7 +163,7 @@ impl Value {
                 Obj::Bytes(b) => Ok(!b.bytes.is_empty()),
                 Obj::Tuple(t) => Ok(!t.is_empty()),
                 Obj::List(l) => Ok(!l.items.is_empty()),
-                Obj::Dict(d) => Ok(!d.map.entries.is_empty()),
+                Obj::Dict(d) => Ok(d.map.used != 0),
                 Obj::Set(s) => Ok(!s.items.is_empty()),
                 _ => Ok(true),
             },
@@ -236,7 +236,7 @@ impl Obj {
             Obj::Bytes(b) => b.bytes.len(),
             Obj::Tuple(t) => t.len() * 8,
             Obj::List(l) => l.items.len() * 8,
-            Obj::Dict(d) => d.map.entries.len() * 16,
+            Obj::Dict(d) => d.map.alloc * 16 + d.map.index.len() * 4,
             Obj::Set(s) => s.items.len() * 8,
             Obj::Array(a) => a.items.len() * 8,
             Obj::Slice(_) => 24,
@@ -250,7 +250,7 @@ impl Obj {
             Obj::Deque(d) => d.items.len() * 8,
             Obj::NamedTuple(n) => n.items.len() * 8,
             Obj::AttrTuple(a) => a.items.len() * 8,
-            Obj::Map(m) => m.entries.len() * 16,
+            Obj::Map(m) => m.alloc * 16 + m.index.len() * 4,
         }
     }
 
@@ -263,9 +263,11 @@ impl Obj {
             Obj::List(l) => l.items.clone(),
             Obj::Dict(d) => {
                 let mut out = Vec::with_capacity(d.map.entries.len() * 2);
-                for (k, v) in &d.map.entries {
-                    out.push(*k);
-                    out.push(*v);
+                for e in &d.map.entries {
+                    if let Some(k) = e.key {
+                        out.push(k);
+                        out.push(e.value);
+                    }
                 }
                 out
             }
@@ -310,9 +312,11 @@ impl Obj {
             Obj::AttrTuple(a) => a.items.clone(),
             Obj::Map(m) => {
                 let mut out = Vec::with_capacity(m.entries.len() * 2);
-                for (k, v) in &m.entries {
-                    out.push(*k);
-                    out.push(*v);
+                for e in &m.entries {
+                    if let Some(k) = e.key {
+                        out.push(k);
+                        out.push(e.value);
+                    }
                 }
                 out
             }
@@ -341,10 +345,49 @@ pub struct ListData {
     pub items: Vec<Value>,
 }
 
-/// Low-level key/value map (`mp_map_t`). C9 owns.
-#[derive(Clone, Debug)]
+/// One entry of a `MapData` table (`mp_map_elem_t`, map.zig).
+/// `key == None` is the SENTINEL tombstone: the entry was removed
+/// but its index slot still points at it, so probes step over it
+/// (map.zig compact-layout comment). A live entry's key is always
+/// `Some` — including `Some(Value::None)` for the `None` key.
+/// `value` is always a real value: the Zig's transient NULL value
+/// (a slot created by ADD before the caller stores into it) is
+/// unobservable, so lookups report it explicitly as `Added` instead
+/// (see `map::LookupOutcome`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapEntry {
+    pub key: Option<Value>,
+    pub value: Value,
+}
+
+/// Low-level key/value map (`mp_map_t`). C9 owns. Two layouts
+/// (map.zig): compact (full config — insertion-ordered hash table:
+/// `entries` in insertion order, `index` an open-addressing index
+/// of `index_cap(alloc)` u32 slots, 0 = empty, i+1 = entry i;
+/// `entries.len()` is the Zig `fill`, live + tombstones) and ordered
+/// (fixed tables + OrderedDict: dense array, no tombstones,
+/// `entries.len() == used`, `index` unused). All logic lives in
+/// `containers::map` (`impl MapData` there); this file holds only
+/// the data definition, like the other payload structs.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapData {
-    pub entries: Vec<(Value, Value)>,
+    /// Entry slots allocated (`alloc`).
+    pub alloc: usize,
+    /// Live entry count (`used`).
+    pub used: usize,
+    /// All keys are qstrs (pointer-compare fast path).
+    pub all_keys_are_qstrs: bool,
+    /// Fixed (ROM) table — never reallocated by lookup.
+    pub is_fixed: bool,
+    /// Ordered-array layout (fixed tables + OrderedDict).
+    pub is_ordered: bool,
+    /// Entries in insertion order; `None` key = SENTINEL tombstone
+    /// (compact only). `len()` is the Zig `fill` (compact) or `used`
+    /// (ordered).
+    pub entries: Vec<MapEntry>,
+    /// Open-addressing index (compact only): `index_cap(alloc)` u32
+    /// slots; 0 = empty, i+1 = entry i. Empty for ordered maps.
+    pub index: Vec<u32>,
 }
 
 /// Dict object (a map). C9 owns.

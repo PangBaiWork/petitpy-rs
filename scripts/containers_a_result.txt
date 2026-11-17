@@ -1,0 +1,282 @@
+Lane C9a: port map + dict to Rust — RESULT
+================================================
+Worktree: ~/workspace/petitpy-rs-containers-a, branch lane/containers-a
+Base: master 704a137 (lib 353 + bin 9, all green)
+Status: DONE, ready for main-agent verification. One commit follows this file.
+
+## Deliverables
+
+New files (src/objects/containers/):
+- map.rs — `map.zig` (630 lines): insertion-ordered hash table
+  (`MpMap`/`MapData`) + set table ops (`MpSet`/`set_lookup`), the
+  128-byte lookup cache, `hash_of`/`hash_via_slot`, compact + ordered
+  lookup paths, `compact_rehash`.
+- objdict.rs — `objdict.zig` (990 lines): `dict` type + methods
+  (get/store/delete/len/clear/copy/get-helper/pop/setdefault/popitem/
+  update/fromkeys), type slots (unary/binary/subscr/print/getiter),
+  views (keys/items/values + view iterators), `dict_type_data`,
+  `BuiltinFn` adapters for the method table.
+- mod.rs — `pub mod map; pub mod objdict;` (+ `pub mod containers;`
+  in objects/mod.rs).
+- tests.rs — test fixture (C7 `Fixture` pattern: slotted int/bool
+  types, slotted dict type, plain types otherwise) + test-double
+  str/tuple print fns (see below).
+- map_tests.rs (8 tests) + objdict_tests.rs (20 tests) = 28 new tests.
+
+Changed files (interface + literal migration):
+- src/objects/value.rs — `MapData` is now the real insertion-ordered
+  hash table (alloc/used/all_keys_are_qstrs/is_fixed/is_ordered/
+  entries `Vec<MapEntry>`/index `Vec<u32>`); `MapEntry { key:
+  Option<Value>, value: Value }` (`None` key = SENTINEL tombstone).
+  `is_true` dict arm uses `used != 0`; `children()` skips
+  tombstones; `heap_bytes` uses `alloc*16 + index.len()*4`.
+- src/objects/obj.rs — `BuiltinTypes` gained `pub dict: GcRef`.
+- src/memory/gc.rs — `CallCtx` gained `pub pool: &'a RuntimeQstr`
+  (same precedent as C7r's `CallCtx.types`: the map/dict hash path
+  needs `qstr_hash` for dynamic ids and the slot/builtin signatures
+  cannot carry it; shared reference only, interning stays the VM's
+  `&mut` job; explicitly NOT a thread-local pool).
+- Fixtures updated for the 4-arg `CallCtx::new`: obj_tests.rs,
+  primitives/tests.rs, primitives/tests_dispatch.rs,
+  primitives/tests_ops.rs, obj_ops_tests.rs, gc_tests.rs.
+- 9 `MapData` literal sites updated (the brief listed 4; the real
+  count is 9 — bc.rs x2 and bc_tests.rs x2 were missed by the brief):
+  gc_tests.rs:324, objint.rs:330, tests.rs:31, obj_tests.rs:77,
+  bc.rs:472/608 (`MapData::new()`), bc_tests.rs:464/504
+  (`MapData::from_pairs(...)`); bc.rs local `map_lookup` adapted to
+  `MapEntry`; tests_ops.rs:429-430; bc_tests.rs:354.
+- map.rs: `HASH_ALLOCATION_SIZES` made `pub(crate)` (test use).
+
+## Acceptance (run by the executor, 2026-11-17)
+
+- `cargo test --release --lib --tests`: 381 passed, 0 failed,
+  1 ignored (baseline 353 + 28 new containers tests).
+- `cargo test --release --bins`: 9 passed, 0 failed.
+- `cargo build --release`: 0 warnings, 0 errors.
+- No `unsafe` anywhere in `src/objects/containers/` (grep).
+- No end-to-end corpus run: the VM does not exist yet (per brief
+  line 32 — acceptance is unit tests + source对照, no fake corpus).
+
+## Design decisions (recorded in code docs)
+
+1. Scoped-borrow probe: map lookups take `(ctx, types, map_ref)`
+   and touch the map only through short scoped borrows
+   (`map_of`/`map_of_mut`); no swap-out (would hide entries from GC
+   during a `__hash__`/`__eq__` slot alloc) and no thread-local pool.
+2. `LookupOutcome { Found, Added, Removed((k, v)), NotFound }` —
+   reports "fresh slot" explicitly: the Zig's marker (live entry
+   with NULL value) has no Rust counterpart (`Value` is
+   non-nullable; `None` is a real value). ADD callers must store
+   the value right after (placeholder `Value::None`, documented).
+3. `hash_of`: qstr → pool.qstr_hash; small int → itself; heap
+   Str/Bytes → `qstr_compute_hash` directly (Rust StrData has no
+   cached `.hash` field — always compute, same value; C8a may add
+   the cache); else the type's HASH slot via `call_unary`;
+   NotImplemented + has-slot → TypeError "unsupported type for
+   operator"; NotImplemented + no-slot → identity hash (`obj_id`
+   word). Bool hash works via the bool slot delegating to int.
+   Float/tuple keys dispatch via `call_unary`, so they work once
+   C18 (float slot) / C9b (tuple slot) register them.
+4. Views are `Obj::Iterator`: view = `{ source: dict, index:
+   kind(0/1/2), extra: [] }`, view-it = `{ source: dict, index:
+   cur, extra: [SmallInt(kind)] }`; header type None until C12
+   assigns the real view types (view-it type additionally awaits
+   C11's iterator-`next` slot, which `TypeData` has no field for).
+5. `dict` print/equality key off the TYPE name ("OrderedDict"),
+   not the `is_ordered` layout flag — so `MapData::from_pairs`
+   (ordered layout, used for literal defkwargs/kwargs dicts)
+   behaves exactly like a compact plain dict.
+6. `collect_iterable` (update/fromkeys/pairs) handles concrete
+   types directly (List/Tuple/Dict-keys/Str-chars as heap Strs —
+   interning needs `&mut` pool which CallCtx doesn't carry —
+   /Bytes-ints/Range/Set-stub-items/dict views); general
+   getiter-slot path deferred to C11; `update_from_keys` returns
+   false for now (no method-lookup machinery yet; no non-dict
+   mapping exists in the tree); pairs materialised whole before
+   the length check + outer iteration materialised before
+   inserting (both unobservable for concrete types, documented).
+7. Re-entrant `__eq__` mutating the map during a probe: Rust
+   re-validates the entry key after a positive `obj_equal` and
+   restarts the probe if it changed (the Zig would use a dangling
+   pointer).
+8. `is_dict_or_ordered` is payload-based (any `Obj::Dict` counts
+   — plain, OrderedDict, future subclass), matching the Zig's
+   make_new-pointer check for everything representable today.
+9. `dict_make_new` takes `(ctx, type_, args, n_kw)` with the Zig
+   args layout (positionals, then interleaved kw pairs); the `dict`
+   builtin has NO `BuiltinFn` adapter — an early draft
+   `dict_builtin_make_new` was DELETED as wrong (a `BuiltinFn`
+   cannot carry `n_kw`; C12/C13's type-call machinery calls
+   `dict_make_new` directly).
+10. `MapData::from_pairs` builds an ORDERED map (no hashing needed,
+    dependency-free); `new_fixed` copies pairs (owned Vec, no ROM
+    aliasing) with a debug_assert that keys are qstrs.
+11. bc.rs's local linear-scan `map_lookup` was adapted to
+    `MapEntry` (not replaced by the real lookup — the setup path
+    holds only `&mut GcArena` + `&RootSet`, no CallCtx; wiring it
+    is C13's, noted in the comment).
+12. `hash_value_to_usize` unwraps heap-Int results via
+    `as_int_checked` (the `-2^63` corner hashes as 0, documented).
+13. `entries` is a PACKED vec (`len == fill`, tombstones included),
+    not an `alloc`-sized slot array: `compact_rehash` builds it
+    with `with_capacity(new_alloc)` and replays only live entries.
+    Invariant: `entries.len() <= alloc`, `used <= entries.len()`.
+14. Test doubles in the fixture ONLY: `str_print_double` (`'…'`,
+    no escaping) and `tuple_print_double` (`(a, b)`, 1-tuple
+    `(a,)`). C8a owns the real str print slot, C9b the real tuple
+    print slot; the fixture uses the doubles so dict/view print
+    tests assert real reprs instead of C6's `<str>`/`<tuple>`
+    placeholders. The doubles are test-only and must be retired
+    when the real slots land.
+
+## Reference-binary probes (2026-11-17, /tmp/c9probe.py, /tmp/c9hash.py)
+
+- `{1:'a'}[True]`→'a', `{True:'a'}[1]`→'a', `{1:'a'}=={True:'a'}`→True,
+  `{1.0:'a'}[1]`→'a' (bool/int/float keys dedup via hash+equal).
+- `hash([])`/`hash({})`/`d[[]]=` → TypeError 'unsupported type for
+  operator'; popitem LIFO ('c',3),('b',2),('a',1); popitem empty →
+  KeyError 'popitem(): dictionary is empty'; pop missing → KeyError
+  'x'; `dict({}, {})` → TypeError 'argument num/types mismatch';
+  `dict('ab')` / `dict([(1,2),(3,)])` / update wrong length →
+  ValueError 'dict update sequence has wrong length'; fromkeys
+  `{1:0,2:0,3:0}`, fromkeys('ab')→`{'a': None, 'b': None}`;
+  `|` and `|=` work; views repr `dict_keys([])`,
+  `dict_items([('a', 1)])`, `dict_values([1])`;
+  `hasattr(dict,'__missing__')`→False.
+- `hash(None)`==6 (= OBJ_NONE word — identity-hash fallback),
+  `hash(True)`==1, `hash(False)`==0, `hash(1.5)`==1, `hash(2.0)`==2,
+  `hash((1,2))`==22815555, `hash(())`==22815552, `hash(b'ab')`==28198,
+  `hash('abc')`==12933, `hash('')`==5381, `hash(2**70)`==0,
+  `hash(-2**70)`==0.
+- Self-referential dict repr CRASHES the original: `d['s']=d;
+  repr(d)` → infinite recursion, stack overflow, abort rc=134 —
+  the original has NO recursion guard in dict print
+  (objdict.zig:162 via obj.zig:458); the Rust port mirrors the
+  no-guard structure.
+- Fixed-map mutation could NOT be triggered from Python (a
+  `**kw` dict is mutable at runtime); the Zig source is the
+  authority: `ensureNotFixed` raises `TypeError(NULL)`
+  (`raiseTypeErrorNull`, builtinevex.zig:101 — bare TypeError, no
+  message), so the Rust `DictError::TypeError("")` carries the
+  empty message, not a paraphrase. (An earlier draft of this lane
+  invented the message "dict is fixed" — corrected after reading
+  the Zig source; the test now asserts `""`.)
+- `dictUpdateImpl` calls `ensureNotFixed` FIRST (objdict.zig:448),
+  so even an empty update on a fixed map raises (test asserts it).
+
+## Zig semantics pinned (read from source, not assumed)
+
+- kwargs layout in `args` is interleaved (key, value) pairs after
+  the positionals (argcheck.zig:138; vendor runtime.c comment).
+- Compact layout: one allocation = `alloc` entries + `fill` +
+  open-addressing index (u8/u16/u32 by alloc; `indexCap =
+  ceilPowerOfTwo(alloc+alloc/2+1)`); `compactRehash` new alloc =
+  `max(used+1, (3*used+1)/2)`; `hash_allocation_sizes` has 34
+  entries; lookup cache is a 128-byte plain global indexed by
+  `(word>>2)%128`, validated by key comparison.
+- `mp_map_lookup` order: cache fast path (not REMOVE, alloc!=0) →
+  `compare_only_ptrs` (all_keys_are_qstrs; qstr→pointer compare;
+  exact str→full equality; non-qstr/non-str + not ADD→null) →
+  ordered path (linear scan, REMOVE memmoves + returns tail slot)
+  → compact path (probe, tombstones, rehash when fill==alloc).
+- Set ops use nano-style open addressing over an Obj array, no
+  cache, hash always via `mp_unary_op` HASH, kind bit-tested
+  (ADD=1/REMOVE=2/3=both).
+- `dictGetHelperImpl`: LOOKUP miss→None/default; REMOVE miss→
+  KeyError (n_args==2) or default (n_args==3); ADD miss→insert
+  default/None.
+- `dictUpdateImpl`: self-update is a no-op; dict source iterated
+  directly (alloc!=0 check); else `updateFromKeys` (keys() method)
+  then iterable-of-pairs (each pair exactly 2, else ValueError);
+  kwargs loop over fixed table.
+- `mp_obj_dict_copy` memcpys the whole table incl. tombstones,
+  forces is_fixed=0, keeps the source's header type.
+- Views: `npy_dt_view_unary_op` — only `.values()` supports HASH
+  (identity hash); binary CONTAINS only for KEYS views, delegating
+  to the dict.
+- `mp_const_empty_dict_obj` is fixed+ordered, all_keys_are_qstrs=0,
+  alloc=0 (used as the empty kwargs map in the OR branch).
+- "object not iterable" is the TERSE TypeError from `mp_getiter`
+  (runtime.zig:1298).
+- `__missing__` is NOT implemented in the Zig either (documented
+  gap in dictSubscrImpl — the subscr slot receives the inner dict
+  storage, not the outer subclass instance).
+- `mpUnaryOpImpl` (runtime.zig:355-362, 381, 390-391): small int
+  HASH→itself; str/bytes HASH→`strUnaryHash` (qstr→`qstr_hash`;
+  heap Str→cached `.hash`, 0→recompute via `qstr_compute_hash`);
+  type WITH unary_op slot returning NULL for HASH→TypeError
+  "unsupported type for operator"; type with NO unary_op
+  slot→identity hash (object word).
+
+## Test failures found and fixed during the lane (all in tests, except noted)
+
+- `map_hash_alloc_sizes_cover_growth`: my expected table values
+  were invented from the compact-dict formula (16/25/253/16384);
+  the real table is 0/2/17/223/10861 (+ `(x+x/2)|1` fallback).
+- `map_growth_keeps_all_keys_in_order`: my assertion
+  `entries.len() == alloc` was wrong — entries is packed (see
+  decision 13); corrected to `entries.len() == used`.
+- `dict_get_store_delete_keyerror_carries_key`: my assertion
+  compared the get result to the PRE-overwrite value; after the
+  overwrite the get correctly returns the new value, in the
+  original position.
+- `dict_print_forms` / `dict_views_repr_iter_contains`: the
+  fixture's plain str/tuple types have no print slot, so
+  `obj_print_helper` fell back to `<str>`/`<tuple>` — fixed with
+  the test doubles (decision 14), not by changing production code.
+- `dict_fixed_map_rejects_writes`: see the TypeError(NULL) finding
+  above — the code was right, the test's invented message was wrong.
+- `map_set_table_ops`: my first draft assumed a `SetSlot::Add`
+  API; the real API is `MpSet::new` + `set_lookup(..., LookupKind)`
+  returning `Option<Value>` + `MpSet::clear`/`remove_first`
+  methods — test rewritten to the real API.
+- `dict_fromkeys` test fn shadowed the imported `dict_fromkeys`
+  (name collision) — test renamed `dict_fromkeys_ctor`.
+- `call_unary`/`call_binary` are `pub(crate)` and take an explicit
+  `type_: Option<GcRef>` + return `SlotOutcome` (no PartialEq/
+  Debug) — test uses `matches!` on the outcomes.
+- Borrow-pattern note for later lanes: in test code, a `CallCtx`
+  value and its `ctx.types` cannot be passed together as
+  `(&mut ctx, ctx.types)` — bind the ctx as `&mut` first
+  (`let ctx = &mut ctx;`) and pass `ctx` directly (the implicit
+  reborrow is two-phase, as in objdict.rs itself); `drop(ctx)` on
+  a `&mut` is a no-op (NLL ends the borrow at last use); never
+  nest `fx.heap_*` / `fx.store` calls (hoist inner allocations
+  into `let` bindings first).
+
+## Known limitations / follow-ups (NOT this lane's scope)
+
+- Float keys work only once C18 registers the float HASH slot;
+  tuple keys only once C9b registers the tuple HASH slot
+  (both dispatch through `call_unary` already; no test-local
+  float/tuple hash needed in this lane).
+- `collect_iterable`'s general getiter-slot path is C11's; an
+  `Obj::Iterator` that is not a dict view/view-it, and any type
+  with a `getiter` slot but no direct arm here, currently raise
+  `TypeError("object not iterable")` (unreachable today — no such
+  type exists in the tree yet).
+- `update_from_keys` returns false until C12/C14 provide method
+  lookup + calls (`mp_load_method_maybe` /
+  `mp_call_method_n_kw`).
+- Real view types (`dict_keys`/`dict_items`/`dict_values` types)
+  and the view-iterator type are C12's; the iterator-`next` slot
+  C11's. The `dict` method table (`locals_dict`) is built by
+  C12/D1 from the `*_builtin` adapters in objdict.rs.
+- `dict_update`'s kwargs path is wired for the VM by C15 (the
+  `dict_update_builtin` adapter covers the no-kw call only).
+- bc.rs's local `map_lookup` still linear-scans; wiring the real
+  lookup is C13's (the setup path has no CallCtx).
+- `__missing__` is not implemented (matches the Zig — documented
+  gap, not a divergence).
+- Self-referential dict repr has no recursion guard (matches the
+  original, which aborts — documented, not fixed).
+
+## Note for the parent (C8a verification)
+
+- This lane added `CallCtx.pool: &'a RuntimeQstr` (shared ref, no
+  thread-local). The C8a draft reportedly added `INSTALLED_TYPES`
+  + `PENDING_STR_ERROR` thread-locals as a "slot types channel +
+  pyerr.pending_exc stand-in". If those are production code, the
+  `CallCtx.types` (C7r) / `CallCtx.pool` (C9a) precedent now offers
+  a non-thread-local channel for both; worth checking at C8a
+  verification whether the thread-locals should move onto CallCtx.

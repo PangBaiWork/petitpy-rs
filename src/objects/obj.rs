@@ -81,6 +81,10 @@ pub struct BuiltinTypes {
     pub complex: GcRef,
     pub tuple: GcRef,
     pub list: GcRef,
+    /// `dict` (C9a: the dict constructor and copy/fromkeys allocate
+    /// with this type; the `dict` builtin reads it from `ctx.types`,
+    /// like the int/bool builtins read theirs).
+    pub dict: GcRef,
     /// `type` itself (the class-getitem branch of `mp_obj_subscr`).
     pub type_: GcRef,
 }

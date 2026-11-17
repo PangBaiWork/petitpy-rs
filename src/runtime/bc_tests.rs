@@ -11,7 +11,7 @@ use crate::compiler::bridge::compile_to_mpy;
 use crate::compiler::mpy::{self, Module, QstrEntry, RawCode};
 use crate::compiler::parser::InputKind;
 use crate::memory::gc::{GcArena, RootSet};
-use crate::objects::value::{DictData, FunBcData, GcRef, MapData, Obj, Value};
+use crate::objects::value::{DictData, FunBcData, GcRef, MapData, MapEntry, Obj, Value};
 use crate::runtime::bc::*;
 use crate::runtime::qstr::RuntimeQstr;
 
@@ -353,7 +353,10 @@ fn setup_kwargs_full_combo() {
         Obj::Dict(d) => {
             assert_eq!(
                 d.map.entries,
-                vec![(Value::Qstr(z_id), Value::SmallInt(6))]
+                vec![MapEntry {
+                    key: Some(Value::Qstr(z_id)),
+                    value: Value::SmallInt(6),
+                }]
             )
         }
         other => panic!("expected kwargs dict, got {:?}", other),
@@ -462,9 +465,7 @@ fn setup_missing_kwonly_with_defkwargs() {
     let defkw = Value::Heap(fx.arena.alloc(
         None,
         Obj::Dict(DictData {
-            map: MapData {
-                entries: vec![(Value::Qstr(m_id), Value::SmallInt(5))],
-            },
+            map: MapData::from_pairs(vec![(Value::Qstr(m_id), Value::SmallInt(5))]),
         }),
         &fx.roots,
     ));
@@ -502,9 +503,7 @@ fn setup_kwonly_default_from_defkwargs() {
     let defkw = Value::Heap(fx.arena.alloc(
         None,
         Obj::Dict(DictData {
-            map: MapData {
-                entries: vec![(Value::Qstr(k_id), Value::SmallInt(7))],
-            },
+            map: MapData::from_pairs(vec![(Value::Qstr(k_id), Value::SmallInt(7))]),
         }),
         &fx.roots,
     ));

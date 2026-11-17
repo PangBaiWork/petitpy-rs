@@ -322,7 +322,7 @@ fn header_type_is_traced() {
     let dict = arena.alloc(
         None,
         Obj::Dict(crate::objects::value::DictData {
-            map: crate::objects::value::MapData { entries: Vec::new() },
+            map: crate::objects::value::MapData::new(),
         }),
         &roots,
     );

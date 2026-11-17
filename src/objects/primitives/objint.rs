@@ -261,6 +261,9 @@ pub fn int_type_data(dict: GcRef) -> TypeData {
         binary_op: None,
         call: None,
         getiter: None,
+        subscr: None,
+        buffer: None,
+        print: None,
     }
 }
 

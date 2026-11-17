@@ -408,7 +408,7 @@ fn int_locals_dict_has_from_bytes() {
     let (name, n_args, func) = match entries[0].1 {
         Value::Heap(r) => match fx.arena.get(r) {
             Obj::FunBuiltin(f) => {
-                let fp: crate::objects::value::BuiltinFn = f.func;
+                let fp: crate::objects::slots::BuiltinFn = f.func;
                 (f.name, f.n_args, fp as usize)
             }
             _ => panic!("not a builtin"),
@@ -417,7 +417,7 @@ fn int_locals_dict_has_from_bytes() {
     };
     assert_eq!(name, from_bytes_id);
     assert_eq!(n_args, fun_n_args(2, 4));
-    let expected_fn: crate::objects::value::BuiltinFn = int_from_bytes_builtin;
+    let expected_fn: crate::objects::slots::BuiltinFn = int_from_bytes_builtin;
     assert_eq!(func, expected_fn as usize);
 }
 

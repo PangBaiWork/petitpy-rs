@@ -47,6 +47,9 @@ pub(crate) fn make_type(arena: &mut GcArena, roots: &RootSet, name: &[u8]) -> Gc
         binary_op: None,
         call: None,
         getiter: None,
+        subscr: None,
+        buffer: None,
+        print: None,
     };
     arena.alloc(None, Obj::Type(data), roots)
 }

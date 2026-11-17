@@ -38,7 +38,12 @@
 pub mod argcheck;
 pub mod bc;
 pub mod builtinevex;
+pub mod builtinimport;
+pub mod compile_bridge;
+pub mod frozen_modules;
+pub mod import_search;
 pub mod opmethods;
+pub mod persistentcode;
 pub mod qstr;
 pub mod raise;
 pub mod runner;
@@ -52,6 +57,7 @@ pub mod runtime_ops;
 pub mod runtime_resume;
 pub mod runtime_smallint;
 pub mod runtime_utils;
+pub mod scheduler;
 pub mod vm;
 pub mod vm_builtins;
 pub mod vm_call;
@@ -71,6 +77,8 @@ pub mod vm_types;
 mod argcheck_tests;
 #[cfg(test)]
 mod bc_tests;
+#[cfg(test)]
+mod import_tests;
 #[cfg(test)]
 mod vm_tests;
 #[cfg(test)]

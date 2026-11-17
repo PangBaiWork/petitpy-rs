@@ -104,6 +104,13 @@ pub(crate) fn dispatch_loop(
                 return DispatchOutcome::Raised(exc);
             }
         }
+        // Scheduler poll (Tier G, `vm.zig:110-114`): an
+        // exception raised from an interrupt (`mp_sched_exception`
+        // — C15b's `scheduler.rs`) is raised here, once per
+        // iteration, after the recorded-raise poll.
+        if let Some(exc) = crate::runtime::scheduler::pending_exc_check(state) {
+            return DispatchOutcome::Raised(exc);
+        }
         frame.ip = ip;
         sync_frame_roots(ctx, frame, mark);
         let op = bc_byte(state, code_idx, ip);

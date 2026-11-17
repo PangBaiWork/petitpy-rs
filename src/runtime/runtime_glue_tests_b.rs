@@ -216,13 +216,14 @@ fn eval_bytes_source() {
 }
 
 #[test]
-fn eval_dispatch_new_name_fails_loud() {
-    // The dispatch-path read-only qstr resolve: a name that was
-    // never interned cannot be interned through the shared
-    // pool, so `eval` fails with `MemoryError` (the interning
-    // subsystem's own error) instead of mis-resolving.
+fn eval_dispatch_new_name_interns() {
+    // C15b: `from_strn` interns through `&self` now, so the
+    // dispatch path interns a genuinely-new name instead of
+    // failing with `MemoryError` (the old read-only resolve).
+    // The name resolves — and the variable is unbound, so the
+    // eval raises `NameError`, as on the original.
     let (name, _args) = Vx::new().raised("eval(\"zzz_new_name_xyz + 1\")");
-    assert_eq!(name, "MemoryError");
+    assert_eq!(name, "NameError");
 }
 
 #[test]

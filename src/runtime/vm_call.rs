@@ -87,6 +87,14 @@ pub fn call_function_ctx(
     if fun == state.build_class_builtin {
         return call_build_class_ctx(ctx, state, n_args, n_kw, args);
     }
+    // The `__import__` builtin is intercepted the same way
+    // (C15b): it needs the VM's module registry + `sys.path`,
+    // which a `FunBuiltin` slot cannot see.
+    if fun == state.import_builtin {
+        return crate::runtime::builtinimport::call_import_ctx(
+            ctx, state, n_args, n_kw, args,
+        );
+    }
     match fun {
         Value::Heap(r) => match ctx.arena.get(r) {
             Obj::FunBc(_) => call_fun_bc_ctx(ctx, state, r, n_args, n_kw, args),

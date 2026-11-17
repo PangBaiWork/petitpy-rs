@@ -280,9 +280,16 @@ fn compile_glue(
             return Err(exc_from_pyerror(ctx, state, e));
         }
     }
-    // Validated — but there is no code object to return.
-    let e = crate::runtime::raise::raise_not_implemented(ctx, None);
-    Err(exc_from_pyerror(ctx, state, e))
+    // Validated — now COMPILE (C15b: the bridge's `compile_to_code`
+    // compiles first, so a syntax error beats the missing-code
+    // error, as on the original — then raises NotImplementedError
+    // because there is no `Obj::Code` yet).
+    let kind = kind.expect("mode checked above");
+    let src = str_data_pool(ctx.arena, ctx.pool, args[0]).expect("source checked above");
+    let filename_bytes =
+        str_data_pool(ctx.arena, ctx.pool, args[1]).expect("filename checked above");
+    let filename = String::from_utf8_lossy(&filename_bytes).into_owned();
+    crate::runtime::compile_bridge::compile_to_code(ctx, state, &src, kind, &filename)
 }
 
 /// The `compile` interception (`call_function_ctx`): the sig

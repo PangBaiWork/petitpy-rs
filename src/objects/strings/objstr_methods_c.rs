@@ -82,15 +82,16 @@ pub fn seq_cmp_bytes(op: BinaryOp, lhs: &[u8], rhs: &[u8]) -> bool {
 // ── binary_op ─────────────────────────────────────────────────────────
 
 /// `mpObjStrBinaryOpImpl` (`objstr.zig:842-932`): the str/bytes
-/// binary-op slot core. `MODULO` is C8b's (`str_modulo_format`) —
-/// `None` here. `MULTIPLY` needs an int rhs (`get_int_maybe`
-/// failing is NULL, not a raise); `n <= 0` yields the empty str
-/// (qstr) / empty bytes. The rhs data is read by same-type, then
-/// by the buffer protocol for a bytes lhs (`b"a" + "b"` is `b"ab"`
-/// on the reference binary); a str lhs with an incompatible rhs
-/// raises for `CONTAINS` and is NULL otherwise. `ADD`: an empty
-/// lhs of the same type returns rhs itself, an empty rhs returns
-/// lhs itself. Comparisons go through `seq_cmp_bytes`.
+/// binary-op slot core. `MODULO` is C8b's (`str_modulo_format`,
+/// wired here — `objstr.zig:844-871`). `MULTIPLY` needs an int rhs
+/// (`get_int_maybe` failing is NULL, not a raise); `n <= 0` yields
+/// the empty str (qstr) / empty bytes. The rhs data is read by
+/// same-type, then by the buffer protocol for a bytes lhs (`b"a" +
+/// "b"` is `b"ab"` on the reference binary); a str lhs with an
+/// incompatible rhs raises for `CONTAINS` and is NULL otherwise.
+/// `ADD`: an empty lhs of the same type returns rhs itself, an
+/// empty rhs returns lhs itself. Comparisons go through
+/// `seq_cmp_bytes`.
 pub fn binary_op_inner(
     ctx: &mut CallCtx,
     types: &BuiltinTypes,
@@ -99,7 +100,14 @@ pub fn binary_op_inner(
     rhs: Value,
 ) -> SlotResult {
     if op == BinaryOp::Modulo {
-        return None;
+        // C8b: `%`-format (`str_modulo_format`, `objstr_format.rs`).
+        // The error is reported via the pending cell (`slot_raise`)
+        // by the caller (`str_binary_op`), so a failed format is
+        // `Some(Err(..))`, not `None` (which would mean "not
+        // implemented" and let the dispatcher try the rhs slot).
+        return Some(
+            crate::objects::strings::objstr_format::str_modulo_format(ctx, types, lhs, rhs),
+        );
     }
     let lhs_type = obj_get_type(ctx.arena, types, lhs);
     let lhs_data = match str_data(ctx.arena, lhs) {

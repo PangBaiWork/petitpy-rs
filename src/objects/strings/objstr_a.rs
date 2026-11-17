@@ -1,10 +1,11 @@
-//! str / bytes core — prelude + constructors + index/slice helpers +
+//! str / bytes core — prelude + constructors + index helpers +
 //! iterators (Lane C8a).
 //!
 //! Port of `src/objects/strings/objstr.zig` lines 1–2080, first half:
 //! the prelude (exception constructors, small helpers), `find_subbytes`,
-//! the `str_index_to_ptr` full arm, the slice helpers (`MpBoundSlice`,
-//! `sliceCount`), and the str/bytes iterators. The method bodies live
+//! the `str_index_to_ptr` full arm, and the str/bytes iterators.
+//! (The slice helpers — `MpBoundSlice`, `sliceCount` — live in
+//! `objstr_slice.rs`.) The method bodies live
 //! in `objstr_methods_a.rs` / `objstr_methods_b.rs` and build on this
 //! file — the shared prelude is imported, never copied (C8b imports
 //! from here too).
@@ -22,15 +23,12 @@
 
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::obj::{
-    obj_get_int, obj_get_int_maybe, obj_get_type, qstr_bytes, BuiltinTypes, ObjError,
-    BUFFER_READ,
+    obj_get_int_maybe, obj_get_type, qstr_bytes, BuiltinTypes, ObjError, BUFFER_READ,
 };
 use crate::objects::obj_ops::{get_buffer, get_index};
 use crate::objects::slots::BufferInfo;
 use crate::objects::strings::unicode::{is_utf8_cont, utf8_next_char};
-use crate::objects::value::{
-    BytesData, GcRef, Obj, SliceData, StrData, Value,
-};
+use crate::objects::value::{BytesData, GcRef, Obj, StrData, Value};
 use crate::pyerr::PyError;
 
 // ── errors ────────────────────────────────────────────────────────────
@@ -46,6 +44,11 @@ pub enum StrExc {
     /// Added by the main agent at the C8a merge (C7r added this variant
     /// to C6's `ExcType`; the `StrError::Obj` mapping must cover it).
     ZeroDivisionError,
+    /// Added by Lane C8b (format machinery raises `KeyError`).
+    KeyError,
+    /// Added by Lane C8b (`vstr` raises bare `RuntimeError` on a
+    /// fixed buffer).
+    RuntimeError,
 }
 
 impl StrExc {
@@ -57,6 +60,8 @@ impl StrExc {
             StrExc::NotImplementedError => "NotImplementedError",
             StrExc::OverflowError => "OverflowError",
             StrExc::ZeroDivisionError => "ZeroDivisionError",
+            StrExc::KeyError => "KeyError",
+            StrExc::RuntimeError => "RuntimeError",
         }
     }
 }
@@ -113,6 +118,47 @@ pub enum StrError {
     /// buffer protocol, …) — same type/message, shared variant so
     /// callers of `obj.rs` helpers don't re-spell the message.
     Obj(ObjError),
+    /// A C7 `PrimError` (float→int conversion in `arg_as_int`, …) —
+    /// same type/message, shared variant so callers of the int lane
+    /// don't re-spell the message. Added by Lane C8b.
+    Prim(crate::objects::primitives::ops::PrimError),
+    /// `TypeError: fillchar must be 1 character` (`str_center` /
+    /// `strPadOneSide`, `objstr.zig:2285,2325`). Added by Lane C8b.
+    FillcharMustBeOne,
+    /// `ValueError: bad format string` (`excBadFormatStr`,
+    /// `objstr.zig:97`). Added by Lane C8b.
+    BadFormatStr,
+    /// `TypeError: format needs a dict` (`excFormatNeedsDict`,
+    /// `objstr.zig:100`). Added by Lane C8b.
+    FormatNeedsDict,
+    /// `TypeError: format string needs more arguments`
+    /// (`excMoreArgs`, `objstr.zig:103`). Added by Lane C8b.
+    MoreArgs,
+    /// `TypeError: %c needs int or char` (`excPctC`,
+    /// `objstr.zig:106`). Added by Lane C8b.
+    PctC,
+    /// `TypeError: integer needed` (`excIntegerNeeded`,
+    /// `objstr.zig:109`). Added by Lane C8b.
+    IntegerNeeded,
+    /// `TypeError: format string didn't convert all arguments`
+    /// (`excExtraArgs`, `objstr.zig:112`). Added by Lane C8b.
+    ExtraArgs,
+    /// `IndexError: tuple index out of range` (`excIndexOOR`,
+    /// `objstr.zig:115`). Added by Lane C8b.
+    TupleIndexOutOfRange,
+    /// `KeyError: <key>` (`excKeyErr`, `objstr.zig:118-121`) — the
+    /// missing key travels with the error (the pending cell only
+    /// keeps type+message, so a slot path records `(KeyError, None)`
+    /// there; the key itself is visible to direct callers of the
+    /// method functions). Added by Lane C8b.
+    KeyError(Value),
+    /// `NotImplementedError: attributes not supported`
+    /// (`excAttrsNotSupp`, `objstr.zig:122`). Added by Lane C8b.
+    AttrsNotSupported,
+    /// Bare `RuntimeError` (no message) — `vstr` extend on a fixed
+    /// buffer (`vstr.zig`, `mp_obj_new_exception_msg(RuntimeError,
+    /// null)`). Added by Lane C8b.
+    RuntimeError,
 }
 
 impl StrError {
@@ -125,17 +171,42 @@ impl StrError {
             | StrError::WrongArgs
             | StrError::ArgNumTypesMismatch
             | StrError::StringIndicesMustBeInts
-            | StrError::ObjectNotIterable => Some(StrExc::TypeError),
+            | StrError::ObjectNotIterable
+            | StrError::FillcharMustBeOne
+            | StrError::FormatNeedsDict
+            | StrError::MoreArgs
+            | StrError::PctC
+            | StrError::IntegerNeeded
+            | StrError::ExtraArgs => Some(StrExc::TypeError),
             StrError::SubstrNotFound
             | StrError::BytesValueOutOfRange
             | StrError::EmptySeparator
             | StrError::NonHexDigit
             | StrError::NegLen
             | StrError::FromHexSepLen
-            | StrError::SliceStepZero => Some(StrExc::ValueError),
-            StrError::StringIndexOutOfRange => Some(StrExc::IndexError),
-            StrError::RsplitNone => Some(StrExc::NotImplementedError),
+            | StrError::SliceStepZero
+            | StrError::BadFormatStr => Some(StrExc::ValueError),
+            StrError::StringIndexOutOfRange | StrError::TupleIndexOutOfRange => {
+                Some(StrExc::IndexError)
+            }
+            StrError::RsplitNone | StrError::AttrsNotSupported => {
+                Some(StrExc::NotImplementedError)
+            }
+            StrError::KeyError(_) => Some(StrExc::KeyError),
+            StrError::RuntimeError => Some(StrExc::RuntimeError),
             StrError::Obj(e) => match e.exc_type() {
+                Some(crate::objects::obj::ExcType::TypeError) => Some(StrExc::TypeError),
+                Some(crate::objects::obj::ExcType::ValueError) => Some(StrExc::ValueError),
+                Some(crate::objects::obj::ExcType::IndexError) => Some(StrExc::IndexError),
+                Some(crate::objects::obj::ExcType::OverflowError) => {
+                    Some(StrExc::OverflowError)
+                }
+                Some(crate::objects::obj::ExcType::ZeroDivisionError) => {
+                    Some(StrExc::ZeroDivisionError)
+                }
+                None => None,
+            },
+            StrError::Prim(e) => match e.exc_type() {
                 Some(crate::objects::obj::ExcType::TypeError) => Some(StrExc::TypeError),
                 Some(crate::objects::obj::ExcType::ValueError) => Some(StrExc::ValueError),
                 Some(crate::objects::obj::ExcType::IndexError) => Some(StrExc::IndexError),
@@ -171,6 +242,21 @@ impl StrError {
             StrError::StringIndexOutOfRange => Some("string index out of range"),
             StrError::SliceStepZero => Some("slice step can't be zero"),
             StrError::ObjectNotIterable => Some("object not iterable"),
+            StrError::FillcharMustBeOne => Some("fillchar must be 1 character"),
+            StrError::BadFormatStr => Some("bad format string"),
+            StrError::FormatNeedsDict => Some("format needs a dict"),
+            StrError::MoreArgs => Some("format string needs more arguments"),
+            StrError::PctC => Some("%c needs int or char"),
+            StrError::IntegerNeeded => Some("integer needed"),
+            StrError::ExtraArgs => Some("format string didn't convert all arguments"),
+            StrError::TupleIndexOutOfRange => Some("tuple index out of range"),
+            // The KeyError message is the missing key's repr — dynamic,
+            // so there is no static literal (the key travels on the
+            // `KeyError(Value)` variant itself).
+            StrError::KeyError(_) => None,
+            StrError::AttrsNotSupported => Some("attributes not supported"),
+            StrError::RuntimeError => None,
+            StrError::Prim(e) => e.message(),
             StrError::Obj(e) => e.message(),
         }
     }
@@ -179,6 +265,7 @@ impl StrError {
     pub fn to_pyerror(self) -> PyError {
         match self {
             StrError::Obj(e) => e.to_pyerror(),
+            StrError::Prim(e) => e.to_pyerror(),
             _ => PyError::PyRaise,
         }
     }
@@ -625,119 +712,9 @@ pub fn str_index_to_ptr(
     }
 }
 
-// ── slice helpers ─────────────────────────────────────────────────────
-
-/// `mp_bound_slice_t` (vendor `py/obj.h`): resolved slice bounds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BoundSlice {
-    pub start: i64,
-    pub stop: i64,
-    pub step: i64,
-}
-
-/// `mp_obj_slice_indices` (vendor `py/objslice.c:129-187`): resolve
-/// a slice against a sequence of `length`, resolving missing
-/// components, negatives and off-the-end values. `step == 0` raises
-/// `ValueError: slice step can't be zero`; a non-int component
-/// raises `TypeError: can't convert to int` (via `obj_get_int`).
-pub fn slice_indices(
-    ctx: &mut CallCtx,
-    types: &BuiltinTypes,
-    slice: &SliceData,
-    length: i64,
-) -> Result<BoundSlice, StrError> {
-    let step: i64 = match slice.step {
-        None => 1,
-        Some(v) => {
-            let n = obj_get_int(ctx, types, v)?;
-            if n == 0 {
-                return Err(StrError::SliceStepZero);
-            }
-            n
-        }
-    };
-    let mut bound = |v: Option<Value>| -> Result<Option<i64>, StrError> {
-        match v {
-            None => Ok(None),
-            Some(v) => Ok(Some(obj_get_int(ctx, types, v)?)),
-        }
-    };
-    if step > 0 {
-        let start = match bound(slice.start)? {
-            None => 0,
-            Some(mut s) => {
-                if s < 0 {
-                    s += length;
-                }
-                s.clamp(0, length)
-            }
-        };
-        let stop = match bound(slice.stop)? {
-            None => length,
-            Some(mut s) => {
-                if s < 0 {
-                    s += length;
-                }
-                s.clamp(0, length)
-            }
-        };
-        Ok(BoundSlice { start, stop, step })
-    } else {
-        let start = match bound(slice.start)? {
-            None => length - 1,
-            Some(mut s) => {
-                if s < 0 {
-                    s += length;
-                }
-                s.clamp(-1, length - 1)
-            }
-        };
-        let stop = match bound(slice.stop)? {
-            None => -1,
-            Some(mut s) => {
-                if s < 0 {
-                    s += length;
-                }
-                s.clamp(-1, length - 1)
-            }
-        };
-        Ok(BoundSlice { start, stop, step })
-    }
-}
-
-/// `mp_seq_get_fast_slice_indexes` (vendor `py/sequence.c:48-64`):
-/// `slice_indices` plus the fast-path adjustments (negative step:
-/// `stop += 1`; positive step with `start > stop`: `stop = start`;
-/// negative step with `start < stop`: `stop = start + 1`). Returns
-/// the bounds and whether the step is 1 (the fast path).
-pub fn fast_slice_indexes(
-    ctx: &mut CallCtx,
-    types: &BuiltinTypes,
-    slice: &SliceData,
-    length: i64,
-) -> Result<(BoundSlice, bool), StrError> {
-    let mut b = slice_indices(ctx, types, slice, length)?;
-    if b.step < 0 {
-        b.stop += 1;
-    }
-    if b.step > 0 && b.start > b.stop {
-        b.stop = b.start;
-    } else if b.step < 0 && b.start < b.stop {
-        b.stop = b.start + 1;
-    }
-    let fast = b.step == 1;
-    Ok((b, fast))
-}
-
-/// `sliceCount` (`objstr.zig:427-433`): how many items a bound
-/// slice selects. A signed walk, so negative-step slices work.
-pub fn slice_count(b: &BoundSlice) -> usize {
-    let step = b.step;
-    if step > 0 && b.stop > b.start {
-        ((b.stop - b.start + step - 1) / step) as usize
-    } else if step < 0 && b.start > b.stop {
-        ((b.start - b.stop + (-step) - 1) / (-step)) as usize
-    } else {
-        0
-    }
-}
+// The slice helpers live in `objstr_slice.rs` (split out to keep
+// this file under 800 lines); re-exported so existing imports
+// (`use objstr_a::*`) keep working.
+pub use crate::objects::strings::objstr_slice::{
+    fast_slice_indexes, slice_count, slice_indices, BoundSlice,
+};

@@ -9,14 +9,25 @@
 //! `objstr_a.rs` and is imported by the other C8 files — never copied.
 
 pub mod objstr_a;
+pub mod objstr_b;
+pub mod objstr_format;
 pub mod objstr_iters;
 pub mod objstr_methods_a;
 pub mod objstr_methods_b;
 pub mod objstr_methods_c;
+pub mod objstr_print;
+pub mod objstr_slice;
 pub mod unicode;
+pub mod vstr;
 
 #[cfg(test)]
 mod objstr_tests;
 
 #[cfg(test)]
 mod objstr_tests_b;
+
+#[cfg(test)]
+mod objstr_tests_c;
+
+#[cfg(test)]
+mod objstr_tests_d;

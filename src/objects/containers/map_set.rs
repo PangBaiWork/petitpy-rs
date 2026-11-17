@@ -81,11 +81,23 @@ impl MpSet {
 }
 
 /// `setRehash` (map.zig): grow via `getHashAllocGeq(alloc + 1)` and
-/// replay the live elements.
+/// replay the live elements. The replay hashes with a 0 fallback:
+/// the Zig's `mp_set_lookup` reads `mp_unary_op` HASH's NULL return
+/// as hash 0 (`MP_OBJ_SMALL_INT_VALUE(NULL) == 0`), so an unhashable
+/// element that was inserted at hash 0 by a quirk caller (see
+/// `set_lookup_hashed`) replays at hash 0 instead of failing the
+/// rehash. `eq_blocked` is threaded through from the caller: while
+/// a raise is pending the Zig's `mp_obj_equal` returns false for
+/// every comparison (`mp_obj_is_true` returns false when pending is
+/// set, obj.zig:470), so a replayed element is never "found" — the
+/// replay inserts it. A set can hold two equal unhashable elements
+/// that way (both inserted while pending was set); the replay must
+/// keep both, which the guard gives.
 fn set_rehash(
     ctx: &mut CallCtx,
     types: &BuiltinTypes,
     set: &mut MpSet,
+    eq_blocked: bool,
 ) -> Result<(), MapError> {
     let old_table = std::mem::take(&mut set.table);
     let old_alloc = set.alloc;
@@ -94,10 +106,25 @@ fn set_rehash(
     set.table = vec![SetSlot::Empty; set.alloc];
     for slot in old_table.into_iter().take(old_alloc) {
         if let SetSlot::Live(k) = slot {
-            let _ = set_lookup(ctx, types, set, k, LookupKind::Add)?;
+            let hash = hash_of(ctx, types, k).unwrap_or(0);
+            let _ = set_lookup_hashed(ctx, types, set, k, LookupKind::Add, hash, eq_blocked)?;
         }
     }
     Ok(())
+}
+
+/// Live elements of an `MpSet` in TABLE order (slot 0..alloc) — the
+/// order `set`/`frozenset` print and iterate in (map.zig:
+/// `npy_set_print` / `npy_set_it_iternext` scan the table, not
+/// insertion order).
+pub fn set_items(set: &MpSet) -> Vec<Value> {
+    set.table
+        .iter()
+        .filter_map(|s| match s {
+            SetSlot::Live(v) => Some(*v),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `mp_set_lookup` (map.zig): find (or add / remove) `index` in the
@@ -114,21 +141,52 @@ pub fn set_lookup(
     index: Value,
     lookup_kind: LookupKind,
 ) -> Result<Option<Value>, MapError> {
-    let kind = lookup_kind as i32;
-    let want_add = (kind & LookupKind::Add as i32) != 0;
-    let want_remove = (kind & LookupKind::Remove as i32) != 0;
-    if set.alloc == 0 {
-        if want_add {
-            set_rehash(ctx, types, set)?;
-        } else {
-            return Ok(None);
-        }
-    }
     // The hash is computed once, before any mutation (it can raise).
     // NOTE: the Zig hashes here with `mp_unary_op` directly (no qstr
     // fast path in `mp_set_lookup`) — `hash_of` applies the same
     // `qstr_hash` for qstrs, so the values agree.
     let hash = hash_of(ctx, types, index)?;
+    set_lookup_hashed(ctx, types, set, index, lookup_kind, hash, false)
+}
+
+/// `mp_set_lookup` with a precomputed `hash` (map.zig). The set
+/// TYPE (C9c) calls this when the hash already failed: the Zig's
+/// `mp_unary_op` HASH bridge returns NULL on failure and the caller
+/// reads it as hash 0 (`MP_OBJ_SMALL_INT_VALUE(NULL) == 0`), so an
+/// unhashable element is STILL inserted (at slot 0) and the error
+/// only surfaces afterwards — verified: `s.add([2])` raises
+/// `TypeError` but `s == {[2]}`. Callers that use this variant own
+/// the pending-error bookkeeping (first pending wins); this function
+/// never hashes and never fails on the hash.
+///
+/// `eq_blocked`: the Zig's probe compares with `mp_obj_equal`,
+/// which is `mp_obj_is_true(equalNotEqualImpl(...))` — and
+/// `mp_obj_is_true` returns false whenever a raise is pending
+/// (obj.zig:470). The quirk caller passes `true` here when it has
+/// already recorded a pending hash error, so the probe never
+/// "finds" an element — verified: with `s == {[2]}` (inserted by
+/// the quirk), `s.remove([2])` raises `KeyError '[2]'` instead of
+/// removing it, and `[2] in s` raises the hash `TypeError`.
+/// `set_lookup` (no pending possible) passes `false`.
+pub fn set_lookup_hashed(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    set: &mut MpSet,
+    index: Value,
+    lookup_kind: LookupKind,
+    hash: usize,
+    eq_blocked: bool,
+) -> Result<Option<Value>, MapError> {
+    let kind = lookup_kind as i32;
+    let want_add = (kind & LookupKind::Add as i32) != 0;
+    let want_remove = (kind & LookupKind::Remove as i32) != 0;
+    if set.alloc == 0 {
+        if want_add {
+            set_rehash(ctx, types, set, eq_blocked)?;
+        } else {
+            return Ok(None);
+        }
+    }
     let mut pos = hash % set.alloc;
     let mut start_pos = pos;
     let mut avail_slot: Option<usize> = None;
@@ -150,7 +208,18 @@ pub fn set_lookup(
                 }
             }
             SetSlot::Live(elem) => {
-                if obj_equal(ctx, types, elem, index).map_err(MapError::from)? {
+                // A pending raise makes `mp_obj_equal` return false
+                // (see `eq_blocked` above); a slot raise inside the
+                // comparison still propagates (`?`) — no type in the
+                // tree today has a raising `__eq__`, so the Zig's
+                // "treat as not-equal and keep probing" for that
+                // case is unobservable and not replicated.
+                let found = if eq_blocked {
+                    false
+                } else {
+                    obj_equal(ctx, types, elem, index).map_err(MapError::from)?
+                };
+                if found {
                     if want_remove {
                         set.used -= 1;
                         let next = set.table[(pos + 1) % set.alloc];
@@ -174,7 +243,7 @@ pub fn set_lookup(
                     return Ok(Some(index));
                 }
                 // Not enough room — rehash and restart.
-                set_rehash(ctx, types, set)?;
+                set_rehash(ctx, types, set, eq_blocked)?;
                 pos = hash % set.alloc;
                 start_pos = pos;
                 avail_slot = None;

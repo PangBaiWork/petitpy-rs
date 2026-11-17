@@ -154,6 +154,9 @@ impl Fx {
             complex: mk_plain(&mut arena, b"complex"),
             tuple: mk_plain(&mut arena, b"tuple"),
             list: mk_plain(&mut arena, b"list"),
+            set: mk_plain(&mut arena, b"set"),
+            frozenset: mk_plain(&mut arena, b"frozenset"),
+            range: mk_plain(&mut arena, b"range"),
             dict: mk_plain(&mut arena, b"dict"),
             type_,
         };

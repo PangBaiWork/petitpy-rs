@@ -11,6 +11,8 @@
 use super::objarray::{array_type_data, bytearray_type_data, memoryview_type_data};
 use super::objdict::dict_type_data;
 use super::objlist::list_type_data;
+use super::objrange::range_type_data;
+use super::objset::{frozenset_type_data, set_type_data};
 use super::objtuple::tuple_type_data;
 use crate::memory::gc::{CallCtx, GcArena, RootSet};
 use crate::objects::obj::BuiltinTypes;
@@ -128,6 +130,12 @@ impl Fixture {
         let tuple = arena.alloc(None, Obj::Type(tuple_type_data(tuple_dict)), &roots);
         let list_dict = empty_dict(&mut arena, &roots);
         let list = arena.alloc(None, Obj::Type(list_type_data(list_dict)), &roots);
+        let set_dict = empty_dict(&mut arena, &roots);
+        let set = arena.alloc(None, Obj::Type(set_type_data(set_dict)), &roots);
+        let frozenset_dict = empty_dict(&mut arena, &roots);
+        let frozenset = arena.alloc(None, Obj::Type(frozenset_type_data(frozenset_dict)), &roots);
+        let range_dict = empty_dict(&mut arena, &roots);
+        let range = arena.alloc(None, Obj::Type(range_type_data(range_dict)), &roots);
         let array_dict = empty_dict(&mut arena, &roots);
         let array = arena.alloc(None, Obj::Type(array_type_data(array_dict)), &roots);
         let bytearray_dict = empty_dict(&mut arena, &roots);
@@ -143,8 +151,8 @@ impl Fixture {
         let dict = arena.alloc(None, Obj::Type(dict_type_data(dict_dict)), &roots);
         let type_ = make_type(&mut arena, &roots, b"type");
         for t in [
-            int, str_, bytes, bool_, none_type, float, complex, tuple, list, array,
-            bytearray, memoryview, dict, type_,
+            int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset,
+            range, array, bytearray, memoryview, dict, type_,
         ] {
             roots.push(Value::Heap(t));
         }
@@ -158,6 +166,9 @@ impl Fixture {
             complex,
             tuple,
             list,
+            set,
+            frozenset,
+            range,
             dict,
             type_,
         };

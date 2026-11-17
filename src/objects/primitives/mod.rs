@@ -36,7 +36,8 @@ pub use objcell::{cell_get, cell_set, cell_type_data, new_cell};
 pub use objint::{
     fun_n_args, int_binary_op, int_binary_slot, int_format, int_from_bytes,
     int_from_bytes_builtin, int_locals_dict, int_make_new, int_pow3, int_print, int_to_bytes,
-    int_to_string, int_type_data, int_unary_op, int_unary_slot, parse_int_text,
+    int_to_bytes_builtin, int_to_string, int_type_data, int_unary_op, int_unary_slot,
+    parse_int_text,
 };
 pub use ops::{prim_to_pyresult, PrimError, PrimOutcome, PrimResult, QstrResolver};
 // Op codes and the builtin-type registry are C6's canonical types

@@ -15,8 +15,8 @@ use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::int_from_float;
 use crate::objects::slots::PrintKind;
 use crate::objects::strings::objstr_a::{
-    find_static_qstr, is_bytes_value, is_str_value, new_str_via_qstr, slot_raise, str_data,
-    StrError,
+    find_static_qstr, is_bytes_value, is_str_value, new_str_via_qstr, slot_raise,
+    str_data_pool, StrError,
 };
 use crate::objects::strings::objstr_b::{dict_get, new_str_type_from_vstr};
 use crate::objects::strings::objstr_methods_c::KwArg;
@@ -280,7 +280,7 @@ fn str_modulo_format_impl(
         match conv {
             b'c' => {
                 if is_str_value(ctx.arena, arg) {
-                    let data = str_data(ctx.arena, arg).unwrap_or(&[]);
+                    let data = str_data_pool(ctx.arena, ctx.pool, arg).unwrap_or_default();
                     if data.len() != 1 {
                         return Err(StrError::PctC);
                     }
@@ -356,9 +356,8 @@ pub fn str_modulo_format(
     pattern: Value,
     rhs: Value,
 ) -> Result<Value, StrError> {
-    let pat_data = str_data(ctx.arena, pattern)
-        .ok_or(StrError::BadImplicitConversion)?
-        .to_vec();
+    let pat_data = str_data_pool(ctx.arena, ctx.pool, pattern)
+        .ok_or(StrError::BadImplicitConversion)?;
     let is_bytes = is_bytes_value(ctx.arena, pattern);
     let (args, dict): (Vec<Value>, Option<Value>) = match rhs {
         Value::Heap(r) => match ctx.arena.get(r) {
@@ -724,7 +723,7 @@ fn format_helper_into(
             }
             match conv_type {
                 0 | b's' => {
-                    let data = str_data(ctx.arena, arg)
+                    let data = str_data_pool(ctx.arena, ctx.pool, arg)
                         .ok_or(StrError::BadImplicitConversion)?;
                     let mut slen = data.len() as i32;
                     let mut prec = precision;
@@ -755,9 +754,8 @@ pub fn str_format(
     kwargs: &[KwArg],
 ) -> Result<Value, StrError> {
     let self_ = args[0];
-    let data = str_data(ctx.arena, self_)
-        .ok_or(StrError::BadImplicitConversion)?
-        .to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, self_)
+        .ok_or(StrError::BadImplicitConversion)?;
     let mut arg_i: i32 = 0;
     let mut out = Vstr::new(16);
     format_helper_into(ctx, types, &data, &mut arg_i, args, kwargs, &mut out)?;
@@ -772,5 +770,5 @@ pub fn str_format_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
-    str_format(ctx, types, args, &[]).map_err(slot_raise)
+    str_format(ctx, types, args, &[]).map_err(|e| slot_raise(ctx, e))
 }

@@ -653,39 +653,39 @@ fn first(args: &[Value]) -> Value {
 
 /// `dict.clear` (fixed 1 arg).
 pub fn dict_clear_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(DictError::to_pyerror)?;
-    dict_clear(ctx, first(args)).map_err(DictError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    dict_clear(ctx, first(args)).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.copy` (fixed 1 arg).
 pub fn dict_copy_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(DictError::to_pyerror)?;
-    dict_copy(ctx, first(args)).map_err(DictError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    dict_copy(ctx, first(args)).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.get` (2–3 args: self, key[, default]).
 pub fn dict_get_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 3).map_err(DictError::to_pyerror)?;
-    dict_get(ctx, first(args), args[1], args.get(2).copied()).map_err(DictError::to_pyerror)
+    check_arity(args, 2, 3).map_err(|e| ctx.record_typed(e))?;
+    dict_get(ctx, first(args), args[1], args.get(2).copied()).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.pop` (2–3 args: self, key[, default]).
 pub fn dict_pop_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 3).map_err(DictError::to_pyerror)?;
-    dict_pop(ctx, first(args), args[1], args.get(2).copied()).map_err(DictError::to_pyerror)
+    check_arity(args, 2, 3).map_err(|e| ctx.record_typed(e))?;
+    dict_pop(ctx, first(args), args[1], args.get(2).copied()).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.setdefault` (2–3 args: self, key[, default]).
 pub fn dict_setdefault_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 3).map_err(DictError::to_pyerror)?;
+    check_arity(args, 2, 3).map_err(|e| ctx.record_typed(e))?;
     dict_setdefault(ctx, first(args), args[1], args.get(2).copied())
-        .map_err(DictError::to_pyerror)
+        .map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.popitem` (fixed 1 arg).
 pub fn dict_popitem_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(DictError::to_pyerror)?;
-    dict_popitem(ctx, first(args)).map_err(DictError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    dict_popitem(ctx, first(args)).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.update` (1–2 positionals + kwargs). The `BuiltinFn`
@@ -693,32 +693,118 @@ pub fn dict_popitem_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value
 /// no-kw call; the VM passes kwargs through `dict_update` directly
 /// (C15).
 pub fn dict_update_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 2).map_err(DictError::to_pyerror)?;
+    check_arity(args, 1, 2).map_err(|e| ctx.record_typed(e))?;
     let empty = MapData::new();
-    dict_update(ctx, first(args), args.get(1).copied(), &empty).map_err(DictError::to_pyerror)
+    dict_update(ctx, first(args), args.get(1).copied(), &empty).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.items` (fixed 1 arg).
 pub fn dict_items_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(DictError::to_pyerror)?;
-    dict_items(ctx, first(args)).map_err(DictError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    dict_items(ctx, first(args)).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.keys` (fixed 1 arg).
 pub fn dict_keys_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(DictError::to_pyerror)?;
-    dict_keys(ctx, first(args)).map_err(DictError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    dict_keys(ctx, first(args)).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.values` (fixed 1 arg).
 pub fn dict_values_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(DictError::to_pyerror)?;
-    dict_values(ctx, first(args)).map_err(DictError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    dict_values(ctx, first(args)).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.fromkeys` (classmethod, 2–3 args: cls, iterable[, value]).
 /// The class is ignored (the Zig builds a plain dict).
 pub fn dict_fromkeys_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 3).map_err(DictError::to_pyerror)?;
-    dict_fromkeys(ctx, args[1], args.get(2).copied()).map_err(DictError::to_pyerror)
+    check_arity(args, 2, 3).map_err(|e| ctx.record_typed(e))?;
+    dict_fromkeys(ctx, args[1], args.get(2).copied()).map_err(|e| ctx.record_typed(e))
 }
+
+/// `dict`'s method table (C13, the Zig's `mp_obj_dict_methods`
+/// shape): name, body, positional arity counting `self`. Sigs
+/// are the ones the adapters already enforce (see their doc
+/// comments). `update` takes kwargs in the original; the
+/// `BuiltinFn` path covers the no-kw call and the VM passes
+/// kwargs through `dict_update` directly (C15).
+pub static DICT_METHODS: &[crate::objects::slots::MethodEntry] = &[
+    crate::objects::slots::MethodEntry {
+        name: "clear",
+        func: dict_clear_builtin,
+        min: 1,
+        max: 1,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "copy",
+        func: dict_copy_builtin,
+        min: 1,
+        max: 1,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "get",
+        func: dict_get_builtin,
+        min: 2,
+        max: 3,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "pop",
+        func: dict_pop_builtin,
+        min: 2,
+        max: 3,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "setdefault",
+        func: dict_setdefault_builtin,
+        min: 2,
+        max: 3,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "popitem",
+        func: dict_popitem_builtin,
+        min: 1,
+        max: 1,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "update",
+        func: dict_update_builtin,
+        min: 1,
+        max: 2,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "items",
+        func: dict_items_builtin,
+        min: 1,
+        max: 1,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "keys",
+        func: dict_keys_builtin,
+        min: 1,
+        max: 1,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "values",
+        func: dict_values_builtin,
+        min: 1,
+        max: 1,
+        kw_func: None,
+    },
+    crate::objects::slots::MethodEntry {
+        name: "fromkeys",
+        func: dict_fromkeys_builtin,
+        min: 2,
+        max: 3,
+        kw_func: None,
+    },
+];

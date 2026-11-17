@@ -26,9 +26,9 @@ use crate::memory::gc::CallCtx;
 use crate::objects::obj::FLAG_BINDS_SELF;
 use crate::objects::value::{ClosureData, GcRef, Obj, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
-use crate::runtime::bc::CodeState;
 
-use super::objfun::{call_fun_builtin, fun_bc_call, load_attr_on_fun, RunOutcome};
+use super::objfun::{call_fun_builtin, fun_bc_call, load_attr_on_fun};
+use crate::runtime::runner::VmRunner;
 
 /// Read a `ClosureData` out of a heap `Value`. `None` when the
 /// value is not a heap closure — the Zig's `fromObj` would read
@@ -64,8 +64,8 @@ fn fun_kind(ctx: &CallCtx, fun: Value) -> u8 {
 /// same `n_kw` (`mp_call_function_n_kw`). `code` / `qstr_table` /
 /// `empty_tuple` are resolved by the caller (C13's dispatcher)
 /// for the `FunBc` path; the builtin path needs none of them.
-pub fn closure_call(
-    ctx: &mut CallCtx,
+pub fn closure_call<'a, 'b>(
+    ctx: &mut CallCtx<'a>,
     self_value: Value,
     code: &RawCode,
     qstr_table: &[u16],
@@ -73,7 +73,7 @@ pub fn closure_call(
     n_args: usize,
     n_kw: usize,
     args: &[Value],
-    runner: &mut dyn FnMut(&mut CallCtx, &mut CodeState) -> RunOutcome,
+    runner: &mut VmRunner<'a, 'b>,
 ) -> PyResult<Value> {
     let data = closure_data(ctx, self_value).ok_or(PyError::PyRaise)?;
     let mut args2: Vec<Value> = Vec::with_capacity(data.cells.len() + args.len());

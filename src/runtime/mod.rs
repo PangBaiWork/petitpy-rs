@@ -7,6 +7,22 @@
 
 pub mod bc;
 pub mod qstr;
+pub mod runner;
+pub mod vm;
+pub mod vm_builtins;
+pub mod vm_call;
+pub mod vm_dispatch;
+pub mod vm_dispatch_exec;
+pub mod vm_dispatch_util;
+pub mod vm_gen;
+pub mod vm_ops;
+pub mod vm_raise;
+pub mod vm_rt;
+pub mod vm_rt_iter;
+pub mod vm_rt_name;
+pub mod vm_types;
 
 #[cfg(test)]
 mod bc_tests;
+#[cfg(test)]
+mod vm_tests;

@@ -133,7 +133,8 @@ pub fn bool_unary_op(
 /// (`slots.rs`) — same conversion as `int_unary_slot`.
 pub fn bool_unary_slot(ctx: &mut CallCtx<'_>, op: UnaryOp, v: Value) -> PyResult<Value> {
     let types = ctx.types;
-    prim_to_pyresult(bool_unary_op(ctx, types, op, v))
+    let r = bool_unary_op(ctx, types, op, v);
+    prim_to_pyresult(ctx, r)
 }
 
 /// `npy_bool_fn_binary_op`: bool → small int 0/1, delegate to
@@ -164,5 +165,6 @@ pub fn bool_binary_slot(
     rhs: Value,
 ) -> PyResult<Value> {
     let types = ctx.types;
-    prim_to_pyresult(bool_binary_op(ctx, types, op, lhs, rhs))
+    let r = bool_binary_op(ctx, types, op, lhs, rhs);
+    prim_to_pyresult(ctx, r)
 }

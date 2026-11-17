@@ -41,7 +41,8 @@
 //! by C13's `BUILD_SLICE` is handled correctly either way.
 
 use super::objdict::ARG_NUM_TYPES_MISMATCH;
-use crate::memory::gc::{CallCtx, GcArena};
+use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::obj::{obj_get_int, BuiltinTypes, ObjError};
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::objint::fun_n_args;
@@ -101,10 +102,20 @@ impl SliceError {
         }
     }
 }
-
-impl From<SliceError> for PyError {
-    fn from(e: SliceError) -> PyError {
-        e.to_pyerror()
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message).
+impl TypedRaise for SliceError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.msg().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.to_pyerror()
     }
 }
 
@@ -297,10 +308,22 @@ pub fn slice_indices_method(
 /// fixed arity 2 — `self` + `length`.
 pub fn slice_indices_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     if args.len() != 2 {
-        return Err(SliceError::TypeError(ARG_NUM_TYPES_MISMATCH).to_pyerror());
+        return Err(ctx.record_typed(SliceError::TypeError(ARG_NUM_TYPES_MISMATCH)));
     }
-    slice_indices_method(ctx, args[0], args[1]).map_err(|e| e.to_pyerror())
+    slice_indices_method(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
 }
+
+/// `slice`'s method table (C13, the Zig's `mp_obj_slice_methods`
+/// shape): name, body, positional arity counting `self`.
+pub static SLICE_METHODS: &[crate::objects::slots::MethodEntry] = &[
+    crate::objects::slots::MethodEntry {
+        name: "indices",
+        func: slice_indices_builtin,
+        min: 2,
+        max: 2,
+        kw_func: None,
+    },
+];
 
 /// `slice_make_new` (`slice(stop)`, `slice(start, stop[, step])`,
 /// objslice.zig:188-194): `n_kw != 0` or fewer than 1 / more than 3

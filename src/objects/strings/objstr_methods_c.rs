@@ -13,7 +13,7 @@
 //! frozen C6 signatures (`fn(&mut CallCtx, …) -> PyResult<…>`),
 //! so they resolve `&BuiltinTypes` from `ctx.types` (the C7r
 //! CallCtx-carried registry) and record specific raises in the
-//! `PENDING_STR_ERROR` cell before returning `PyRaise` — see that
+//! `CallCtx` pending raise before returning `PyRaise` — see that
 //! file for the contract. The `*_inner` helpers take `types`
 //! explicitly and return `SlotResult` (`None` = the original
 //! returns NULL, i.e. "not implemented"; `Some` = a value or a
@@ -101,17 +101,17 @@ pub fn binary_op_inner(
 ) -> SlotResult {
     if op == BinaryOp::Modulo {
         // C8b: `%`-format (`str_modulo_format`, `objstr_format.rs`).
-        // The error is reported via the pending cell (`slot_raise`)
-        // by the caller (`str_binary_op`), so a failed format is
-        // `Some(Err(..))`, not `None` (which would mean "not
-        // implemented" and let the dispatcher try the rhs slot).
+        // The error is reported via the `CallCtx` pending raise
+        // (`slot_raise`) by the caller (`str_binary_op`), so a failed
+        // format is `Some(Err(..))`, not `None` (which would mean
+        // "not implemented" and let the dispatcher try the rhs slot).
         return Some(
             crate::objects::strings::objstr_format::str_modulo_format(ctx, types, lhs, rhs),
         );
     }
     let lhs_type = obj_get_type(ctx.arena, types, lhs);
-    let lhs_data = match str_data(ctx.arena, lhs) {
-        Some(d) => d.to_vec(),
+    let lhs_data = match str_data_pool(ctx.arena, ctx.pool, lhs) {
+        Some(d) => d,
         None => return None,
     };
     let lhs_is_str = is_str_value(ctx.arena, lhs);
@@ -143,8 +143,8 @@ pub fn binary_op_inner(
 
     let rhs_data: Vec<u8>;
     if obj_get_type(ctx.arena, types, rhs) == lhs_type {
-        rhs_data = match str_data(ctx.arena, rhs) {
-            Some(d) => d.to_vec(),
+        rhs_data = match str_data_pool(ctx.arena, ctx.pool, rhs) {
+            Some(d) => d,
             None => return None,
         };
     } else if !lhs_is_str {
@@ -204,7 +204,7 @@ pub fn str_binary_op(
     match binary_op_inner(ctx, types, op, lhs, rhs) {
         None => Err(PyError::PyRaise),
         Some(Ok(v)) => Ok(v),
-        Some(Err(e)) => Err(slot_raise(e)),
+        Some(Err(e)) => Err(slot_raise(ctx, e)),
     }
 }
 
@@ -316,8 +316,8 @@ pub(crate) fn subscr_inner(
     if !matches!(arg, SubscrArg::Get) {
         return None;
     }
-    let data = match str_data(ctx.arena, self_value) {
-        Some(d) => d.to_vec(),
+    let data = match str_data_pool(ctx.arena, ctx.pool, self_value) {
+        Some(d) => d,
         None => return None,
     };
     let is_bytes = is_bytes_value(ctx.arena, self_value);
@@ -361,7 +361,7 @@ pub fn str_subscr(
     match subscr_inner(ctx, types, base, index, arg) {
         None => Err(PyError::PyRaise),
         Some(Ok(v)) => Ok(v),
-        Some(Err(e)) => Err(slot_raise(e)),
+        Some(Err(e)) => Err(slot_raise(ctx, e)),
     }
 }
 

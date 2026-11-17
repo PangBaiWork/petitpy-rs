@@ -14,8 +14,8 @@ use super::objlist::list_type_data;
 use super::objrange::range_type_data;
 use super::objset::{frozenset_type_data, set_type_data};
 use super::objtuple::tuple_type_data;
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
-use crate::objects::callables::objgenerator::gen_instance_type_data;
+use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
+use crate::objects::callables::objgenerator_types::gen_instance_type_data;
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::slots::PrintKind;
 use crate::objects::primitives::objbool::bool_type_data;
@@ -113,6 +113,7 @@ pub(crate) struct Fixture {
     pub(crate) roots: RootSet,
     pub(crate) types: BuiltinTypes,
     pub(crate) pool: RuntimeQstr,
+    pub(crate) pending_raise: Option<PendingRaise>,
     /// The three array-family types (C9b). They are fixture
     /// fields — not `BuiltinTypes` fields — because the
     /// callers take the header type explicitly, exactly like
@@ -227,6 +228,7 @@ impl Fixture {
             roots,
             types,
             pool: RuntimeQstr::new(),
+            pending_raise: None,
             array,
             bytearray,
             memoryview,
@@ -235,7 +237,7 @@ impl Fixture {
     }
 
     pub(crate) fn ctx(&mut self) -> CallCtx<'_> {
-        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool)
+        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool, &mut self.pending_raise)
     }
 
     /// A heap `Str` with these bytes.

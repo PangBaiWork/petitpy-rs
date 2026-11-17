@@ -30,7 +30,8 @@
 //! boundary — the accepted C6 convention until C13 adds
 //! `pending_exc`.
 
-use crate::memory::gc::{GcArena, RootSet};
+use crate::memory::gc::{CallCtx, GcArena, RootSet, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::obj::{BuiltinTypes, ExcType};
 use crate::objects::value::{small_int_fits, GcRef, Obj, Value};
 use crate::pyerr::{PyError, PyResult};
@@ -133,6 +134,22 @@ impl PrimError {
             PrimError::OutOfMemory => PyError::OutOfMemory,
             _ => PyError::PyRaise,
         }
+    }
+}
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message).
+impl TypedRaise for PrimError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_type().map(|t| t.name()).unwrap_or("")
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.message().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.to_pyerror()
     }
 }
 
@@ -346,13 +363,18 @@ pub use crate::objects::value::{SMALL_INT_MAX, SMALL_INT_MIN};
 /// Convert a `PrimError` into the frozen `PyResult` signal, dropping
 /// the exception data (the C6 slot-boundary convention — the data is
 /// preserved only on the rich `PrimResult` path).
-pub fn prim_to_pyresult<T>(r: PrimResult) -> PyResult<T>
+/// Convert a rich slot result into the slot-boundary `PyResult`,
+/// recording a raise on the `CallCtx` (the `slot_raise` pattern —
+/// a value passes through, `NotHandled` is bare `PyRaise` with no
+/// recording, a typed error records its (name, message) via
+/// `TypedRaise`).
+pub fn prim_to_pyresult<T>(ctx: &mut CallCtx, r: PrimResult) -> PyResult<T>
 where
     T: From<Value>,
 {
     match r {
         Ok(PrimOutcome::Value(v)) => Ok(T::from(v)),
         Ok(PrimOutcome::NotHandled) => Err(PyError::PyRaise),
-        Err(e) => Err(e.to_pyerror()),
+        Err(e) => Err(ctx.record_typed(e)),
     }
 }

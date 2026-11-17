@@ -7,7 +7,8 @@
 use super::callables_tests::{compile_fun, n_state_of, ret_arg0, ret_arg1, CFx};
 use super::objboundmeth::*;
 use super::objclosure::*;
-use super::objfun::{new_fun_bc, RunOutcome};
+use super::objfun::new_fun_bc;
+use crate::runtime::runner::RunOutcome;
 use crate::memory::gc::CallCtx;
 use crate::objects::obj::obj_id;
 use crate::objects::primitives::objint::fun_n_args;
@@ -64,10 +65,11 @@ fn bound_meth_call_primary_prepends_self_in_state() {
     let mut ctx = cfx.ctx();
     let args = [Value::SmallInt(7)];
     let mut seen: Vec<Option<Value>> = Vec::new();
-    let mut runner = |_ctx: &mut CallCtx, cs: &mut CodeState| {
-        seen = cs.state.clone();
-        RunOutcome::Normal(Value::SmallInt(7))
-    };
+    let mut runner =
+        |_ctx: &mut CallCtx, cs: &mut CodeState, _send: Value, _throw: Option<Value>| {
+            seen = cs.state.clone();
+            RunOutcome::Normal(Value::SmallInt(7))
+        };
     let r = bound_meth_call(&mut ctx, bm, &code, &table, empty, 1, 0, &args, &mut runner);
     assert_eq!(r, Ok(Value::SmallInt(7)));
     drop(runner);
@@ -249,10 +251,11 @@ fn closure_call_primary_prepends_cells_in_state() {
     let mut ctx = cfx.ctx();
     let x = Value::SmallInt(7);
     let mut seen: Vec<Option<Value>> = Vec::new();
-    let mut runner = |_ctx: &mut CallCtx, cs: &mut CodeState| {
-        seen = cs.state.clone();
-        RunOutcome::Normal(Value::SmallInt(10))
-    };
+    let mut runner =
+        |_ctx: &mut CallCtx, cs: &mut CodeState, _send: Value, _throw: Option<Value>| {
+            seen = cs.state.clone();
+            RunOutcome::Normal(Value::SmallInt(10))
+        };
     let r = closure_call(&mut ctx, cl, &code, &table, empty, 1, 0, &[x], &mut runner);
     assert_eq!(r, Ok(Value::SmallInt(10)));
     drop(runner);

@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 
 use super::objgenerator::*;
+use crate::runtime::runner::RunOutcome;
 use crate::compiler::bridge::compile_to_mpy;
 use crate::compiler::mpy::{self, Module, QstrEntry, RawCode};
 use crate::compiler::parser::InputKind;

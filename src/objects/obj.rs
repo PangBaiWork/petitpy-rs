@@ -48,7 +48,8 @@
 //! four-line allocate-and-tag-type wrapper, no Rust counterpart is
 //! needed).
 
-use crate::memory::gc::{CallCtx, GcArena};
+use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::slots::{BinaryOp, BufferFn, PrintFn, SubscrArg, UnaryOp};
 use crate::objects::value::{GcRef, Obj, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
@@ -272,6 +273,22 @@ impl ObjError {
             ObjError::OutOfMemory => PyError::OutOfMemory,
             _ => PyError::PyRaise,
         }
+    }
+}
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message).
+impl TypedRaise for ObjError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_type().map(|t| t.name()).unwrap_or("")
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.message().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.to_pyerror()
     }
 }
 
@@ -755,7 +772,7 @@ pub fn obj_is_true(ctx: &mut CallCtx, types: &BuiltinTypes, arg: Value) -> PyRes
     match call_unary(ctx, t, UnaryOp::Bool, arg) {
         Ok(SlotOutcome::Value(r)) => return Ok(r == Value::Bool(true)),
         Ok(SlotOutcome::NotImplemented) => {}
-        Err(e) => return Err(e.to_pyerror()),
+        Err(e) => return Err(ctx.record_typed(e)),
     }
     if let Some(len) = obj_len_maybe(ctx, types, arg) {
         // The Zig code compares the len Obj to `newSmallInt(0)` by

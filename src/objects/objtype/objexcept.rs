@@ -84,7 +84,8 @@
 //!   `true` case would need an immediate's type as the except
 //!   clause, which the VM rejects earlier via `is_exception_type`).
 
-use crate::memory::gc::{CallCtx, GcArena};
+use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{MakeNewFn, PrintKind};
@@ -127,6 +128,25 @@ impl ExcError {
             ExcError::OutOfMemory => PyError::OutOfMemory,
             _ => PyError::PyRaise,
         }
+    }
+}
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message).
+impl TypedRaise for ExcError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        match self {
+            ExcError::TypeError(m) => Some(m.to_string()),
+            _ => None,
+        }
+    }
+    fn raise_signal(&self) -> PyError {
+        self.clone().to_pyerror()
     }
 }
 

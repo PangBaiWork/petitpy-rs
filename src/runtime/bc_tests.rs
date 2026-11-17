@@ -10,17 +10,56 @@
 use crate::compiler::bridge::compile_to_mpy;
 use crate::compiler::mpy::{self, Module, QstrEntry, RawCode};
 use crate::compiler::parser::InputKind;
-use crate::memory::gc::{GcArena, RootSet};
-use crate::objects::value::{DictData, FunBcData, GcRef, MapData, MapEntry, Obj, Value};
+use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
+use crate::objects::obj::BuiltinTypes;
+use crate::objects::primitives::ops::static_qstr_id;
+use crate::objects::value::{DictData, FunBcData, GcRef, MapData, MapEntry, Obj, TypeData, Value};
 use crate::runtime::bc::*;
 use crate::runtime::qstr::RuntimeQstr;
 
 // ── fixture: arena + qstr pool + singletons ──────────────────
 
+/// A plain (all slots `None`) type object — the setup path only
+/// needs `types` for the kwargs/defkw hash-table lookups, whose
+/// keys are qstr immediates (they hash by id, no slot involved).
+fn plain_type(arena: &mut GcArena, roots: &RootSet, name: &[u8]) -> GcRef {
+    let dict = arena.alloc(
+        None,
+        Obj::Dict(DictData {
+            map: MapData::new(),
+        }),
+        roots,
+    );
+    arena.alloc(
+        None,
+        Obj::Type(TypeData {
+            name: static_qstr_id(name).expect("type name is a static qstr"),
+            flags: 0,
+            base: None,
+            mro: Vec::new(),
+            dict,
+            unary_op: None,
+            binary_op: None,
+            call: None,
+            getiter: None,
+            subscr: None,
+            buffer: None,
+            print: None,
+            namedtuple_fields: None,
+            attr: None,
+            make_new: None,
+            bases: None,
+        }),
+        roots,
+    )
+}
+
 struct Fixture {
     arena: GcArena,
     roots: RootSet,
     pool: RuntimeQstr,
+    types: BuiltinTypes,
+    pending_raise: Option<PendingRaise>,
     empty_tuple: Value,
     fun: GcRef,
 }
@@ -45,10 +84,39 @@ impl Fixture {
             }),
             &roots,
         );
+        let mk = |arena: &mut GcArena, name: &[u8]| plain_type(arena, &roots, name);
+        let type_ = mk(&mut arena, b"type");
+        let types = BuiltinTypes {
+            int: mk(&mut arena, b"int"),
+            str_: mk(&mut arena, b"str"),
+            bytes: mk(&mut arena, b"bytes"),
+            bool_: mk(&mut arena, b"bool"),
+            none_type: mk(&mut arena, b"NoneType"),
+            float: mk(&mut arena, b"float"),
+            complex: mk(&mut arena, b"complex"),
+            tuple: mk(&mut arena, b"tuple"),
+            list: mk(&mut arena, b"list"),
+            dict: mk(&mut arena, b"dict"),
+            set: mk(&mut arena, b"set"),
+            frozenset: mk(&mut arena, b"frozenset"),
+            range: mk(&mut arena, b"range"),
+            type_,
+            object: mk(&mut arena, b"object"),
+            super_: mk(&mut arena, b"super"),
+            staticmethod: mk(&mut arena, b"staticmethod"),
+            classmethod: mk(&mut arena, b"classmethod"),
+            boundmeth: mk(&mut arena, b"bound_method"),
+            empty_tuple: mk(&mut arena, b"tuple"),
+            empty_bytes: mk(&mut arena, b"bytes"),
+            native_init_wrapper: mk(&mut arena, b"function"),
+            property: mk(&mut arena, b"property"),
+        };
         Fixture {
             arena,
             roots,
             pool: RuntimeQstr::new(),
+            types,
+            pending_raise: None,
             empty_tuple,
             fun,
         }
@@ -123,6 +191,13 @@ fn setup(
     args: &[Value],
 ) -> Result<CodeState, SetupError> {
     let n_state = n_state_of(fun);
+    let mut ctx = CallCtx::new(
+        &mut fx.arena,
+        &mut fx.roots,
+        &fx.types,
+        &fx.pool,
+        &mut fx.pending_raise,
+    );
     setup_code_state(
         fx.fun,
         fun,
@@ -133,8 +208,7 @@ fn setup(
         n_args,
         n_kw,
         args,
-        &mut fx.arena,
-        &fx.roots,
+        &mut ctx,
     )
 }
 

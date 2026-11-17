@@ -442,7 +442,8 @@ fn int_locals_dict_has_from_bytes() {
         Obj::Dict(d) => d.map.entries.clone(),
         _ => panic!("not a dict"),
     };
-    assert_eq!(entries.len(), 1);
+    // C13 added `to_bytes` (sig 1–4 counting `self`).
+    assert_eq!(entries.len(), 2);
     let from_bytes_id = static_qstr_id(b"from_bytes").unwrap();
     assert_eq!(entries[0].key, Some(Value::Qstr(from_bytes_id)));
     let (name, n_args, func) = match entries[0].value {
@@ -459,6 +460,22 @@ fn int_locals_dict_has_from_bytes() {
     assert_eq!(n_args, fun_n_args(2, 4));
     let expected_fn: crate::objects::slots::BuiltinFn = int_from_bytes_builtin;
     assert_eq!(func, expected_fn as usize);
+    let to_bytes_id = static_qstr_id(b"to_bytes").unwrap();
+    assert_eq!(entries[1].key, Some(Value::Qstr(to_bytes_id)));
+    let (name2, n_args2, func2) = match entries[1].value {
+        Value::Heap(r) => match fx.arena.get(r) {
+            Obj::FunBuiltin(f) => {
+                let fp: crate::objects::slots::BuiltinFn = f.func;
+                (f.name, f.n_args, fp as usize)
+            }
+            _ => panic!("not a builtin"),
+        },
+        _ => panic!("not heap"),
+    };
+    assert_eq!(name2, to_bytes_id);
+    assert_eq!(n_args2, fun_n_args(1, 4));
+    let expected_fn2: crate::objects::slots::BuiltinFn = int_to_bytes_builtin;
+    assert_eq!(func2, expected_fn2 as usize);
 }
 
 // ── formatting ──────────────────────────────────────────────────────────

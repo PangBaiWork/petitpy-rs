@@ -1,0 +1,274 @@
+Lane C13: port runtime/vm.zig (VM dispatch loop) to Rust — RESULT
+================================================================
+Branch: lane/vm, base master c30aa0a (C11 merge, lib 789 + bin 9).
+HEAD after this lane: lib 858 passed, 0 failed, 1 ignored;
+bins 9/9; cargo build --release 0 warnings; no unsafe;
+every file < 800 lines (max vm_tests.rs 781, vm_call.rs 565).
+Original repo ~/workspace/petitpy-orig untouched (git status clean).
+
+1:1 mapping (vm.zig -> Rust)
+----------------------------
+vm.zig:1191 mp_execute_bytecode
+  -> src/runtime/vm_raise.rs: execute_frame (outer exception loop:
+     Normal/Yield/Raised/RetExc; Raised re-enters via
+     exception_handler, else returns Exception).
+vm.zig:192 exceptionHandler
+  -> vm_raise.rs: exception_handler (StopIteration fast-path,
+     traceback annotation skipped for re-raise/GeneratorExit,
+     catch-or-propagate; returns bool).
+vm.zig:500 dispatchBody / :287 decodeUint / :300 decodeQstr /
+  :539 LOAD_CONST_SMALL_INT signed decode
+  -> src/runtime/vm_dispatch.rs: dispatch_loop (fetch polls
+     ctx.has_pending_raise() FIRST; inject raised at once unless
+     next op is YIELD_FROM; local ip byte offset; bc_byte reads
+     via fresh borrow, 0 out-of-bounds)
+  -> src/runtime/vm_dispatch_exec.rs: dispatch_exec (yields,
+     builders, unpack, make, call, imports, with/setup group)
+  -> src/runtime/vm_dispatch_util.rs: DispatchOutcome, Flow,
+     decode_uint / decode_int / decode_qstr / decode_ulabel /
+     decode_slabel / jump_by, stack + unwind helpers.
+  -> src/runtime/opcodes.rs: NOT created — constants already in
+     src/compiler/emit/consts.rs (85 MP_BC_*); only the four
+     missing MULTI_NUMs were added there.
+vm.zig:449 unwindReturn / :472 unwindJump
+  -> vm_dispatch_util.rs: unwind_return / unwind_jump
+     (UNWIND_JUMP pushes dest as SmallInt — Rust cannot store
+     the Zig's raw pointer).
+vm.zig:449-... SETUP_EXCEPT / SETUP_FINALLY / END_FINALLY /
+  RAISE_LAST / WITH_CLEANUP / SETUP_WITH
+  -> vm_dispatch.rs + vm_dispatch_exec.rs (see §3 for the
+     END_FINALLY None-vs-NULL fix).
+vm.zig:811-886 mp_call_function_n_kw / :838-845
+  mp_call_method_n_kw / :896-1048 mp_call_prepare_args_n_kw_var
+  -> src/runtime/vm_call.rs (split out of vm_ops.rs at the end
+     of the lane — vm_ops.rs was 869 lines, over the cap):
+     call_function_ctx / call_fun_bc_ctx / call_fun_builtin_ctx
+     / resume_via_method_ctx / call_type_ctx /
+     call_via_type_slot_ctx / call_next_ctx / call_method_ctx /
+     call_method_var_kw_ctx / intern_kw_key.
+  -> src/runtime/vm_ops.rs keeps the exception builders
+     (exc_from_typed / exc_from_pyerror / exc_from_obj_error /
+     exc_from_setup / exc_from_gen_error / type_error),
+     make_function_ctx / make_closure_ctx, and the &mut Vm
+     wrappers (call_function / call_method / resume_generator /
+     resume_generator_value / close_generator / make_function /
+     make_closure).
+vm.zig:36-69 extern fns (mp_load_name/global/attr/method,
+  mp_store_*, mp_getiter, mp_iternext_allow_raise,
+  mp_unpack_sequence/ex, mp_call_function_n_kw, mp_unary_op,
+  mp_binary_op, mp_import_from, mp_obj_subscr,
+  mp_load_build_class, mp_load_super_method, mp_obj_is_true,
+  mp_obj_new_tuple/list/dict/set/slice, mp_resume,
+  mp_obj_dict_store)
+  -> src/runtime/vm_rt.rs (is_true/unary/binary, load/store),
+     vm_rt_name.rs (load/store name/global, load_method,
+     load_attr, store_attr, load_super_method),
+     vm_rt_iter.rs (getiter/iternext/resume/unpack/imports),
+     vm_call.rs (call dispatch). IMPORT_* are C15 stubs
+     (raise ImportError "import system not implemented (C15)").
+     mp_load_method itself is C14's (load_method_maybe_ctx is
+     the VM-side approximation; see §5).
+vm.zig:1188 mp_load_method — C14, NOT implemented here.
+src/runtime/vm.rs: Vm / VmState / CodeStore / build_builtins /
+  load_module_from_mpy / load_module_from_source.
+src/runtime/vm_types.rs: build_vm_types (ROM types).
+src/runtime/vm_builtins.rs: print / next / __build_class__
+  builtins; int.to_bytes FunBuiltin (C7 deferred item);
+  str.format kwargs pass-through (C8b deferred item,
+  format_kw_wrapper).
+src/runtime/vm_gen.rs: resume_generator_ctx /
+  resume_generator_value_ctx / close_generator_ctx /
+  run_gen_frame_ctx (frame plumbing).
+src/runtime/runner.rs: VmRunner<'a,'b> unifying C10a/C10b
+  (RunOutcome { Normal, Yield, Exception }; C10a's NeedsVm
+  deleted).
+src/runtime/bc.rs: CodeState gained stack: Vec<Option<Value>>
+  (None == MP_OBJ_NULL) + exc_stack: Vec<ExcBlock> with
+  exc_sp_idx mirroring len; setup_code_state takes &mut CallCtx
+  and uses C9 map_lookup/dict_get_value (linear scan removed);
+  const-table support (CodeStore.const_tables, CodeEntry.
+  const_table, register_module pins const objects in
+  roots.extra at extra_base; LOAD_CONST_OBJ reads the same
+  object every time).
+src/objects/callables/objgenerator.rs split BEFORE adding
+  code (784 -> 598 + objgenerator_types.rs 212).
+src/objects/value.rs: Obj::Ellipsis added.
+src/runtime/vm_tests.rs: 69 end-to-end VM tests (first tests
+  to use Vm::new() / load_module_from_source).
+
+Probed behaviours (reference binary ~/workspace/petitpy-orig/zig-out/bin/petitpy)
+----------------------------------------------------------------------------------
+- print(...)/repr(...) -> Ellipsis; type(...) -> <class ''>;
+  ... == ... / ... is ... True.
+- int.to_bytes always two's-complement ((-1).to_bytes(1,"big")
+  -> b'\xff').
+- print kwargs: sep=2 -> TypeError "can't convert to str
+  implicitly"; unknown kw -> TypeError "argument num/types
+  mismatch"; bytes sep accepted; print(1,2,sep="-") -> 1-2.
+- record_raise returns (); list arity() returns bare PyRaise
+  while dict check_arity returns typed DictError.
+- gen_wrap_call returns (GcRef, CodeState); frame.ip stays at
+  the opcode byte during the opcode, local ip written back at
+  each opcode end; YIELD_VALUE sets ip past the opcode then
+  yields; YIELD_FROM on sub-generator yield rewinds ip -= 1;
+  UNWIND_JUMP pushes (dest, count byte); SETUP_WITH val_sp
+  points at exit_self; WITH_CLEANUP 3 layouts (None / small-int
+  / exception); END_FINALLY pops exc block, None -> pop,
+  small-int <0 -> unwindReturn, >=0 -> push back + unwindJump,
+  exception -> raise; fetch polls pending_raise FIRST;
+  mp_obj_get_int_maybe guard (pending set -> conversions read
+  0); mp_iternext pre-flight: pending set -> stop WITHOUT
+  clearing.
+- for i in range(n) is COMPILED to an optimised form
+  (handlers_control.rs range recognizer) that never calls the
+  range type — which is why `for i in range(5)` passed while
+  `x = range(3)` raised "object not callable" (see §4).
+- LOAD_CONST_SMALL_INT is a SIGNED varint: bit 6 of the FIRST
+  byte is the sign; a set bit initialises the accumulator to
+  all-ones (vm.zig:539-548). decode_int implements it; the
+  unsigned decode_uint misread -100 as 16284.
+- STORE_SUBSCR stack is [value, base, index] (index on TOP —
+  the compiler pushes the value first; vm.zig:663-674); value
+  == NULL is `del x[i]` (DELETE_SUBSCR = LOAD_NULL +
+  STORE_SUBSCR). STORE_MAP is [dict, value, key] (key on top).
+- mp_obj_subscr rule (obj.zig:604-605): a slot failure WITH a
+  pending exception propagates THAT error; only a failure with
+  NO pending error falls through to the generic raise
+  ("object isn't subscriptable" / "object doesn't support item
+  assignment"). exc_from_obj_error (vm_ops.rs) drains the
+  pending raise first, else converts the ObjError.
+- list_subscr / tuple_subscr dropped get_index errors (returned
+  PyRaise without recording); fixed to record_typed (IndexError
+  now surfaces instead of the generic TypeError).
+- Dynamic qstrs (>= N_TOTAL, e.g. string literals from the
+  module) cannot be resolved by the arena-only str_data
+  (qstr_bytes is static-only). str_data_pool (objstr_a.rs)
+  resolves Qstr through RuntimeQstr::qstr_str (static AND
+  dynamic) and heap Str/Bytes through the arena; used by
+  str_binary_op / str_subscr (objstr_methods_c.rs) and the %
+  formatting + str.format paths (objstr_format.rs). The other
+  ~50 str_data call sites (str methods, etc.) still use the
+  arena-only form — same gap, out of this lane's scope.
+- Generator throw/close/send interception: the four
+  gen_instance_*_builtin stubs are byte-identical macro bodies,
+  so the release linker folds them (ICF) and std::ptr::
+  fn_addr_eq reports all four as equal — the first check
+  (send) won for every call, misrouting throw/close as a plain
+  send (the generator resumed normally and exhausted). Fixed by
+  matching on the FunBuiltin NAME qstr + a generator first-arg
+  check (vm_call.rs: call_fun_builtin_ctx).
+- convert_member_lookup payload rule (C12a's lookup.rs fix,
+  applied here to vm_rt_name.rs): FunBuiltin/FunBc are
+  allocated with header None, so the header-type read cannot
+  see BINDS_SELF. Payload check: FunBuiltin binds self unless
+  found in an instance type; FunBc always binds self. Without
+  this, a generator's throw/close/send loaded UNBOUND (self
+  None) and the call passed the generator as an arg.
+- gen.close() uses close_generator_ctx (gen_instance_close):
+  a yield is RuntimeError("generator ignored GeneratorExit");
+  a raise is swallowed iff it is a GeneratorExit; normal is a
+  successful close. (The send/throw form
+  resume_generator_value_ctx propagates the raise — wrong for
+  close.)
+- mp_resume (runtime.zig:1363-1456): a NON-generator resume
+  uses `send` ONLY when the send value is non-None; a None
+  send falls through to __next__. resume_vm_ctx previously
+  routed every Some(send) through `send`, so `yield from [1,2]`
+  raised AttributeError("no attribute 'send'") on the list
+  iterator. Fixed: send path only when sv != Value::None.
+- The `for` loop range recognizer, the compiler's
+  optimised-range form, and the `list[str]` /
+  `__class_getitem__` branch (needs runtime.typingCall, C14/C15)
+  are NOT in this lane.
+
+Intentional divergences
+-----------------------
+- A Str `**` key that was never interned cannot be created
+  through the immutable CallCtx.pool — it raises
+  TypeError("keyword argument name is not an interned string")
+  instead of being silently dropped (the Zig interns it; a
+  &mut pool on CallCtx would close the gap).
+- `len(range(0,10,2**32)[::2**32])` — Rust returns 0, the
+  original aborts rc=134 (pre-existing, C9c).
+- The original crashes on five C8b inputs (center with
+  negative width, huge widths) — Rust returns self/truncates
+  (pre-existing, C8b).
+- `deque([], 2**62)` aborts the original rc=134; Rust returns
+  OutOfMemory (pre-existing, C11).
+- A self-referential dict's repr crashes the original by
+  infinite recursion; Rust mirrors it with no guard
+  (pre-existing, C9a).
+- `sort(key=len)` on ints aborts the original rc=134
+  (pre-existing, C9b).
+- `(a*)*` aborts the reference binary rc=134 (pre-existing, RE15).
+- The original's complex constants are broken at runtime
+  (print(4j) ValueError, complex(3,4) panics rc=134)
+  (pre-existing, frontend).
+- `98 in bytearray(b'abc')` raises bare NotImplementedError
+  (pre-existing, C9b).
+
+Seams for C14 / C15 (and C12a at merge)
+----------------------------------------
+- C14 (runtime.zig, mp_load_method): load_method_maybe_ctx
+  (vm_rt_name.rs) is the VM-side approximation — it covers
+  __class__ (full-only), __next__ + hasIterNext, the C10a attr
+  fns (fun_bc_attr / bound_meth_attr / closure_attr),
+  module_attr / exception_attr, and the type locals-dict +
+  convert_member_lookup path. The real mp_load_method
+  (runtime.zig:1188) subsumes it. load_super_method_ctx has
+  the __init__-native-make_new SENTINEL gap (needs C12a's
+  make_new slot).
+- C15 (import system): IMPORT_NAME / IMPORT_FROM / IMPORT_STAR
+  raise ImportError "import system not implemented (C15)".
+  The `list[str]` / `__class_getitem__` branch in obj_subscr
+  needs runtime.typingCall (C14/C15).
+- C12a (type_call / make_new): builtin types have call: None,
+  so `range(3)`, `list(...)`, `dict(...)`, `set(...)`,
+  `int(...)` etc. as CALLS raise TypeError "object not
+  callable". This is C12a's MakeNew-adapter work (brief §"What
+  you do NOT own"). The vm_tests avoid type calls: list
+  literals instead of range(), explicit next() instead of
+  list(g()), for-range uses the compiler's optimised form.
+  `len` is NOT bound as a builtin (tests avoid it); `iter` is
+  NOT a builtin (use a generator + next()).
+- C18: the float type's IntMaybe slot must return
+  NotImplemented, otherwise `"%o" % 3.0` no longer raises
+  (hard requirement from the C8b merge).
+- str_data_pool covers the str slot + % / str.format paths
+  only; the remaining ~50 arena-only str_data call sites
+  (str methods etc.) have the same dynamic-qstr gap.
+- `with` is NOT covered by a vm_test (no context manager
+  exists without user classes — C12a's type_call); the shared
+  unwind machinery is covered via try/finally/break/continue.
+- objgenerator.rs is 598 lines (was 784); only the runner-side
+  parts were split out (objgenerator_types.rs 212). C13 must
+  NOT add code to objgenerator.rs without splitting again if
+  it approaches 800.
+
+Merge note
+----------
+- Rebase onto current master before merging: this branch is
+  based on c30aa0a (pre-C12a). C12a has since merged (master
+  869 tests). Expect the usual rebase work: TypeData literals
+  gain C12a's attr/make_new/bases fields; the objtype/mod.rs
+  union (C12b's + C12a's); vm_rt_name.rs convert_member_lookup
+  should be reconciled with C12a's lookup.rs (this lane
+  applied C12a's payload rule locally — after rebase, prefer
+  the shared lookup.rs version if the signatures align);
+  call_type_ctx should pick up C12a's MakeNew adapters once
+  they land (then the vm_tests' type-call avoidances can be
+  reverted to range()/list() forms). Full test suite after
+  rebase AND after merge (lanes from stale bases merge
+  textually but fail to compile).
+- Files changed: 52 modified + 16 new (see git status).
+  New: src/runtime/vm.rs, vm_builtins.rs, vm_call.rs,
+  vm_dispatch.rs, vm_dispatch_exec.rs, vm_dispatch_util.rs,
+  vm_gen.rs, vm_ops.rs, vm_raise.rs, vm_rt.rs, vm_rt_iter.rs,
+  vm_rt_name.rs, vm_tests.rs, vm_types.rs, runner.rs,
+  objgenerator_types.rs. Modified (selection): bc.rs,
+  value.rs (Obj::Ellipsis), objlist.rs, objtuple.rs,
+  objstr_a.rs, objstr_methods_c.rs, objstr_format.rs,
+  vm_rt_name.rs, vm_rt_iter.rs, mod.rs, consts.rs (4 MULTI_NUMs).
+- The brief (scripts/vm_brief.md) stays UNCOMMITTED.
+- One commit on lane/vm: "Lane C13: port runtime/vm.zig (VM dispatch loop) to Rust".
+- Do NOT merge from this lane; stop for verification.

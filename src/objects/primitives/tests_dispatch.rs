@@ -6,7 +6,7 @@
 
 use super::tests::*;
 use super::*;
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::obj::{call_binary, call_unary, SlotOutcome};
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
@@ -22,6 +22,7 @@ struct SlotFixture {
     roots: RootSet,
     types: BuiltinTypes,
     pool: RuntimeQstr,
+    pending_raise: Option<PendingRaise>,
 }
 
 /// A call context borrowing the arena + roots + types fields only,
@@ -33,8 +34,9 @@ fn make_ctx<'a>(
     roots: &'a mut RootSet,
     types: &'a BuiltinTypes,
     pool: &'a RuntimeQstr,
+    pending_raise: &'a mut Option<PendingRaise>,
 ) -> CallCtx<'a> {
-    CallCtx::new(arena, roots, types, pool)
+    CallCtx::new(arena, roots, types, pool, pending_raise)
 }
 
 impl SlotFixture {
@@ -100,7 +102,7 @@ impl SlotFixture {
             native_init_wrapper,
             property,
         };
-        SlotFixture { arena, roots, types, pool: RuntimeQstr::new() }
+        SlotFixture { arena, roots, types, pool: RuntimeQstr::new(), pending_raise: None }
     }
 
     fn heap_int(&mut self, z: BigInt) -> Value {
@@ -117,7 +119,7 @@ impl SlotFixture {
 #[test]
 fn dispatch_int_maybe_small_int_fast_path() {
     let mut fx = SlotFixture::new();
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     // The runtime `mp_unary_op` small-int fast path (C6's
     // `call_unary`): INT_MAYBE on a small int returns it without
     // consulting the slot.
@@ -129,7 +131,7 @@ fn dispatch_int_maybe_small_int_fast_path() {
 fn dispatch_int_maybe_heap_int_via_slot() {
     let mut fx = SlotFixture::new();
     let big = fx.heap_int(pow2(70));
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     // A heap int has no fast path — INT_MAYBE reaches the int slot,
     // which returns the value itself.
     let r = call_unary(&mut ctx, Some(fx.types.int), UnaryOp::IntMaybe, big);
@@ -140,7 +142,7 @@ fn dispatch_int_maybe_heap_int_via_slot() {
 fn dispatch_int_unary_via_slot() {
     let mut fx = SlotFixture::new();
     let big = fx.heap_int(pow2(70));
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     let r = call_unary(&mut ctx, Some(fx.types.int), UnaryOp::Negative, Value::SmallInt(5));
     assert!(matches!(r, Ok(SlotOutcome::Value(Value::SmallInt(-5)))));
     let r = call_unary(&mut ctx, Some(fx.types.int), UnaryOp::Bool, Value::SmallInt(0));
@@ -153,7 +155,7 @@ fn dispatch_int_unary_via_slot() {
     // so the call runs in its own block and the payload is checked
     // after the context is dropped.
     let v = {
-        let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+        let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
         match call_unary(&mut ctx, Some(fx.types.int), UnaryOp::Negative, big) {
             Ok(SlotOutcome::Value(v)) => v,
             _ => panic!("expected a value from int -2**70"),
@@ -170,7 +172,7 @@ fn dispatch_int_binary_add_and_compare() {
     let mut fx = SlotFixture::new();
     let big = fx.heap_int(pow2(70));
     let one = Value::SmallInt(1);
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     let r = call_binary(
         &mut ctx,
         Some(fx.types.int),
@@ -180,7 +182,7 @@ fn dispatch_int_binary_add_and_compare() {
     );
     assert!(matches!(r, Ok(SlotOutcome::Value(Value::SmallInt(7)))));
     let v = {
-        let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+        let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
         match call_binary(&mut ctx, Some(fx.types.int), BinaryOp::Add, big, one) {
             Ok(SlotOutcome::Value(v)) => v,
             _ => panic!("expected a value from 2**70 + 1"),
@@ -190,7 +192,7 @@ fn dispatch_int_binary_add_and_compare() {
         crate::objects::primitives::ops::heap_int(&fx.arena, v),
         Some(&(pow2(70) + BigInt::from_int(1)))
     );
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     let r = call_binary(
         &mut ctx,
         Some(fx.types.int),
@@ -212,7 +214,7 @@ fn dispatch_int_binary_add_and_compare() {
 #[test]
 fn dispatch_bool_ops_via_slot() {
     let mut fx = SlotFixture::new();
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     let r = call_unary(&mut ctx, Some(fx.types.bool_), UnaryOp::Bool, Value::Bool(true));
     assert!(matches!(r, Ok(SlotOutcome::Value(Value::Bool(true)))));
     let r = call_binary(
@@ -245,7 +247,7 @@ fn dispatch_bool_ops_via_slot() {
 fn dispatch_nothandled_is_not_implemented() {
     let mut fx = SlotFixture::new();
     let fl = fx.heap_float(1.5);
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     // LEN is not implemented by the int slot (the original's
     // `mp_obj_int_unary_op` returns NULL for it).
     let r = call_unary(&mut ctx, Some(fx.types.int), UnaryOp::Len, Value::SmallInt(5));
@@ -268,7 +270,7 @@ fn dispatch_nothandled_is_not_implemented() {
 #[test]
 fn dispatch_raise_signals_pyraise() {
     let mut fx = SlotFixture::new();
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     // The adapter converts a rich raise to `Err(PyError::PyRaise)`.
     let r = int_binary_slot(
         &mut ctx,
@@ -302,7 +304,7 @@ fn dispatch_print_int_and_bool() {
     let mut fx = SlotFixture::new();
     let big = fx.heap_int(pow2(70));
     let fl = fx.heap_float(1.5);
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     let mut s = String::new();
     obj_print_helper(&mut ctx, &fx.types, Value::SmallInt(42), PrintKind::Str, &mut s);
     assert_eq!(s, "42");
@@ -332,7 +334,7 @@ fn dispatch_cell_slots_stay_none() {
     let cell_type: GcRef =
         fx.arena
             .alloc(None, Obj::Type(cell_type_data(cell_dict)), &fx.roots);
-    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool);
+    let mut ctx = make_ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     let cell = new_cell(&mut ctx, cell_type, Value::SmallInt(9));
     // All 11 cell slots are null in the original — dispatch finds
     // no slot at all.

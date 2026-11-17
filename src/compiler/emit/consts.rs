@@ -126,9 +126,19 @@ pub const MP_BC_LOAD_CONST_SMALL_INT_MULTI: u8 = 0x70;
 pub const MP_BC_LOAD_CONST_SMALL_INT_MULTI_NUM: isize = 64;
 pub const MP_BC_LOAD_CONST_SMALL_INT_MULTI_EXCESS: isize = 16;
 pub const MP_BC_LOAD_FAST_MULTI: u8 = 0xb0;
+/// `MP_BC_LOAD_FAST_MULTI_NUM` (vendor `py/bc0.h:75`).
+pub const MP_BC_LOAD_FAST_MULTI_NUM: isize = 16;
 pub const MP_BC_STORE_FAST_MULTI: u8 = 0xc0;
+/// `MP_BC_STORE_FAST_MULTI_NUM` (vendor `py/bc0.h:76`).
+pub const MP_BC_STORE_FAST_MULTI_NUM: isize = 16;
 pub const MP_BC_UNARY_OP_MULTI: u8 = 0xd0;
+/// `MP_BC_UNARY_OP_MULTI_NUM` = `MP_UNARY_OP_NUM_BYTECODE`
+/// (vendor `py/runtime0.h:60`: POSITIVE..NOT = 4).
+pub const MP_BC_UNARY_OP_MULTI_NUM: isize = 4;
 pub const MP_BC_BINARY_OP_MULTI: u8 = 0xd7;
+/// `MP_BC_BINARY_OP_MULTI_NUM` = `MP_BINARY_OP_NUM_BYTECODE`
+/// (vendor `py/runtime0.h:64`: LESS..POWER = 35).
+pub const MP_BC_BINARY_OP_MULTI_NUM: isize = 35;
 
 // ── py/emit.h kind enums ────────────────────────────────────────────────
 /// Emitter pass. Discriminants match Zig's `Pass` (scope=1 .. emit=4);

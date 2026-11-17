@@ -47,7 +47,8 @@
 //! - The `__new__` locals-dict entry stores the plain
 //!   `FunBuiltin` (the staticmethod wrapper is C12a's).
 
-use crate::memory::gc::{CallCtx, GcArena};
+use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::obj::FLAG_INSTANCE_TYPE;
 use crate::objects::objtype::objexcept::{check_arity, ExcError};
 use crate::objects::primitives::objint::fun_n_args;
@@ -102,6 +103,22 @@ impl ObjectError {
             ObjectError::OutOfMemory => PyError::OutOfMemory,
             _ => PyError::PyRaise,
         }
+    }
+}
+/// `TypedRaise` (C13): the VM builds the exception object from
+/// the recorded (name, message).
+impl TypedRaise for ObjectError {
+    fn raise_name(&self) -> &'static str {
+        self.exc_name()
+    }
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+    fn raise_message(&self, _pool: &RuntimeQstr) -> Option<String> {
+        self.message().map(|m| m.to_string())
+    }
+    fn raise_signal(&self) -> PyError {
+        self.clone().to_pyerror()
     }
 }
 
@@ -246,27 +263,27 @@ pub fn object_delattr(ctx: &mut CallCtx, self_in: Value, attr: Value) -> Result<
 
 /// `object.__init__` — fixed 1 arg.
 pub fn object_init_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(ExcError::to_pyerror)?;
-    object_init(ctx, args[0]).map_err(ObjectError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    object_init(ctx, args[0]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `object.__new__` — fixed 1 arg (the class; staticmethod —
 /// no self is bound by the call machinery).
 pub fn object_new_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 1, 1).map_err(ExcError::to_pyerror)?;
-    object_new(ctx, args[0]).map_err(ObjectError::to_pyerror)
+    check_arity(args, 1, 1).map_err(|e| ctx.record_typed(e))?;
+    object_new(ctx, args[0]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `object.__setattr__` — fixed 3 args.
 pub fn object_setattr_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 3, 3).map_err(ExcError::to_pyerror)?;
-    object_setattr(ctx, args[0], args[1], args[2]).map_err(ObjectError::to_pyerror)
+    check_arity(args, 3, 3).map_err(|e| ctx.record_typed(e))?;
+    object_setattr(ctx, args[0], args[1], args[2]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `object.__delattr__` — fixed 2 args.
 pub fn object_delattr_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    check_arity(args, 2, 2).map_err(ExcError::to_pyerror)?;
-    object_delattr(ctx, args[0], args[1]).map_err(ObjectError::to_pyerror)
+    check_arity(args, 2, 2).map_err(|e| ctx.record_typed(e))?;
+    object_delattr(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
 }
 
 /// `object_locals_dict` (`objobject.zig:165`): the fixed ROM

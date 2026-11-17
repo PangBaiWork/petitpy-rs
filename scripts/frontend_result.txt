@@ -1,0 +1,169 @@
+Lane C17: frontend remainder — parsenum/emitglue/parsenumbase
+================================================================
+Worktree: ~/workspace/petitpy-rs-frontend, branch lane/frontend, base master 7bbfa58
+Executor baseline (verified at dispatch): lib 1146 passed, 0 failed, 3 ignored; bins 9/9.
+
+ACCEPTANCE — VERIFIED BY THE EXECUTOR (full suite re-run after the final edit)
+  cargo test --release --lib --tests: 1168 passed, 0 failed, 3 ignored   (1146 + 22 new)
+  cargo test --release --bins: 9 passed, 0 failed
+  cargo build --release: clean, 0 warnings (lib + bins + test builds)
+  No unsafe. Every file < 800 lines (largest touched: objint.rs 684).
+  Original repo ~/workspace/petitpy-orig untouched (git status clean).
+  Frontend gate re-run: scripts/check_compile_mpy.py — 552/552 byte-identical, PASS.
+
+NEW TESTS: 22 (18 in src/vendor/parsenum_tests.rs + 1 emitglue + 3 vm_raise)
+  parsenum_tests.rs (18): parse_num_base auto/explicit/short (3 fns),
+    parse_num_integer decimal/sign/ws, prefixes, underscores, big values,
+    bad base, invalid syntax (6 fns), parse_float_internal_with_len
+    consumed + dangling exponent (2 fns), parse_num_float plain/inf-nan/
+    errors (3 fns), parse_num_decimal imag suffix / force_complex
+    two-pass / errors (3 fns), is_space agreement over all 256 bytes.
+  compile/tests.rs (1): emitglue_raw_code_kind_and_generator_flag.
+  vm_raise_tests.rs (3): obj_from_entry float values / float errors /
+    complex values+errors (via the runtime Env fixture).
+
+§1 — ENTRY MAPPING TABLE (Zig fn → Rust home)
+------------------------------------------------------------------------
+parsenumbase.zig:
+  mp_parse_num_base :17        → vendor::parsenum::parse_num_base (NEW,
+    exact port incl. the `goto no_prefix` shape: len<=1 and c!='0'
+    fall through to the `*base==0 → 10` tail; the c=='0' path skips
+    the tail; base-0 leading-zero → base 1). The C7 private copy in
+    objint.rs is DELETED; objint delegates.
+
+parsenum.zig:
+  mp_parse_num_integer :212    → vendor::parsenum::parse_num_integer
+    (NEW, BigInt accumulation — value-identical to the Zig's
+    small-int + mpz re-parse, the C7 justification moved with it).
+    objint::parse_int_text is now a thin wrapper mapping
+    ParseNumIntError → PrimError (BadBase → IntBaseRange,
+    InvalidSyntax → InvalidSyntaxForInt). The message literals live
+    on PrimError::message (no second copy).
+  mp_decimal_exp :271          → vendor::parsenum::decimal_exp (FMT).
+    VERIFIED ONLY (formatfloat tests), no change.
+  mp_parse_float_internal :328 → vendor::parsenum::parse_float_internal
+    (FMT) + NEW parse_float_internal_with_len returning
+    Option<(consumed, value)> — the Zig returns the pointer past
+    the scan / NULL on a dangling exponent ("1e+"); the old wrapper
+    keeps the f64-only shape (NULL → 0.0) for formatfloat.rs.
+  mp_parse_num_float :487      → vendor::parsenum::parse_num_float
+    (NEW: decimal(allow_imag, force_complex=false), vendor
+    parsenum.h:47-49). Wired into the .mpy loader (below).
+  mp_parse_num_decimal :505    → vendor::parsenum::parse_num_decimal
+    (NEW: full parseDecimalImpl with complex_enabled=true — 'j'
+    suffix, inf/infinity/nan, two-pass force_complex; the nano
+    complex_enabled=false arms are dead under full and not
+    represented). parse_num_complex = decimal(true, true)
+    (vendor parsenum.h:51-53) is also added, #[allow(dead_code)]
+    — no in-tree caller yet; C18's complex(str) will call it.
+  convertToSyntaxError / raiseExc / LexerLayout
+                               → NOT PORTED: the lex!=NULL → SyntaxError
+    conversion belongs to the lexer/parser call path, which never
+    calls these entries (the parser validates literals itself);
+    the Rust forms carry the ValueError shape only (documented
+    on each error enum).
+
+emitglue.zig:
+  mp_emit_glue_new_raw_code :59
+                               → SUBSUMED: no standalone Rust form.
+    The driver builds each scope's RawCode directly with
+    kind=MP_CODE_BYTECODE (compile/driver.rs:483); there is no
+    RESERVED intermediate state in Rust.
+  mp_emit_glue_assign_bytecode :70
+                               → SUBSUMED: same construction
+    (fun_data + children filled by assemble_raw_code); the
+    is_generator assignment has no RawCode field — the bit lives
+    in the prelude scope_flags, read at make_function time
+    (runtime/vm_ops.rs via prelude_sig_decode). Pinned by the
+    emitglue test (2 children, both BYTECODE, exactly one with
+    the generator prelude flag).
+  mp_make_function_from_proto_fun :89
+                               → runtime::vm_ops::make_function_ctx
+    (C13). VERIFIED ONLY (mapping + existing tests).
+  mp_make_closure_from_proto_fun :110
+                               → runtime::vm_ops::make_closure_ctx
+    (C13). VERIFIED ONLY.
+
+§2 — nodes.rs DISPOSITION (kept, documented, no behavior change)
+------------------------------------------------------------------------
+  validate_int_literal — kept. Its validity check is
+    bigint::parse_literal (the Zig bigint.zig parseLiteral, NOT
+    mp_parse_num_integer); the two agree on bare literal text
+    (no sign/whitespace), and the leading-zero rule is the
+    parser-level rule from parser.zig:983-993. Doc updated.
+  parse_int_base0 — kept. It is the Zig stdlib parseInt mirror
+    (parser.zig:1001), deliberately NOT mp_parse_num_integer:
+    parseInt rejects '_', so `1_000` falls through to a
+    const_object, as in the original. Only the 30-bit SMALL_INT
+    leaf gate uses it. Doc updated.
+
+§3 — .mpy LOADER WIRING (the real behavior fix this lane)
+------------------------------------------------------------------------
+  runtime::vm_raise::obj_from_entry Float/Complex arms now call
+  vendor::parsenum::parse_num_float (allow_imag=false / true),
+  replacing `str::parse().unwrap_or(0.0)` and the hand-rolled
+  parse_complex_text (DELETED — it had a real divergence: "1e-2j"
+  split at the exponent '-' into (0.0, -2.0) instead of (0, 0.01)).
+  Errors record ValueError("invalid syntax for number") via
+  ctx.record_raise + PyError::PyRaise.
+  C15b's overlap table called load_obj "ALREADY PORTED" via
+  obj_from_entry — the Int/Str/Bytes/Tuple arms were; the
+  Float/Complex arms were NOT equivalent. Fixed here.
+
+§4 — FINDINGS (all probed on the reference binary, C17)
+------------------------------------------------------------------------
+  - int("010") == 10 (explicit base 10); int("010", 0) → ValueError
+    "invalid syntax for integer" (base-0 → base 1, no digits).
+  - int("_") == 0; int("1_000") == 1000; int("0b102") /
+    int("12z") → ValueError "invalid syntax for integer".
+  - float("inf"/"infinity"/"nan"/"1_0.5"/" 1.5 ") == inf/inf/nan/
+    10.5/1.5; float("1e+") / float("1e") / float("1.5j") /
+    float("j") / float("3+4j") → ValueError "invalid syntax for number".
+  - EVERY complex literal raises at LOAD time: print(1j),
+    print(3+4j), print(1e-2j), print(1.5j) → ValueError "invalid
+    syntax for number". Cause (proven by .mpy bytes): the compiler
+    emits `1j` as a FLOAT const `"1j"` (Rust and Zig byte-identical)
+    and `3+4j` as int 3 + FLOAT `"4j"`; the loader calls
+    mp_parse_num_float(allow_imag=false), which rejects the 'j'.
+    The Rust loader used to return 0.0 — now raises, matching.
+  - A hand-built .mpy with a COMPLEX entry "1j" parses fine
+    (Complex{0,1}) but the module then crashes in libc (the
+    original's complex objects are broken at runtime — pre-existing,
+    C18's slot work, not the parse). A COMPLEX entry "(1+2j)"
+    (the vendor PRINT_REPR form, objcomplex.c:45-62) raises
+    ValueError — the parenthesised text can never load, because
+    the loader calls mp_parse_num_float (force_complex=false).
+    Same for "3+4j" as a COMPLEX entry. Only bare "Nj" loads.
+  - "3 + 4j" fails even for parse_num_complex: whitespace is
+    skipped BEFORE the sign but NOT between sign and digits, so
+    the second pass sees " 4j" after '+' and consumes nothing
+    (probed: COMPLEX .mpy entry "3 + 4j" → ValueError). My first
+    test expected success — the probe corrected it.
+  - Two test-only failures during the lane, both fixed in-lane:
+    (a) the "3+4j " (trailing space) case is VALID (trailing
+    whitespace is skipped before the end check) — moved to the
+    success table; (b) the "3 + 4j" case above.
+
+§5 — NOT PORTED / NOT DONE
+------------------------------------------------------------------------
+  - No Obj::Code, no float()/complex() builtins (C18 owns the
+    float/complex types; parse_num_float/parse_num_complex are
+    its entry points). No `complex(str)` wiring.
+  - convertToSyntaxError/raiseExc/LexerLayout (see §1).
+  - The `is_space` one-line copy in vendor/parsenum.rs (keeps
+    vendor/ free of objects/ imports) is pinned by the 256-byte
+    agreement test against canonical unichar_isspace — flag if
+    the parent prefers a direct dependency instead.
+  - ConstObj::Complex is never created by the compiler (no
+    creation sites in-tree); the Complex .mpy arm is reachable
+    only from foreign .mpy files.
+
+HANDOVER (C18)
+  - float(str) → parse_num_float(s, false); complex(str) →
+    parse_num_complex(s). Both return DecimalNum; map
+    InvalidNumber → ValueError("invalid syntax for number").
+  - The .mpy loader now raises ValueError for complex literals
+    (1j/3+4j) at LOAD time — corpus files using them will raise
+    the same way on the reference binary; do not "fix" this.
+  - parse_num_complex carries #[allow(dead_code)] until C18
+    wires complex(str); remove the attribute then.

@@ -94,4 +94,6 @@ mod runtime_tests_b;
 #[cfg(test)]
 mod runtime_tests_c;
 #[cfg(test)]
+mod vm_raise_tests;
+#[cfg(test)]
 mod vm_tests_b;

@@ -40,122 +40,21 @@ use crate::pyerr::{PyError, PyResult};
 use crate::vendor::mpz::BigInt;
 
 // ── `mp_parse_num_integer` (vendor `py/parsenum.c:71`) ─────────────────
-
-/// ASCII whitespace per `unichar_isspace` (vendor `py/unicode.c:119-121`):
-/// `c < 128 && FL_SPACE` — exactly `0x09..=0x0d` and `0x20`. The
-/// parse works on raw bytes, so non-ASCII bytes are never space.
-/// Delegates to the canonical predicate (C16 unification — this
-/// was a second copy of the same table).
-fn is_space(b: u8) -> bool {
-    crate::objects::strings::unicode::unichar_isspace(b as u32)
-}
-
-/// `mp_parse_num_base` (vendor `py/parsenumbase.c`): strip an
-/// optional `0x` / `0o` / `0b` prefix (case-insensitive) and settle
-/// `base`; returns the prefix length to skip. Base 0 with a leading
-/// `0` and no prefix letter becomes base 1 (provokes `ValueError`
-/// unless every digit is zero); base 0 with no prefix becomes 10.
-/// A prefix letter only counts when it matches the requested base.
-fn parse_num_base(s: &[u8], base: &mut i32) -> usize {
-    if s.len() <= 1 {
-        if *base == 0 {
-            *base = 10;
-        }
-        return 0;
-    }
-    if s[0] == b'0' {
-        let c = s[1] | 0x20;
-        let b = *base;
-        if c == b'x' && (b == 0 || b == 16) {
-            *base = 16;
-            2
-        } else if c == b'o' && (b == 0 || b == 8) {
-            *base = 8;
-            2
-        } else if c == b'b' && (b == 0 || b == 2) {
-            *base = 2;
-            2
-        } else {
-            if b == 0 {
-                *base = 1;
-            }
-            0
-        }
-    } else {
-        if *base == 0 {
-            *base = 10;
-        }
-        0
-    }
-}
-
-/// `mp_parse_num_integer` (vendor `py/parsenum.c:71`): the exact
-/// integer denoted by `s` in `base` (0 = auto-detect). The original
-/// parses into a `u64` and re-parses via mpz on overflow; accumulating
-/// straight into a `BigInt` gives the identical value.
-/// `_` is skipped ANYWHERE (including leading/trailing/doubled —
-/// `int("_")` is 0: the `_` advances past `str_val_start`, so the
-/// no-digits check does not fire); a digit `>= base` ends the digit
-/// run without error; trailing whitespace is skipped and anything
-/// else left raises `InvalidSyntaxForInt`.
+//
+// Canonical home: `crate::vendor::parsenum::parse_num_integer`
+// (Lane C17 — the `mp_parse_num_base` / `mp_parse_num_integer`
+// port, moved here from this file's private copies). This is a
+// thin error-mapping wrapper: `ParseNumIntError` → `PrimError`
+// (`BadBase` → `IntBaseRange`, `InvalidSyntax` → `InvalidSyntaxForInt`).
+// The digit loop, the `_`-anywhere rule and the base-1 quirk live
+// there; see that module for the port notes.
 pub fn parse_int_text(s: &[u8], base_in: i32) -> Result<BigInt, PrimError> {
-    let mut base = base_in;
-    if (base != 0 && base < 2) || base > 36 {
-        return Err(PrimError::IntBaseRange);
-    }
-    let top = s.len();
-    let mut i = 0;
-    while i < top && is_space(s[i]) {
-        i += 1;
-    }
-    let mut neg = false;
-    if i < top {
-        if s[i] == b'+' {
-            i += 1;
-        } else if s[i] == b'-' {
-            i += 1;
-            neg = true;
+    crate::vendor::parsenum::parse_num_integer(s, base_in).map_err(|e| match e {
+        crate::vendor::parsenum::ParseNumIntError::BadBase => PrimError::IntBaseRange,
+        crate::vendor::parsenum::ParseNumIntError::InvalidSyntax => {
+            PrimError::InvalidSyntaxForInt
         }
-    }
-    i += parse_num_base(&s[i..], &mut base);
-    let val_start = i;
-    let mut z = BigInt::zero();
-    let bbase = BigInt::from_int(base as i64);
-    while i < top {
-        let mut dig = s[i];
-        if (b'0'..=b'9').contains(&dig) {
-            dig -= b'0';
-        } else if dig == b'_' {
-            i += 1;
-            continue;
-        } else {
-            dig |= 0x20;
-            if (b'a'..=b'z').contains(&dig) {
-                dig -= b'a' - 10;
-            } else {
-                break;
-            }
-        }
-        if dig as i32 >= base {
-            break;
-        }
-        z.mul_assign(&bbase);
-        z.add_assign(&BigInt::from_int(dig as i64));
-        i += 1;
-    }
-    if i == val_start {
-        return Err(PrimError::InvalidSyntaxForInt);
-    }
-    while i < top && is_space(s[i]) {
-        i += 1;
-    }
-    if i != top {
-        return Err(PrimError::InvalidSyntaxForInt);
-    }
-    if neg {
-        z = -z;
-    }
-    Ok(z)
+    })
 }
 
 // ── `mp_obj_int_make_new` (objint.zig; vendor `py/objint.c:40`) ────────

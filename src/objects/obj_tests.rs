@@ -260,7 +260,13 @@ pub(crate) fn print_marker_slot(
     let _ = sink.write_str("PRINTED");
 }
 
-fn dummy_call(_ctx: &mut CallCtx, _f: Value, _args: &[Value]) -> PyResult<Value> {
+fn dummy_call(
+    _ctx: &mut CallCtx,
+    _f: Value,
+    _n_args: usize,
+    _n_kw: usize,
+    _args: &[Value],
+) -> PyResult<Value> {
     Ok(Value::None)
 }
 

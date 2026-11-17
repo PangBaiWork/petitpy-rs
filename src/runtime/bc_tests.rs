@@ -38,6 +38,10 @@ impl Fixture {
                 name: 0,
                 n_args: 0,
                 code: 0,
+                // C10: default args + module context (empty here).
+                def_pos: Vec::new(),
+                def_kw: None,
+                context: None,
             }),
             &roots,
         );

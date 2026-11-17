@@ -16,7 +16,8 @@
 use crate::memory::gc::{GcArena, RootSet};
 use crate::objects::containers::map_set::{set_items, MpSet};
 use crate::objects::slots::{
-    BinaryOpFn, BufferFn, BuiltinFn, CallFn, GetIterFn, PrintFn, SubscrFn, UnaryOpFn,
+    BinaryOpFn, BufferFn, BuiltinFn, BuiltinKwFn, CallFn, GetIterFn, PrintFn, SubscrFn,
+    UnaryOpFn,
 };
 use crate::pyerr::PyResult;
 use crate::vendor::mpz::BigInt;
@@ -335,6 +336,16 @@ impl Obj {
                 }
                 out
             }
+            Obj::FunBc(f) => {
+                let mut out = f.def_pos.clone();
+                if let Some(kw) = f.def_kw {
+                    out.push(kw);
+                }
+                if let Some(c) = f.context {
+                    out.push(Value::Heap(c));
+                }
+                out
+            }
             _ => Vec::new(),
         }
     }
@@ -464,19 +475,44 @@ pub struct SliceData {
 
 /// Bytecode function (`mp_obj_fun_bc_t`). `code` is an index into the
 /// VM's code store (owned by C13); the VM roots the store. C10 owns.
+///
+/// `def_pos` / `def_kw` are the trailing extra args of
+/// `mp_obj_new_fun_bc` (`objfun.zig:204-241`): `def_args[0]` is the
+/// tuple of positional defaults (unpacked here), `def_args[1]` the
+/// keyword-defaults dict. `setup_code_state` (`bc.rs`) takes them as
+/// `extra_args` — positional defaults first, then the defkwargs dict
+/// iff the `DEFKWARGS` scope flag is set (`bc.rs`, `extra_args[sig.
+/// n_def_pos_args]`). `context` is the module context
+/// (`mp_module_context_t`, whose offset 0 IS the module object —
+/// `objfun.zig:359-361`); `__globals__` reads the module's dict
+/// through it. C13's loader fills `name` / `n_args` (decoded from
+/// the prelude + qstr table) and `context`.
 #[derive(Clone, Debug)]
 pub struct FunBcData {
     pub name: u32,
     pub n_args: u16,
     pub code: usize,
+    pub def_pos: Vec<Value>,
+    pub def_kw: Option<Value>,
+    pub context: Option<GcRef>,
 }
 
 /// Built-in function (`mp_obj_fun_builtin_t`). C10 / D1 own the registry.
+///
+/// `n_args` is C7's `(min << 8) | max` packing (`fun_n_args`,
+/// `objint.rs:277`) — the arity range the adapters check. `kw_func`
+/// is the keyword-taking body (`mp_obj_fun_builtin_var_t` with the
+/// takes_kw sig bit set, `argcheck.zig` `mpArgCheckNumSigImpl`):
+/// `Some` ⟺ this builtin takes kwargs, and the `fun_builtin_var_call`
+/// adapter calls it (never `func`) when it is `Some`. `None` for
+/// fixed-arity and var-no-kw builtins. D1 fills it for kw builtins
+/// (`print`, ...).
 #[derive(Clone, Debug)]
 pub struct FunBuiltinData {
     pub name: u32,
     pub n_args: u16,
     pub func: BuiltinFn,
+    pub kw_func: Option<BuiltinKwFn>,
 }
 
 /// Bound method (`mp_obj_bound_meth_t`). C10 owns.

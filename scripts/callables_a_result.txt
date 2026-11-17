@@ -1,0 +1,256 @@
+Lane C10a: port fun + boundmeth + closure to Rust
+====================================================
+分支 lane/callables-a，基线 master 553d9fc
+提交：63bbcc2
+工作区 ~/workspace/petitpy-rs-callables-a
+范围：objfun.zig 532 行 + objboundmeth.zig 98 行 + objclosure.zig 90 行
+      = 720 行，全部移植（3 个文件均 0 test block）
+
+验收
+----
+- cargo test --release --lib --tests：567 passed, 0 failed, 1 ignored
+  （基线 542 + 25 新测试）
+- cargo test --release --bins：9 passed, 0 failed
+- 0 warnings（lib 构建 + lib test 构建均为 0）
+- 无 unsafe（"unsafe" 一词仅出现在 src/objects/slots.rs:270 的旧文档注释中）
+- 每文件 <800 行：objfun.rs 605，objboundmeth.rs 241，objclosure.rs 166，
+  callables_tests.rs 611，callables_tests_b.rs 298，callables_tests_c.rs 283，
+  mod.rs 15；改动文件 value.rs 736、obj.rs 742、slots.rs 314 均 <800
+
+新测试（25 个，callables_tests*.rs）
+-----------------------------------
+arg_check_fixed_arities，arg_check_var_range_and_kw，
+builtin_0_call，builtin_1_call，builtin_2_and_3_call，
+builtin_var_call_no_kw，builtin_var_call_kw，
+call_fun_builtin_dispatches_by_sig，
+new_fun_bc_unpacks_defaults_and_traces，new_fun_bc_no_defaults，
+fun_bc_attr_name_and_globals，fun_bc_print_format，callable_type_data_shapes，
+prepare_binds_positionals_and_defaults，prepare_errors，
+prepare_defaults_and_varargs，
+fun_bc_call_runner_outcomes，fun_bc_call_runner_sees_prepared_state，
+bound_meth_call_slot_builtin_prepends_self，
+bound_meth_call_primary_prepends_self_in_state，
+bound_meth_hash_and_equal，bound_meth_attr_and_children，
+closure_call_slot_builtin_prepends_cells，
+closure_call_primary_prepends_cells_in_state，
+closure_attr_delegates_to_fun
+
+新增 / 改动文件
+--------------
+新增 src/objects/callables/：
+  objfun.rs（605）— fun_builtin_0/1/2/3/var_call，call_fun_builtin，
+    fun_bc_get_name，new_fun_bc，fun_bc_prepare_call，fun_bc_call，
+    fun_bc_call_slot，fun_bc_print，fun_bc_attr，load_attr_on_fun，
+    8 个 type-data 构造函数，FUN_BC_ATTR 常量，RunOutcome
+  objboundmeth.rs（241）— bound_meth_call，bound_meth_call_slot，
+    bound_meth_unary_op，bound_meth_binary_op，new_bound_meth，
+    bound_meth_attr，bound_meth_type_data
+  objclosure.rs（166）— closure_call，closure_call_slot，new_closure，
+    closure_attr，closure_type_data
+  mod.rs（15），callables_tests.rs（611），callables_tests_b.rs（298），
+    callables_tests_c.rs（283）
+改动：
+  src/objects/mod.rs — 注册 callables 模块
+  src/objects/slots.rs — CallFn 改签名；新增 BuiltinKwFn、AttrFn
+  src/objects/value.rs — FunBcData / FunBuiltinData 扩展；
+    wrap_small_int 移到此处（objtuple.rs 仍 re-export，见 C9b 后续修正）
+  src/objects/obj.rs — FLAG_BINDS_SELF（0x0020）、FLAG_BUILTIN_FUN（0x0040）
+  src/objects/primitives/objint.rs — int_locals_dict 增加 kw_func: None
+  src/objects/obj_tests.rs — dummy_call 改新签名
+  src/runtime/bc_tests.rs — fixture 增加 kw_func: None
+  docs/value-obj-design.md — D5 增加 C10 修正与 C10 注（见下）
+
+接口修正（已写入 docs/value-obj-design.md D5，C6 前例）
+------------------------------------------------------
+1. CallFn 改签名：C0 的 fn(&mut CallCtx, Value, &[Value]) 无法表达原版
+   调用协议。vendor mp_call_function_t（py/obj.h）是
+   call(self, n_args, n_kw, args)，args = n_args 个位置参数后跟
+   2*n_kw 个 (name, value) 关键字对。没有 n_kw，槽无法拆分切片，
+   fun_bc_call 根本无法移植。现为
+   CallFn = fn(&mut CallCtx, Value, usize, usize, &[Value])。
+   修正时 grep 确认此前没有任何 lane 填过 call 槽（只有 call: None
+   字面量），故不破坏任何已有代码。
+2. BuiltinFn 不变（fn(&mut CallCtx, &[Value])，位置参数专用；
+   C8b/C9b 方法适配器已按此约定编写）。关键字内置函数另有
+   BuiltinKwFn = fn(&mut CallCtx, &[Value], &[(u32, Value)])，
+   由 FunBuiltinData.kw_func: Option 携带（Some ⟺ 接受关键字参数）。
+   FunBuiltinData.n_args 仍用 C7 的 (min << 8) | max 打包（fun_n_args）。
+3. AttrFn 新增（slots.rs）：
+   AttrFn = fn(&mut CallCtx, Value, u32) -> PyResult<Option<Value>>，
+   load-only（Some = 找到，None = 未找到，Err = 抛出）。
+   但 TypeData 仍无 attr 字段——补一个字段要改 30 处字面量，且与并行
+   的 C9c lane 共享 fixture 冲突。三个 attr 函数（fun_bc_attr /
+   bound_meth_attr / closure_attr）已按此约定移植并单测，C12 在接
+   mp_load_method 时把它们挂进 TypeData（FUN_BC_ATTR 常量已备好）。
+4. FunBcData 扩展（读 mp_obj_new_fun_bc objfun.zig:204-241 后决定）：
+   { name: u32, n_args: u16, code: usize, def_pos: Vec<Value>,
+     def_kw: Option<Value>, context: Option<GcRef> }。
+   def_pos = 解包后的 def_args[0] 元组；def_kw = def_args[1] 字典
+   （setup_code_state 只在 DEFKWARGS 作用域标志置位时读尾随字典）；
+   context = 模块对象（C13 的加载器填充；__globals__ 经它读模块字典，
+   模块位于 context 偏移 0 处）。children() 追踪三者。
+5. TypeData flags 新增：FLAG_BINDS_SELF = 0x0020，
+   FLAG_BUILTIN_FUN = 0x0040（vendor py/obj.h:566-577）。
+
+已验证的发现（全部在参考二进制上探过，见 /tmp/c10a_probe*.py）
+--------------------------------------------------------------
+- f.__name__ == "f"；repr(f) == "<function f at 0x...>"（地址每次运行
+  不同——Rust 打印 arena 槽位索引，格式相同）；str(f) 与 repr 相同
+  （kind 被忽略）；f.__qualname__ / f.__doc__ → AttributeError；
+  f.__globals__ is globals() 为 True。
+- 内置函数没有 __name__（len.__name__ → AttributeError；内置函数类
+  型根本没有 attr 槽）；repr(len) == "<function>"；[].append.__name__
+  → AttributeError；repr([].append) == "<bound_method>"；
+  C().m.__name__ == "m"；repr(C().m) == "<bound_method>"；
+  c.m == c.m（同一个 c），C().m != C().m；repr(closure) == "<closure>"；
+  f.__name__ = "x"（store）→ AttributeError。
+- 元数错误全部是 terse TypeError "argument num/types mismatch"：
+  len(1,2)、len()、f()、f(1,2,3)；setup 错误各有自己的消息：
+  f(1,c=5) → "unexpected keyword argument"；f(a=1,a=2) →
+  "function got multiple values for argument 'a'"；
+  f(b=3) → "function missing required positional argument #0"；
+  g(a=1)（def g(a,b,c=3)）→ missing #1（0-based 后增量，C5 已述）。
+- g(1) → terse mismatch；g(1,2) == (1,2,3)；g(1,2,3,4) → terse；
+  g(1,b=2,c=3) == (1,2,3)；v(1,2,3) == (2,3)（def v(a,*args)）；
+  v() → terse；v(1) == ()；w(1,2,3) == (1,(2,3),9)，
+  w(1,2,3,k=5) == (1,(2,3),5)（def w(a,*args,k=9)）。
+- print(1, 2, sep="-") 打印 1-2——关键字内置函数在原版里真实存在，
+  故 BuiltinKwFn 不是自创。
+- __doc__ 不是静态 qstr（static_qstr_id 返回 None）；编译器在源码
+  提到它时动态 intern。测试里用池子动态 intern（cfx.q）。
+- 内置函数类型没有 print 槽：Zig 的 builtinFunType 只填 call 槽
+  （objfun.zig:405-425，slot_index_print = 0，slot_index_call = 1，
+  其余全 0）。repr(len) == "<function>" 是 VM 对无 print 槽对象的
+  默认打印（C13 的事），不是本 lane 的槽。测试断言 print.is_none()。
+- fun_bc 类型槽位（objfun.zig:488-492）：print=1，attr=2，call=3，
+  unary=0，binary=0。bound_method（objboundmeth.zig:70-74）：print=0，
+  call=2，unary=3，binary=4，attr=1。closure
+  （objclosure.zig:66-70）：print=0，call=2，unary=0，binary=0，attr=1。
+- var-args 元组槽位：vpk_idx = n_state - 1 - n_pos_args -
+  n_kwonly_args——kwonly 参数也要减。def w(a, *args, k=9) 时
+  state[n-1]=a，state[n-2]=k，state[n-3]=args 元组（测试最初把
+  tuple 与 k 的槽位写反了，测试失败后按 bc.rs setup_code_state
+  的代码纠正；v(a, *args) 时 state[n-2] 是 tuple，无 kwonly，
+  不受影响）。
+
+简报前提核对（对的 / 错的）
+--------------------------
+- 对：fun_builtin_*_call 适配器完全可移植（objfun.zig:72/79/86/93/100，
+  签名均为 (self, n_args, n_kw, args)，与 C0 的 CallFn 修正后一致）；
+  fun_bc_call 可拆 prepare + runner seam；globals 存取是 C13 的；
+  FunBcData 需加默认参数字段（见接口修正 4）。
+- 错（测试写错、已纠正，移植代码无错）：
+  (a) 曾断言内置函数类型有 print 槽——Zig 只有 call 槽（见上）；
+  (b) 曾断言 w(a, *args, k=9) 的 args 元组在 state[n-2]——实际在
+  state[n-3]（vpk 减 kwonly，见上）；
+  (c) 曾用 static_qstr_id 取 __doc__——它不是静态 qstr。
+- 补充：bound_meth 的 HASH 是 wrap_small_int(word(self) ^
+  word(meth))，word 为 REPR_A 的 obj_id 值；EQUAL 只比较 self 与
+  meth 两部分（obj_equal），不同对象但字节相同的 str 作 self 时
+  相等，不同 FunBuiltin 对象（同一函数体）作 meth 时不等
+  （obj_equal 回落到指针比较）；NOT_EQUAL 不是槽操作。
+
+Runner seam 定义（C13 的契约，不得改动签名而不通知 C13）
+--------------------------------------------------------
+- RunOutcome（objfun.rs）：Normal(Value) / Exception(Value) /
+  NeedsVm。值放在 outcome 里传递——Rust 的 CodeState 没有 sp，
+  栈由 VM 管理；Zig 是从 code_state.sp[0]（NORMAL）/
+  statePtr()[0]（EXCEPTION）读结果（objfun.zig:370-373）。
+- fun_bc_prepare_call(ctx, fun: GcRef, code, qstr_table, empty_tuple,
+  n_args, n_kw, args) -> Result<CodeState, SetupError>：
+  prelude 解码（只读 n_state 与 n_exc_stack；后者仅定 Zig 缓冲大小，
+  Rust CodeState 无 exc-stack 存储，解码后丢弃——与 C5 的 setup 一致），
+  extra_args = def_pos + def_kw，setup_code_state 绑定参数。
+  返回的 CodeState 的 ip 已指向 source-info 段（与 C5 的 setup 一致）。
+  setup 失败 = Err（SetupError 带消息数据；Zig 是返回 NULL 且
+  pending_exc 已置位——同一 polled-sentinel 形状，向上一层）。
+  fun 不是堆上 FunBc 时 panic（调用方契约违规；Zig 的 fromObj
+  会读垃圾——与 bc.rs 的 dict_entries_mut 同类处理）。
+- fun_bc_call(ctx, self_value, code, qstr_table, empty_tuple, n_args,
+  n_kw, args, runner: &mut dyn FnMut(&mut CallCtx, &mut CodeState)
+  -> RunOutcome) -> PyResult<Value>：prepare + runner。Normal → Ok，
+  Exception / NeedsVm → Err(PyError::PyRaise)（异常值在槽边界丢弃，
+  待 C13 加 pending_exc——C6 约定）。
+- fun_bc_call_slot / bound_meth_call_slot / closure_call_slot：
+  空 runner——槽里没有 RawCode / qstr 表 / 空元组单例（都在 C13 的
+  代码库里），FunBc 路径一律返回 PyRaise；内置函数路径是活的
+  （不需要 runner / 代码）。C13 在代码库落地后替换这三个槽的接线。
+- bound_meth_call / closure_call（带 runner 的主入口）：与 fun_bc_call
+  同一形状；bound method 在 self 前置（n_args + 1，mp_call_method_
+  self_n_kw 的语义）；closure 在 cells 前置（n_closed + n_args，
+  n_total = n_closed + n_args + 2*n_kw）。
+- call_fun_builtin(ctx, fun, n_args, n_kw, args)：按 sig 分发
+  （fun_builtin_0/1/2/3/var_call），与按 Zig 的每类型 call 槽分发
+  在可观察行为上等价（同一 arg_check_num 谓词；测试
+  call_fun_builtin_dispatches_by_sig 钉住 (2,2) 与 fixed-2 一致）。
+
+C13 延期清单（带 Zig 行号，不要按 CPython 猜）
+----------------------------------------------
+- globals 存取：fun_bc_call 里的 old_globals = globalsGet()
+  （objfun.zig:352）、执行前 globalsSet(模块 globals)
+  （objfun.zig:365-366）、执行后恢复（:367）。context 是模块对象，
+  模块位于偏移 0（:363-364 注释）。
+- 执行步：mp_execute_bytecode(code_state, 0)（objfun.zig:366）。
+- 结果读取：NORMAL 取 sp[0]，EXCEPTION 取 statePtr()[0]
+  （objfun.zig:370-373）——Rust 里是 RunOutcome 的值。
+- setup 的 polled 检查（objfun.zig:355-359）：setup 后若 pending_exc
+  已置位，在进 VM 前返回 NULL。Rust 里是 fun_bc_prepare_call 的
+  Err 返回。
+- pending_exc：RunOutcome::Exception 的值目前在槽边界丢弃；C13
+  加 VmState.pending_exc 后接上（并替换 C8a 的 PENDING_STR_ERROR
+  占位单元）。
+- 空元组单例：setup 的 empty_tuple 参数是 VM 拥有的 () 单例
+  （C5 的约定；空 *args 就是它，不是新分配的）。
+- attr 槽进 TypeData（C12）：fun_bc_attr（objfun.zig:465，
+  __name__/__globals__；__code__ 在两种配置下都是死代码）、
+  bound_meth_attr（objboundmeth.zig:57，委托给 fun 的 attr）、
+  closure_attr（objclosure.zig:54，委托给 fun 的 attr）已移植，
+  FUN_BC_ATTR 常量已备好；C12 在接 mp_load_method 时挂接。
+- make_new：FunBc / bound_method / closure 的构造走 C12 的
+  类型调用机制（new_fun_bc / new_bound_meth / new_closure 是
+  构造器本身，已移植；MAKE_FUNCTION 等字节码由 C13 发）。
+
+有意分歧（与原版不同，语料不可见）
+----------------------------------
+- 状态分配：Zig 用 88 字节栈缓冲 + 堆回落，堆分配失败报
+  MemoryError（objfun.zig:315-344）；Rust 的状态是 CodeState
+  里的 Vec，分配失败 abort 而不是报 MemoryError（与 Zig 自己
+  的堆失败注释同类）。
+- print 地址：Zig 打印堆指针（%p）；Rust 打印 arena 槽位索引，
+  格式 "<function NAME at 0x{:x}>" 相同。
+- closure 的 5 槽栈缓冲：Zig 在 n_total <= 5 时用栈缓冲，否则堆
+  分配（objclosure.zig:21-40）；Rust 一律一个 Vec（不可观察）。
+- fun_bc_get_name 直接读存储的 name 字段；Zig 每次调用都从
+  prelude 解码 + 查 qstr 表（objfun.zig:167）。
+- bound_meth / closure 的 new_* 在 fun 不是堆对象时 panic
+  （调用方契约）；Zig 的 fromObj 会读垃圾。
+- fun_bc_prepare_call 在 fun 不是 FunBc 时 panic（同上）。
+
+与 C10b 的共享面
+----------------
+- src/objects/callables/mod.rs 是 C10a 与 C10b 共用：本 lane 只加了
+  objfun / objboundmeth / objclosure 三个模块 + 三个测试模块，未动
+  其他内容；C10b 加 objgenerator.rs 时只追加一行 pub mod。
+- RunOutcome 与 runner 形状是 C10a/C10b 共用的 seam：C10b 的
+  gen_resume 用同一 RunOutcome 枚举（本地定义改为引用
+  objfun::RunOutcome，避免两份定义）；C13 统一时以本文件的
+  seam 定义为准。
+- 闭包与生成器的 cells：均使用 C7 的 CellData；生成器帧的去留
+  由 C10b 决定（见其简报），本 lane 不预设。
+
+MERGE NOTE（给主 agent）
+------------------------
+- 基线 master 553d9fc（lib 542 + bin 9）；本 lane 在此基线上一次
+  通过，无 integration 修正（除下述两处测试内修正）。
+- 与 C9c 并行：C9c 也可能改 src/objects/containers/mod.rs 与
+  value.rs；本 lane 改的 value.rs 是 FunBcData / FunBuiltinData
+  扩展 + wrap_small_int 位置（C9b 后续修正已把它放进 value.rs，
+  objtuple.rs re-export——本 lane 未动该处）；合入顺序若 C9c 先，
+  注意 value.rs 的 FunBcData 段冲突。
+- 与 C10b 并行：mod.rs 共用；后合入的一方只需追加一行 pub mod，
+  无冲突预期。
+- value.rs 的 FunBcData 段：若 C9c 的 rebase 动了同一区域，以本
+  lane 的形状为准（def_pos / def_kw / context 三字段 + children
+  追踪，测试 new_fun_bc_unpacks_defaults_and_traces 钉住）。
+- 提交：63bbcc2（本文件记录的是 amend 前的原始提交；amend 只改了
+  本文件内的哈希行，内容其余部分与 63bbcc2 完全一致）

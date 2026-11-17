@@ -145,6 +145,28 @@ pub struct TypeData {
   （52 变体，vendor 判别值 0–51，NOT_IN=50、IS_NOT=51）定义在
   `src/objects/slots.rs`。修正时 grep 确认此前没有任何 lane
   实现过槽，故不破坏任何已有代码。
+- **C10 修正（2026-11-17）：`CallFn` 带 `n_args`/`n_kw`。** C0 的
+  `CallFn = fn(&mut CallCtx, Value, &[Value])` 无法表达原版调用
+  协议——vendor `mp_call_function_t`（`py/obj.h`）是
+  `call(self, n_args, n_kw, args)`，其中 `args` 为 `n_args` 个
+  位置参数后跟 `2 * n_kw` 个 `(name, value)` 关键字对。没有
+  `n_kw`，槽无法拆分切片（关键字参数会被误读为位置参数），
+  `fun_bc_call`（第一个绑定关键字参数的槽）根本无法移植。现为
+  `CallFn = fn(&mut CallCtx, Value, usize, usize, &[Value])`。
+  修正时 grep 确认此前没有任何 lane 填过 `call` 槽（只有
+  `call: None` 字面量），故不破坏任何已有代码。`BuiltinFn`
+  （`fn(&mut CallCtx, &[Value])`）保持不变——位置参数专用，
+  C8b/C9b 的方法适配器已按此约定编写；关键字内置函数另有
+  `BuiltinKwFn = fn(&mut CallCtx, &[Value], &[(u32, Value)])`
+  （位置参数 + 关键字对），由 `FunBuiltinData.kw_func: Option`
+  携带（`Some` ⟺ 接受关键字参数），D1 填充。
+- **C10 注（2026-11-17）：`attr` 槽尚未进 `TypeData`。**
+  `TypeData` 仍无 `attr` 字段——补一个字段要改 30 处字面量，
+  且与并行的 C9c lane 共享的 fixture 冲突。三个 attr 函数
+  （`fun_bc_attr` / `bound_meth_attr` / `closure_attr`）已按
+  load-only 约定（`AttrFn = fn(&mut CallCtx, Value, u32) ->
+  PyResult<Option<Value>>`，`slots.rs`）移植并单测，C12 在接
+  `mp_load_method` 时把它们挂进 `TypeData`。
 - 内置类型（int/str/list/…）的 `TypeData` 由各对象 lane 在
   `GcArena` 里构造并登记；`mp_type_roms.zig` 的静态 ROM 表在 Rust
   里改为启动时构造（无 `extern const`）。

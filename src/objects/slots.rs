@@ -209,12 +209,43 @@ impl BinaryOp {
 pub type UnaryOpFn = for<'a> fn(&mut CallCtx<'a>, UnaryOp, Value) -> PyResult<Value>;
 /// `fn(&mut CallCtx, BinaryOp, Value, Value) -> PyResult<Value>` — binary-op slot.
 pub type BinaryOpFn = for<'a> fn(&mut CallCtx<'a>, BinaryOp, Value, Value) -> PyResult<Value>;
-/// `fn(&mut CallCtx, Value, &[Value]) -> PyResult<Value>` — call slot.
-pub type CallFn = for<'a> fn(&mut CallCtx<'a>, Value, &[Value]) -> PyResult<Value>;
+/// `fn(&mut CallCtx, Value, n_args, n_kw, &[Value]) -> PyResult<Value>` —
+/// call slot.
+///
+/// C10 amendment (2026-11-17): the C0 signature was
+/// `fn(&mut CallCtx, Value, &[Value])`, which cannot express the Zig
+/// call protocol — vendor `mp_call_function_t`
+/// (`py/obj.h`): `call(self, n_args, n_kw, args)`, where `args` holds
+/// `n_args` positionals followed by `2 * n_kw` `(name, value)` keyword
+/// pairs. Without `n_kw` a slot cannot split the slice (kwargs would
+/// be misread as positionals), so `fun_bc_call` — the first slot that
+/// binds keyword arguments — could not be ported at all. No `call`
+/// slot existed yet in the tree (only `call: None` literals), so
+/// nothing breaks. Same process as C6's op-parameter amendment.
+pub type CallFn =
+    for<'a> fn(&mut CallCtx<'a>, Value, usize, usize, &[Value]) -> PyResult<Value>;
 /// `fn(&mut CallCtx, Value) -> PyResult<Value>` — getiter slot.
 pub type GetIterFn = for<'a> fn(&mut CallCtx<'a>, Value) -> PyResult<Value>;
-/// Built-in function body.
+/// Built-in function body (fixed-arity and var-no-kw builtins).
+/// Receives positional args only; arity is checked by the
+/// `fun_builtin_*_call` adapters before the call.
 pub type BuiltinFn = for<'a> fn(&mut CallCtx<'a>, &[Value]) -> PyResult<Value>;
+/// Keyword-taking built-in body (`mp_obj_fun_builtin_var_t` with the
+/// takes_kw sig bit set, C10): positionals plus the keyword pairs as
+/// `(name qstr id, value)`. The `fun_builtin_var_call` adapter builds
+/// the pairs from the call's `args` slice; a builtin with a `kw_func`
+/// is never called through `func`.
+pub type BuiltinKwFn =
+    for<'a> fn(&mut CallCtx<'a>, &[Value], &[(u32, Value)]) -> PyResult<Value>;
+/// Load-only attribute access (`mp_obj_type_t.attr`, C10).
+/// `Ok(Some(v))` = the attribute was found (Zig: `dest[0] = v`);
+/// `Ok(None)` = not found (Zig: `dest` left `NULL`); `Err` = the slot
+/// raised. Store/delete (`dest[0] != NULL` in the Zig — the attr fns
+/// return early, "not handled") is the caller's problem: the
+/// reference raises `AttributeError` for stores (`f.__name__ = "x"`,
+/// probed 2026-11-17). C12 wires this into `TypeData` (no `attr`
+/// field exists yet) together with `mp_load_method`.
+pub type AttrFn = for<'a> fn(&mut CallCtx<'a>, Value, u32) -> PyResult<Option<Value>>;
 
 /// Subscript argument: the Zig `mp_obj_subscr(base, index, value)`
 /// encodes get/set/del in one `Obj` (`MP_OBJ_NULL` = delete,

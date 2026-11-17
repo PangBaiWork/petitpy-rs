@@ -323,6 +323,8 @@ pub fn int_locals_dict(ctx: &mut CallCtx<'_>) -> GcRef {
             name: from_bytes_id,
             n_args: fun_n_args(2, 4),
             func: int_from_bytes_builtin,
+            // C10: `from_bytes` takes no kwargs.
+            kw_func: None,
         }),
     );
     ctx.alloc(

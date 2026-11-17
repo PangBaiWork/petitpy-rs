@@ -538,15 +538,20 @@ pub fn type_is_subclass_of(arena: &GcArena, type_: GcRef, base: GcRef) -> bool {
 /// `mp_obj_is_exception_type` (`objexcept.zig:105`): the value's
 /// type is an exception type — i.e. `BaseException` is in its MRO.
 /// (The Zig's make_new-slot branch is subsumed: see module docs.)
-/// Immediates are never exception types.
+/// Immediates are never exception types. NON-TYPE values are
+/// never exception types either: the Zig falls through to
+/// `mp_obj_is_subclass_fast`, which is false for a non-type
+/// (`is_subclass_fast` needs a `TypeData` to walk) — probed:
+/// `except ValueError("b")` raises `binopUnsupported` on the
+/// reference binary, and `make_raise_obj` must NOT call an
+/// exception instance. (An earlier revision checked the
+/// header type here and returned true for instances; C14
+/// corrected it 2026-11-18.)
 pub fn is_exception_type(arena: &GcArena, value: Value, base_exc: GcRef) -> bool {
     match value {
         Value::Heap(r) => match arena.get(r) {
             Obj::Type(_) => type_is_subclass_of(arena, r, base_exc),
-            _ => match header_type(arena, value) {
-                Some(t) => type_is_subclass_of(arena, t, base_exc),
-                None => false,
-            },
+            _ => false,
         },
         _ => false,
     }

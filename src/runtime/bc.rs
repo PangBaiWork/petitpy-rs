@@ -77,7 +77,7 @@
 
 use crate::compiler::mpy::RawCode;
 use crate::memory::gc::{GcArena, RootSet};
-use crate::objects::value::{CellData, DictData, GcRef, MapData, Obj, Value};
+use crate::objects::value::{CellData, DictData, GcRef, MapData, MapEntry, Obj, Value};
 use crate::runtime::qstr::RuntimeQstr;
 
 /// Re-exported emit-side encoder — the same algorithm as Zig
@@ -226,18 +226,26 @@ pub(crate) fn prelude_size_decode(ip: &mut &[u8]) -> PreludeSize {
 /// `NULL`). `None` only for a `LOOKUP` miss.
 ///
 /// Note: the C map is a hash table; this linear scan has the same
-/// lookup semantics (C9 owns the `DictData` payload and may replace
-/// it with a hash table later).
+/// lookup semantics. The real hash-table lookup lives in
+/// `crate::objects::containers::map::map_lookup` (C9a); this scan is
+/// kept because the setup path holds only `&mut GcArena` + `&RootSet`
+/// (no `CallCtx`, so no hashing/equality dispatch) — wiring it to
+/// the real lookup is C13's, when the setup path gains a context.
+/// (C9a: the entry type changed from `(Value, Value)` to
+/// `MapEntry`; the scan skips tombstones via `key == Some(..)`.)
 fn map_lookup(
-    entries: &mut Vec<(Value, Value)>,
+    entries: &mut Vec<MapEntry>,
     key: Value,
     mode: i32,
 ) -> Option<(usize, bool)> {
-    if let Some(pos) = entries.iter().position(|(k, _)| *k == key) {
+    if let Some(pos) = entries.iter().position(|e| e.key == Some(key)) {
         return Some((pos, false));
     }
     if mode == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND {
-        entries.push((key, Value::None));
+        entries.push(MapEntry {
+            key: Some(key),
+            value: Value::None,
+        });
         Some((entries.len() - 1, true))
     } else {
         None
@@ -246,7 +254,7 @@ fn map_lookup(
 
 /// Mutable entry list of a heap `Dict` (panics if the slot does not
 /// hold a dict — a caller-contract violation).
-fn dict_entries_mut(arena: &mut GcArena, dict: GcRef) -> &mut Vec<(Value, Value)> {
+fn dict_entries_mut(arena: &mut GcArena, dict: GcRef) -> &mut Vec<MapEntry> {
     match arena.get_mut(dict) {
         Obj::Dict(d) => &mut d.map.entries,
         _ => panic!("kwargs dict slot does not hold a Dict"),
@@ -470,9 +478,7 @@ fn setup_code_state_helper(
             let d = arena.alloc(
                 None,
                 Obj::Dict(DictData {
-                    map: MapData {
-                        entries: Vec::new(),
-                    },
+                    map: MapData::new(),
                 }),
                 roots,
             );
@@ -517,7 +523,7 @@ fn setup_code_state_helper(
             match map_lookup(entries, wanted_arg_name, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
                 Some((pos, is_new)) => {
                     if is_new {
-                        entries[pos].1 = value;
+                        entries[pos].value = value;
                     } else {
                         // error_multiple (jumped to from goto in C)
                         return Err(SetupError::MultipleValues {
@@ -584,7 +590,7 @@ fn setup_code_state_helper(
                         Value::Qstr(u32::from(arg_qstr)),
                         MP_MAP_LOOKUP,
                     ) {
-                        found = Some(entries[pos].1);
+                        found = Some(entries[pos].value);
                     }
                 }
                 match found {
@@ -606,9 +612,7 @@ fn setup_code_state_helper(
             let d = arena.alloc(
                 None,
                 Obj::Dict(DictData {
-                    map: MapData {
-                        entries: Vec::new(),
-                    },
+                    map: MapData::new(),
                 }),
                 roots,
             );

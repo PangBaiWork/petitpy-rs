@@ -426,8 +426,8 @@ fn int_locals_dict_has_from_bytes() {
     };
     assert_eq!(entries.len(), 1);
     let from_bytes_id = static_qstr_id(b"from_bytes").unwrap();
-    assert_eq!(entries[0].0, Value::Qstr(from_bytes_id));
-    let (name, n_args, func) = match entries[0].1 {
+    assert_eq!(entries[0].key, Some(Value::Qstr(from_bytes_id)));
+    let (name, n_args, func) = match entries[0].value {
         Value::Heap(r) => match fx.arena.get(r) {
             Obj::FunBuiltin(f) => {
                 let fp: crate::objects::slots::BuiltinFn = f.func;

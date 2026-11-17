@@ -1,0 +1,51 @@
+# Lane C9a-split 结果 — 把 map.rs / objdict.rs 拆到 800 行以下
+
+- 工作区：`~/workspace/petitpy-rs-containers-a`，分支 `lane/containers-a`，基线 `6df20bf`（"Lane C9a: port map + dict to Rust"）
+- 任务：只拆文件，不改行为。`map.rs` 908 行、`objdict.rs` 1277 行均超 standing rule 的 800 行上限；其余验收在 C9a 已全部通过。
+- Commit：见 lane 执行者最终报告（一个提交，"Lane C9a: split map/objdict under 800 lines"；只 git add 自己的文件路径，未用 `git add -A`）
+
+## 拆分映射
+
+### map.rs 908 → map.rs 741 + map_set.rs 186
+
+- 移入 `map_set.rs`（原 738–908 行，整段搬走，含段首注释）：`SetSlot`、`MpSet` + `impl MpSet`（`new` / `clear` / `remove_first`）、`set_rehash`、`set_lookup`。
+- `map_set.rs` 的 import：`CallCtx`、`BuiltinTypes`、`obj_equal`、`Value` + `super::map::{get_hash_alloc_geq, hash_of, LookupKind, MapError}`（set 段只依赖这四项 map 侧符号；核查过 1–737 行不引用任何 set 符号，除文档注释外）。
+- `map.rs` 尾部加 `pub use super::map_set::{MpSet, SetSlot, set_lookup};`，公共路径（`map::MpSet` 等）不变；`map_tests.rs` 的 `use super::map::*;` 无需改动。
+- `map.rs` 头文档的 set 条目改为指向 `map_set.rs`。
+
+### objdict.rs 1277 → objdict.rs 623 + objdict_methods.rs 698
+
+移入 `objdict_methods.rs`（均整段搬走，含段首注释）：
+
+| 段 | 内容 |
+|---|---|
+| view 定义 | `DictViewKind` + impl、`make_view` / `make_view_it` / `as_dict_view` / `as_dict_view_it` |
+| get/pop 方法 | `dict_get_helper`、`dict_get`、`dict_pop`、`dict_setdefault`、`dict_popitem` |
+| 迭代 | `view_next_entry`、`IterPlan`、`collect_iterable`、`heap_char` |
+| update/fromkeys | `update_from_keys`、`dict_update`、`dict_fromkeys` |
+| 视图方法与槽 | `dict_keys` / `dict_items` / `dict_values`、`dict_view_it_next`、`dict_view_print`、`dict_view_unary_op`、`dict_view_binary_op`、`dict_view_getiter` |
+| BuiltinFn 适配器 | `check_arity`、`first`、全部 11 个 `dict_*_builtin` |
+
+- `objdict.rs` 留下：头部文档、`DictError` + 4 个 `From` impl、小 helpers、构造（`dict_new` / `dict_new_typed` / `dict_init` / `dict_make_new`）、基本操作（`dict_get_value` / `dict_store` / `dict_delete` / `dict_len` / `dict_clear` / `dict_copy`）、全部 type slots（`dict_unary_op` / `dict_equal` / `dict_binary_op` / `dict_subscr` / `dict_print` / `dict_getiter`）、`dict_type_data`。
+- 可见性调整（仅为跨文件调用，行为不变）：`dict_ref_of` / `ensure_not_fixed` / `entry_value` / `dict_get_helper` / `make_view` / `make_view_it` 改为 `pub(crate)`；三个 const（`ARG_NUM_TYPES_MISMATCH` / `NOT_ITERABLE` / `UPDATE_SEQ_WRONG_LEN`）改为 `pub(crate) const`。
+- `objdict.rs` 尾部加 `pub use super::objdict_methods::{…21 项…};`（含 `dict_update`——`dict_make_new` / `dict_binary_op` 内部也用它，一个 `pub use` 同时作内部 import 用）与 `use super::objdict_methods::{dict_get_helper, make_view_it};`（`dict_delete` 与 `dict_getiter` 的内部调用，私有 import）。公共路径（`objdict::dict_update`、`objdict::dict_keys` 等）不变；`objdict_tests.rs` 的 `use super::objdict::*;` 与 `tests.rs` 的 `super::objdict::dict_store` / `dict_type_data` 无需改动。
+- `objdict.rs` 头文档加指向 `objdict_methods.rs` 的说明；`mod.rs` 加 `pub mod map_set;` / `pub mod objdict_methods;`。
+
+## 验收数字（拆分后实测，基线不变）
+
+- `cargo test --release --lib --tests`：**381 passed, 0 failed, 1 ignored**（与拆分前一致，无增减）
+- `cargo test --release --bins`：**9 passed**
+- `cargo build --release`：**0 warnings**；`cargo test --release --lib --tests --no-run`：**0 warnings**
+- 无 `unsafe`（`src/objects/containers/` 内 grep 无代码级 unsafe）
+- 各文件行数：`map.rs` 742、`map_set.rs` 186、`objdict.rs` 630、`objdict_methods.rs` 698、`map_tests.rs` 343、`objdict_tests.rs` 744、`tests.rs` 251、`mod.rs` 17——全部 <800
+- 原项目 `~/workspace/petitpy-orig` 未修改（`git status` 干净）
+
+## 拆分中发现并修复的问题（均为拆分引入的接线问题，非行为问题）
+
+- `dict_delete`（留在 core）调用已移走的 `dict_get_helper`：把后者改为 `pub(crate)` 并在 core 里私有 import。
+- `objdict_methods.rs` 初版 import 里多余的 `MapError`：删掉（移走的代码不直接命名它）。
+- `objdict.rs` 的 core import 里 `obj_id` / `obj_len_maybe` / `IteratorData` 在拆分后不再被 core 使用：已删掉（`obj_id` 只在 `dict_view_unary_op` 用，`obj_len_maybe` 只在 `dict_fromkeys` 用，`IteratorData` 只在 `make_view` / `make_view_it` 用，三者都在新文件）。
+
+## 未动
+
+- 行为、测试期望值、测试文件、其余文件均未动；`scripts/containers_a_brief.md` 与 `scripts/containers_a_result.txt` 未动。

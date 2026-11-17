@@ -1,6 +1,7 @@
 //! Value / Obj model (C0, frozen interface).
 //! See `docs/value-obj-design.md`.
 
+pub mod containers;
 pub mod obj;
 pub mod obj_ops;
 pub mod primitives;

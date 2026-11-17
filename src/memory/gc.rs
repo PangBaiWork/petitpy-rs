@@ -114,6 +114,7 @@
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::value::{GcRef, Obj, ObjHeader, Value};
 use crate::pyerr::PyResult;
+use crate::runtime::qstr::RuntimeQstr;
 
 /// Bytes per GC block (`gc.zig`: `4 * @sizeOf(usize)`, 64-bit).
 pub const BYTES_PER_BLOCK: usize = 32;
@@ -166,10 +167,20 @@ impl RootSet {
 /// functions, and a `fn` pointer cannot capture it — so it rides on
 /// the context (the C5/C6 explicit-parameter precedent, threaded
 /// through the context instead of every call site).
+/// `pool` is the same growth done by C9a, for the same reason: the
+/// map/dict hash path needs the runtime qstr pool (`qstr_hash` for
+/// dynamic ids — `map.zig:349` calls the C `qstr_hash`, which reads
+/// the pool), and the slot/builtin signatures cannot carry it. It is
+/// a shared reference: interning (`from_strn`) stays the VM's job
+/// (C13 owns the `&mut` pool); lanes only read hashes/bytes through
+/// it. No thread-local pool (the C8a draft's `INSTALLED_TYPES` /
+/// `PENDING_STR_ERROR` thread-locals were flagged at review — shared
+/// state rides on the context, not on globals).
 pub struct CallCtx<'a> {
     pub arena: &'a mut GcArena,
     pub roots: &'a mut RootSet,
     pub types: &'a BuiltinTypes,
+    pub pool: &'a RuntimeQstr,
 }
 
 impl<'a> CallCtx<'a> {
@@ -177,8 +188,9 @@ impl<'a> CallCtx<'a> {
         arena: &'a mut GcArena,
         roots: &'a mut RootSet,
         types: &'a BuiltinTypes,
+        pool: &'a RuntimeQstr,
     ) -> CallCtx<'a> {
-        CallCtx { arena, roots, types }
+        CallCtx { arena, roots, types, pool }
     }
 
     /// Allocate an object, rooted at this context's roots.

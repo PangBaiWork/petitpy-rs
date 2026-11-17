@@ -378,7 +378,7 @@ fn type_data_slots() {
     let dict = fx.arena.alloc(
         None,
         Obj::Dict(DictData {
-            map: MapData { entries: vec![] },
+            map: MapData::new(),
         }),
         &fx.roots,
     );

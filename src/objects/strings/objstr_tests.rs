@@ -24,6 +24,7 @@ use crate::objects::strings::objstr_methods_b::*;
 use crate::objects::strings::objstr_methods_c::*;
 use crate::objects::value::*;
 use crate::pyerr::PyError;
+use crate::runtime::qstr::RuntimeQstr;
 
 fn plain_type_data(name: u32, flags: u16, dict: GcRef) -> TypeData {
     TypeData {
@@ -68,6 +69,7 @@ pub(crate) struct Fx {
     pub(crate) arena: GcArena,
     pub(crate) roots: RootSet,
     pub(crate) types: BuiltinTypes,
+    pub(crate) pool: RuntimeQstr,
 }
 
 impl Fx {
@@ -78,7 +80,7 @@ impl Fx {
             arena.alloc(
                 None,
                 Obj::Dict(DictData {
-                    map: MapData { entries: vec![] },
+                    map: MapData::new(),
                 }),
                 &roots,
             )
@@ -131,6 +133,7 @@ impl Fx {
             complex: mk_plain(&mut arena, b"complex"),
             tuple: mk_plain(&mut arena, b"tuple"),
             list: mk_plain(&mut arena, b"list"),
+            dict: mk_plain(&mut arena, b"dict"),
             type_,
         };
         clear_pending_str_error();
@@ -138,11 +141,12 @@ impl Fx {
             arena,
             roots,
             types,
+            pool: RuntimeQstr::new(),
         }
     }
 
     pub(crate) fn ctx(&mut self) -> CallCtx<'_> {
-        CallCtx::new(&mut self.arena, &mut self.roots, &self.types)
+        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool)
     }
 
     pub(crate) fn s(&mut self, data: &[u8]) -> Value {

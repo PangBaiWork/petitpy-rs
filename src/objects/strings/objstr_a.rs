@@ -322,7 +322,7 @@ pub fn iter_items(
                 str_data(ctx.arena, arg).unwrap_or(&[]).to_vec(),
                 is_str_value(ctx.arena, arg),
             ),
-            Obj::Dict(d) => JoinSource::Items(d.map.entries.iter().map(|(k, _)| *k).collect()),
+            Obj::Dict(d) => JoinSource::Items(d.map.entries.iter().filter_map(|e| e.key).collect()),
             Obj::Set(s) => JoinSource::Items(s.items.clone()),
             Obj::Range(rg) => JoinSource::Range(rg.start, rg.stop, rg.step),
             _ => return Err(StrError::ObjectNotIterable),

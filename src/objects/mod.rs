@@ -5,6 +5,7 @@ pub mod callables;
 pub mod containers;
 pub mod obj;
 pub mod obj_ops;
+pub mod objtype;
 pub mod primitives;
 pub mod slots;
 pub mod strings;

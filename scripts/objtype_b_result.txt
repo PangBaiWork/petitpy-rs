@@ -1,0 +1,233 @@
+Lane C12b: port objexcept + objmodule + objobject to Rust — RESULT
+====================================================================
+Worktree: ~/workspace/petitpy-rs-objtype-b, branch lane/objtype-b,
+base master 50d5652 (C10b merge). Original ~/workspace/petitpy-orig
+read-only, clean (git status empty).
+
+VERDICT
+-------
+cargo test --release --lib --tests : 748 passed, 0 failed, 1 ignored
+  (baseline 715 + 33 new: objexcept 20, objmodule 9, objobject 4;
+  acceptance was >=25)
+cargo test --release --bins           : 9 passed, 0 failed
+cargo build --release                 : 0 warnings
+unsafe                                : none (0 occurrences)
+every file < 800 lines                : mod 20, objexcept 575,
+  objexcept_types 281, objmodule 409, objobject 317,
+  objtype_tests 555, objtype_tests_b 389
+orig repo                             : clean
+
+1:1 ZIG -> RUST MAPPING (all in src/objects/objtype/)
+------------------------------------------------------
+objexcept.zig 581  -> objexcept.rs (575) + objexcept_types.rs (281)
+  mp_obj_exception_make_new   -> exception_make_new (sig (0,0xffff,false);
+                                 n_kw>0 -> terse mismatch)
+  mp_obj_new_exception(_args/_msg) -> new_exception(_args/_msg)
+  mp_obj_exception_add_traceback -> exception_add_traceback
+    (no limit: MICROPY_PY_SYS_TRACEBACKLIMIT=0 -> -1)
+  mp_obj_exception_get_traceback / clear -> exception_get_traceback /
+    exception_clear_traceback
+  mp_obj_exception_get_value  -> exception_get_value (args[0] alias)
+  mp_obj_exception_attr (load) -> exception_attr (AttrFn shape,
+    load-only; __cause__/__suppress_context__/__context__/args/
+    value/errno; __traceback__ -> None = unhandled)
+  mp_obj_exception_attr (store) -> exception_store_attr
+    (__traceback__=None clears, __cause__=v stores)
+  mp_obj_exception_print      -> exception_print (Str/Repr/Exc +
+    OSError "[Errno N] NAME" branch + errno_name 22-entry table)
+  mp_obj_exception_match      -> exception_match (class or tuple
+    classinfo, mp_obj_is_subclass_fast rule)
+  mp_obj_is_exception_type / _instance / _native_exception_instance
+    -> is_exception_type / is_exception_instance /
+       is_native_exception_instance (base_exc passed explicitly)
+  is_exception (make_new-slot identity) -> is_exception_type_obj
+    (print-slot fn_addr_eq, C9c precedent)
+  mp_obj_is_subclass_fast (single-class walk) -> type_is_subclass_of
+objmodule.zig 232  -> objmodule.rs (409)
+  mp_obj_new_module (alloc half) -> new_module (fresh module +
+    empty dict + __name__; registration is C15's)
+  mp_module_generic_attr      -> module_generic_attr (Load/Store/Delete)
+  mp_module_get_builtin       -> module_get_builtin (non-extensible
+    map, usys -> sys, extensible early-None, u-prefix strip,
+    __init__ call seam)
+  module_attr (load)          -> module_attr_load + module_attr
+    (AttrFn adapter, seam None)
+  module_attr (store/delete)  -> module_store_attr (fixed-dict
+    builtins override dict, created on first use)
+  module_print                -> module_print
+objobject.zig 207  -> objobject.rs (317)
+  mp_type_object              -> object_type_data (flags 0, no base,
+    MRO [self] by bootstrap)
+  object_make_new (sig (0,0,false)) -> object_make_new
+  object___init__             -> object_init + object_init_builtin
+  object___new__              -> object_new + object_new_builtin
+  object___setattr__          -> object_setattr + object_setattr_builtin
+  object___delattr__          -> object_delattr + object_delattr_builtin
+  object_locals_dict (4 entries, fixed) -> object_locals_dict
+
+PROBED BEHAVIOURS (reference binary, /tmp/c12b_p1.py .. /tmp/c12b_p5.py)
+------------------------------------------------------------------------
+Exceptions:
+- repr(ValueError('x')) == "ValueError('x',)" ; repr(ValueError()) ==
+  "ValueError()" ; str(TypeError('a','b')) == "('a', 'b')"
+- str(KeyError('k')) == 'k' (NOT "'k'" — single arg printed STR)
+- str(OSError(2,'x')) == '[Errno 2] ENOENT: x' ; str(OSError(2)) ==
+  '[Errno 2] ENOENT' ; errno 999 -> tuple form "(999, 'x')" ;
+  3 args -> tuple form. OSError(2).errno == 2.
+- issubclass(KeyboardInterrupt, Exception) == False ;
+  issubclass(SystemExit, Exception) == False ;
+  issubclass(StopAsyncIteration, Exception) == True ;
+  issubclass(UnicodeError, ValueError) / (IndentationError, SyntaxError)
+  / (ModuleNotFoundError, ImportError) / (KeyError, LookupError) /
+  (NotImplementedError, RuntimeError) == True
+- ValueError.__mro__ == (ValueError, Exception, BaseException, object) ;
+  BaseException.__mro__ == (BaseException, object) ;
+  int.__mro__ == (int, object) ; object.__mro__ == (object,) ;
+  object.__bases__ == () ; Exception.__bases__ == (BaseException,) ;
+  BaseException.__bases__ == (object,)
+- fresh exception: __cause__ None, __context__ None,
+  __suppress_context__ False ; __traceback__ load ALWAYS raises
+  AttributeError "no attribute '__traceback__'" (no load branch in
+  the Zig — even after a real raise) ; e.__traceback__ = None
+  succeeds (clears)
+- raise ... from KeyError("k"): __cause__ == KeyError('k',),
+  __suppress_context__ True, __context__ None ;
+  raise ... from None: __cause__ None, __suppress_context__ True
+- raise ValueError (class) -> args ()
+Modules:
+- repr(sys) == "<module 'sys'>" ; repr(math) == "<module 'math'>" ;
+  sys.__name__ == 'sys' ; sys.__dict__ is sys.__dict__ ;
+  missing attr -> AttributeError "no attribute 'nonexistent'" ;
+  sys.__dict__['path'] -> KeyError 'path'
+- type(sys).__mro__ == (module, object) ;
+  type(sys).__bases__ == (object,)
+- user module (mymod.py, x=1): set/get/del work ; del mymod.foo
+  then load -> AttributeError "no attribute 'foo'" ;
+  del mymod.nonexistent -> KeyError 'nonexistent' ;
+  del mymod.x then mymod.x = 9 works ; repr(mymod) == "<module 'mymod'>"
+- sys module (fixed ROM dict): sys.foo = 42 -> AttributeError
+  "no attribute 'foo'" ; del sys.nonexistent -> AttributeError
+  "no attribute 'nonexistent'" ; del sys.__name__ -> AttributeError
+Object:
+- object().__init__() -> None ; object().__init__(1,2) -> TypeError
+  'argument num/types mismatch' ; object(1) / object(1,2) -> same
+- o.x = 1 -> AttributeError "no attribute 'x'" ; del o.x -> same
+- object().__setattr__('a',1) -> TypeError 'arg must be user-type' ;
+  object.__new__(object) / object.__new__(int) / object.__new__(1)
+  -> TypeError 'arg must be user-type' (object type has NO
+  FLAG_INSTANCE_TYPE 0x0200)
+- type(object()) == object ; hasattr(object(),'x') False ;
+  getattr(object(),'x',9) == 9 ; ValueError(x=1) -> TypeError
+  'argument num/types mismatch'
+Config (verified in source):
+- MICROPY_PY_ERRNO == 1 in full (build.zig:96,122) -> OSError
+  branch live ; errno table = moderrno.zig:72-94, 22 entries
+- MICROPY_MODULE_GETATTR == 1 (mpconfigport.h:317) -> module
+  __getattr__ live ; MICROPY_MODULE___FILE__ on in full ->
+  __file__ lookup live ; MICROPY_CPYTHON_COMPAT == 1 ->
+  module __dict__ load works ; MICROPY_PY_SYS == 1
+- MICROPY_HAVE_REGISTERED_EXTENSIBLE_MODULES == 6 (nonzero,
+  genhdr/moduledefs.h:111) -> extensible map + u-strip live
+
+28-TYPE HIERARCHY (EXCEPTION_HIERARCHY, Zig ROM order; base -> MRO)
+--------------------------------------------------------------------
+BaseException (object) -> [self, object]
+  SystemExit (BaseException) ; KeyboardInterrupt (BaseException) ;
+  GeneratorExit (BaseException)
+  Exception (BaseException) -> [self, BaseException, object]
+    StopAsyncIteration ; StopIteration ; ArithmeticError
+      OverflowError (ArithmeticError) ; ZeroDivisionError (ArithmeticError)
+    AssertionError ; AttributeError ; EOFError ; ImportError
+      ModuleNotFoundError (ImportError)
+    LookupError ; IndexError (LookupError) ; KeyError (LookupError)
+    MemoryError ; NameError ; OSError ; RuntimeError
+      NotImplementedError (RuntimeError)
+    SyntaxError ; IndentationError (SyntaxError)
+    TypeError ; ValueError ; UnicodeError (ValueError)
+(Each child MRO is [self, <parent chain>, BaseException, object];
+verified in test hierarchy_mros for ValueError, KeyError,
+BaseException, object.)
+
+INTENTIONAL DIVERGENCES (documented in code, not silent)
+--------------------------------------------------------
+1. e.args returns a FRESH tuple per access (ExceptionData.args is
+   Vec<Value>, frozen); 0-arg args is a fresh empty tuple, not the
+   ROM () singleton (C12a's ROM work).
+2. exception_match on immediates returns false (observably
+   equivalent — immediates are never exception instances).
+3. PRINT_EXC_SUBCLASS (0x80) not plumbed (no Instance yet — the
+   vendor sets it only in objtype.c:271 for user-subclass
+   exception inner print).
+4. Emergency-exception-buffer fallback is dead (Rust alloc is
+   infallible).
+5. Module delegation (npy_mod_attr_try_delegation,
+   MICROPY_MODULE_DELEGATIONS table) has no Rust counterpart yet:
+   load/store report not-found/unhandled where the Zig consults
+   the table. No delegation table exists in the tree (C15/D own
+   extension modules).
+6. object_make_new / object_new / object_setattr / object_delattr
+   validate their checks, then return PyRaise where the Zig
+   touches the Instance members map / allocates (no Instance
+   payload yet — C12a's mp_obj_new_instance). object.__new__ is
+   stored as a plain FunBuiltin; the staticmethod wrapper is
+   C12a's (mp_type_staticmethod).
+7. The `__file__` qstr is NOT static (config-gated out of the
+   static table; main.zig:148 — interned dynamically at runtime),
+   so module_print finds the __file__ entry by scanning the dict
+   for a key whose string is "__file__" (dict_lookup_by_str),
+   not by id lookup. The old static_qstr_id(b"__file__").expect()
+   would have panicked at runtime — caught by the test suite.
+8. Value::Qstr ids are u32; RuntimeQstr::qstr_str takes Qstr
+   (u16) — all call sites cast `as u16` (codebase convention).
+9. Dynamic qstr interning needs &mut RuntimeQstr, which CallCtx
+   does not carry: module_get_builtin takes an `intern` seam
+   (None skips the u-prefix strip); the __getattr__ and __init__
+   call seams are likewise optional (None skips the call).
+
+C10b HANDOVER (closed)
+----------------------
+Item 4 — generator_exit_instance(ctx, generator_exit) in
+objexcept_types.rs: a GeneratorExit instance (0 args), used by
+the generator's close(). Test generator_exit_instance_is_exception
+pins it (is_exception_instance, empty args).
+
+SEAMS FOR C13/C14 (C10 pattern — the VM supplies the real call)
+---------------------------------------------------------------
+- module_attr_load / module_attr: `getattr_call` seam
+  (__getattr__(name)); AttrFn adapter passes None.
+- module_get_builtin: `init` seam (__init__()) + `intern` seam
+  (dynamic qstr interning for the u-prefix strip).
+- module_store_attr: caller-owned `override_dict: &mut Option<GcRef>`
+  (the VM's mp_module_builtins_override_dict slot) +
+  `builtins_globals: Option<GcRef>`.
+- exception_store_attr: NOT expressible through the load-only
+  AttrFn — C13/C14's attribute-store machinery calls it directly.
+- object_make_new / object_new / object_setattr / object_delattr:
+  three PyRaise stub points replaced when C12a's Instance lands.
+- is_exception_type_obj's make_new-slot identity is spelled as a
+  print-slot identity until TypeData gains a make_new slot (C12).
+
+MERGE NOTE (main agent)
+-----------------------
+- This lane creates src/objects/objtype/ (mod.rs + 4 production
+  files + 2 test files) and registers `pub mod objtype;` in
+  src/objects/mod.rs. C12a owns objtype.rs in the SAME directory
+  (its own mod.rs lists objtype.rs + tests): merge the two mod.rs
+  files (union of module lists, keep both test modules).
+- C12a also touches the shared containers/tests.rs fixture; this
+  lane deliberately did NOT touch it — its tests use a LOCAL Fx
+  (built from containers::tests::{empty_dict, make_type} only).
+- No other lane files touched. The brief
+  (scripts/objtype_b_brief.md) is NOT committed.
+
+FILES (one commit)
+------------------
+src/objects/mod.rs                    (1 line: pub mod objtype;)
+src/objects/objtype/mod.rs            (20)
+src/objects/objtype/objexcept.rs      (575)
+src/objects/objtype/objexcept_types.rs (281)
+src/objects/objtype/objmodule.rs      (409)
+src/objects/objtype/objobject.rs      (317)
+src/objects/objtype/objtype_tests.rs  (555: fixture + objexcept tests)
+src/objects/objtype/objtype_tests_b.rs (389: objmodule + objobject tests)
+scripts/objtype_b_result.txt          (this file)

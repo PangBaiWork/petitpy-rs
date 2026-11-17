@@ -11,7 +11,7 @@
 //! `build_exception_types` over them — the same shape the VM
 //! (C13) will build on.
 
-use crate::memory::gc::{CallCtx, GcArena, RootSet};
+use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::containers::objdict::dict_store;
 use crate::objects::containers::objlist::new_list;
 use crate::objects::containers::objtuple::new_tuple;
@@ -49,6 +49,8 @@ pub(crate) struct Env {
     pub next_obj: Value,
     pub builtins: Builtins,
     pub globals: Value,
+    /// C13's pending-raise slot (CallCtx::new is 5-arg since C13).
+    pub pending_raise: Option<PendingRaise>,
     /// The generator-instance type (fixture field, not a
     /// `BuiltinTypes` field — callers take the header type
     /// explicitly).
@@ -83,14 +85,15 @@ impl Env {
         types0.bytes = bytes;
         roots.push(Value::Heap(str_));
         roots.push(Value::Heap(bytes));
-        let mut ctx = CallCtx::new(&mut arena, &mut roots, &types0, &pool);
+        let mut pending_raise = None;
+        let mut ctx = CallCtx::new(&mut arena, &mut roots, &types0, &pool, &mut pending_raise);
         let rom = build_rom(&mut ctx);
         drop(ctx);
         let types = rom.types;
         // Rebuild the ctx over the ROM types before building
         // the exception registry (its headers must be the ROM
         // `type`, not the fixture's plain one).
-        let mut ctx = CallCtx::new(&mut arena, &mut roots, &types, &pool);
+        let mut ctx = CallCtx::new(&mut arena, &mut roots, &types, &pool, &mut pending_raise);
         let exc = build_exception_types(&mut ctx, types.object);
         let refs = ExcRefs::from_exception_types(&exc);
         let next_obj = next_builtin_obj(&mut ctx);
@@ -127,11 +130,12 @@ impl Env {
             globals,
             gen_instance,
             module_type,
+            pending_raise,
         }
     }
 
     pub(crate) fn ctx(&mut self) -> CallCtx<'_> {
-        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool)
+        CallCtx::new(&mut self.arena, &mut self.roots, &self.types, &self.pool, &mut self.pending_raise)
     }
 
     /// Resolve a name to a qstr id: static when present, else

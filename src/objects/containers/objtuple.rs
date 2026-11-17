@@ -602,6 +602,7 @@ pub fn tuple_type_data(dict: GcRef) -> TypeData {
                 tuple_print(ctx, value, kind, sink)
             },
         ),
+        namedtuple_fields: None,
     }
 }
 

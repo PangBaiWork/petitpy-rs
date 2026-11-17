@@ -693,6 +693,7 @@ pub fn set_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: Some(set_print),
+        namedtuple_fields: None,
     }
 }
 
@@ -713,5 +714,6 @@ pub fn frozenset_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: Some(set_print),
+        namedtuple_fields: None,
     }
 }

@@ -610,6 +610,7 @@ pub fn dict_type_data(dict: GcRef) -> TypeData {
         subscr: Some(dict_subscr),
         buffer: None,
         print: Some(dict_print),
+        namedtuple_fields: None,
     }
 }
 

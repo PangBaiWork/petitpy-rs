@@ -427,5 +427,6 @@ pub fn slice_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: Some(slice_print),
+        namedtuple_fields: None,
     }
 }

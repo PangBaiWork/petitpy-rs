@@ -79,6 +79,7 @@ pub(crate) fn quirk_value(fx: &mut Fixture) -> Value {
         subscr: None,
         buffer: None,
         print: None,
+        namedtuple_fields: None,
     };
     let t = fx.arena.alloc(None, Obj::Type(data), &fx.roots);
     fx.roots.push(Value::Heap(t));

@@ -231,7 +231,6 @@ pub enum Obj {
     Super(SuperData),
     Iterator(IteratorData),
     Deque(DequeData),
-    NamedTuple(NamedTupleData),
     AttrTuple(AttrTupleData),
     Map(MapData),
 }
@@ -256,11 +255,14 @@ impl Obj {
             Obj::BoundMeth(_) | Obj::Cell(_) | Obj::Super(_) => 16,
             Obj::Closure(c) => c.cells.len() * 4,
             Obj::Generator(_) => 48,
-            Obj::Type(t) => t.mro.len() * 4 + 64,
+            Obj::Type(t) => {
+                t.mro.len() * 4
+                    + 64
+                    + t.namedtuple_fields.as_ref().map_or(0, |f| f.len() * 4)
+            }
             Obj::Module(_) | Obj::Exception(_) | Obj::Property(_) => 48,
             Obj::Iterator(i) => i.extra.len() * 8 + 16,
             Obj::Deque(d) => d.items.len() * 8,
-            Obj::NamedTuple(n) => n.items.len() * 8,
             Obj::AttrTuple(a) => a.items.len() * 8,
             Obj::Map(m) => m.alloc * 16 + m.index.len() * 4,
         }
@@ -325,11 +327,6 @@ impl Obj {
                 out
             }
             Obj::Deque(d) => d.items.clone(),
-            Obj::NamedTuple(n) => {
-                let mut out = vec![Value::Heap(n.type_)];
-                out.extend(n.items.iter().copied());
-                out
-            }
             Obj::AttrTuple(a) => a.items.clone(),
             Obj::Map(m) => {
                 let mut out = Vec::with_capacity(m.entries.len() * 2);
@@ -596,6 +593,14 @@ pub struct TypeData {
     pub buffer: Option<BufferFn>,
     /// Print slot (`mp_print_t`). C6 adds it (D5).
     pub print: Option<PrintFn>,
+    /// Named-tuple field names (qstr ids), in order. `Some` only
+    /// for classes created by the named-tuple factory
+    /// (`NamedtupleType`, objnamedtuple.zig:93-99) — the Zig keeps
+    /// them in the type struct itself, after the header, so Rust
+    /// keeps them here too (C11). `None` for every other type.
+    /// The field names are qstr ids, not `Value`s, so they need no
+    /// GC tracing (see `children()`).
+    pub namedtuple_fields: Option<Vec<u32>>,
 }
 
 /// Module object (`mp_obj_module_t`). C12 owns.
@@ -658,17 +663,21 @@ pub struct IteratorData {
     pub extra: Vec<Value>,
 }
 
-/// Deque object. C11 owns.
+/// Deque object (`mp_obj_deque_t`, objdeque.zig:6-13) — a ring
+/// buffer, ported faithfully (C11). `alloc` is the ring capacity
+/// (`maxlen + 1`; the extra slot distinguishes full from empty);
+/// `len = (i_put - i_get) mod alloc`. `items` has exactly `alloc`
+/// slots; slots outside `[i_get, i_put)` hold `Value::None` (the
+/// Zig zeroes them with `m_malloc0`, i.e. `OBJ_NULL` — never
+/// observed, since every read goes through the ring indices).
+/// `flags` bit 0 is `FLAG_CHECK_OVERFLOW` (objdeque.zig:14).
 #[derive(Clone, Debug)]
 pub struct DequeData {
+    pub alloc: usize,
+    pub i_get: usize,
+    pub i_put: usize,
     pub items: Vec<Value>,
-}
-
-/// Named-tuple instance. C11 owns.
-#[derive(Clone, Debug)]
-pub struct NamedTupleData {
-    pub type_: GcRef,
-    pub items: Vec<Value>,
+    pub flags: u32,
 }
 
 /// Attribute tuple (`mp_obj_attrtuple_t`). C9 owns. A regular tuple

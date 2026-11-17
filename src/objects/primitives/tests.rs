@@ -52,6 +52,7 @@ pub(crate) fn make_type(arena: &mut GcArena, roots: &RootSet, name: &[u8]) -> Gc
         subscr: None,
         buffer: None,
         print: None,
+        namedtuple_fields: None,
     };
     arena.alloc(None, Obj::Type(data), roots)
 }

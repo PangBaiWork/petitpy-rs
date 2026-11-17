@@ -341,6 +341,7 @@ fn header_type_is_traced() {
             subscr: None,
             buffer: None,
             print: None,
+            namedtuple_fields: None,
         }),
         &roots,
     );

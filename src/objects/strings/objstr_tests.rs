@@ -43,6 +43,7 @@ fn plain_type_data(name: u32, flags: u16, dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: None,
+        namedtuple_fields: None,
     }
 }
 

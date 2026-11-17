@@ -5,9 +5,12 @@
 //! ports `mpy` (the .mpy reader/writer) and `mpy_roundtrip`.
 
 pub mod bigint;
+pub mod bridge;
 pub mod build_options {
     include!(concat!(env!("OUT_DIR"), "/build_options.rs"));
 }
+pub mod compile;
+pub mod emit;
 pub mod grammar_data;
 pub mod grammar_ext;
 pub mod lexer;

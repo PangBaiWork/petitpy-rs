@@ -1,0 +1,234 @@
+Phase B result — port compile + emit + bridge from Zig
+=======================================================
+Executor: Phase B subagent, main worktree ~/workspace/petitpy-rs, master,
+base 942d8d0 (170 tests green). One commit for this chunk (see git log):
+"Phase B: port compile + emit + bridge from Zig".
+
+Sources (petitpy devel HEAD df7de3a, read-only ~/workspace/petitpy-orig):
+  src/compiler/compile.zig  5,593 lines, 12 test blocks
+  src/compiler/emit.zig     1,682 lines, 12 test blocks
+  src/compiler/bridge.zig     123 lines,  0 test blocks
+  Total                     7,398 lines, 24 test blocks
+
+1:1 mapping
+------------
+emit.zig -> src/compiler/emit/ (each file < 800 lines):
+  emit.zig §1-§3 constants/opcodes  -> emit/consts.rs (245)
+  emit.zig encodeUint/encodeInt     -> emit/encoders.rs (65)
+  emit.zig ConstObj / const pool    -> emit/const_obj.rs (80)
+  emit.zig EmitCommon               -> emit/common.rs (124)
+  emit.zig Emit (bytecode writer)   -> emit/emit.rs (687)
+  emit.zig writers (writeRawCode..) -> emit/writers.rs (365)
+  emit.zig 12 test blocks           -> emit/tests.rs (289), 12 tests
+
+compile.zig -> src/compiler/compile/ (each file < 800 lines):
+  §4 WK block, §6 Compiler struct, §7 errors, §9 helpers
+                                      -> compile/mod.rs (468)
+  dispatch table + compile_node      -> compile/dispatch.rs (206)
+  §scope_compute_things, pass drivers, compile() entry
+                                      -> compile/driver.rs (614)
+  §10 c_assign family                -> compile/assign.rs (276)
+  §11,§12,§20 + re-exports           -> compile/handlers.rs (228)
+  §13 import family                  -> compile/handlers_import.rs (249)
+  §14-§16 global/nonlocal + control -> compile/handlers_control.rs (462)
+  §17 try/except/finally + with      -> compile/handlers_try.rs (280)
+  §18 expr-stmt + PEP 526 annotations -> compile/handlers_expr_stmt.rs (381)
+  §19,§21,§23,§24,§29 + re-exports   -> compile/expr.rs (495)
+  §22 atom-expr/trailers/call        -> compile/expr_atom.rs (397)
+  §26 const-object + pn_to_const_obj -> compile/expr_const.rs (273)
+  §20,§24 funcdef/classdef/comps     -> compile/funcdef.rs (262)
+  trailer-paren / atom-brace helpers -> compile/funcdef_call.rs (283)
+  §27 param/codegen helpers          -> compile/funcdef_params.rs (352)
+  §33.1 async/await                  -> compile/async_stmt.rs (352)
+  §34 match statement                -> compile/match_stmt.rs (685)
+  compile.zig 12 test blocks         -> compile/tests.rs (291), 12 tests
+
+bridge.zig -> src/compiler/bridge.rs (59):
+  compile_to_mpy(source, kind) -> Result<Vec<u8>, CompileError>
+  compile_to_mpy_named(source, kind, source_name) (source name seeds
+  qstr-table index 0). Pipeline: lexer -> parser -> compile -> mpy::write.
+  No extern "C" exports (Phase F). C malloc/free out-buf contract becomes
+  Vec ownership; ERR_* codes map to the CompileError enum.
+  examples/compile_mpy.rs (57): CLI compile_mpy <in.py> <out.mpy>
+  [file|single|eval] [source-name]; source-name defaults to the input path.
+
+Pass structure (verbatim from compile.zig)
+------------------------------------------
+SCOPE / CODE_SIZE / EMIT three-pass driver preserved exactly:
+run_scope_pass_one + run_scope_pass (iterative worklist over scope_head,
+scope_pass_done flag), then per scope STACK_SIZE -> CODE_SIZE -> EMIT with
+overflow -> OutOfMemory, code_base sliced to used length. A "3-pass
+consistency" test (in both emit/tests.rs and compile/tests.rs) watches
+bytecode offsets across passes. scopeComputeThings order is vendor order
+(star-param swap, forward pass, cells, frees). compile() entry:
+root scope, seed source_file qstr at index 0, set_max_num_labels(1024),
+SCOPE bail on compile_error, scope_compute_things over the chain,
+codegen per scope, assemble qstrs/objs/RawCode tree.
+
+Ownership design (A3 arena pattern, no Rc<RefCell>)
+----------------------------------------------------
+- Emit owns EmitCommon by value (Zig holds *EmitCommon; Rust
+  self-reference not expressible).
+- Compiler owns qctx: QstrContext and tree: ParseTree (no lifetimes;
+  Zig borrows qctx, bridge creates one per compilation anyway).
+- Scope stash slots: Compiler.scope_slots: HashMap<Pn, ScopeId> replaces
+  Zig writing scope pointers into parse-tree node slots (lambdef
+  nodes[2], funcdef nodes[4], classdef nodes[3], comp_for nodes[3]).
+- Per-scope code: Compiler.raw_codes: Vec<Option<RawCode>> +
+  raw_children: Vec<Vec<ScopeId>> (indexed by ScopeId, dense 0..n);
+  assembly is recursive, no pointer round-trip (Zig's cloneRawCodeTree
+  pointer slots). Scope.raw_code: usize field left as 0 (unused).
+- ConstObj payloads owned (Vec<u8>/Vec<ConstObj>) — Zig borrows slices
+  from the parse tree, which would be self-referential in a Compiler
+  owning both tree and EmitCommon.
+- Emit methods take scopes: &ScopeArena (read-only) or &mut ScopeArena
+  (everything adjusting stack / setting generator flag / id_op); call
+  sites use disjoint field borrows (self.emit.foo(..., &mut self.scopes)).
+- Handlers copy child Pn lists to owned Vec<Pn> before recursing
+  (borrowck: tree.struct_nodes borrow cannot be held across &mut self
+  calls); scope scalars copied out before emit calls.
+- Allocation failure is not propagated in Rust (Vec/HashMap abort on
+  OOM); Zig `catch { overflow = true }` paths around findOrAdd/useQstr/
+  useConstObj/allocConstChild do not exist; id_op missing-id keeps Zig
+  shape (debug_assert!(false) + overflow = true, set directly in Emit::id_op).
+- Pass derives PartialOrd/Ord (variant order = discriminant order) so
+  `pass >= Pass::CodeSize` gates port directly.
+- compile_syntax_error_arg is defined in Zig §7 but never called there;
+  ported as a pub method for 1:1 parity.
+- File-size rule forced splits of handlers.rs (1515), expr.rs (1111),
+  funcdef.rs (844) into sibling modules with `pub use` re-exports, so
+  dispatch.rs / driver.rs / tests.rs keep the same `handlers::` /
+  `expr::` / `funcdef::` paths. Split is code-motion only: both strong
+  differentials were re-run after the split and still pass (see below).
+  Cross-module fallout fixed during the split: handlers_expr_stmt's
+  pub(crate) has_annassign/annotations_qstr re-exported as pub(crate);
+  funcdef_params::compile_funcdef_lambdef made pub(crate); SMALL_INT_*
+  consts moved to expr_const.rs / funcdef_call.rs where they are used.
+
+Acceptance numbers
+------------------
+- cargo test --release --lib --tests: 194 passed / 0 failed / 1 ignored
+  (baseline 170 + 12 emit + 12 compile; the 1 ignored is the stale A3
+  empty-file expectation, ported as #[ignore]).
+- cargo build --release --lib --tests --examples: 0 warnings, 0 errors.
+- No unsafe in any Phase B file (emit/, compile/, bridge.rs, example).
+- Every new file < 800 lines (largest: emit/emit.rs 687, match_stmt.rs 685).
+- Pure std, no external crates. Original repo clean (git status empty).
+- Strong differential 1 (scripts/check_compile_mpy.py): 552/552 corpus
+  .py -> .mpy byte-identical to `petitpy --emit-mpy`. PASS.
+- Strong differential 2 (scripts/check_compile_run.py): control arm
+  552/552 (orig .mpy under petitpy-vm == Rust .mpy under petitpy-vm),
+  primary 532/552, 0 REAL-DIFFs, 0 Rust compile failures. PASS.
+  (Primary diffs are runner/oracle artifacts — see below.)
+
+Divergences / corrections found while porting
+---------------------------------------------
+- doImportName (compile.zig:2977): builds the full dotted string
+  ("a.b.c") and emits ONE IMPORT_NAME of it, plus ATTR_LOAD per tail
+  component when as-aliased; there is NO IMPORT_FROM in it.
+  compile_dotted_as_name: loadConstSmallInt(0), loadConstTok(NONE),
+  doImportName, compileStoreId. (An early draft had invented IMPORT_FROM
+  steps — caught by re-reading the source.)
+- compileImportFrom loop condition is pnIsToken (any TOKEN leaf,
+  (pn & 0x0f) == PN_TOKEN), not just DEL_PERIOD/ELLIPSIS.
+- cAssignAtomExpr: AugStore does NOT recompile the LHS chain (aug-load
+  already left the value on the stack); AugLoad period = dupTop + attr
+  LOAD (leaves [obj, value]); AugLoad bracket = dupTopTwo + subscr LOAD
+  (leaves [obj, index, value]); AugStore bracket = rotThree + subscr
+  STORE; AugStore period = rotTwo + attr STORE.
+- cAssign structure: testlist_star_expr/testlist_comp/exprlist -> tuple
+  (kind must be store, else "can't assign to expression"); atom_paren
+  unwraps inner testlist_comp (empty -> error, null inner -> "can't
+  assign to ()"); atom_bracket has empty/single/testlist_comp sub-cases;
+  c_assign_tuple_flat takes &[Pn] targets (not pn + n); star targets
+  unwrap inside the tuple assign loops; duplicate star -> "multiple
+  starred targets".
+- qstr_from_strn takes &[u8] (Zig qstrFromStrn(comp, []const u8)), not
+  &str; driver.rs call sites use b"ucollections" / b"OrderedDict".
+- WK_NAMES/[&str; WK_LEN] + WK_LEN = WK_NAMES.len() is a const cycle
+  rustc rejects (E0391); fixed to WK_NAMES: [&str; 27].
+- call_function/call_method take usize counts (not u32);
+  compile_trailer_paren_helper's n_positional_extra is usize.
+- close_over_variables_etc borrow fix: child-scope free ids collected
+  up front into this_free: Vec<Qstr> because the loop calls
+  load_local(&mut comp.scopes) and cannot hold an immutable borrow of
+  the same arena.
+- Dispatch-table test uses std::ptr::fn_addr_eq with `as Handler`
+  coercion (fn items need coercion to fn pointers for the FnPtr bound);
+  plain == on fn pointers warns (unpredictable_function_pointer_
+  comparisons), and assert_eq! fails (no Debug on fn items).
+- parse_int_auto mirrors Zig std.fmt.parseInt(isize, bytes, 0):
+  optional sign, 0x/0o/0b prefix (either case — verified empirically:
+  0X123, 0x123, 291 produce byte-identical .mpy from the reference
+  binary), NO underscores (those fall through to normalize_to_decimal,
+  so 1_000 emits int_big, matching Zig), overflow -> Err. SMALL_INT
+  window 63-bit: MAX=(1<<62)-1, MIN=-(1<<62).
+- to_mpy_raw_code sets kind = MP_CODE_BYTECODE (2); Zig's sets
+  .kind = 0, which its own writer would reject — dead code in Zig
+  (nothing calls it), so the 0 is a latent bug, fixed in the port.
+- compile_scope (emit.zig helper, unused by the driver) ported as a
+  free fn taking a closure, returning owned (Vec<u8>, u16); the driver
+  uses its own run_codegen_passes because the body needs the full
+  Compiler.
+- compile.zig's comment claiming DEL_PIPE_EQUAL is at 69 is stale/wrong
+  — both Zig lexer.zig (line 137) and Rust tables.rs have
+  DEL_PIPE_EQUAL = 71; the MP_BINARY_OP_INPLACE_OR + (tok -
+  DEL_PIPE_EQUAL) arithmetic is self-consistent in each implementation
+  (A2's 552/552 zigdiff already proved token streams byte-identical).
+- Zig compileScope/toMpyRawCode in emit.zig are never called by
+  compile.zig (only mentioned in a comment). Zig mpy.RawCode.kind is
+  absolute (MP_CODE_BYTECODE=2); writer encodes (kind - 2) in low 2 bits.
+- Emitter's MP_TOKEN_* family is NOT the lexer TokenKind family:
+  MP_TOKEN_ELLIPSIS=9, KW_FALSE=10, KW_NONE=11, KW_TRUE=12 vs lexer
+  13/14/15/16; compile.rs maps explicitly.
+- Unused wk_idx constants (INIT, LOCALS, DOC, UNDERSCORE, MODULE_TAG,
+  LAMBDA, LISTCOMP, DICTCOMP, SETCOMP, GENEXPR, STOP_ITERATION) are kept
+  with #[allow(dead_code)] on the module — the complete Zig WK_IDX
+  table, reserved for later phases.
+- Source-name finding (differential 1): `petitpy --emit-mpy` records
+  the LITERAL source name `<emit-mpy>` in the .mpy, not the file path
+  (verified by dumping its output for two different paths). The Rust
+  side must be invoked with that same literal name for byte-identity;
+  compile_mpy gained an optional 4th [source-name] argument for this,
+  and check_compile_mpy.py passes `<emit-mpy>`.
+
+Differential 2 — the 20 primary diffs, all explained by the control arm
+------------------------------------------------------------------------
+The script compares (rc, stdout+stderr) of `petitpy <stem>.py` vs
+`petitpy-vm <rust .mpy>`, plus a CONTROL arm: `petitpy-vm <orig .mpy>`
+vs `petitpy-vm <rust .mpy>` under the SAME runner. Control 552/552.
+The 20 primary diffs break down as:
+- 19 x ORACLE-COMPILER-NOT-LINKED: petitpy-vm does NOT link the
+  compiler, so any test calling eval()/exec()/compile() at runtime
+  (incl. SyntaxError-via-compile checks and f-string evaluation) raises
+  `NotImplementedError: compiler not linked in petitpy-vm` under
+  petitpy-vm but passes under petitpy. Files: assign_expr_syntaxerror,
+  async_syntaxerror, builtin_compile, builtin_eval, builtin_eval_buffer,
+  builtin_eval_error, builtin_exec, builtin_exec_buffer,
+  fun_calldblstar2, fun_callstardblstar, lexer, parser, python34,
+  special_comparisons, stopiteration, string_fstring,
+  string_fstring_invalid, syntaxerror, syntaxerror_return. Verified
+  individually on the reference binary.
+- 1 x RUNNER-__file__/sys.path: sys_path.py — `__file__` / sys.path[0]
+  are set by the runner, not the .mpy: petitpy .py run sets __file__
+  from argv (open(sys.path[0]+"/sys_path.py") -> ENOENT, rc=1), the
+  .mpy run sets __file__ to the .mpy path (test prints SKIP, rc=0).
+  Same .mpy under the same runner behaves identically (control arm).
+- deque_micropython.py (KNOWN-FAIL) now MATCHES (both-fail-identically):
+  both sides raise TypeError; the earlier mismatch was traceback
+  routing (petitpy -> stderr, petitpy-vm -> stdout) plus the recorded
+  source name (<stdin> vs <emit-mpy>) — the script merges streams and
+  normalises both spellings.
+- The 7 documented known-fails fail against the *vendor* goldens, not
+  against themselves: both sides print the same output, so they match
+  in this differential.
+
+What is NOT in this chunk
+--------------------------
+- No extern "C" exports (Phase F). No Value/Obj work (Phase C).
+- No change to the original repo (read-only; git status clean).
+- No change to A1/A2/A3/Lane M/Lane C/Lane FMT/Lane RE15 code or tests
+  (baseline 170 kept intact).
+
+Commit: one commit for this chunk (see git log).
+Message: "Phase B: port compile + emit + bridge from Zig".

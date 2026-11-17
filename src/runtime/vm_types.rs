@@ -89,7 +89,7 @@ fn plain_type(ctx: &mut CallCtx, name: u32) -> GcRef {
 /// identical to the fixed-arity call slots, C10a). `kw_overrides`
 /// replaces the `kw_func` for a named method (the `str.format`
 /// pass-through — see `format_kw_wrapper`).
-fn locals_dict_from_entries(
+pub(crate) fn locals_dict_from_entries(
     ctx: &mut CallCtx,
     fun_builtin_var: GcRef,
     entries: &[MethodEntry],
@@ -198,8 +198,26 @@ pub(crate) fn build_vm_types(
     object_data.make_new = Some(object_make_new_slot);
     let object = ctx.alloc(None, Obj::Type(object_data));
 
+    // `staticmethod` / `classmethod` come before the int dict:
+    // `int.from_bytes` is a classmethod object (see
+    // `int_locals_dict`), so the classmethod type must exist
+    // when the dict is built. Both use the ROM registry's real
+    // `*_type_data` fns (empty locals dicts — the VM builds no
+    // user classes, and the MRO patch is the ROM's, not the
+    // VM's).
+    let staticmethod_dict = empty_dict(ctx);
+    let staticmethod = ctx.alloc(
+        None,
+        Obj::Type(staticmethod_type_data(staticmethod_dict)),
+    );
+    let classmethod_dict = empty_dict(ctx);
+    let classmethod = ctx.alloc(
+        None,
+        Obj::Type(classmethod_type_data(classmethod_dict)),
+    );
+
     // Primitives.
-    let int_dict = int_locals_dict(ctx);
+    let int_dict = int_locals_dict(ctx, fun_builtin_var, classmethod);
     let int = ctx.alloc(None, Obj::Type(int_type_data(int_dict)));
     let bool_dict = empty_dict(ctx);
     let bool_ = ctx.alloc(None, Obj::Type(bool_type_data(bool_dict)));
@@ -355,27 +373,18 @@ pub(crate) fn build_vm_types(
     let empty_tuple_ref = ctx.alloc(Some(tuple), Obj::Tuple(vec![]));
     let empty_tuple = Value::Heap(empty_tuple_ref);
 
-    // C12a's remaining `BuiltinTypes` fields. `super` /
-    // `staticmethod` / `classmethod` use the ROM registry's real
-    // `*_type_data` fns (empty locals dicts — the VM builds no
-    // user classes, and the MRO patch is the ROM's, not the VM's);
-    // `empty_bytes` is the VM-local singleton (header = the VM's
-    // `bytes` type, same shape as `rom.rs`); `native_init_wrapper`
-    // is the fixture pattern (a plain type named `function` — the
-    // VM never calls `instance_make_new`, the only reader of this
-    // field, `typecreate.rs:362`).
+    // C12a's remaining `BuiltinTypes` fields. `super` uses the
+    // ROM registry's real `*_type_data` fn (empty locals dict —
+    // the VM builds no user classes, and the MRO patch is the
+    // ROM's, not the VM's); `staticmethod` / `classmethod` were
+    // built above, before the int dict. `empty_bytes` is the
+    // VM-local singleton (header = the VM's `bytes` type, same
+    // shape as `rom.rs`); `native_init_wrapper` is the fixture
+    // pattern (a plain type named `function` — the VM never calls
+    // `instance_make_new`, the only reader of this field,
+    // `typecreate.rs:362`).
     let super_dict = empty_dict(ctx);
     let super_ = ctx.alloc(None, Obj::Type(super_type_data(super_dict)));
-    let staticmethod_dict = empty_dict(ctx);
-    let staticmethod = ctx.alloc(
-        None,
-        Obj::Type(staticmethod_type_data(staticmethod_dict)),
-    );
-    let classmethod_dict = empty_dict(ctx);
-    let classmethod = ctx.alloc(
-        None,
-        Obj::Type(classmethod_type_data(classmethod_dict)),
-    );
     let empty_bytes = ctx.alloc(
         Some(bytes),
         Obj::Bytes(BytesData { bytes: Vec::new() }),

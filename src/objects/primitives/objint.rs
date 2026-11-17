@@ -37,7 +37,8 @@ use crate::objects::primitives::ops::{
 };
 use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
 use crate::objects::value::{
-    wrap_small_int, BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj, TypeData, Value,
+    wrap_small_int, BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj,
+    StaticClassMethodData, TypeData, Value,
 };
 use crate::pyerr::{PyError, PyResult};
 use crate::vendor::mpz::BigInt;
@@ -246,13 +247,25 @@ pub fn int_to_bytes_builtin(ctx: &mut CallCtx<'_>, args: &[Value]) -> PyResult<V
 /// counting `cls`) and `to_bytes` (sig 1–4 counting `self`, wired
 /// by C13 — see `int_to_bytes_builtin` above; the `BuiltinFn`
 /// signature carries `CallCtx`, whose `types` supplies the bytes
-/// type). Both objects are allocated with a `None` header type —
-/// the bootstrap pattern (the dict/builtin-function types do not
-/// exist yet).
-pub fn int_locals_dict(ctx: &mut CallCtx<'_>) -> GcRef {
+/// type). Both `FunBuiltin`s take `fun_builtin_var` as their
+/// header type (the `build_vm_types` order guarantees it exists —
+/// the old "types do not exist yet" bootstrap comment was stale:
+/// `fun_builtin_var` is built first). `from_bytes` is stored as
+/// a `StaticClassMethod` object wrapping the `FunBuiltin` (the
+/// original: `int_from_bytes_obj: MpObjStaticClassMethod`,
+/// `base.type = &mp_type_classmethod` — `objint.zig:431-438`),
+/// so it prints `<classmethod>` and binds the class as
+/// `args[0]`; a bare `FunBuiltin` printed `<>` (a `None`
+/// header resolves to no type name) and would print
+/// `<function>`.
+pub fn int_locals_dict(
+    ctx: &mut CallCtx<'_>,
+    fun_builtin_var: GcRef,
+    classmethod: GcRef,
+) -> GcRef {
     let from_bytes_id = static_qstr_id(b"from_bytes").expect("MP_QSTR_from_bytes is static");
     let fun = ctx.alloc(
-        None,
+        Some(fun_builtin_var),
         Obj::FunBuiltin(FunBuiltinData {
             name: from_bytes_id,
             n_args: fun_n_args(2, 4),
@@ -261,12 +274,18 @@ pub fn int_locals_dict(ctx: &mut CallCtx<'_>) -> GcRef {
             kw_func: None,
         }),
     );
+    let from_bytes_obj = ctx.alloc(
+        Some(classmethod),
+        Obj::StaticClassMethod(StaticClassMethodData {
+            fun: Value::Heap(fun),
+        }),
+    );
     // C13: `to_bytes` (sig 1–4 counting `self`; see
     // `int_to_bytes_builtin` above). The `BuiltinFn` signature
     // carries `CallCtx`, whose `types` supplies the bytes type.
     let to_bytes_id = static_qstr_id(b"to_bytes").expect("MP_QSTR_to_bytes is static");
     let to_bytes_fun = ctx.alloc(
-        None,
+        Some(fun_builtin_var),
         Obj::FunBuiltin(FunBuiltinData {
             name: to_bytes_id,
             n_args: fun_n_args(1, 4),
@@ -278,7 +297,7 @@ pub fn int_locals_dict(ctx: &mut CallCtx<'_>) -> GcRef {
         None,
         Obj::Dict(DictData {
             map: MapData::from_pairs(vec![
-                (Value::Qstr(from_bytes_id), Value::Heap(fun)),
+                (Value::Qstr(from_bytes_id), Value::Heap(from_bytes_obj)),
                 (Value::Qstr(to_bytes_id), Value::Heap(to_bytes_fun)),
             ]),
         }),

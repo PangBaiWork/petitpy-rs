@@ -172,6 +172,10 @@ pub struct VmState {
     /// in `call_function_ctx`, like `eval` — its `func` is a
     /// stub, see `builtinimport.rs`). Added by C15b.
     pub import_builtin: Value,
+    /// The `help` builtin (intercepted by GcRef identity in
+    /// `call_function_ctx`, like `eval` — its `func` is a
+    /// stub, see `builtinhelp.rs`). Added by C18b.
+    pub help_builtin: Value,
     /// The scheduler pending-exception slot
     /// (`MP_STATE_THREAD(mp_pending_exception)`,
     /// `scheduler.zig:33`): `None` = `MP_OBJ_NULL` = nothing
@@ -325,6 +329,7 @@ impl Vm {
                 exec_builtin: Value::None,
                 compile_builtin: Value::None,
                 import_builtin: Value::None,
+                help_builtin: Value::None,
                 pending_sched: None,
                 sys_path: vec![String::new()],
                 frozen_modules: crate::runtime::frozen_modules::FrozenTable::new(),
@@ -526,6 +531,18 @@ impl Vm {
         // `func` is a stub, as `eval`'s is. Added by C15b.
         let import_val =
             mk_var(&mut ctx, "__import__", 1, 5, import_builtin_fn, &mut pairs);
+        // `help` (0–1 args: `MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN
+        // (mp_builtin_help_obj, 0, 1, ...)`, `builtinhelp.c:189`),
+        // intercepted by identity in `call_function_ctx` — its
+        // `func` is a stub, as `eval`'s is. Added by C18b.
+        let help_val = mk_var(
+            &mut ctx,
+            "help",
+            0,
+            1,
+            crate::runtime::builtinhelp::help_builtin_fn,
+            &mut pairs,
+        );
 
         let builtins = ctx.alloc(
             None,
@@ -543,6 +560,7 @@ impl Vm {
         state.exec_builtin = exec_val;
         state.compile_builtin = compile_val;
         state.import_builtin = import_val;
+        state.help_builtin = help_val;
         // Pin everything live: the types, the singletons, the
         // builtins dict and the builtin values.
         let mut pins: Vec<Value> = Vec::new();

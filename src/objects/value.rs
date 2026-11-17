@@ -259,6 +259,16 @@ pub enum Obj {
     /// `type(...)` as `<class ''>` and `repr(...)` as
     /// `Ellipsis`, probed 2026-11-17).
     Ellipsis,
+    /// `io.StringIO` / `io.BytesIO` payload (C18b owns;
+    /// `vendor/py/objstringio.c`). `buf` is the owned content
+    /// (the C keeps a borrowed `fixed_buf` + `ref_obj` for a
+    /// str/bytes constructor arg; Rust clones eagerly —
+    /// observably identical because str/bytes are immutable
+    /// and a bytearray arg takes the C's copy path too,
+    /// probed 2026-11-18). `pos` is the read/write cursor;
+    /// `closed` means `vstr == NULL` in the C (close frees
+    /// the buffer but does NOT reset `pos`).
+    StringIo(StringIoData),
 }
 
 impl Obj {
@@ -271,6 +281,7 @@ impl Obj {
             Obj::Int(z) => z.num_digits() * 4,
             Obj::Str(s) => s.bytes.len(),
             Obj::Bytes(b) => b.bytes.len(),
+            Obj::StringIo(s) => s.buf.len(),
             Obj::Tuple(t) => t.len() * 8,
             Obj::List(l) => l.items.len() * 8,
             Obj::Dict(d) => d.map.alloc * 16 + d.map.index.len() * 4,
@@ -501,6 +512,21 @@ pub struct ArrayData {
     pub len: usize,
     pub data: Vec<u8>,
     pub source: Option<GcRef>,
+}
+
+/// `io.StringIO` / `io.BytesIO` object (C18b owns;
+/// `vendor/py/objstringio.c:173-178` `stringio_new`).
+/// `is_text` is NOT stored here: the content type
+/// (`str` vs `bytes`, for `getvalue` and the print label)
+/// comes from the header type's stream protocol
+/// (`StreamP.is_text`, resolved through the MRO — a
+/// subclass instance prints/getvalues as its base,
+/// probed 2026-11-18).
+#[derive(Clone, Debug)]
+pub struct StringIoData {
+    pub buf: Vec<u8>,
+    pub pos: usize,
+    pub closed: bool,
 }
 
 /// Range object. C9 owns.

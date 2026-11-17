@@ -61,6 +61,14 @@ impl FrozenTable {
         self.entries.len()
     }
 
+    /// The frozen module names, in table order
+    /// (`mp_help_add_from_names` iterates the same list; the C
+    /// strips a trailing `.py` — Rust names are stored
+    /// without it).
+    pub fn names(&self) -> Vec<&str> {
+        self.entries.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
     /// Whether the table is empty (the default build).
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

@@ -64,11 +64,11 @@ fn str_equal(arena: &GcArena, pool: &RuntimeQstr, o1: Value, o2: Value) -> bool 
 /// The `str` vs `bytes` comparison warning (`obj.zig`
 /// equalNotEqualImpl, full + feature-warning): the original prints
 /// it to stderr (verified on the reference binary:
-/// `Warning: Comparison between bytes and str`). Until the print
-/// machinery (C13/C14) centralises stderr, this writes there
-/// directly.
+/// `Warning: Comparison between bytes and str`). Now routed
+/// through the central `mp_warning` (`runtime/warning.rs` —
+/// the centralisation this comment was waiting for since C8a).
 fn warn_str_bytes_cmp() {
-    eprintln!("Warning: Comparison between bytes and str");
+    crate::runtime::warning::mp_warning(None, "Comparison between bytes and str");
 }
 
 /// `mp_obj_equal_not_equal` (`obj.zig:309-368`): the general

@@ -296,7 +296,7 @@ pub fn stream_unbuffered_iter(
 
 // ── Builtin method bodies ───────────────────────────────────────────────
 
-fn stream_read_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_read_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     stream_read_generic(ctx, args, MP_STREAM_RW_READ)
 }
 
@@ -304,7 +304,7 @@ fn stream_read1_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     stream_read_generic(ctx, args, MP_STREAM_RW_READ | MP_STREAM_RW_ONCE)
 }
 
-fn stream_write_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_write_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     stream_readinto_write_generic(ctx, args, MP_STREAM_RW_WRITE)
 }
 
@@ -312,7 +312,7 @@ fn stream_write1_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     stream_readinto_write_generic(ctx, args, MP_STREAM_RW_WRITE | MP_STREAM_RW_ONCE)
 }
 
-fn stream_readinto_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_readinto_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     stream_readinto_write_generic(ctx, args, MP_STREAM_RW_READ)
 }
 
@@ -320,7 +320,7 @@ fn stream_readinto1_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value
     stream_readinto_write_generic(ctx, args, MP_STREAM_RW_READ | MP_STREAM_RW_ONCE)
 }
 
-fn stream_unbuffered_readline_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_unbuffered_readline_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     stream_unbuffered_readline(ctx, args)
 }
 
@@ -328,15 +328,15 @@ fn stream_unbuffered_readlines_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyR
     stream_unbuffered_readlines(ctx, args[0])
 }
 
-fn stream_close_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_close_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     stream_close(ctx, args[0])
 }
 
-fn stream_exit_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_exit_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     stream_close(ctx, args[0])
 }
 
-fn stream_seek_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_seek_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let types = ctx.types;
     let offset = obj_get_int(ctx, types, args[1]).map_err(|e| ctx.record_typed(e))?;
     let mut whence = SEEK_SET;
@@ -356,7 +356,7 @@ fn stream_seek_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     ))
 }
 
-fn stream_tell_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_tell_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     // `streamTell`: `streamSeek(0, SEEK_CUR)`.
     let res = stream_seek(ctx, args[0], 0, SEEK_CUR)?;
     Ok(Value::int(
@@ -367,7 +367,7 @@ fn stream_tell_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     ))
 }
 
-fn stream_flush_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_flush_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let stream_p = get_stream_raise(ctx, args[0], MP_STREAM_OP_IOCTL)?;
     let ioctl: StreamIoctlFn = stream_p
         .ioctl

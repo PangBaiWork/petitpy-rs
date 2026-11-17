@@ -152,6 +152,34 @@ pub fn iternext_allow_raise_ctx(
             };
         }
     }
+    // Streams (`MP_TYPE_FLAG_ITER_IS_STREAM`): the C's
+    // `mp_iternext` gives them `mp_stream_unbuffered_iter`
+    // (vendor `py/obj.h:560-561`) — one line per step, EOF is
+    // `StopIteration`. This is the `for line in stream:` path
+    // (C18b: the corpus `io_stringio_base.py` iterates a
+    // `StringIO`; C16 ported `stream_unbuffered_iter` but
+    // nothing wired it into the VM's iternext). The flag is
+    // read on the header type only, matching `getiter`'s
+    // `FLAG_ITER_IS_ITERNEXT` check — a user subclass does
+    // not inherit the flag (C12a's `typecreate` inherits
+    // only `HAS_SPECIAL_ACCESSORS`), so subclass iteration
+    // stays a `typecreate` item with `make_new` inheritance.
+    if let Some(t) = obj_get_type(ctx.arena, ctx.types, it) {
+        if let Obj::Type(d) = ctx.arena.get(t) {
+            if d.flags & crate::objects::obj::FLAG_ITER_IS_STREAM != 0 {
+                return match crate::support::stream_methods::stream_unbuffered_iter(
+                    ctx, it,
+                ) {
+                    Ok(Some(v)) => Ok(v),
+                    Ok(None) => Err(crate::objects::objtype::objexcept::new_exception(
+                        ctx,
+                        state.exc.stop_iteration,
+                    )),
+                    Err(e) => Err(exc_from_pyerror(ctx, state, e)),
+                };
+            }
+        }
+    }
     // The `__next__` method path.
     let (method, self_) = load_next_method_ctx(ctx, state, it)?;
     crate::runtime::vm_call::call_method_ctx(ctx, state, method, self_, 0, 0, &[])

@@ -411,8 +411,21 @@ pub fn str_get_buffer(
     if flags != BUFFER_READ {
         return Ok(false);
     }
-    let Some(data) = str_data(ctx.arena, value) else {
-        return Ok(false);
+    // String literals load as `Value::Qstr` (`load_const_str`,
+    // `MP_BC_LOAD_CONST_STRING` — like MicroPython, where a
+    // string const IS a qstr); the C's `mp_obj_str_get_buffer`
+    // handles qstrs, so read a qstr's bytes from the pool (the
+    // slice is pool-owned — static table or leaked `Box` — so
+    // the raw pointer stored in `bufinfo` stays valid). Fixed
+    // by C18b: `StringIO.write("!")` failed with
+    // `BufferProtocol` because the literal is a qstr, not a
+    // heap `Str` (a heap `Str` worked all along).
+    let data: &[u8] = match value {
+        Value::Qstr(id) => ctx.pool.qstr_str(id as u16),
+        _ => match str_data(ctx.arena, value) {
+            Some(d) => d,
+            None => return Ok(false),
+        },
     };
     bufinfo.data = data.as_ptr();
     bufinfo.len = data.len();

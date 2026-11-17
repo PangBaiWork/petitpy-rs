@@ -1,0 +1,259 @@
+Lane C9c: port set + range + slice + property + attrtuple to Rust
+=====================================================================
+Branch: lane/containers-c (base master 613b242, "Lane C8c: port mpprint.zig to Rust")
+Worktree: ~/workspace/petitpy-rs-containers-c
+Originals: src/objects/containers/objset.zig (747), objrange.zig (310),
+  objslice.zig (256), objproperty.zig (135), objattrtuple.zig (118) — all 0 test blocks.
+
+VERDICT
+-------
+cargo test --release --lib --tests: 586 passed, 0 failed, 1 ignored
+  (baseline 466 + 120 new: set 47, slice 24, range 25, property 17, attrtuple 7)
+cargo test --release --bins: 9 passed, 0 failed
+cargo build --release: 0 warnings, 0 errors
+No `unsafe` anywhere in the lane's files (grep clean).
+Every file < 800 lines (max: objset.rs 717).
+Original repo ~/workspace/petitpy-orig: clean (git status --porcelain empty).
+
+1:1 MAPPING (Zig -> Rust)
+------------------------
+objset.zig (747)        -> src/objects/containers/objset.rs (717)
+                           + objset_methods.rs (534)
+                           + objset_tests.rs (481) + objset_tests_b.rs (426)
+objrange.zig (310)      -> src/objects/containers/objrange.rs (410)
+                           + objrange_tests.rs (574)
+objslice.zig (256)      -> src/objects/containers/objslice.rs (429)
+                           + objslice_tests.rs (530)
+objproperty.zig (135)   -> src/objects/containers/objproperty.rs (264)
+                           + objproperty_tests.rs (337)
+objattrtuple.zig (118)  -> src/objects/containers/objattrtuple.rs (135)
+                           + objattrtuple_tests.rs (175)
+
+Shared / touched (all this lane's own edits):
+  src/objects/containers/map_set.rs (255): split set_lookup into hash
+    computation + set_lookup_hashed (probe loop, never hashes); added
+    set_items (live elements in table order); set_lookup_hashed and
+    set_rehash gained an `eq_blocked: bool` parameter (see §7).
+  src/objects/containers/map.rs: re-export {set_items, set_lookup_hashed}.
+  src/objects/containers/mod.rs: the 5 modules + 6 test modules.
+  src/objects/containers/objdict_methods.rs: collect_iterable made
+    pub(crate) (C9c reuses it); Set arm iterates set_items (table order).
+  src/objects/containers/tests.rs (Fixture): set/frozenset upgraded to
+    real slotted types (set_type_data / frozenset_type_data); range
+    upgraded to real slotted type (range_type_data).
+  src/objects/obj.rs: BuiltinTypes gained set, frozenset, range.
+    All 5 BuiltinTypes literals updated (obj_tests.rs, primitives/tests.rs,
+    primitives/tests_dispatch.rs, strings/objstr_tests.rs, containers/tests.rs).
+  src/objects/value.rs: SetData { table: MpSet } (was items: Vec<Value>);
+    AttrTupleData gained fields: Vec<u32>; is_true / heap_bytes /
+    children() Set arms updated to the table.
+  src/objects/strings/objstr_a.rs: str.join Set arm uses set_items.
+
+§1. SET: the brief's "set 的底层就是 C9a 的 MapData" is imprecise
+---------------------------------------------------------------
+The Zig stores sets in `mp_set_t` (map.zig: alloc/used/table of Obj) —
+NOT MapData. The Rust equivalent is C9a's MpSet + set_lookup /
+set_lookup_hashed (map_set.rs); no second hash table was built.
+`mp_obj_new_set(n, items)` sets `alloc = n` exactly, while make_new
+builds from an empty set (alloc 0, rehashing to 2 then 4) — so
+`{1,2,3}` prints `{3, 1, 2}` but `set([1,2,3])` prints `{1, 2, 3}`,
+and `frozenset({1,2,3})` prints `{1, 2, 3}` (verified on the
+reference binary). SetData is now `{ table: MpSet }`; table order IS
+the iteration/print/pop order everywhere (set_items).
+
+§2. RANGE: boundary type is i64
+---------------------------------
+objrange.zig: `Int = isize`. The i64 RangeData stub was correct as-is;
+no big-int rework. Full config: NO binary_op (RANGE_BINOP=0 —
+`range(5) == range(5)` is False, `r == r` True via identity fallback;
+the nano equality-only binary op is out of scope), attr live
+(start/stop/step), NO locals dict (`range(10).index` →
+AttributeError, verified). Range iterator = Obj::Iterator, header
+type None until C12 (dict-view precedent), flags 0x0080 recorded
+for C11/C12. range_len uses wrapping arithmetic throughout
+(`wrapping_sub/add/div`); two corners where the Zig aborts and Rust
+does not (documented intentional divergences, in objrange.rs):
+  * step 0 from a wrapped slice product — `range(0, 10, 2**32)[::2**32]`
+    IS `range(0, 4294967296, 0)` (verified: the object prints fine);
+    its len() divides by zero and CRASHES the reference binary;
+    range_len returns 0 instead.
+  * `@divTrunc(isize::MIN, -1)` — wrapping_div returns MIN (then the
+    `len < 0` rule clamps to 0); reachable only for
+    `range(isize::MIN, 0, -1)`-shaped ranges.
+
+§3. FROZENSET HASH SEED (address-dependent, hardcoded)
+------------------------------------------------------
+The Zig seeds with the type object's address
+(`@intFromPtr(&mp_type_frozenset)`). `nm` on the reference binary
+puts `mp_type_frozenset` at 0x15c0e50 = 22810192, exactly
+`hash(frozenset())`. Hardcoded as FROZENSET_HASH_SEED = 22810192
+(objset.rs) with that citation; element hashes wrapping-add onto it
+(`hash(frozenset({1,2}))` = 22810195, `hash(frozenset({5}))` =
+22810197, `hash(frozenset({-1}))` = 22810191 — all verified).
+NOTE (same class as the tuple-seed finding in MEMORY.md): the seed is
+a link artifact of the reference binary; C12 must revisit when a
+ROM-type-object model lands.
+
+§4. SLICE: the C8a-helper caveat (DO NOT "fix" C8a's helper)
+-----------------------------------------------------------
+C8a's `slice_indices` (objstr_slice.rs) raises EAGERLY on a failed
+conversion, but the Zig's `mpObjSliceIndicesImpl` never polls pending
+after `mp_obj_get_int`. This lane's `slice_indices_polled`
+(objslice.rs) is the Zig-faithful version, used by the `indices`
+method AND range's subscr; C8a's helper is untouched (it is also used
+by str/bytes slicing, which therefore shares the eager divergence —
+recorded here, not fixed here):
+  * `slice(1,2,"a").indices(5)` → ValueError "slice step can't be zero"
+    (NOT the int-conversion error C8a's helper would raise).
+  * `slice("a",2,3).indices(5)` → TypeError "can't convert to int".
+  * `slice(1,2).indices("a")` → TypeError "can't convert to int".
+  * `slice(None,None,None).indices(5)` → (0, 5, 1);
+    `slice(None,None,-1).indices(5)` → (4, -1, -1).
+  * `Some(Value::None)` counts as a missing bound (the Zig compares
+    against OBJ_NONE); slice_make_new normalizes explicit None args,
+    and the polled helper normalizes again (covers C13's BUILD_SLICE).
+  * `newSmallInt` in the Zig is a raw shift with no window check;
+    the Rust port uses `Value::int` (heap Int out of window) for the
+    indices tuple elements — the Zig's value there is
+    address-dependent garbage, the Rust value is the true bound.
+
+§5. THE POLLED-PENDING RULES (all probed on the reference binary)
+-----------------------------------------------------------------
+The Zig has one global pending_exc; every raise OVERWRITES it
+(`raiseMsg` assigns unconditionally, runtime.zig:218). Rust threads
+a local `pending: &mut Option<E>` instead. Rules, mechanism-verified
+from the Zig source (pyerr.zig, obj.zig, runtime.zig, map.zig):
+  * FIRST PENDING WINS, except step-zero OVERWRITES: a conversion
+    failure records the first error and reads back 0; a zero step
+    `try raiseStepZero()`s and overwrites whatever pending was set.
+  * THE `mp_obj_get_int_maybe` GUARD (obj.zig:197): while pending is
+    set, every `mp_obj_get_int` returns false WITHOUT converting —
+    even a valid int reads back 0. Consequence, both probed:
+    `slice(1,2,3).indices("x")` → step-zero (the step conversion
+    reads 0 after the failed length conversion), while
+    `slice("a",2).indices("x")` → int-conversion (step is None → 1,
+    no conversion, the length error survives). This guard is what
+    makes the second probe in §4 come out step-zero; an earlier
+    draft of this lane missed it and the probe caught it.
+  * `mp_iternext` returns 0 (== OBJ_STOP_ITERATION,
+    mp_mirrors.zig:493) immediately when pending is set, WITHOUT
+    clearing it (runtime.zig:1359-1362): a make_new / update /
+    difference loop stops pulling items the moment any pending is
+    set. `mp_getiter` has NO pre-flight — it runs (and its error
+    OVERWRITES pending) even when pending is set. Probes:
+    `set(1,2)` → 'object not iterable' (NOT the arg mismatch);
+    `s.update([[]], 1)` → 'object not iterable', s={[]. 1};
+    `{1,2}.difference([[]], 1)` → 'object not iterable'.
+  * `mp_obj_is_true` returns false whenever pending is set
+    (obj.zig:470), and `mp_obj_equal` is `mp_obj_is_true(...)` —
+    so a set lookup performed while a hash error is pending NEVER
+    finds its element. This is the `eq_blocked` parameter on
+    `set_lookup_hashed` / `set_rehash`.
+
+§6. THE UNHASHABLE-INSERT QUIRK (all probed)
+--------------------------------------------
+`mp_unary_op` HASH failure → bridge returns NULL → callers read the
+hash as 0 and INSERT ANYWAY (the hash error is recorded as pending):
+  * `s.add([2])` → TypeError 'unsupported type for operator' AND
+    `s == {[2]}` (the item IS in the set).
+  * `s.update([1], [[]])` → unsupported, `s == {[], 1}`; later
+    iterables are NOT processed (iternext pre-flight, §5).
+  * `set([[1]])`, `set([{1:2}])` → 'unsupported type for operator';
+    `set([[]],[2])` → 'argument num/types mismatch' (getiter
+    succeeds, first iternext stops, arg check wins).
+  * `s.remove([2])` on s={[2]} (inserted via the quirk) →
+    KeyError '[2]' (NOT TypeError): the lookup misses because of
+    the `mp_obj_is_true` guard (§5), and the remove's KeyError
+    OVERWRITES the hash pending. `s.remove([3])` → KeyError '[3]'.
+  * `s.discard([3])` → TypeError 'unsupported type for operator';
+    `[2] in {[2]}` → TypeError 'unsupported type for operator'.
+  * `set(x=1)` → 'argument num/types mismatch'.
+
+§7. SET BINARY OP (all probed)
+------------------------------
+Non-set rhs (except CONTAINS) → NULL (PyRaise at the slot boundary);
+in-place ops act in place ONLY when lhs is exact `set` (frozenset
+falls back to the non-inplace op): `{1,2} &= frozenset({2})` →
+({2}, set); `frozenset({1,2}) &= {2}` → ({2}, SET, not frozenset);
+`frozenset & frozenset` → set; `|`/`-`/`^` preserve the lhs type.
+`{1} | [1]` → TypeError "unsupported types for __or__: 'set', 'list'";
+`{1} | 1` → "...'set', 'int'". `{1} == frozenset({1})` → True
+(setEqual has no type check). pop order: literal `{1,2,3,4,5}` pops
+5,1,2,3,4; make_new `set([1,2,3,4,5])` pops 1,2,3,4,5 (the alloc
+difference, §1). Method tables: set 18 entries (incl `__contains__`),
+frozenset 9 entries (the earlier brief said 10; the source shows 9).
+setCopyImpl copies alloc+used+table element-wise, header type = self's
+type. `set()`-identity checks run even while pending is set
+(`s.difference_update([[]], s)` → unsupported, s=set() — the
+identity-clear DID run).
+
+§8. PROPERTY: the empty-qstr kw fills ALL THREE slots
+-----------------------------------------------------
+`mp_arg_parse_all` (vendor argcheck.c:80-134) looks the kw up PER
+SLOT by qstr; the first three slots share the empty qstr, so one
+empty-qstr kw entry fills all three. Verified on the reference
+binary: `property(**{'': 9})` has getter, setter AND deleter all 9
+(`C().x`, `c.x = 5`, `del c.x` all raise "object not callable").
+An earlier draft of this lane expected only the getter to be 9;
+the probe caught it. Other parse rules, all probed:
+`property(1,2,3,4,5)` → mismatch; `property(fget=1)` → mismatch
+(only `doc` is a named arg); `property(1,2,3,4,doc='x')` →
+mismatch (duplicate doc); `property(1,2,3,doc='x')` → OK;
+`property(doc='x')` → OK; doc is silently discarded either way.
+getter/setter/deleter clone with one slot replaced, keeping self's
+header type (`cloneWith` copies the whole struct, `m_malloc`).
+`property_proxy` returns the (getter, setter, deleter) triple for
+C12. No print/unary/binary slots — prints via C6's fallback
+(`<property>`, verified). PROPERTY_METHODS: getter/setter/deleter.
+
+§9. ATTRTUPLE: type name is "tuple", slots delegate to tuple
+------------------------------------------------------------
+`mp_obj_new_attrtuple(fields, n, items)`; print is custom
+(`(field=item, ...)` with PRINT_REPR items, NO type-name prefix —
+verified via namedtuple repr); attr is a field-name qstr lookup
+(first match wins); unary/binary/subscr/getiter delegate to the
+TUPLE's slots. AttrTupleData = { items: Vec<Value>, fields: Vec<u32> }
+(fields added to the C0 stub this lane). attrtuple_print_helper is
+pub for C11's namedtuple repr. The tuple slots are C9b's — C9b has
+merged into master, but THIS worktree is on the stale base 613b242
+(pre-C9b) where the tuple type has no slots yet, so the four
+delegating slots are None with TODO comments in attrtuple_type_data.
+THE REBASE MUST WIRE THEM (tuple_unary_op / tuple_binary_op /
+tuple_subscr / tuple_getiter from C9b's objtuple.rs) — the type
+data test pins the current (None) shape, update it at the rebase.
+
+§10. OTHER NOTES FOR THE MERGE
+------------------------------
+* BuiltinTypes gained `set`, `frozenset`, `range` (C9a precedent for
+  `dict`). Slice/property/attrtuple types are NOT added (make_new
+  takes type_ as a param; slice/attrtuple checks are payload-based).
+* Range subscr checks the slice PAYLOAD, not `isExactType(index,
+  &mp_type_slice)` — the slice type is not registered in
+  BuiltinTypes (C12 owns type creation). A slice SUBCLASS instance
+  (C12) would take the slice branch here where the Zig falls through
+  to `mp_get_index`. Recorded in objrange.rs for C12.
+* Frozenset hash of a heap-int element whose hash leaves the 62-bit
+  window: the Zig's `newSmallInt` reads back pointer bits (garbage);
+  Rust returns `Value::int` (the true hash). Documented corner.
+* `Value::int` is used for frozenset hash / range len / range
+  iterator yields / slice indices tuple elements / range attr values
+  (heap Int when out of the 62-bit window).
+* objset_tests.rs was split into objset_tests.rs (481) +
+  objset_tests_b.rs (426) for the 800-line cap (helpers are
+  pub(crate) in the first file).
+* Known test-expectation fixes during this lane (implementation was
+  right, the tests were wrong): set pop order literal-vs-make_new
+  (probe 8); the empty-qstr kw case (§8); `x`/`bogus`/`fget` are
+  NOT static qstrs (used `start`/`stop`/`len`/`doc` instead).
+* This lane's base (613b242) is STALE — C9b merged into master
+  during this lane (master now 541+ tests). The merge needs a
+  rebase (as C9b's merge did); the attrtuple TODO (§9) must be
+  resolved in the rebase, and the test counts re-verified there.
+
+SPLIT (800-line cap)
+--------------------
+objset.rs 717, objset_methods.rs 534, objset_tests.rs 481,
+objset_tests_b.rs 426, objrange.rs 410, objrange_tests.rs 574,
+objslice.rs 429, objslice_tests.rs 530, objproperty.rs 264,
+objproperty_tests.rs 337, objattrtuple.rs 135,
+objattrtuple_tests.rs 175, map_set.rs 255. All < 800.

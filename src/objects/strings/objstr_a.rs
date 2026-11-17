@@ -22,6 +22,7 @@
 //! C13 teaches them to check the pending cell (design doc D7).
 
 use crate::memory::gc::{CallCtx, GcArena};
+use crate::objects::containers::map_set::set_items;
 use crate::objects::obj::{
     obj_get_int_maybe, obj_get_type, qstr_bytes, BuiltinTypes, ObjError, BUFFER_READ,
 };
@@ -410,7 +411,7 @@ pub fn iter_items(
                 is_str_value(ctx.arena, arg),
             ),
             Obj::Dict(d) => JoinSource::Items(d.map.entries.iter().filter_map(|e| e.key).collect()),
-            Obj::Set(s) => JoinSource::Items(s.items.clone()),
+            Obj::Set(s) => JoinSource::Items(set_items(&s.table)),
             Obj::Range(rg) => JoinSource::Range(rg.start, rg.stop, rg.step),
             _ => return Err(StrError::ObjectNotIterable),
         },

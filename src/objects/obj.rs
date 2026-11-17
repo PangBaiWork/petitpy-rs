@@ -87,6 +87,17 @@ pub struct BuiltinTypes {
     pub complex: GcRef,
     pub tuple: GcRef,
     pub list: GcRef,
+    /// `set` (C9c: the set/frozenset constructor and the in-place
+    /// `update = isExactType(lhs, &mp_type_set)` check read it from
+    /// `ctx.types`, like the int/bool builtins read theirs).
+    pub set: GcRef,
+    /// `frozenset` (C9c: the frozenset hash seed check
+    /// `isExactType(self, &mp_type_frozenset)` and the frozenset
+    /// constructor read it).
+    pub frozenset: GcRef,
+    /// `range` (C9c: `range.__getitem__` on a slice builds a plain
+    /// `range`, as the Zig hardcodes `&mp_type_range`).
+    pub range: GcRef,
     /// `dict` (C9a: the dict constructor and copy/fromkeys allocate
     /// with this type; the `dict` builtin reads it from `ctx.types`,
     /// like the int/bool builtins read theirs).

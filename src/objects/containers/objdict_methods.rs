@@ -10,7 +10,7 @@
 
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::containers::map::{
-    map_lookup, map_of, map_of_mut, map_set_value, LookupKind, LookupOutcome,
+    map_lookup, map_of, map_of_mut, map_set_value, set_items, LookupKind, LookupOutcome,
 };
 use crate::objects::obj::{obj_id, obj_len_maybe};
 use crate::objects::obj_ops::obj_print_helper;
@@ -255,6 +255,8 @@ fn view_next_entry(
 /// today — it is the documented C11 follow-up, not a behaviour.)
 /// What `collect_iterable` does, decided from an immutable borrow
 /// first so the allocations below do not borrow the arena.
+/// Shared with the set lane (C9c: `set` construction / `update` /
+/// `difference` / `intersection` iterate the same way).
 enum IterPlan {
     /// Elements already in hand.
     Elems(Vec<Value>),
@@ -298,7 +300,7 @@ pub(crate) fn collect_iterable(ctx: &mut CallCtx, value: Value) -> Result<Vec<Va
                     .collect(),
             ),
             Obj::Range(range) => IterPlan::Range(range.start, range.stop, range.step),
-            Obj::Set(s) => IterPlan::Elems(s.items.clone()),
+            Obj::Set(s) => IterPlan::Elems(set_items(&s.table)),
             Obj::Array(a) => {
                 // Elements via `binary_get_val_array`
                 // (materialised — the same observable as the

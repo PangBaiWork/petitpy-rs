@@ -105,6 +105,9 @@ impl Fixture {
             complex: mk(&mut arena, b"complex"),
             tuple: mk(&mut arena, b"tuple"),
             list: mk(&mut arena, b"list"),
+            set: mk(&mut arena, b"set"),
+            frozenset: mk(&mut arena, b"frozenset"),
+            range: mk(&mut arena, b"range"),
             dict: mk(&mut arena, b"dict"),
             type_,
         };

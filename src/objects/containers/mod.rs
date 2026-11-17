@@ -9,10 +9,24 @@ pub mod map;
 pub mod map_set;
 pub mod objarray;
 pub mod objarray_methods;
+pub mod objattrtuple;
+#[cfg(test)]
+pub(crate) mod objattrtuple_tests;
 pub mod objdict;
 pub mod objdict_methods;
 pub mod objlist;
 pub mod objlist_methods;
+pub mod objproperty;
+#[cfg(test)]
+pub(crate) mod objproperty_tests;
+pub mod objrange;
+#[cfg(test)]
+pub(crate) mod objrange_tests;
+pub mod objset;
+pub mod objset_methods;
+pub mod objslice;
+#[cfg(test)]
+pub(crate) mod objslice_tests;
 pub mod objtuple;
 pub mod sequence;
 
@@ -30,5 +44,9 @@ pub(crate) mod objtuple_tests;
 pub(crate) mod sequence_tests;
 #[cfg(test)]
 pub(crate) mod objdict_tests;
+#[cfg(test)]
+pub(crate) mod objset_tests;
+#[cfg(test)]
+pub(crate) mod objset_tests_b;
 #[cfg(test)]
 pub(crate) mod tests;

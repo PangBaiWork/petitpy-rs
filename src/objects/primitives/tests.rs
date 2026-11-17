@@ -69,9 +69,12 @@ impl Fixture {
         let complex = make_type(&mut arena, &roots, b"complex");
         let tuple = make_type(&mut arena, &roots, b"tuple");
         let list = make_type(&mut arena, &roots, b"list");
+        let set = make_type(&mut arena, &roots, b"set");
+        let frozenset = make_type(&mut arena, &roots, b"frozenset");
+        let range = make_type(&mut arena, &roots, b"range");
         let dict = make_type(&mut arena, &roots, b"dict");
         let type_ = make_type(&mut arena, &roots, b"type");
-        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, dict, type_] {
+        for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset, range, dict, type_] {
             roots.push(Value::Heap(t));
         }
         let types = BuiltinTypes {
@@ -84,6 +87,9 @@ impl Fixture {
             complex,
             tuple,
             list,
+            set,
+            frozenset,
+            range,
             dict,
             type_,
         };

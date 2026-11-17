@@ -739,4 +739,4 @@ fn compact_rehash(
 
 // The set table operations live in `map_set.rs` (C9a-split); re-exported
 // here so the public paths (`map::MpSet`, `map::set_lookup`, …) are unchanged.
-pub use super::map_set::{MpSet, SetSlot, set_lookup};
+pub use super::map_set::{set_items, set_lookup, set_lookup_hashed, MpSet, SetSlot};

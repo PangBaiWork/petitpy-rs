@@ -14,6 +14,7 @@
 //!   Rust fn pointers, one per `mp_obj_type_t` slot.
 
 use crate::memory::gc::{GcArena, RootSet};
+use crate::objects::containers::map_set::{set_items, MpSet};
 use crate::objects::slots::{
     BinaryOpFn, BufferFn, BuiltinFn, CallFn, GetIterFn, PrintFn, SubscrFn, UnaryOpFn,
 };
@@ -174,7 +175,7 @@ impl Value {
                 Obj::Tuple(t) => Ok(!t.is_empty()),
                 Obj::List(l) => Ok(!l.items.is_empty()),
                 Obj::Dict(d) => Ok(d.map.used != 0),
-                Obj::Set(s) => Ok(!s.items.is_empty()),
+                Obj::Set(s) => Ok(s.table.used != 0),
                 _ => Ok(true),
             },
         }
@@ -247,7 +248,7 @@ impl Obj {
             Obj::Tuple(t) => t.len() * 8,
             Obj::List(l) => l.items.len() * 8,
             Obj::Dict(d) => d.map.alloc * 16 + d.map.index.len() * 4,
-            Obj::Set(s) => s.items.len() * 8,
+            Obj::Set(s) => s.table.alloc * 8,
             Obj::Array(a) => a.data.len(),
             Obj::Slice(_) => 24,
             Obj::FunBc(_) | Obj::FunBuiltin(_) => 32,
@@ -281,7 +282,7 @@ impl Obj {
                 }
                 out
             }
-            Obj::Set(s) => s.items.clone(),
+            Obj::Set(s) => set_items(&s.table),
             Obj::Array(a) => a
                 .source
                 .map(|s| Value::Heap(s))
@@ -410,10 +411,13 @@ pub struct DictData {
     pub map: MapData,
 }
 
-/// Set object. C9 owns.
+/// Set object. C9 owns. The payload is the `MpSet` hash table
+/// itself (`mp_set_t`, map.zig: `alloc`/`used`/`table`) — the Zig
+/// stores nothing else in `MpObjSet`, so there is no `items` vec:
+/// table order IS the iteration/print order.
 #[derive(Clone, Debug)]
 pub struct SetData {
-    pub items: Vec<Value>,
+    pub table: MpSet,
 }
 
 /// Array / bytearray / memoryview object (`objarray.zig`).
@@ -610,10 +614,14 @@ pub struct NamedTupleData {
     pub items: Vec<Value>,
 }
 
-/// Attribute tuple (`mp_obj_attrtuple_t`). C9 owns.
+/// Attribute tuple (`mp_obj_attrtuple_t`). C9 owns. A regular tuple
+/// plus the field-name array: the Zig stores the qstr array as a
+/// fake-Obj pointer in the trailing `items[len]` slot; Rust keeps it
+/// as a parallel `Vec<u32>` of qstr ids (same order as `items`).
 #[derive(Clone, Debug)]
 pub struct AttrTupleData {
     pub items: Vec<Value>,
+    pub fields: Vec<u32>,
 }
 
 // ── Method-slot fn types (op codes + slot fn pointers) ───────────────

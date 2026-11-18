@@ -226,7 +226,6 @@ fn d5_frozen_ipaddress() {
 }
 
 #[test]
-#[ignore = "FunBc __init__ stub-seam gap (C13b class, Phase E VM-seam runner): ip_network() instantiates the Python IPv4Network class"]
 fn d5_frozen_ipaddress_ignored() {
     let mut fx = Fx::new();
     fx.run_ok(
@@ -259,7 +258,6 @@ fn d5_frozen_enum_pathlib_shutil_uuid() {
 }
 
 #[test]
-#[ignore = "FunBc __init__ stub-seam gap (C13b class, Phase E VM-seam runner): typing instantiates _Subscriptable at import; datetime instantiates timezone at import"]
 fn d5_frozen_typing_datetime_ignored() {
     let mut fx = Fx::new();
     fx.run_ok(
@@ -344,7 +342,6 @@ fn d5_frozen_sys_modules() {
 // the gap is fixed — they must NOT be deleted.
 
 #[test]
-#[ignore]
 fn d5_frozen_re_compile_ignored() {
     let mut fx = Fx::new();
     fx.run_ok(

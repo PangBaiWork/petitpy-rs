@@ -35,7 +35,11 @@
 //!   like the Zig's `npy_set_make_new`, `objset.zig:133-151`).
 
 use crate::memory::gc::CallCtx;
-use crate::objects::slots::CallHook;
+use crate::objects::obj::ObjError;
+use crate::objects::objtype::instance::instance_unary_op;
+use crate::objects::objtype::seams::with_call_hook_seams;
+use crate::objects::slots::{CallHook, UnaryOp};
+use crate::objects::value::Obj;
 use crate::objects::containers::objarray_make_new::{
     array_make_new, bytearray_make_new, memoryview_make_new,
 };
@@ -334,13 +338,52 @@ pub fn enumerate_make_new_slot(
 
 /// `int` (`objint.rs:223`): builds the `QstrResolver` from
 /// `ctx.pool` (see the module doc), error mapping only.
+/// (E2h: with a VM hook, a user-class instance runs its
+/// `__int__` through `instance_unary_op` INT_MAYBE first — the
+/// vendor's `mpObjIntMakeNewImpl` INT_MAYBE step (objint.zig:
+/// 151-154). `Some(v)` is the int itself (`finish_unary` passes
+/// an exact int through unchanged, so `1 << 100` survives); `None` (no
+/// `__int__`) falls through to `int_make_new`, which raises
+/// `IntConversion` — the same `TypeError("can't convert to
+/// int")` the slot path raises for a non-int-convertible
+/// instance. A raise from the hooked call, or a non-int return,
+/// BOTH report `TypeError("can't convert to int")` (the vendor's
+/// INT_MAYBE NULL rule — the stashed raise is discarded, see the
+/// `Err` arm).)
 pub fn int_make_new_slot(
     ctx: &mut CallCtx,
     _type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
+    if let Some(hook) = call {
+        let n_pos = args.len().saturating_sub(2 * n_kw);
+        if n_pos == 1 {
+            let arg = args[0];
+            if matches!(arg, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::Instance(_))) {
+                match with_call_hook_seams(&mut *hook, |seams| {
+                    instance_unary_op(ctx, UnaryOp::IntMaybe, arg, seams)
+                }) {
+                    Ok(Some(v)) => return Ok(v),
+                    Ok(None) => {}
+                    Err(_) => {
+                        // The vendor's INT_MAYBE NULL rule: whether
+                        // the `__int__` call raised or returned a
+                        // non-int, `int()` reports TypeError "can't
+                        // convert to int" — the stashed raise is
+                        // discarded (see `VmHook::take_pending`),
+                        // and the failure is recorded on
+                        // `ctx.pending_raise` (the `int_make_new`
+                        // convention — the VM drains it into the
+                        // exception object).
+                        let _ = hook.take_pending();
+                        return Err(ctx.record_typed(ObjError::IntConversion));
+                    }
+                }
+            }
+        }
+    }
     let types = ctx.types;
     let pool = ctx.pool;
     let resolver: QstrResolver<'_> = &|id| {

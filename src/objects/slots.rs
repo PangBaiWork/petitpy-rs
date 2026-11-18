@@ -289,6 +289,19 @@ pub trait VmHook {
     fn next(&mut self, ctx: &mut CallCtx, it: Value) -> Result<Option<Value>, PyError> {
         self.resume(ctx, it)
     }
+
+    /// Take (and clear) the exception stashed by the last `call` /
+    /// `resume` / `binary_op` / `next` on this hook, if any (E2h).
+    /// The `mp_unary_op` HASH / INT_MAYBE rule: a slot raise is
+    /// swallowed by the op's own "not implemented" TypeError, so
+    /// the caller takes (discards) the stashed raise instead of
+    /// draining it — a raise stashed here is how the caller tells
+    /// a member-call raise apart from a bad return (which stashes
+    /// nothing). Default: `None` — a hook with no side channel
+    /// (e.g. `SeamHook`) never stashes.
+    fn take_pending(&mut self) -> Option<Value> {
+        None
+    }
 }
 
 /// The VM's user-code hook: `&mut dyn VmHook` — see `VmHook`.

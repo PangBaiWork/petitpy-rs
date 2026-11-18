@@ -1,0 +1,286 @@
+# Lane E2h — int / hash / bytes conversions — result file
+# Branch: lane/e2h-int-hash. Base: master 2ae4032 (E2f merge).
+# Executor: E2h subagent. Date: 2026-11-18.
+# Scope: ONLY cluster (p-int) — the 8 corpus targets
+# builtin_hash, builtin_hash_intbig, builtin_str_hex, int_parse,
+# int_big_rshift, int_bytes_intbig, special_methods,
+# special_methods_intbig. All 8 flip; 0 regressions anywhere.
+
+## §1 — Runners + comparison rules
+
+- The six gate runners under `scripts/` were run with DEFAULTS
+  (no `--bin`; the defaults are absolute paths to this worktree's
+  `target/release/petitpy-rs`), EXCEPT the full gate, which was run
+  as `python3 scripts/run_full_gate.py --bin
+  target/release/petitpy-rs` from the repo root (the E2d-verified
+  invocation). Capability uses its defaults (`--vm` =
+  `target/release/petitpy-vm` — passing `petitpy-rs` there makes
+  every construct fail, the E2b lesson).
+- Full-corpus fail names were extracted with
+  `grep -E "^\s+\+ FAIL" <gate-out> | awk '{print $3}' | sort`
+  and set-diffed against master's 25 (E2f §4). Integration and
+  golden fail sets were set-diffed the same way against a
+  master baseline measured in a scratch worktree at `2ae4032`
+  (built fresh, removed afterwards): integration 183/202,
+  golden 570/585, nano 437/541 — all three reproduce the
+  merged-master numbers exactly, so the deltas below are exact.
+- Probes: byte-compare of stdout + stderr + exit code between
+  this worktree's `target/release/petitpy-rs` and the reference
+  binary `~/workspace/petitpy-orig/zig-out/bin/petitpy`.
+  Verification outputs (probe scripts + REF/RUST outputs + gate
+  outputs) are in `~/workspace/e2h_verify/` and
+  `~/workspace/e2h_gate_*.txt` / `~/workspace/e2h_master_*.txt`.
+- Reference-binary probe scripts lose buffered stdout when a
+  later statement aborts (rc=134) — probe crash cases in separate
+  scripts, and wrap AttributeError-prone lines in try/except
+  (the standing E2 lesson).
+
+## §2 — Gates (all re-run in the worktree, release build)
+
+- lib: **1606 passed, 0 failed, 3 ignored** (E2f 1597 + 9 new
+  e2h tests in NEW `src/runtime/vm_tests_e2h.rs`). Bins 9.
+  `tests/entry_cli.rs` 45. 0 warnings (forced recompile:
+  `touch src/lib.rs && cargo build --release`). No `unsafe`
+  in the diff. `scripts/check_compile_mpy.py` PASS (0 byte
+  mismatches, 552/552). `scripts/check_frozen.py` PASS (23/23,
+  38,141 bytes). Binaries: petitpy-rs **1,896,272 B**,
+  petitpy-vm **1,883,376 B**. Largest touched file: `map.rs`
+  945 lines (cap is 2500 — no split needed). The 3 remaining
+  ignored tests are all pre-existing, none is this lane's:
+  `smoke_empty_file_input_parses_to_single_struct` (parser),
+  `makenew_class_attr_on_class` (the type-object attribute gap
+  — `C.x`), `int_from_bytes_e2e_after_classmethod_wrap` (same
+  gap — still FAILS when run with `-- --ignored`).
+- Full corpus: **528/552** (master 520) — **+8, 0 regressions**.
+  24 fails = 17 regressions + 7 known-fails exactly.
+  Newly passing (8, set-diffed — exactly the brief's targets):
+  builtin_hash, builtin_hash_intbig, builtin_str_hex, int_parse,
+  int_big_rshift, int_bytes_intbig, special_methods,
+  special_methods_intbig. The `int_big_rshift` SIGABRT panic is
+  gone (verified: the corpus file runs rc=0, byte-identical).
+- Integration: **183/202** (master 183) — identical fail sets
+  (set-diffed against the scratch-worktree master baseline:
+  0 gains, 0 regressions). 19 fails: enum_members,
+  init_subclass, native_subclass_operands, runtime_annotations,
+  json_cpython_behaviour, cpython_platform_import_slice_mro,
+  itertools_cpython_functions, dict_missing_basic,
+  dict_missing_counter_pattern, object_setattr_method_available,
+  gc_reclaims_garbage, gc_closes_dropped_files_and_sockets,
+  os_kill_esrch_raises, os_chown_self_noop, socket_fromfd_wraps_fd,
+  select_timeout_zero_returns_promptly, select_readable_fd_is_ready,
+  subprocess_check_raises_on_nonzero,
+  subprocess_streams_env_cwd_text.
+- Golden: **573/585** (master 570) — **+3, 0 regressions**
+  (set-diffed against the scratch-worktree master baseline).
+  Newly passing: builtin_hash.py, int_parse.py,
+  special_methods_micropython.py. rust==cpython 566/585
+  (master 563). 12 fails: array_add.py, array_micropython.py,
+  class_delattr_setattr.py, class_new.py, class_store_class.py,
+  class_super_closure.py, getitem.py, import_instance_method.py,
+  memoryerror.py, object_new.py, stopiteration.py,
+  subclass_native_buffer.py.
+- Capability: **67/67 — GATE GREEN** (matches the baseline
+  exactly).
+- test-stdlib: **6/8** (master 6/8 — unchanged). Failing:
+  test_abc, test_enum (both (n)-territory, E2g's scope).
+- Nano (report-only): **441/541** (master 437) — **+4, 0
+  regressions** (set-diffed against the scratch-worktree master
+  baseline). Newly passing: builtin_hash, builtin_str_hex,
+  int_parse, special_methods. The four `*intbig` targets
+  (builtin_hash_intbig, int_big_rshift, int_bytes_intbig,
+  special_methods_intbig) still fail under nano for nano-config
+  reasons (the nano corpus compares against the nano reference,
+  which lacks the full bigint paths) — not regressions.
+
+## §3 — Fixes (all probed byte-identical vs the reference)
+
+- **Fix 1 — `int_big_rshift` SIGABRT** (`src/vendor/mpz_ops.rs`,
+  `shr_inpl`): the round-up path did `dest.dig.truncate(len)`
+  after `mpn::shr`, destroying the spare digit the vendor's
+  `mpz_need_dig(dest, lhs->len)` (mpz.c:1101) provides; the
+  subsequent `mpn::add(&mut dest.dig, &tmp, &[1])` needs
+  `out.len() >= a.len()+1` and its final carry write panicked
+  ("index out of bounds: the len is 1 but the index is 1" at
+  `src/vendor/mpn.rs:142`). Trigger: `(-0xffffffffffffffff) >>
+  32` (shifted value all 1s). Fix: `dest.dig.resize(tmp.len()
+  + 1, 0)` before the add. The other two `mpn::shr` call sites
+  (pow/pow3 loops, mpz_ops.rs:264/309) operate on full clones —
+  safe. `not_inpl`'s add branch already resizes to len+1 first
+  — safe. Existing shr unit tests 5/5 pass after the fix.
+- **Fix 2 — `int_bytes_intbig`** (`src/objects/primitives/
+  objint.rs`, `int_to_bytes`): it called `z.as_bytes(!little,
+  true, &mut buf)` with `as_signed=true` unconditionally; the
+  vendor `mp_obj_int_to_bytes_impl` (objint_mpz.c:115-119)
+  passes `as_signed = self->mpz.neg` — the sign-bit overflow
+  check applies ONLY to negative ints. Positive heap ints with
+  the top bit set (e.g. `(2**64-1).to_bytes(8, 'little')` =
+  `b'\xff'*8`) wrongly raised `OverflowError: buffer too
+  small`. Fix: `z.as_bytes(!little, z.is_neg(), &mut buf)`.
+  Negative behavior unchanged (`as_signed=true` preserved).
+  Probed: `(2**64-1).to_bytes(7)` still `OverflowError`,
+  `(-1).to_bytes(1) == b'\xff'` (signed), `(-129).to_bytes(1)`
+  still `OverflowError`.
+- **Fix 3 — `int_parse`** (`src/objects/primitives/objint.rs`,
+  `int_make_new_1`): it used `str_bytes_of` (Qstr/Str/Bytes
+  only); the vendor `mpObjIntMakeNewImpl` (objint.zig:151-154)
+  tries `mp_get_buffer(arg, MP_BUFFER_READ)` after INT_MAYBE —
+  ANY buffer provider. Fix: after the `str_bytes_of` check, try
+  E2e's safe `buffer_bytes(ctx, arg)` (handles Array incl.
+  memoryview view chains) and parse base 10.
+  `int(bytearray(b"123"))` and `int(memoryview(b"123"))` now
+  work (`int(b"123")` already did).
+- **Fix 4 — `builtin_str_hex`** (`src/runtime/vm_types.rs`):
+  only memoryview lacked `hex` — bytes/bytearray already
+  worked. Vendor `mp_obj_memoryview_locals_dict`
+  (objstr.zig:3615-3616) is just the `hex` entry. Fix: the
+  memoryview `empty_dict(ctx)` was replaced with a one-entry
+  dict built via `locals_dict_from_entries` with `MethodEntry {
+  name: "hex", func: bytes_hex_builtin, min: 1, max: 255,
+  kw_func: None }`. `bytes_hex` reads self via `buffer_data` →
+  `buffer_bytes`, which covers the memoryview source chain.
+  Note (probed): `memoryview(b'').hex()` returns `b''` (bytes),
+  not `''` — the existing `bytes_hex` empty rule, already
+  vendor-faithful.
+- **Fix 5 — `__hash__` / `__int__` hook dispatch** (the
+  mechanism; four files + one trait method):
+  - Root cause (same for both): the slot
+    `instance_unary_op_slot` uses stub seams, which cannot run
+    a `FunBc` dunder — so `hash(A())` / `int(A())` raised
+    `TypeError` even though `instance_unary_op` already
+    implements the full vendor HASH / INT_MAYBE logic (member
+    path → `finish_unary` truncation / exact-int passthrough;
+    no-`__hash__` path → the identity / `__eq__` rule).
+  - NEW `hash_of_hook(ctx, types, key, hook)` (`map.rs`):
+    instance key + hook → `instance_unary_op(HASH)` via
+    `with_call_hook_seams`; else exactly `hash_of`. Also fixes
+    `hash_value_to_usize`'s heap-Int arm: `as_int_checked()
+    .unwrap_or(0)` → `z.hash_mpz() as usize` (the vendor's
+    truncation, objint_mpz.c:420-428 — a `__hash__` returning
+    `(1 << 70) | 1` hashed as 0 instead of 1).
+  - `map_lookup_hook` / `compact_lookup` / `compact_rehash`
+    thread the hook through the hash computation and the rehash
+    replays (`map.rs`); NEW `dict_store_hook` (`objdict.rs`,
+    `dict_store` refactored to `dict_store_inner` + hook).
+    STORE_MAP + STORE_COMP tag 1 (`vm_dispatch_exec.rs`) now
+    store with `Some(&mut make_hook(state))` — `{A(): 1}` and
+    dict comprehensions over instance keys work, including
+    across growth rehashes (20-key regression test).
+  - `hash` builtin intercepted by GcRef identity
+    (`VmState.hash_builtin`, registered via `D1Bindings` in
+    `vm_builtins_bind.rs` — the captured `mk_var` return value,
+    NOT a dict lookup; the `mk_var` call order is unchanged) →
+    NEW `call_hash_ctx` (`builtin_vm.rs`) routes through
+    `hash_of_hook` (one rule, one place).
+  - `unary_op_ctx`'s HASH arm (`vm_rt.rs`) also routes through
+    `hash_of_hook` (the public `unary_op` wrapper path).
+  - `int_make_new_slot` (`make_new.rs` — see the §4 note):
+    with a VM hook, a 1-positional-arg user instance runs
+    `instance_unary_op(INT_MAYBE)` first; `Some(v)` is the int
+    itself (`finish_unary` passes an exact int through, so
+    `1 << 100` survives); `None` falls through to
+    `int_make_new` (raises `IntConversion`).
+  - NEW `VmHook::take_pending` (`slots.rs`, default `None`;
+    `StateHook` takes `state.pending_exc`). See the vendor
+    raise rule below — this is how the caller tells a
+    member-call raise apart from a bad return, and discards
+    the stashed raise instead of leaking it.
+  - **Vendor raise rule (probed + read in the original —
+    runtime.zig `mpUnaryOpImpl`, objtype.zig
+    `instanceUnaryOpImpl` B2, pyerr.zig `bridge`/`raiseMsg`):**
+    a slot raise inside `mp_unary_op` is SWALLOWED by the op's
+    own "not implemented" TypeError — for HASH the fallthrough
+    `raiseMsg(TypeError, "unsupported type for operator")`
+    overwrites the pending raise; for INT_MAYBE the NULL return
+    makes the caller raise "can't convert to int". A NON-INT
+    RETURN raises "can't convert to int" in `finish_unary`
+    (`mp_obj_get_int`, C-nlr — it bypasses the fallthrough).
+    The `"%d" % x` path is DIFFERENT and propagates (E2e's
+    existing behavior, verified byte-identical — untouched).
+    Probed on the reference: `hash(R())` → TypeError
+    "unsupported type for operator"; `{R(): 1}` → same;
+    `int(R())` → TypeError "can't convert to int";
+    `hash(D())` (`__hash__` returns None) → TypeError "can't
+    convert to int"; `int(BadInt())` → same; `"%d" % R()` →
+    ValueError (propagates). All six now match byte-identically
+    (messages asserted in the new regression tests, including a
+    no-leak check: a `sorted(key=)` after a swallowed raise
+    still works).
+  - Regression tests: 9 new tests in NEW
+    `src/runtime/vm_tests_e2h.rs` (rshift no-panic, to_bytes
+    top-bit, int-from-buffer, memoryview hex, hash user class
+    incl. truncation + messages, hash-raise swallow + no-leak,
+    dict growth rehash, int user class incl. `1 << 100`,
+    int-raise → "can't convert to int").
+
+## §4 — Remaining work / notes (read before merging)
+
+- **ATTENTION — `make_new.rs` is E2g territory (brief §4
+  forbids `src/objects/objtype/*`, and E2g is working on the
+  same files in parallel): this lane DOES touch
+  `src/objects/objtype/make_new.rs`, in exactly ONE function
+  (`int_make_new_slot`, + ~25 lines + 2 import lines). The
+  change is UNAVOIDABLE for this lane's targets, not
+  convenience: the `MakeNewFn` hook parameter is the SOLE
+  entry point for the VM hook into `int()`'s construction
+  path — `int_make_new` / `int_make_new_1` take no hook, the
+  stub-seam slot path cannot run a `FunBc` `__int__`, and
+  intercepting the `int` type call in the VM would be a much
+  larger change in the same forbidden area. Without it,
+  `special_methods` / `special_methods_intbig` (`int(A())`)
+  cannot be fixed at all. The change touches NO class-creation
+  logic (E2g's actual subject: `class_new`,
+  `class_store_class`, `class_delattr_setattr`,
+  `class_descriptor`, `class_super_closure`,
+  `subclass_native_*`) — it is a builtin-constructor adapter
+  only, so a rebase conflict with E2g is unlikely (E2g has no
+  reason to edit `int_make_new_slot`); if one appears, the
+  rebase should keep BOTH sides (E2g's class-creation edits
+  elsewhere in the file + this lane's `int_make_new_slot`
+  hook block). No other §4-forbidden file was touched:
+  `obj_ops.rs` was only READ; `instance.rs`,
+  `objarray*.rs`, `objdict_collect.rs`, `vm_rt_iter.rs`,
+  `builtinimport.rs`, `import_search.rs`, `objlist.rs` and
+  the `builtins` module registration are untouched.**
+- Remaining full-corpus regressions: **17** (verbatim):
+  array1, array_add, array_micropython, builtin_override,
+  class_delattr_setattr, class_new, class_store_class,
+  class_super_closure, getitem, import_instance_method,
+  io_iobase, memoryerror, object_new, ordereddict1,
+  stopiteration, subclass_native_buffer, subclass_native_exc_new.
+  (Master's 25 minus this lane's 8 flips.)
+- Out of scope (found while working, NOT fixed — next lanes):
+  - Subscript dict store / lookup with an instance key
+    (`d[A()] = v`, `d[A()]`): STORE_SUBSCR / LOAD_SUBSCR go
+    through `obj_subscr` → the dict subscr slot → ctx-only
+    `dict_store` / `dict_get_value`. Threading a hook there
+    would mean changing the `SubscrFn` slot signature (all
+    types) or `obj_subscr`'s instance-dispatch arms
+    (`obj_ops.rs`, forbidden) — E2g/E2i territory. Note the
+    reference ALSO raises TypeError "unsupported type for
+    operator" for a RAISING `__hash__` on these paths, so the
+    current ctx-only behavior is accidentally right for the
+    raise case and wrong only for a working `__hash__`.
+  - Set literals / set stores with an instance key (`{A()}`):
+    `set_lookup` → ctx-only `hash_of`. Same hook-threading
+    shape as the map fix, not done here.
+  - `type(iter(...))` — explicitly out of scope per the brief.
+  - `int()` with 2 args (`int(x, base)`) on a user instance:
+    `int_make_new_2` has no INT_MAYBE step in either binary
+    (the vendor's 2-arg path is str-only) — untested, untouched.
+- No other divergences found. The `hash_value_to_usize`
+  heap-Int fix (`hash_mpz`) is strictly more vendor-faithful
+  than the old `unwrap_or(0)` and is covered by the truncation
+  regression test (`hash(F()) == 1`).
+- Watch cron: none created by this lane (the parent agent
+  owns watch crons; this lane ran inside one subagent turn).
+- Files changed (15, +312/−28): `src/objects/containers/
+  map.rs`, `objdict.rs`, `src/objects/objtype/make_new.rs`
+  (see the note above), `src/objects/primitives/objint.rs`,
+  `src/objects/slots.rs`, `src/runtime/builtin_vm.rs`,
+  `mod.rs`, `vm.rs`, `vm_builtins_bind.rs`,
+  `vm_call_intercept.rs`, `vm_dispatch_exec.rs`, `vm_rt.rs`,
+  `vm_seams.rs`, `vm_types.rs`, `src/vendor/mpz_ops.rs`;
+  NEW `src/runtime/vm_tests_e2h.rs`. Result file:
+  `scripts/e2h_result.txt` (this file).
+- The executor did NOT merge (per the brief). The lane branch
+  is ready for the main agent's independent verification.

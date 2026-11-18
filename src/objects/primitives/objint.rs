@@ -26,6 +26,7 @@
 //! So int's `base` is `None` and its MRO is `[int]`.
 
 use crate::memory::gc::CallCtx;
+use crate::objects::containers::binary::buffer_bytes;
 use crate::objects::obj::{call_binary, obj_get_type, BuiltinTypes, SlotOutcome};
 use crate::objects::primitives::objcomplex::complex_binary_op;
 use crate::objects::primitives::objfloat::float_binary_op;
@@ -81,6 +82,17 @@ fn int_make_new_1(
         return Ok(arg);
     }
     if let Some(bytes) = str_bytes_of(ctx.arena, types, resolver, arg) {
+        let z = parse_int_text(&bytes, 10)?;
+        return Ok(new_int_from_bigint(ctx.arena, types, ctx.roots, &z));
+    }
+    // Vendor `mpObjIntMakeNewImpl` (objint.zig:151-154): after
+    // INT_MAYBE it tries `mp_get_buffer(arg, MP_BUFFER_READ)` —
+    // ANY buffer provider, not just str/bytes. `buffer_bytes`
+    // is the safe reader (E2e): bytearray and memoryview (an
+    // Array with a source chain) parse their raw bytes base 10.
+    // `str_bytes_of` above already covered str/bytes/qstr, so
+    // only Array/memoryview can reach here.
+    if let Some((bytes, _tc)) = buffer_bytes(ctx, arg) {
         let z = parse_int_text(&bytes, 10)?;
         return Ok(new_int_from_bigint(ctx.arena, types, ctx.roots, &z));
     }
@@ -384,7 +396,15 @@ pub fn int_to_bytes(
                 buf.try_reserve_exact(dlen)
                     .map_err(|_| PrimError::OutOfMemory)?;
                 buf.resize(dlen, 0);
-                if !z.as_bytes(!little, true, &mut buf) {
+                // Vendor `mp_obj_int_to_bytes_impl`
+                // (objint_mpz.c:115-119) passes
+                // `as_signed = self->mpz.neg` — the sign-bit
+                // overflow check applies ONLY to negative ints.
+                // Passing `true` unconditionally made a positive
+                // heap int whose top byte has the high bit set
+                // fail, e.g. `(2**64 - 1).to_bytes(8, 'little')`
+                // raised `OverflowError: buffer too small`.
+                if !z.as_bytes(!little, z.is_neg(), &mut buf) {
                     return Err(PrimError::BufferTooSmall);
                 }
                 buf

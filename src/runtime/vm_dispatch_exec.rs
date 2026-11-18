@@ -15,7 +15,7 @@ use crate::compiler::emit::consts::{
     MP_BC_WITH_CLEANUP, MP_BC_YIELD_FROM, MP_BC_YIELD_VALUE,
 };
 use crate::memory::gc::CallCtx;
-use crate::objects::containers::objdict::{dict_new, dict_store};
+use crate::objects::containers::objdict::{dict_new, dict_store_hook};
 use crate::objects::obj::obj_get_type;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::containers::objlist::new_list;
@@ -35,6 +35,7 @@ use crate::runtime::vm_call::{call_function_ctx, call_method_ctx};
 use crate::runtime::vm_call_var_kw::call_method_var_kw_ctx;
 use crate::runtime::vm_ops::{exc_from_obj_error, make_closure_ctx, make_function_ctx};
 use crate::runtime::vm_rt::is_true_ctx;
+use crate::runtime::vm_seams::make_hook;
 use crate::runtime::vm_rt_name::load_method_ctx;
 use crate::runtime::vm_raise::make_raise_obj;
 use crate::runtime::vm_rt_iter::{
@@ -370,11 +371,15 @@ pub(crate) fn dispatch_exec(
             MP_BC_STORE_MAP => {
                 // (`vm.zig:834-837`): `[.., dict, value,
                 // key]` — the key is on top, the value below
-                // it; the dict stays.
+                // it; the dict stays. (E2h: the hook-aware
+                // store — an instance key runs its `__hash__`
+                // through the VM's real call hook.)
                 let key = spop(frame).unwrap_or(Value::None);
                 let value = spop(frame).unwrap_or(Value::None);
                 let dict = stop(frame).unwrap_or(Value::None);
-                if let Err(e) = dict_store(ctx, dict, key, value) {
+                if let Err(e) =
+                    dict_store_hook(ctx, dict, key, value, Some(&mut make_hook(state)))
+                {
                     return Some(DispatchOutcome::Raised(exc_from_obj_error(
                         ctx, state, e,
                     )));
@@ -404,7 +409,9 @@ pub(crate) fn dispatch_exec(
                     1 => {
                         let key = spop(frame).unwrap_or(Value::None);
                         let value = spop(frame).unwrap_or(Value::None);
-                        if let Err(e) = dict_store(ctx, obj, key, value) {
+                        if let Err(e) =
+                            dict_store_hook(ctx, obj, key, value, Some(&mut make_hook(state)))
+                        {
                             return Some(DispatchOutcome::Raised(exc_from_obj_error(
                                 ctx, state, e,
                             )));

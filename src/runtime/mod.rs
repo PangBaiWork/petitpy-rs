@@ -143,3 +143,5 @@ mod vm_tests_e2d;
 mod vm_tests_e2e;
 #[cfg(test)]
 mod vm_tests_e2f;
+#[cfg(test)]
+mod vm_tests_e2h;

@@ -75,7 +75,9 @@ use std::cell::RefCell;
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::obj::{call_unary, is_str, obj_get_type, obj_id, BuiltinTypes, ObjError, SlotOutcome};
 use crate::objects::obj_ops::obj_equal;
-use crate::objects::slots::UnaryOp;
+use crate::objects::objtype::instance::instance_unary_op;
+use crate::objects::objtype::seams::with_call_hook_seams;
+use crate::objects::slots::{CallHook, UnaryOp};
 use crate::objects::value::{GcRef, MapData, MapEntry, Obj, Value};
 use crate::pyerr::PyError;
 use crate::qstr_table::qstr_compute_hash;
@@ -489,15 +491,18 @@ fn obj_id_word(value: Value) -> usize {
 /// contract (`slots.rs`) says `__hash__` returns a small int; the
 /// int slot keeps it (`new_int_from_i64(hash_mpz())` may heap-allocate
 /// when the folded hash leaves the 62-bit window, so a heap `Int` is
-/// unwrapped too — `as_int_checked` rejects exactly `-2^63`, which
-/// then hashes as 0; that corner needs a folded hash of precisely
-/// `i64::MIN`). Anything else (a broken slot) hashes as 0 — the
-/// Zig's `>> 1` on a non-small-int word is equally meaningless.
+/// unwrapped too — with the vendor's truncation (`mp_obj_hash`
+/// truncates via `mp_obj_get_int_truncated`, objint_mpz.c:420-428:
+/// `hash_mpz`), NOT `as_int_checked` (which mapped an out-of-range
+/// heap int to 0 — e.g. a `__hash__` returning `(1 << 70) | 1`
+/// hashed as 0 instead of 1). Anything else (a broken slot) hashes
+/// as 0 — the Zig's `>> 1` on a non-small-int word is equally
+/// meaningless.
 fn hash_value_to_usize(arena: &GcArena, v: Value) -> usize {
     match v {
         Value::SmallInt(n) => n as usize,
         Value::Heap(r) => match arena.get(r) {
-            Obj::Int(z) => z.as_int_checked().map(|n| n as usize).unwrap_or(0),
+            Obj::Int(z) => z.hash_mpz() as usize,
             _ => 0,
         },
         _ => 0,
@@ -544,6 +549,58 @@ pub fn hash_of(
         },
         _ => hash_via_slot(ctx, types, key),
     }
+}
+
+/// `hash_of` with an optional VM hook (E2h): a user-class instance
+/// key runs its `__hash__` through the VM's real call hook
+/// (`instance_unary_op` HASH — the member path truncates via
+/// `finish_unary`, the no-`__hash__` path applies the vendor's
+/// identity / `__eq__` rule, an unhashable instance reports
+/// `TypeError("unsupported type for operator")`). Without a hook
+/// (or for a non-instance key) this is exactly `hash_of` — the
+/// stub-seam slot path, which cannot run a `FunBc` `__hash__`.
+/// A raise from the hooked `__hash__` call is SWALLOWED (the
+/// vendor's `mp_unary_op` fallthrough — see the `Err` arm below);
+/// the stashed raise is discarded here, never drained.
+pub fn hash_of_hook(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    key: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<usize, MapError> {
+    if let Some(hook) = hook {
+        if matches!(key, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::Instance(_))) {
+            return match with_call_hook_seams(&mut *hook, |seams| {
+                instance_unary_op(ctx, UnaryOp::Hash, key, seams)
+            }) {
+                Ok(Some(v)) => Ok(hash_value_to_usize(ctx.arena, v)),
+                Ok(None) => Err(MapError::TypeError("unsupported type for operator")),
+                Err(_) => {
+                    // A raise from the hooked `__hash__` call is
+                    // swallowed by the vendor's `mp_unary_op`
+                    // fallthrough (runtime.zig `mpUnaryOpImpl` —
+                    // the slot's NULL return falls to
+                    // `raiseMsg(TypeError, "unsupported type for
+                    // operator")`, overwriting the pending raise);
+                    // a non-int return raises "can't convert to
+                    // int" in `finish_unary` (`mp_obj_get_int`,
+                    // C-nlr — it bypasses the fallthrough). The
+                    // two are told apart by the hook's side
+                    // channel: a raise stashes the exception
+                    // there, a bad return stashes nothing — and
+                    // the stashed raise is DISCARDED here, never
+                    // drained, or it would leak into a later
+                    // operation's drain.
+                    if hook.take_pending().is_some() {
+                        Err(MapError::TypeError("unsupported type for operator"))
+                    } else {
+                        Err(MapError::TypeError("can't convert to int"))
+                    }
+                }
+            };
+        }
+    }
+    hash_of(ctx, types, key)
 }
 
 fn hash_via_slot(
@@ -605,6 +662,32 @@ pub fn map_lookup(
     key: Value,
     kind: LookupKind,
 ) -> Result<LookupOutcome, MapError> {
+    map_lookup_inner(ctx, types, map_ref, key, kind, None)
+}
+
+/// `map_lookup` with an optional VM hook for instance keys (E2h):
+/// the hook threads into `compact_lookup`'s hash computation (and
+/// its rehash replays) only; the ordered path computes no hash.
+/// See `hash_of_hook`.
+pub fn map_lookup_hook(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    map_ref: GcRef,
+    key: Value,
+    kind: LookupKind,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<LookupOutcome, MapError> {
+    map_lookup_inner(ctx, types, map_ref, key, kind, hook)
+}
+
+fn map_lookup_inner(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    map_ref: GcRef,
+    key: Value,
+    kind: LookupKind,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<LookupOutcome, MapError> {
     if kind != LookupKind::Remove {
         let alloc = map_of(ctx.arena, map_ref).alloc;
         if alloc != 0 {
@@ -639,7 +722,7 @@ pub fn map_lookup(
         // Full config is always compact (`COMPACT`); the nano
         // hash-table path is out of scope for petitpy-rs.
         debug_assert!(COMPACT);
-        compact_lookup(ctx, types, map_ref, key, kind, compare_only_ptrs)
+        compact_lookup(ctx, types, map_ref, key, kind, compare_only_ptrs, hook)
     }
 }
 
@@ -725,15 +808,16 @@ fn compact_lookup(
     key: Value,
     kind: LookupKind,
     compare_only_ptrs: bool,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<LookupOutcome, MapError> {
     if map_of(ctx.arena, map_ref).alloc == 0 {
         if kind != LookupKind::Add {
             return Ok(LookupOutcome::NotFound);
         }
-        compact_rehash(ctx, types, map_ref)?;
+        compact_rehash(ctx, types, map_ref, hook.as_deref_mut())?;
     }
     // The hash is computed once, before any mutation (it can raise).
-    let hash = hash_of(ctx, types, key)?;
+    let hash = hash_of_hook(ctx, types, key, hook.as_deref_mut())?;
     'outer: loop {
         let cap = {
             let m = map_of(ctx.arena, map_ref);
@@ -796,7 +880,7 @@ fn compact_lookup(
             (m.entries.len(), m.alloc)
         };
         if fill == alloc_now {
-            compact_rehash(ctx, types, map_ref)?;
+            compact_rehash(ctx, types, map_ref, hook.as_deref_mut())?;
             continue 'outer;
         }
         let i = fill;
@@ -825,6 +909,7 @@ fn compact_rehash(
     ctx: &mut CallCtx,
     types: &BuiltinTypes,
     map_ref: GcRef,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<(), MapError> {
     let used = map_of(ctx.arena, map_ref).used;
     let new_alloc = (used + 1).max((3 * used + 1) / 2);
@@ -844,7 +929,7 @@ fn compact_rehash(
         m.all_keys_are_qstrs = true;
     }
     for (k, v) in live {
-        match compact_lookup(ctx, types, map_ref, k, LookupKind::Add, false)? {
+        match compact_lookup(ctx, types, map_ref, k, LookupKind::Add, false, hook.as_deref_mut())? {
             LookupOutcome::Added(i) => map_set_value(ctx.arena, map_ref, i, v),
             // Unreachable on a fresh table (no duplicates, room for
             // `used` entries in `new_alloc >= used + 1` slots).

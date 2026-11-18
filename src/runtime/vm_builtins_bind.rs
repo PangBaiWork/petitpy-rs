@@ -50,6 +50,7 @@ pub(crate) struct D1Bindings {
     pub sum_builtin: Value,
     pub repr_builtin: Value,
     pub len_builtin: Value,
+    pub hash_builtin: Value,
     pub io_module: Value,
 }
 
@@ -164,7 +165,7 @@ pub(crate) fn bind_d1_builtins(
     let _ = mk_var(ctx, "chr", 1, 1, chr_builtin, pairs);
     let _ = mk_var(ctx, "divmod", 2, 2, divmod_builtin, pairs);
     let _ = mk_var(ctx, "format", 1, 2, format_builtin, pairs);
-    let _ = mk_var(ctx, "hash", 1, 1, hash_builtin, pairs);
+    let hash_val = mk_var(ctx, "hash", 1, 1, hash_builtin, pairs);
     let _ = mk_var(ctx, "hex", 1, 1, hex_builtin, pairs);
     let _ = mk_var(ctx, "id", 1, 1, id_builtin, pairs);
     let len_val = mk_var(ctx, "len", 1, 1, len_builtin, pairs);
@@ -227,6 +228,7 @@ pub(crate) fn bind_d1_builtins(
         sum_builtin: sum_val,
         repr_builtin: repr_val,
         len_builtin: len_val,
+        hash_builtin: hash_val,
         io_module,
     }
 }
@@ -466,6 +468,7 @@ impl Vm {
                 state.list_sort_builtin = v;
             }
         }
+        state.hash_builtin = d1.hash_builtin;
         state.min_builtin = d1.min_builtin;
         state.max_builtin = d1.max_builtin;
         state.getattr_builtin = d1.getattr_builtin;

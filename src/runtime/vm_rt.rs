@@ -18,7 +18,7 @@
 //! precheck.
 
 use crate::memory::gc::CallCtx;
-use crate::objects::containers::map::hash_of;
+use crate::runtime::vm_seams::make_hook;
 use crate::objects::containers::objlist::{is_exact_list, list_items_vec};
 use crate::objects::containers::objtuple::{is_exact_tuple, tuple_items};
 use crate::objects::obj::{call_binary, call_unary, obj_get_type, obj_is_true, SlotOutcome};
@@ -119,13 +119,17 @@ pub fn unary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op: UnaryOp, arg: Va
         return Ok(v);
     }
     if op == UnaryOp::Hash {
-        // Every value hashes through `hash_of` (small ints /
+        // Every value hashes through `hash_of_hook` (small ints /
         // qstrs / None / bools are handled inside it; heap
         // values go through their hash slot, and a type with no
-        // slot falls back to the identity hash — `map.rs`).
-        use crate::objects::containers::map::MapError;
+        // slot falls back to the identity hash — `map.rs`). The
+        // hook lets an instance key run its `__hash__` through
+        // the VM's real call hook (E2h) — the ctx-only `hash_of`
+        // slot path cannot run a `FunBc` `__hash__`.
+        use crate::objects::containers::map::{hash_of_hook, MapError};
         let types = ctx.types;
-        return match hash_of(ctx, types, arg) {
+        let mut hook = make_hook(state);
+        return match hash_of_hook(ctx, types, arg, Some(&mut hook)) {
             Ok(h) => Ok(Value::int(ctx.arena, Some(ctx.types.int), ctx.roots, h as i64)),
             Err(MapError::TypeError(msg)) => Err(type_error(ctx, state, msg)),
             Err(_) => Err(pending_exc_or_type_error(ctx, state)),

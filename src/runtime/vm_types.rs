@@ -442,7 +442,23 @@ pub(crate) fn build_vm_types(
         &[("fromhex", fun_n_args(2, 3))],
     );
     let bytearray = ctx.alloc(None, Obj::Type(bytearray_type_data(bytearray_dict)));
-    let memoryview_dict = empty_dict(ctx);
+    // Vendor `mp_obj_memoryview_locals_dict` (objstr.zig:3615-3616):
+    // just the `hex` entry — `bytes_hex` reads self through the
+    // buffer protocol, which covers the memoryview's source chain.
+    let memoryview_dict = locals_dict_from_entries(
+        ctx,
+        fun_builtin_var,
+        Some(classmethod),
+        &[MethodEntry {
+            name: "hex",
+            func: crate::objects::strings::objstr_methods_b::bytes_hex_builtin,
+            min: 1,
+            max: 255,
+            kw_func: None,
+        }],
+        &[],
+        &[],
+    );
     let memoryview = ctx.alloc(None, Obj::Type(memoryview_type_data(memoryview_dict)));
 
     // `map` / `filter` / `zip` / `enumerate` (C13b): the ROM

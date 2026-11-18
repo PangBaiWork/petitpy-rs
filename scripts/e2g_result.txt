@@ -1,0 +1,258 @@
+Lane E2g result — descriptor / class-creation / native-subclass dispatch (cluster (n))
+Worktree: ~/workspace/petitpy-rs-e2g-class-native, branch lane/e2g-class-native
+Base: master 2ae4032 (E2f); REBASED onto master a477f2a (E2h merged
+2026-11-19 ~00:45) in-worktree — one conflict (src/runtime/mod.rs,
+both lanes appended a test-module line; kept both). All numbers in
+§2 are measured on the REBASED tree (commit 9ba7d87); the pre-rebase
+numbers on base 2ae4032 were full 527/552, integration 185/202,
+golden 576/585, stdlib 7/8, nano 444/541 (same 7 targets, 0 new
+fails — the rebase changed only the baseline underneath).
+
+§1 — Runners and comparison rules
+- The six runners under scripts/ are E2's, run with NO arguments
+  (their defaults are absolute, ROOT-derived — a relative --bin
+  breaks golden/stdlib/integration; capability takes --vm, not
+  --bin). Full gate: `python3 scripts/run_full_gate.py`;
+  integration/golden/capability/stdlib/nano likewise.
+- A corpus name counts as fixed only when the full gate flips it
+  AND the set-diff against the baseline fail list shows exactly
+  the claimed names with 0 new fails. Baselines: E2h's master
+  (full 528/552, 17 regressions + 7 known-fails; integration
+  183/202; golden 573/585; stdlib 6/8; nano 441/541).
+- Probes are byte-compared against the reference binary
+  (~/workspace/petitpy-orig/zig-out/bin/petitpy): stdout + stderr
+  + exit code, with the reference run first (and repeatedly for
+  hash-order-sensitive cases — it is ASLR-nondeterministic there).
+- Verification outputs live under ~/workspace/e2g_verify/
+  (gate outputs in gates/; probes in probes/; the .mpy decoder in
+  decode_mpy.py). /tmp was NOT used (wiped by restarts).
+
+§2 — Measured numbers (rebased tree, commit 9ba7d87)
+- lib: 1615 passed, 0 failed, 3 ignored (1597 + 9 new e2g tests
+  + 9 E2h tests); bins 9; entry_cli 45. 0 warnings (forced
+  recompile: `touch src/lib.rs && cargo build --release`). No
+  `unsafe` in the diff vs master (grep count 0). All touched
+  files < 2500 lines (largest: vm_types.rs 779).
+  Binaries: petitpy-rs 1,900,256 B, petitpy-vm 1,887,360 B.
+- scripts/check_compile_mpy.py PASS (552/552 byte-identical);
+  scripts/check_frozen.py PASS (23/23, 38,141 bytes).
+- Full corpus: 535/552 (E2h master 528) — +7, 0 regressions.
+  17 fails = 10 regressions + 7 known-fails exactly.
+  Newly passing (set-diffed, exactly the brief's 7 targets):
+  class_delattr_setattr, class_new, class_store_class,
+  class_super_closure, object_new, subclass_native_buffer,
+  subclass_native_exc_new.
+- Integration: 186/202 (E2h master 183) — +3, 0 new fails.
+  Newly passing (set-diffed vs the E2h-master binary's fail
+  set): json_cpython_behaviour, object_setattr_method_available,
+  subprocess_check_raises_on_nonzero. Current 16 fails:
+  cpython_platform_import_slice_mro, dict_missing_basic,
+  dict_missing_counter_pattern, enum_members,
+  gc_closes_dropped_files_and_sockets, gc_reclaims_garbage,
+  init_subclass, itertools_cpython_functions,
+  native_subclass_operands, os_chown_self_noop,
+  os_kill_esrch_raises, runtime_annotations,
+  select_readable_fd_is_ready, select_timeout_zero_returns_promptly,
+  socket_fromfd_wraps_fd, subprocess_streams_env_cwd_text.
+- Golden: 579/585 (E2h master 573) — +6, 0 new failures.
+  Works 578/584 + works-native-only 1/1; rust==cpython 572/585.
+  Current fails: array_add.py, array_micropython.py, getitem.py,
+  import_instance_method.py, memoryerror.py, stopiteration.py.
+- Capability: 67/67 — GATE GREEN (matches the baseline exactly).
+- test-stdlib: 7/8 (E2h master 6/8) — +1: test_abc now passes
+  (its "argument num/types mismatch" instantiating a concrete
+  ABC subclass was the same type_call direct-path bug — a user
+  subclass's __init__ dispatch through the exception path).
+  Only test_enum still fails (1 inner failure, §4).
+- Nano (report-only): 448/541 (E2h master 441) — +7.
+
+§3 — Fixes (all vendor-checked before implementing; probes
+byte-identical to the reference unless noted)
+1. LOAD_SUPER_METHOD stack effect (class_super_closure).
+   The vendor consumes THREE stack slots ([super_fn, type, obj]
+   -> [method, self], vm.zig:608-612); Rust popped two, leaving
+   the `super` fn underneath. Harmless for a bare
+   `return super().foo()` but fatal when another stack consumer
+   followed — the failure is specific to `super().foo()` as a
+   comprehension's ITERABLE (p_supc4; element/standalone forms
+   passed). Decoded the reference .mpy with a purpose-built
+   decoder (~/workspace/e2g_verify/decode_mpy.py) to pin the
+   bytecode shape first. Fix: one line in vm_dispatch.rs
+   (`let _super_fn = spop(frame);`). Verified: lib green, full
+   gate +1 (521/552 at that point), class_super_closure
+   IDENTICAL.
+2. object.__new__ / __setattr__ / __delattr__ + the __new__ wrap
+   (class_delattr_setattr, class_new, object_new).
+   (a) The three were Err(PyRaise) stubs; the vendor allocates
+   via mp_obj_new_instance and stores/deletes straight into
+   the members map (objobject.zig:89,111,129). Now:
+   object_new allocates via new_instance; setattr stores
+   into the members map; delattr removes (missing ->
+   AttributeError "no such attribute").
+   (b) __new__ is a StaticClassMethod in the vendor
+   (objobject.zig:101-107); as a plain FunBuiltin,
+   convert_member_lookup bound self for it, so
+   super(cls, A).__new__(cls) called the builtin with 2 args
+   -> arity mismatch. Wrapped only __new__ (the other three
+   stay plain FunBuiltins).
+   (c) The wrap's header: the VM bootstrap CallCtx carries a
+   dummy BuiltinTypes (staticmethod: GcRef(0)), so heading
+   the wrapper at ctx.types.staticmethod pointed it at a dict
+   and convert_member_lookup returned the wrapper itself
+   ("object not callable" — found by probing
+   type()/callable()/load behaviour, NOT by re-reading the
+   trace, which looked correct). Fix: the wrapper is allocated
+   with header None in object_locals_dict, and each registry
+   (build_rom, build_vm_types) calls the new
+   fix_object_new_header once the staticmethod type exists.
+   This also explains the pre-existing type()/callable()
+   symptoms on header-None FunBuiltins (see §4).
+   Verified: p_new5/p_new10 IDENTICAL; class_new, object_new,
+   class_delattr_setattr flip.
+3. class_store_class metaclass resolution (call_build_class_ctx).
+   The namedtuple type is allocated with header None, so
+   obj_get_type returned None and every class statement with
+   a namedtuple base failed with a mismatch. Fix: if
+   is_type_value(args[2]) the metaclass is type itself (the
+   same precedent type_make_new's 1-arg path uses). The
+   namedtuple allocation header was deliberately NOT changed.
+   Verified: p_store2c IDENTICAL; class_store_class flips.
+   Extra: a namedtuple subclass instance's FIELD access
+   (R("a","b").x) also failed — see fix 6.
+4. subclass_native_buffer (buffer_bytes Instance arm).
+   binary_op Add on two my_bytes instances failed because
+   buffer_bytes had no Obj::Instance arm (subobj[0] holds the
+   native bytes payload new_instance primes). Fix: recurse
+   into instance_subobj0. Safe: subobj[0] is never the
+   instance itself. Verified: subclass_native_buffer flips
+   (incl. bytes(b1)).
+5. subclass_native_exc_new (two sites + the args/traceback
+   family — the largest fix, with a caught regression).
+   (a) call_type_ctx took the direct exception_make_new path
+   for EVERY exception type (is_exception_type); user
+   subclasses never ran their Python __new__. Now the direct
+   path is taken only when the type's make_new slot IS
+   exception_make_new_slot (is_exception_type_obj — the
+   existing slot-identity predicate); user subclasses go
+   through type_call -> instance_make_new. ROM exception
+   types are unaffected (same direct path, same error
+   mapping — no vm_tests pin the old behaviour for user
+   subclasses; the full suite stayed green).
+   (b) make_raise_obj (vm_raise.rs) built the instance
+   directly instead of calling the type. Now it calls the
+   type with 0 args through call_type_ctx (VM hook); a call
+   failure IS the raise value (the vendor's nlr propagates);
+   a non-exception result takes the TypeError. Signature
+   changed to &mut VmState; all three call sites already
+   pass &mut state, so the forbidden vm_rt_iter.rs needed
+   NO edit (auto-reborrow).
+   (c) User exception instances are Obj::Instance, so their
+   args/value/traceback/cause lived in subobj[0] (built by
+   the native-base tail of instance_make_new) but nothing
+   read them there: exception_get_value / add/get/clear
+   traceback / set/get cause now delegate through the new
+   native_exception_ref (the vendor's getNativeException,
+   objexcept.zig:76-81, single step); the printer's
+   is_exception_instance recognises user instances (MRO
+   slot-identity check) and reads frames via
+   exception_get_traceback; exception_cause delegates too.
+   (d) real_load_maybe consults the data attr slots first
+   (the vendor's mp_load_method_maybe, runtime.c:1197-1205):
+   exception_attr (args/value/errno), module_attr, and the
+   namedtuple field reader — so lookup_in step 3's subobj[0]
+   delegation finds E("x").args and R("a","b").x. ONLY the
+   data slots: the first version consulted the generic
+   TypeData.attr, which broke BOTH E2f __set_name__ tests
+   (user types carry attr: Some(instance_attr), whose return
+   is an already-bound value — reported as (value, None) it
+   failed the collector's bound.is_some() gate). The vendor
+   gives user types NO attr slot at all; the fix matches
+   that. Caught by the full suite (1603 passed, 2 failed),
+   fixed, re-verified green.
+   (e) REGRESSION CAUGHT AND FIXED: subclass_native3 failed
+   after fix (a) — `yield from` took None instead of 3 for
+   a user MyStopIteration(3) (exception_get_value only read
+   Obj::Exception payloads) — and uncaught user exceptions
+   lost their whole traceback (the printer read the payload
+   directly). Both fixed by (c); subclass_native3 flips back
+   (verified byte-identical incl. the yield-from value).
+   Verified: p_exc1–p_exc4, p_tb1, p_tb2 IDENTICAL;
+   subclass_native_exc_new flips.
+6. __build_class__ override lookup (builtin_override, this
+   lane's half).
+   (a) load_build_class_ctx returned the fixed
+   VmState.build_class handle unconditionally (let _ = ctx).
+   Now it checks the override dict for __build_class__ first
+   (the vendor's mp_load_build_class, runtime.zig:328-336).
+   (b) The override dict was never persisted: every per-call
+   Builtins was built with override_dict: None, so a store
+   into the fixed builtins module dict created a fresh dict
+   that was dropped when the call returned. New VmState
+   field builtins_override: store_attr_ctx threads it in
+   and writes it back; load_global_ctx consults it between
+   globals and the builtins globals (the vendor's
+   mp_load_global order, runtime.zig:301-324). This also
+   wires the `builtins.abs = ...` half (load_global) — the
+   remaining builtin_override work is E2i's module
+   registration + the __import__ override (vm_rt_iter.rs
+   still builds per-call Builtins with override_dict: None
+   for the import paths — untouched, E2i's file).
+   Verified by unit test e2g_build_class_override (the dict
+   is installed directly — the store path that creates it
+   needs the builtins module object, which is E2i's);
+   builtin_override still fails on the corpus for E2i-side
+   reasons (§4).
+7. test_abc flips as a side effect of fix 5(a) (see §2).
+
+§4 — Shortfalls and known divergences
+- Remaining corpus regressions (10): array1, array_add,
+  array_micropython, builtin_override, getitem,
+  import_instance_method, io_iobase, memoryerror, ordereddict1,
+  stopiteration. (E2h's 8 are NOT in this list — they stay
+  fixed after the rebase; E2i owns array/import/misc.)
+- builtin_override: still fails — needs E2i: `import builtins`
+  raises ModuleNotFoundError (line 3) and the __import__
+  override lives in the import path (vm_rt_iter.rs, E2i's).
+  This lane's half is done and unit-tested; after E2i lands,
+  `builtins.__build_class__ = lambda x, y: ('class', y)` must
+  make `class A: pass` produce `('class', 'A')` (the override
+  dict is now persisted and consulted by load_build_class).
+- test_enum: 1 inner failure (test_members_are_hashable).
+  Characterised, NOT fixed (E2h's hash/map territory — do not
+  touch E2h files): `hash(Color.RED)` works, `==` works, a
+  single-key dict store works, and the `class Color(Enum)`
+  form works end-to-end; storing a SECOND @enum-decorator
+  member key (`d[Color.GREEN] = "two"`) raises TypeError
+  "unsupported type for operator" in the dict-store/map-lookup
+  hash path (E2h's hash_of_hook / dict_store_hook). Probes
+  p_enum1–p_enum4 in ~/workspace/e2g_verify/probes/.
+- Pre-existing divergences, unchanged by this lane (all
+  probed REF vs RUST, byte-compared):
+  - `repr(object.__new__)` is `<>` on Rust, `<function>` on
+    the reference (FunBuiltin has no print slot and a None
+    header — the header-None repr gap, same class as
+    type()/callable() on header-None FunBuiltins:
+    `type(object.__init__)` raises bare TypeError,
+    `callable(object.__init__)` is False on Rust; the
+    reference returns <class 'function'> / True).
+  - User-instance hash/id values are arena indices on Rust
+    vs ASLR raw addresses on the reference (p_enum2/p_enum4:
+    612/764/767 vs 12-digit addresses) — deliberate, as in
+    E2d's set-order finding (the reference itself is
+    nondeterministic there).
+  - `class B(A)` calls an overridden __build_class__ with 3
+    args (func, name, None) on the reference — the third arg
+    is None, a reference quirk (probed p_bc1); the no-base
+    form passes 2 args, which is what the corpus test uses.
+- Forbidden files (§4 of the brief) were NOT touched:
+  src/objects/ints/*, src/objects/containers/objarray*.rs,
+  src/objects/containers/objdict_collect.rs,
+  src/runtime/vm_rt_iter.rs, src/runtime/builtinimport.rs,
+  src/runtime/import_search.rs,
+  src/objects/strings/objstr_methods*.rs,
+  src/objects/containers/objlist.rs, and the `builtins` module
+  registration. (E2h's own commit touched make_new.rs with a
+  §4 note that it is E2g territory — this lane did not touch
+  it; no conflict arose at rebase.)
+- No file was split (cap is 2500; largest touched file is
+  vm_types.rs at 779 lines).

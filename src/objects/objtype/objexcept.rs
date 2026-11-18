@@ -232,12 +232,38 @@ pub fn new_exception_msg(ctx: &mut CallCtx, exc_type: GcRef, msg: &str) -> Value
 
 // ── traceback ────────────────────────────────────────────────────────
 
+/// The native exception object behind a value (`getNativeException`,
+/// `objexcept.zig:76-81`): the value itself when it IS a native
+/// exception instance, else the `subobj[0]` of a user exception
+/// subclass instance (the native-base tail of `instance_make_new`
+/// builds it there — E2g routes user subclasses through
+/// `instance_make_new`, so their payload is `Instance`, not
+/// `Exception`). `None` when there is no exception object (an
+/// uninitialised native base, or not an exception at all). Single
+/// step, like the Zig — the tail always builds the exception
+/// object itself, never another instance.
+pub(crate) fn native_exception_ref(arena: &GcArena, exc: Value) -> Option<GcRef> {
+    let Value::Heap(r) = exc else {
+        return None;
+    };
+    match arena.get(r) {
+        Obj::Exception(_) => Some(r),
+        Obj::Instance(_) => {
+            match crate::objects::objtype::subclass::instance_subobj0(arena, exc) {
+                Some(Value::Heap(s)) if matches!(arena.get(s), Obj::Exception(_)) => Some(s),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// `mp_obj_exception_add_traceback` (`objexcept.zig:381`): append
 /// a (file, line, block) frame. No limit
 /// (`MICROPY_PY_SYS_TRACEBACKLIMIT = 0` → `tracebackMaxEntries`
 /// returns -1). `block == 0` is `MP_QSTRnull` → `None`.
 pub fn exception_add_traceback(ctx: &mut CallCtx, exc: Value, file: u32, line: u32, block: u32) {
-    if let Value::Heap(r) = exc {
+    if let Some(r) = native_exception_ref(ctx.arena, exc) {
         if let Obj::Exception(e) = ctx.arena.get_mut(r) {
             e.traceback.push(TraceFrame {
                 name: file,
@@ -252,18 +278,18 @@ pub fn exception_add_traceback(ctx: &mut CallCtx, exc: Value, file: u32, line: u
 /// stored frames (innermost first — the renderer iterates in
 /// reverse; `obj::print_exception`).
 pub fn exception_get_traceback<'a>(arena: &'a GcArena, exc: Value) -> &'a [TraceFrame] {
-    match exc {
-        Value::Heap(r) => match arena.get(r) {
+    match native_exception_ref(arena, exc) {
+        Some(r) => match arena.get(r) {
             Obj::Exception(e) => &e.traceback,
             _ => &[],
         },
-        _ => &[],
+        None => &[],
     }
 }
 
 /// `mp_obj_exception_clear_traceback` (`objexcept.zig:126`).
 pub fn exception_clear_traceback(ctx: &mut CallCtx, exc: Value) {
-    if let Value::Heap(r) = exc {
+    if let Some(r) = native_exception_ref(ctx.arena, exc) {
         if let Obj::Exception(e) = ctx.arena.get_mut(r) {
             e.traceback.clear();
         }
@@ -274,12 +300,12 @@ pub fn exception_clear_traceback(ctx: &mut CallCtx, exc: Value) {
 /// or None when there are no args (`value` / `errno` aliases read
 /// through here too).
 pub fn exception_get_value(arena: &GcArena, exc: Value) -> Value {
-    match exc {
-        Value::Heap(r) => match arena.get(r) {
+    match native_exception_ref(arena, exc) {
+        Some(r) => match arena.get(r) {
             Obj::Exception(e) => e.args.first().copied().unwrap_or(Value::None),
             _ => Value::None,
         },
-        _ => Value::None,
+        None => Value::None,
     }
 }
 
@@ -291,7 +317,7 @@ pub fn exception_get_value(arena: &GcArena, exc: Value) -> Value {
 /// stores (`None` = no cause recorded; `Some(Value::None)` =
 /// explicitly `raise ... from None`).
 pub fn exception_set_cause(ctx: &mut CallCtx, exc: Value, cause: Value) {
-    if let Value::Heap(r) = exc {
+    if let Some(r) = native_exception_ref(ctx.arena, exc) {
         if let Obj::Exception(e) = ctx.arena.get_mut(r) {
             e.cause = Some(cause);
         }
@@ -302,12 +328,12 @@ pub fn exception_set_cause(ctx: &mut CallCtx, exc: Value, cause: Value) {
 /// recorded by `raise ... from`, or None when there is none (the
 /// Zig `cause == 0`).
 pub fn exception_get_cause(arena: &GcArena, exc: Value) -> Value {
-    match exc {
-        Value::Heap(r) => match arena.get(r) {
+    match native_exception_ref(arena, exc) {
+        Some(r) => match arena.get(r) {
             Obj::Exception(e) => e.cause.unwrap_or(Value::None),
             _ => Value::None,
         },
-        _ => Value::None,
+        None => Value::None,
     }
 }
 

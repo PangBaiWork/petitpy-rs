@@ -49,7 +49,7 @@ use crate::objects::callables::objboundmeth::new_bound_meth;
 use crate::objects::obj::{call_binary, call_subscr, call_unary, obj_get_type, ObjError, SlotOutcome};
 use crate::objects::objtype::lookup::{class_lookup, LookupHit};
 use crate::objects::slots::{BinaryOp, CallHook, SubscrArg, UnaryOp};
-use crate::objects::value::{GcRef, Value};
+use crate::objects::value::{GcRef, Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 
 /// What `mp_obj_subscr` raised. `KeyError` is separate because
@@ -355,11 +355,57 @@ pub fn with_call_hook_seams<R>(hook: CallHook<'_, '_>, f: impl FnOnce(&mut VmSea
 /// for native types). No recursion: the inner `class_lookup`
 /// runs on stub seams, whose own `load_maybe` is the None stub
 /// (its step-3 native-subobj fallback simply never fires).
+///
+/// E2g: the attr slot FIRST (the vendor's `mp_load_method_maybe`,
+/// `runtime.c:1197-1205`, calls `type->attr` before the
+/// locals_dict search) — but ONLY for the native slots that
+/// return DATA, never the generic `TypeData.attr`: user types
+/// carry `attr: Some(instance_attr)`, whose return is an
+/// already-bound value, and reporting it as `(value, None)`
+/// breaks the `(fun, bound)` contract — the `__set_name__`
+/// collector captures only `bound.is_some()` hits, so it
+/// silently skipped every descriptor (E2f regression). The
+/// data slots are: an exception's `args`/`value`/`errno`
+/// (`exception_attr`), a module's dict entries (`module_attr`),
+/// and a namedtuple's fields (`namedtuple_attr_fn` — without
+/// it, `lookup_in` step 3's subobj[0] delegation found nothing
+/// for a namedtuple subclass instance, so `R("a", "b").x`
+/// raised AttributeError even though the plain namedtuple
+/// worked). An attr fn that errors or misses falls through to
+/// the class lookup below (a `load_maybe` is a probe — the
+/// VM's primary load path already propagates attr errors
+/// properly).
 pub fn real_load_maybe(
     ctx: &mut CallCtx,
     obj: Value,
     attr: u32,
 ) -> Option<(Value, Option<Value>)> {
+    if let Value::Heap(r) = obj {
+        // The namedtuple field reader, only when the tuple's
+        // header type actually carries fields (a plain tuple
+        // type has `attr: None`).
+        let is_namedtuple = match ctx.arena.get(r) {
+            Obj::Tuple(_) => obj_get_type(ctx.arena, ctx.types, obj)
+                .and_then(|t| {
+                    crate::objects::iters::objnamedtuple::namedtuple_fields_of(ctx.arena, t)
+                })
+                .is_some(),
+            _ => false,
+        };
+        let attr_fn: Option<crate::objects::slots::AttrFn> = match ctx.arena.get(r) {
+            Obj::Module(_) => Some(crate::objects::objtype::objmodule::module_attr),
+            Obj::Exception(_) => Some(crate::objects::objtype::objexcept::exception_attr),
+            Obj::Tuple(_) if is_namedtuple => {
+                Some(crate::objects::iters::objnamedtuple::namedtuple_attr_fn)
+            }
+            _ => None,
+        };
+        if let Some(f) = attr_fn {
+            if let Ok(Some(v)) = f(ctx, obj, attr) {
+                return Some((v, None));
+            }
+        }
+    }
     let t = obj_get_type(ctx.arena, ctx.types, obj)?;
     let hit = with_stub_seams(|seams| class_lookup(ctx, Some(obj), attr, None, false, t, seams))?;
     match hit {

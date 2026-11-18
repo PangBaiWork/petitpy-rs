@@ -155,10 +155,20 @@ pub fn delete_global_ctx(
 }
 
 /// `mp_load_build_class` (`runtime.zig:328`): the override dict's
-/// `__build_class__` (D1) else the VM's `__build_class__`
-/// builtin (a stub until C12a's `type_call`).
+/// `__build_class__` (E2g — the vendor's
+/// `mp_module_builtins_override_dict` lookup, full only; a
+/// `builtins.__build_class__ = X` store lands there via
+/// `module_store_attr` once the builtins module exists) else the
+/// VM's `__build_class__` builtin.
 pub fn load_build_class_ctx(ctx: &mut CallCtx, state: &mut VmState) -> Result<Value, Value> {
-    let _ = ctx;
+    use crate::objects::containers::objdict::dict_get_value;
+    if let Some(od) = state.builtins_override_dict {
+        if let Some(q) = crate::runtime::runtime::dunder(b"__build_class__") {
+            if let Ok(v) = dict_get_value(ctx, od, Value::Qstr(q)) {
+                return Ok(v);
+            }
+        }
+    }
     Ok(state.build_class_builtin)
 }
 
@@ -440,6 +450,11 @@ pub fn store_attr_ctx(
     use crate::runtime::runtime_method::store_attr;
     use crate::runtime::vm_rt_iter::drain_seam_raise;
     let mut seams = RuntimeSeams::stub();
+    // The override dict is VM-owned state
+    // (`state.builtins_override_dict`, E2i/E2g) — a store into
+    // the fixed builtins module dict creates it on first use
+    // (`module_store_attr`), and it must survive the call so
+    // `load_global` / `load_build_class` see the override.
     let mut builtins = Builtins {
         globals: Value::Heap(state.builtins),
         override_dict: state.builtins_override_dict,

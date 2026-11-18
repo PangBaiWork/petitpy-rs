@@ -35,7 +35,7 @@ use crate::objects::obj::BuiltinTypes;
 use crate::objects::objtype::instance_create::native_base_init_wrapper_obj;
 use crate::objects::objtype::objexcept_types::{build_exception_types, ExceptionTypes};
 use crate::objects::objtype::objmodule::module_type_data;
-use crate::objects::objtype::objobject::object_type_data;
+use crate::objects::objtype::objobject::{fix_object_new_header, object_type_data};
 use crate::objects::objtype::rom::{
     classmethod_type_data, object_make_new_slot, staticmethod_type_data, super_type_data,
     type_type_data,
@@ -310,6 +310,10 @@ pub(crate) fn build_vm_types(
         None,
         Obj::Type(staticmethod_type_data(staticmethod_dict)),
     );
+    // E2g: point `object.__new__`'s wrapper at the real
+    // staticmethod type (see `object_locals_dict` — it is
+    // allocated with header `None`).
+    fix_object_new_header(ctx, object_dict, staticmethod);
     let classmethod_dict = empty_dict(ctx);
     let classmethod = ctx.alloc(
         None,

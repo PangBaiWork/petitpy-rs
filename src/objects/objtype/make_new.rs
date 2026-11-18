@@ -236,38 +236,68 @@ pub fn filter_make_new_slot(
 }
 
 /// `reversed` (`objreversed.rs:17-51`): the `__reversed__`
-/// delegation needs a call seam at construction time, but a
-/// `MakeNewFn` slot has no `VmState` access, so the seam is a
-/// stub (the C13b class of gap: a user class whose
-/// `__reversed__` is a Python method raises a bare `TypeError`
-/// instead of being called — the VM-seam runner of Phase E owns
-/// the real call). No builtin sequence defines `__reversed__`
-/// in its type dict (verified against the original sources), so
-/// the delegation is skipped for `list`/`tuple`/`str`/`range`/
-/// `dict` and the length+subscript path runs seam-free.
+/// delegation needs a call seam at construction time, which
+/// the slot now carries from the VM hook (E2f — the C13b stub
+/// seam is gone). The header stamp applies ONLY to the fresh
+/// reversed iterator: the delegation returns the method's
+/// result as-is (the Zig's `mp_obj_reversed_make_new` returns
+/// `dest` untouched), and stamping ITS header would retype
+/// the caller's object (probed: `print(reversed(B()))`
+/// showed `<reversed>` for a delegated list — the list's own
+/// header had been overwritten).
 pub fn reversed_make_new_slot(
     ctx: &mut CallCtx,
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    use crate::objects::iters::iter::{CallOutcome, IterSeams};
-    let mut call =
+    use crate::objects::iters::iter::{CallOutcome, IterSeams, REVERSED_ITER_TAG};
+    use crate::objects::value::Obj;
+    // E2f: on the VM path the hook runs the `__reversed__` /
+    // `__len__` calls inside `reversed_make_new` (a FunBc
+    // method cannot run through the Raise-always seams the
+    // ctx-only path uses). The adapter maps a hook raise to
+    // `Raise` — `reversed_make_new` treats `Stop` and `Raise`
+    // the same (both `PyRaise`), so no Stop/ Raise split is
+    // needed here.
+    let mut hook_call;
+    let mut raise_call =
         |_: &mut CallCtx, _: Value, _: &[Value]| -> CallOutcome { CallOutcome::Raise };
+    let call_ref: &mut dyn FnMut(&mut CallCtx, Value, &[Value]) -> CallOutcome = match call {
+        Some(hook) => {
+            hook_call = |ctx: &mut CallCtx, fun: Value, args: &[Value]| -> CallOutcome {
+                match hook.call(ctx, fun, args.len(), 0, args) {
+                    Ok(v) => CallOutcome::Value(v),
+                    Err(_) => CallOutcome::Raise,
+                }
+            };
+            &mut hook_call
+        }
+        None => &mut raise_call,
+    };
     let mut getitem =
         |_: &mut CallCtx, _: Value, _: i64| -> CallOutcome { CallOutcome::Raise };
     let mut seams = IterSeams {
-        call: &mut call,
+        call: call_ref,
         getitem: &mut getitem,
-        // No `next` seam: the slot is ctx-only (E2c — same as
-        // the `collect_iterable` fallback).
+        // No `next` seam: the slot is ctx-only for iteration
+        // (E2c — same as the `collect_iterable` fallback);
+        // `reversed_iternext` takes its seams from the
+        // `iternext` dispatch instead.
         next: None,
         next_builtin: None,
     };
     let v = reversed_make_new(ctx, args, n_kw, &mut seams).map_err(|e| ctx.record_typed(e))?;
+    // Stamp the header ONLY on the fresh reversed iterator
+    // (tag 114 in `extra[0]`): a delegated result keeps its
+    // own header (see the doc comment above).
     if let Value::Heap(r) = v {
-        ctx.arena.set_header_type(r, Some(type_));
+        if matches!(ctx.arena.get(r), Obj::Iterator(d)
+            if d.extra.first() == Some(&Value::SmallInt(REVERSED_ITER_TAG)))
+        {
+            ctx.arena.set_header_type(r, Some(type_));
+        }
     }
     Ok(v)
 }

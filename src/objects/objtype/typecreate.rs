@@ -73,7 +73,7 @@ use super::lookup::{
     type_bases_tuple, type_locals_dict_readonly, LookupHit, SlotKind,
 };
 use super::instance_create::{count_native_bases, instance_make_new};
-use super::seams::{with_stub_seams, VmSeams};
+use super::seams::{with_hook_load_seams, with_stub_seams, VmSeams};
 use super::subclass::{is_exact_type, is_subclass, is_type_value};
 
 /// `TYPE_BASE_FLAGS` (`objtype.zig:1898`): the flags every type
@@ -147,7 +147,7 @@ pub fn type_make_new(
     _type: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let n_pos = args.len().saturating_sub(2 * n_kw);
     let sig_err = arg_check_num_sig(n_pos, n_kw, 1, 3, false);
@@ -165,7 +165,18 @@ pub fn type_make_new(
         }
     } else if n_pos == 3 {
         let name = type_name_qstr(ctx, args[0]).map_err(|e| e.to_pyerror())?;
-        with_stub_seams(|seams| mp_obj_new_type(ctx, name, args[1], args[2], seams))
+        // E2f: on the VM path the hook is present — `mp_obj_new_type`
+        // needs hook-load seams (a real `load_maybe`) so the
+        // `__set_name__` collector and the special-accessors scan
+        // can find FunBc methods; the stub seams' None loader made
+        // both silently do nothing. The ctx-only path keeps the
+        // stubs (no runner for a FunBc callee there).
+        match call {
+            Some(hook) => with_hook_load_seams(hook, |seams| {
+                mp_obj_new_type(ctx, name, args[1], args[2], seams)
+            }),
+            None => with_stub_seams(|seams| mp_obj_new_type(ctx, name, args[1], args[2], seams)),
+        }
     } else {
         Err(ObjTypeError::TypeTakesOneOrThree)
     };

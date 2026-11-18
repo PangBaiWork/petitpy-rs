@@ -27,7 +27,7 @@ use crate::objects::objtype::instance::{
     instance_subscr, instance_unary_op,
 };
 use crate::objects::objtype::lookup::{class_lookup, SlotKind};
-use crate::objects::objtype::seams::{with_call_hook_seams, with_stub_seams};
+use crate::objects::objtype::seams::{with_call_hook_seams, with_hook_load_seams, with_stub_seams};
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BinaryOp, SubscrArg, UnaryOp};
 use crate::objects::value::{Obj, Value};
@@ -124,6 +124,22 @@ impl crate::objects::slots::VmHook for StateHook<'_> {
                 if self.state.pending_exc.is_none() {
                     self.state.pending_exc = Some(exc);
                 }
+                Err(PyError::PyRaise)
+            }
+        }
+    }
+
+    /// E2f: the full VM step — `iternext_vm_ctx` (generators,
+    /// C11 iterators, streams, user `__next__`) with exhaustion
+    /// as `Ok(None)` (its `is_stop_iteration` check is
+    /// subclass-aware, so a user `StopIteration` subclass ends
+    /// iteration too). A raise is stashed on `pending_exc`
+    /// (the `StateHook` contract — the caller drains it).
+    fn next(&mut self, ctx: &mut CallCtx, it: Value) -> Result<Option<Value>, PyError> {
+        match crate::runtime::vm_rt_iter::iternext_vm_ctx(ctx, self.state, it) {
+            Ok(v) => Ok(v),
+            Err(exc) => {
+                self.state.pending_exc = Some(exc);
                 Err(PyError::PyRaise)
             }
         }
@@ -292,7 +308,12 @@ pub(crate) fn try_instance_load_attr(
         return Ok(None);
     }
     let mut hook = make_hook(state);
-    let loaded = match with_call_hook_seams(&mut hook, |seams| instance_load_attr(ctx, obj, attr, seams))
+    // E2f: hook-LOAD seams, not the plain hook seams — the
+    // descriptor `__get__` step inside `instance_load_attr`
+    // probes methods via `load_maybe`, and the plain hook
+    // seams' loader is a None stub (so `a.Forward` returned
+    // the descriptor itself instead of calling `__get__`).
+    let loaded = match with_hook_load_seams(&mut hook, |seams| instance_load_attr(ctx, obj, attr, seams))
     {
         Ok(v) => v,
         Err(e) => return Err(drain_hook_raise(ctx, state, e)),
@@ -300,16 +321,20 @@ pub(crate) fn try_instance_load_attr(
     if let Some(v) = loaded {
         return Ok(Some(v));
     }
-    // The `__getattr__` fallback (E2): `with_call_hook_seams`'
-    // `load_maybe` is a stub (it cannot carry `state` — a
-    // second `&mut VmState` closure next to the call hook
-    // would be E0499), so `instance_load_attr`'s own
-    // `__getattr__` step never fires. Do it here, where state
-    // is live — the same guards as `load_attr_getattr`
-    // (`instance.rs`): never for `__getattr__` itself, never
-    // for the descriptor-protocol dunders. The lookup binds
-    // in the class dict (via `load_method_maybe_ctx`, whose
-    // own instance try finds it there); the call passes the
+    // The `__getattr__` fallback (E2): with the old plain hook
+    // seams this never fired inside `instance_load_attr`
+    // (their `load_maybe` was a None stub — it cannot carry
+    // `state`, a second `&mut VmState` closure next to the
+    // call hook would be E0499), so it was done here, where
+    // state is live. With hook-load seams the fallback now
+    // fires inside `instance_load_attr` itself; this stays as
+    // the safety net for the paths that return None without
+    // firing it (e.g. the descriptor-dunder guard below) — the
+    // same guards as `load_attr_getattr` (`instance.rs`):
+    // never for `__getattr__` itself, never for the
+    // descriptor-protocol dunders. The lookup binds in the
+    // class dict (via `load_method_maybe_ctx`, whose own
+    // instance try finds it there); the call passes the
     // attribute NAME as a qstr, with the bound self prepended
     // when the lookup returned one.
     let getattr_q = static_qstr_id(b"__getattr__").unwrap_or(u32::MAX);

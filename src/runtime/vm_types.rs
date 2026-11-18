@@ -32,6 +32,7 @@ use crate::objects::iters::objmap::map_type_data;
 use crate::objects::iters::objreversed::reversed_type_data;
 use crate::objects::iters::objzip::zip_type_data;
 use crate::objects::obj::BuiltinTypes;
+use crate::objects::objtype::instance_create::native_base_init_wrapper_obj;
 use crate::objects::objtype::objexcept_types::{build_exception_types, ExceptionTypes};
 use crate::objects::objtype::objmodule::module_type_data;
 use crate::objects::objtype::objobject::object_type_data;
@@ -47,7 +48,9 @@ use crate::objects::primitives::objint::{fun_n_args, int_locals_dict, int_type_d
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BuiltinFn, BuiltinKwFn, MethodEntry};
 use crate::objects::strings::objstr_b::{
-    str_splitlines_kw_wrapper, BYTES_METHODS, STR_METHODS,
+    bytes_decode_kw_wrapper, str_encode_kw_wrapper, str_replace_kw_wrapper,
+    str_rsplit_kw_wrapper, str_split_kw_wrapper, str_splitlines_kw_wrapper, BYTES_METHODS,
+    STR_METHODS,
 };
 use crate::objects::strings::objstr_methods_b::{bytes_type_data, str_type_data};
 use crate::objects::value::{
@@ -340,13 +343,22 @@ pub(crate) fn build_vm_types(
     }
 
     // Strings (the `format` entry takes the kwargs pass-through —
-    // C8b's deferred item, see `format_kw_wrapper`).
+    // C8b's deferred item, see `format_kw_wrapper`; `split` /
+    // `rsplit` / `replace` / `encode` take the `kwVar` wrappers —
+    // E2f, see `str_split_kw_wrapper`).
     let str_dict = locals_dict_from_pairs(
         ctx,
         fun_builtin_var,
         classmethod,
         STR_METHODS,
-        &[("format", format_kw_wrapper), ("splitlines", str_splitlines_kw_wrapper)],
+        &[
+            ("format", format_kw_wrapper),
+            ("splitlines", str_splitlines_kw_wrapper),
+            ("split", str_split_kw_wrapper),
+            ("rsplit", str_rsplit_kw_wrapper),
+            ("replace", str_replace_kw_wrapper),
+            ("encode", str_encode_kw_wrapper),
+        ],
         &[],
     );
     let str_ = ctx.alloc(
@@ -361,7 +373,13 @@ pub(crate) fn build_vm_types(
         fun_builtin_var,
         classmethod,
         BYTES_METHODS,
-        &[("splitlines", str_splitlines_kw_wrapper)],
+        &[
+            ("splitlines", str_splitlines_kw_wrapper),
+            ("split", str_split_kw_wrapper),
+            ("rsplit", str_rsplit_kw_wrapper),
+            ("replace", str_replace_kw_wrapper),
+            ("decode", bytes_decode_kw_wrapper),
+        ],
         &[("fromhex", fun_n_args(2, 3))],
     );
     let bytes = ctx.alloc(
@@ -549,20 +567,33 @@ pub(crate) fn build_vm_types(
     // ROM's, not the VM's); `staticmethod` / `classmethod` were
     // built above, before the int dict. `empty_bytes` is the
     // VM-local singleton (header = the VM's `bytes` type, same
-    // shape as `rom.rs`); `native_init_wrapper` is the fixture
-    // pattern (a plain type named `function` — the VM never calls
-    // `instance_make_new`, the only reader of this field,
-    // `typecreate.rs:362`).
+    // shape as `rom.rs`).
+    //
+    // The native-base `__init__` wrapper singleton (E2f): the
+    // REAL `native_base_init_wrapper_obj` (the same fn `rom.rs`
+    // uses), NOT the old fixture plain type named `function`.
+    // `super().__init__()` binds THIS value (see
+    // `super_attr_impl`'s NativeSlot arm); the plain type had
+    // `make_new: None`, so calling it raised
+    // `TypeError("can't create instance")` — the frozen `deque`
+    // (`super().__init__(iterable)`) never constructed. One
+    // wrapper per registry, as in `rom.rs` (its identity is what
+    // `new_instance` primes into `subobj[0]` and what
+    // `instance_make_new`'s tail compares against). It lives
+    // only in `BuiltinTypes` (no builtin dict references it),
+    // so it is rooted here like `rom.rs` roots its copy.
     let super_dict = empty_dict(ctx);
     let super_ = ctx.alloc(None, Obj::Type(super_type_data(super_dict)));
     let empty_bytes = ctx.alloc(
         Some(bytes),
         Obj::Bytes(BytesData { bytes: Vec::new() }),
     );
-    let native_init_wrapper = plain_type(
-        ctx,
-        static_qstr_id(b"function").expect("function is a static qstr"),
-    );
+    let wrapper_dict = empty_dict(ctx);
+    let Value::Heap(native_init_wrapper) = native_base_init_wrapper_obj(ctx, wrapper_dict)
+    else {
+        unreachable!("native_base_init_wrapper_obj always returns a heap value");
+    };
+    ctx.roots.push(Value::Heap(native_init_wrapper));
 
     // D2: the FILE stream types (one shared locals dict).
     // Allocated with a `None` header here, like the other
@@ -594,7 +625,7 @@ pub(crate) fn build_vm_types(
         fun_builtin_var, object, int, bool_, cell, float, complex, none_type, str_, bytes,
         tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
         filter, zip, enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
-        property, ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
+        property, ellipsis, type_, super_, staticmethod, classmethod,
         fileio, textio, attrtuple, code, dict_view, dict_view_it,
     ] {
         ctx.arena.set_header_type(t, Some(type_));
@@ -614,7 +645,7 @@ pub(crate) fn build_vm_types(
         fun_builtin_var, object, int, bool_, cell, float, complex, none_type, str_, bytes,
         tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
         filter, zip, enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
-        property, ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
+        property, ellipsis, type_, super_, staticmethod, classmethod,
         fileio, textio, attrtuple, code, dict_view, dict_view_it,
     ] {
         let dict_ref = match ctx.arena.get(t) {
@@ -648,7 +679,7 @@ pub(crate) fn build_vm_types(
         fun_builtin_var, int, bool_, cell, float, complex, none_type, str_, bytes, tuple, list,
         dict, set, frozenset, range, slice, array, bytearray, memoryview, map, filter, zip,
         enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module, property,
-        ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper, code,
+        ellipsis, type_, super_, staticmethod, classmethod, code,
         dict_view, dict_view_it,
     ] {
         if let Obj::Type(d) = ctx.arena.get_mut(t) {

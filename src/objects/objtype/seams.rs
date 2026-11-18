@@ -47,6 +47,7 @@
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objboundmeth::new_bound_meth;
 use crate::objects::obj::{call_binary, call_subscr, call_unary, obj_get_type, ObjError, SlotOutcome};
+use crate::objects::objtype::lookup::{class_lookup, LookupHit};
 use crate::objects::slots::{BinaryOp, CallHook, SubscrArg, UnaryOp};
 use crate::objects::value::{GcRef, Value};
 use crate::pyerr::{PyError, PyResult};
@@ -340,6 +341,51 @@ pub fn with_call_hook_seams<R>(hook: CallHook<'_, '_>, f: impl FnOnce(&mut VmSea
             hook.call(ctx, fun, n, k, a)
         },
         |_ctx: &mut CallCtx, _obj: Value, _attr: u32| None,
+        stub_subscr,
+        f,
+    )
+}
+
+/// `mp_load_method_maybe` for the seams (E2f): a REAL `load_maybe`
+/// — class lookup (pure dict lookup via nested stub seams, no
+/// call — the E2b `try_instance_getiter` precedent) plus
+/// `convert_member_lookup` binding, which `class_lookup` already
+/// applies to the hit. A `NativeSlot` hit is not a method value,
+/// so it reports "no such attribute" (the same as the stub did
+/// for native types). No recursion: the inner `class_lookup`
+/// runs on stub seams, whose own `load_maybe` is the None stub
+/// (its step-3 native-subobj fallback simply never fires).
+pub fn real_load_maybe(
+    ctx: &mut CallCtx,
+    obj: Value,
+    attr: u32,
+) -> Option<(Value, Option<Value>)> {
+    let t = obj_get_type(ctx.arena, ctx.types, obj)?;
+    let hit = with_stub_seams(|seams| class_lookup(ctx, Some(obj), attr, None, false, t, seams))?;
+    match hit {
+        LookupHit::Member(fun, bound) => Some((fun, bound)),
+        LookupHit::NativeSlot(_) => None,
+    }
+}
+
+/// Run `f` with seams whose `call` is the VM's real call hook
+/// AND whose `load_maybe` is the real loader above (E2f). This is
+/// what `mp_obj_new_type` needs on the VM path: the
+/// `__set_name__` collector and the special-accessors scan both
+/// probe methods via `load_maybe`, and the stub's None made both
+/// silently do nothing (the class got no
+/// `FLAG_HAS_SPECIAL_ACCESSORS`, so descriptor `__get__` never
+/// fired on instance attribute loads either). Deliberately a
+/// separate constructor from `with_call_hook_seams`: the other
+/// hook-seams users keep the stub loader (their behaviour is
+/// pinned by their own lanes' tests); only the call sites that
+/// need method loading use this one.
+pub fn with_hook_load_seams<R>(hook: CallHook<'_, '_>, f: impl FnOnce(&mut VmSeams) -> R) -> R {
+    with_custom_seams(
+        |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
+            hook.call(ctx, fun, n, k, a)
+        },
+        real_load_maybe,
         stub_subscr,
         f,
     )

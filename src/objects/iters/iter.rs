@@ -514,7 +514,7 @@ pub fn iternext(
         Value::SmallInt(MAP_ITER_TAG) => map_iternext(ctx, it, seams),
         Value::SmallInt(FILTER_ITER_TAG) => filter_iternext(ctx, it, seams),
         Value::SmallInt(ZIP_ITER_TAG) => zip_iternext(ctx, it, seams),
-        Value::SmallInt(REVERSED_ITER_TAG) => reversed_iternext(ctx, it),
+        Value::SmallInt(REVERSED_ITER_TAG) => reversed_iternext(ctx, it, seams),
         Value::SmallInt(GETITEM_ITER_TAG) => getitem_iternext(ctx, it, seams),
         Value::SmallInt(DEQUE_ITER_TAG) => deque_iternext(ctx, it),
         _ => Err(IterError::TypeError(NOT_AN_ITERATOR)),

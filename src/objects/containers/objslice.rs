@@ -432,10 +432,21 @@ pub fn slice_attr(ctx: &mut CallCtx, slice_v: Value, attr: u32) -> Option<Value>
     None
 }
 
+/// `slice_attr` as an `AttrFn` slot (the `range_attr_slot`
+/// precedent): the type data wires this, not the bare fn.
+pub fn slice_attr_slot(
+    ctx: &mut CallCtx,
+    slice_v: Value,
+    attr: u32,
+) -> PyResult<Option<Value>> {
+    Ok(slice_attr(ctx, slice_v, attr))
+}
+
 /// `mp_type_slice` ROM data (objslice.zig): flags `0x0000`; slots
-/// unary_op + print only (attr is a standalone fn for C12 —
-///
-/// `TypeData` has no `attr` field by the frozen C0 design).
+/// unary_op + print only; `start` / `stop` / `step` / `indices`
+/// live in the type data via `slice_attr_slot` (E2f — the
+/// `range_attr_slot` precedent; the old "no `attr` field" note
+/// predates C12a adding it).
 pub fn slice_type_data(dict: GcRef) -> TypeData {
     TypeData {
         name: static_qstr_id(b"slice").expect("MP_QSTR_slice is in the static table"),
@@ -450,7 +461,7 @@ pub fn slice_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: Some(slice_print),
-        attr: None,
+        attr: Some(slice_attr_slot),
         make_new: Some(crate::objects::objtype::make_new::slice_make_new_slot),
         bases: None,
         namedtuple_fields: None,

@@ -1,0 +1,151 @@
+E2j fix pass — EQUAL / NOT_EQUAL 2-pass protocol for instance operands (array1)
+Lane: lane/e2j-equal (base master 82f4229)
+Result file: scripts/e2j_result.txt
+
+§1 — Acceptance (measured by the executor in the worktree)
+-----------------------------------------------------------
+- cargo test --release --lib --tests: lib 1636 passed, 0 failed,
+  3 ignored (1627 + 9 new e2j tests); bins 9 passed;
+  tests/entry_cli.rs 45 passed. 0 warnings (forced recompile).
+- No `unsafe` in the diff (grep; doc-comment hits only — none).
+- check_compile_mpy.py: PASS (552/552 byte-identical).
+- check_frozen.py: PASS (23/23).
+- Six gates (runners with DEFAULTS, no --bin; capability --vm
+  defaults to petitpy-vm): full corpus 545/552 (array1 flips,
+  0 regressions — "Full gate: GREEN (matches known-fails
+  baseline exactly)", 7 known-fails / 7 actual fails),
+  integration 186/202 (unchanged; fail set identical to
+  E2g master's, diffed name-by-name), golden 585/585
+  (unchanged, rust==cpython 576/585), capability 67/67 GREEN,
+  stdlib 7/8 (unchanged, only test_enum), nano 454/541
+  (unchanged, report-only).
+- Full-corpus fail set-diff vs master's 1 regression + 7
+  known-fails: FLIPPED exactly array1. 0 regressions.
+  Remaining fails are exactly the 7 documented known-fails
+  (class_inplace_op2, memoryview_slice_size,
+  subclass_native_call, nanbox_smallint, builtin_help,
+  deque_micropython, deque_slice).
+- Probe table (~/workspace/e2j_probe.py, REF vs Rust,
+  byte-compared): all 11 lines identical after the fix
+  (5 differed before: X==bytes, X!=bytes, L==L, S==S, D==D).
+- Edge probes (~/workspace/e2j_verify/edge/, REF vs Rust):
+  user `__eq__` on the rhs runs (p_eq_rhs), `__ne__`-first
+  asymmetry (p_ne) — both byte-identical, stdout + stderr +
+  rc. Two divergences found there are PRE-EXISTING on base
+  82f4229 (verified against a fresh base build in a scratch
+  worktree, since removed): see §4(a)(b).
+
+§2 — What was fixed (one mechanism)
+------------------------------------
+1. array1 + the L/S/D family: `instance_binary_op`'s
+   SENTINEL arm (`src/objects/objtype/instance.rs`) now
+   routes EQUAL / NOT_EQUAL through the FULL protocol
+   (`obj_equal_not_equal` in `src/objects/obj_ops.rs`) instead
+   of the slot-level `seams.binary`. The hook for the inner
+   protocol is the seam's `call` closure wrapped in `SeamHook`
+   (already defined in `src/objects/objtype/seams.rs` — no
+   seams.rs change needed). Other ops keep the slot-level
+   seam (`<`, `in`, … — the E2i `<` behaviour is unchanged).
+- Regression tests: NEW `src/runtime/vm_tests_e2j.rs`
+  (9 tests, registered in `src/runtime/mod.rs` under
+  `#[cfg(test)]` — attribute present, verified in the file).
+
+§3 — Root causes, per case (each probed REF vs Rust first)
+------------------------------------------------------------
+1. `X('b',[97,98]) == b'ab'` → REF False, Rust True (and
+   `!=` inverted). Vendor rule (objtype.zig:1167-1168):
+   the SENTINEL branch calls the FULL `mp_binary_op`, and
+   for EQUAL/NOT_EQUAL that is `mp_obj_equal_not_equal`
+   (runtime.zig:553-554, obj.zig:268-368) — the 2-pass loop.
+   Rust called only the lhs type's slot (`call_binary` on
+   the array type), whose EQUAL arm compares buffer contents
+   and returned True. The full protocol skips both passes
+   (array/bytes flags are 0 — verified: `array_type_data`
+   passes flags 0, `objarray.rs:567-575`; str/bytes/list/
+   dict/tuple likewise 0) and the pointer fallback returns
+   False. Fix 1.
+2. `L([1,2]) == L([1,2])` → REF True, Rust False (same for
+   `S('ab') == S('ab')`, `D(a=1) == D(a=1)`). The list/str/
+   dict slot refuses a non-list/str/dict rhs (NotImplemented),
+   so the slot-level path fell through to the pointer
+   fallback. The full protocol's pass 1 swaps the operands:
+   the instance's type HAS `FLAG_EQ_CHECKS_OTHER_TYPE`
+   (user classes get `TYPE_BASE_FLAGS = 0x021C`,
+   `typecreate.rs:84`) so pass 1 reaches the instance slot,
+   which delegates to subobj[0] and compares contents.
+   Fix 1.
+3. `X == array.array('b')`, `B(b'ab') == b'ab'` /
+   `B == B`, `L == [1,2]`, `S == 'ab'`, `D == {'a':1}`:
+   already True before the fix; kept True (regression
+   guards in the test file, §2 items 2/6 + the `_plain`
+   cases). The full protocol reaches the same native slot
+   via the pass whose types match.
+4. `!=` is the same protocol's negation, not a separate
+   path: `obj_equal_not_equal` inverts via
+   `local_true`/`local_false` (obj.zig:271-280) and tries
+   `__ne__` first when the type has a neq test (the CPython
+   asymmetry, obj.zig:357-360). Probed: `N([1]) != [1]`
+   calls `N.__ne__` (returns False) while `N([1]) == [1]`
+   calls `N.__eq__` (returns True) — byte-identical.
+5. Why the inner protocol needs a hook (not `None`): a
+   bare `None` hook would make the inner loop's instance
+   pass run the stub slot (`instance_binary_op_slot`), so
+   a user `__eq__` on the rhs would raise instead of
+   running and the inner protocol would answer a
+   definitive False before the outer loop ever tried the
+   rhs's type. Probed: `L1([1,2]) == L2([9,9])` with
+   `L2.__eq__` returning True prints "L2.__eq__ called"
+   and returns True on REF — the rhs dunder IS consulted
+   — and Rust now matches byte-identically. The hook is
+   the seam's own `call` closure (`SeamHook::new(&mut
+   *seams.call)`), so on ctx-only paths it degrades to
+   exactly the old stub behaviour (`call_via_type_slot`).
+   `L3.__eq__` returning NotImplemented → False on both
+   (treated as "not implemented", falls through).
+
+§4 — Shortfalls, out-of-scope notes, and handoffs
+-------------------------------------------------
+(a) `hash(S('ab'))` fails on Rust ("TypeError: unsupported
+    type for operator") — dicts with a str-subclass key
+    (`{S('ab'): 1}[S('ab')]`, `{S('ab'): 1}['ab']`) fail
+    the same way. PRE-EXISTING on base 82f4229 (verified
+    against a fresh base build: identical failure, same
+    message; the stale master binary in
+    ~/workspace/petitpy-rs/target/release/ agrees too).
+    Root cause (not this lane's): the HASH path —
+    `instance_unary_op`'s HASH fallback re-looks `__eq__`
+    up and the str binary slot answers, so the instance
+    reports unhashable. NOT touched here (unary path,
+    E2h territory); no corpus coverage (full gate is
+    GREEN at 545/552 without it).
+(b) Ordering between two same-subclass instances raises on
+    Rust where REF returns a bool: `L([1,2]) < L([1,3])`
+    and `S('ab') < S('ac')` → REF True, Rust `TypeError:
+    unsupported types for __lt__: 'L', 'L'` (REF names
+    the delegated operands: 'list', 'L'). PRE-EXISTING
+    on base 82f4229 (fresh base build: identical raise,
+    identical message). Same slot-level-seam shape as
+    this lane's fix but for ordering ops: the seam's
+    `binary` refuses a non-exact rhs, while the vendor's
+    full `mp_binary_op` would delegate subobj[0] and
+    compare. Out of scope — this lane is EQUAL/NOT_EQUAL
+    only, per the brief; the `<` side for instances was
+    E2i's (array `<`), and this list/str-subclass `<`
+    gap has no corpus coverage. A follow-up lane could
+    route Less/More/LessEqual/MoreEqual through the full
+    protocol the same way. Ordering with a PLAIN rhs
+    (`L < [1,3]`, `S < 'ac'`) works and is pinned by
+    test e2j_ordering_containment_unchanged.
+(c) `type(iter(s))` still fails (bare TypeError) — E2b's
+    known gap, explicitly out of this lane's scope.
+(d) No file outside the brief's touch list was edited:
+    `instance.rs` (the SENTINEL arm + one import line)
+    and `mod.rs` (test registration) only, plus the new
+    test file. `seams.rs` needed NO change (`SeamHook`
+    already existed); `obj_ops.rs` needed NO change
+    (`obj_equal_not_equal` already implements the full
+    protocol). No shared file was needed.
+(e) Scratch worktree `~/workspace/petitpy-rs-base82f`
+    (fresh base-82f4229 build, used only to prove §4(a)(b)
+    pre-existing) was removed after verification; orig
+    is clean.

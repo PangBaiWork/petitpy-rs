@@ -1,0 +1,378 @@
+Lane D2: os/sys/file_io — modos.zig + file_io.zig + modsys.zig
+=============================================================
+Worktree ~/workspace/petitpy-rs-d2-ossys, branch lane/d2-ossys,
+base master c9fc4e6 (stale — master is now 2140ecf after D1's
+merge 2026-11-18 ~08:28; the rebase is the main agent's job,
+see §4). One commit, no merge. Pure Rust std, no unsafe,
+every file <800 lines.
+
+Acceptance (verified 2026-11-18, this worktree):
+- cargo test --release --lib --tests: 1282 passed, 0 failed,
+  4 ignored (baseline 1249 + 33 new: modsys 10, modos 12,
+  print(file=) 3, objfileio 8)
+- cargo test --release --bins: 9 passed, 0 failed
+- 0 warnings; 0 `unsafe` blocks/fns (the word appears only in
+  comments); scripts/check_compile_mpy.py PASS (0 rust compile
+  failures, 0 byte mismatches, 552/552)
+- ~/workspace/petitpy-orig clean (read-only, untouched)
+- value.rs 886 -> 520 (the recorded cap debt is CLOSED by the
+  split in this lane); vm.rs 842 -> 789 via the vm_roots /
+  vm_modules split below; vm_call.rs 776; map.rs 860 is still
+  over cap (pre-existing, unscheduled)
+
+§1 — What was built (Zig -> Rust)
+---------------------------------
+value.rs split (step 1): all payload structs moved to
+  src/objects/value_data.rs (480 lines); value.rs 886 -> 495
+  at the split (now 520 after the File variant + ModuleDelegation
+  additions); `pub use` re-export keeps every
+  `crate::objects::value::TypeData` path working. Obj::File
+  added (FileData { handle: FileHandle, fd, is_text, closed,
+  buffer: Option<GcRef> }); FileHandle::{ Owned(Rc<RefCell<File>>),
+  Stdin, Stdout, Stderr, Closed } — std::fs::File is not Clone,
+  stdio has no safe from_raw_fd (unsafe is banned).
+
+file_io.zig -> src/objects/containers/objfileio.rs (704 lines):
+  fileio_read/write/ioctl (SEEK via SeekFrom, FLUSH, CLOSE;
+  closed -> EBADF; stdio seek -> ESPIPE(29); stdin flush no-op;
+  close drops the Owned Rc immediately so the fd closes at
+  close time, not at GC); fileio_print ("<io.FileIO %d>" /
+  "<io.TextIOWrapper %d>", fd -1 when closed); fileno (closed
+  -> EBADF); textio_attr (.buffer only for stdio objects, via
+  the stable FileData.buffer sibling); FILEIO_LOCALS 13 entries
+  in the Zig's order; fileio/textio TypeData (flags 0x0180,
+  make_new None — FileIO is not in the io module's globals,
+  probed `io.FileIO` -> AttributeError); build_fileio_types;
+  build_stdio_objects (6 objects); open_builtin +
+  open_builtin_kw -> open_impl (path via str_data_pool,
+  TypeError bare for non-str/bytes; mode used only if qstr or
+  exact str — probed open(p,123) and open(p,b"rb") both open
+  text "r"; glibc mode parser: first byte must be r/w/a else
+  EINVAL, +/b/x (x only with w/a — probed "rx" succeeds, "wbx"
+  -> EEXIST), others ignored; NUL truncation for path+mode).
+  BuiltinTypes gained fileio/textio (+ the shared attrtuple,
+  see below); build_vm_types calls build_fileio_types.
+
+modsys.zig -> src/runtime/modsys.rs (428 lines): VERSION_STR
+  verbatim ("3.4.0; MicroPython (with v2.0 preview)
+  v1.28.0-preview.80.gb14d129a16 on 2026-06-04"), MACHINE_STR,
+  MPY_FILE_HEADER_INT = 413773; build_sys_module (17 entries
+  after __name__ in table order; dict fixed); sys_exit (0,1),
+  getrecursionlimit (-> 1000), setrecursionlimit (no-op ->
+  None), intern (pool.from_strn -> Qstr; non-str/bytes ->
+  TypeError "can't convert to str implicitly"; bytes accepted),
+  exc_info (always (None,None,None) — see §3), print_exception
+  (sig (1,2); target = args[1] or state.sys_stdout, validated
+  FIRST via get_stream_raise; renders via obj_print_exception,
+  writes via stream_write_adaptor) + its interception in
+  call_function_ctx by GcRef identity (C15a pattern).
+  ModuleData gained delegation: Option<ModuleDelegation>
+  (value_data.rs; None = C NULL slot); module_attr_load serves
+  it AFTER __getattr__; module_store_attr handles delegation
+  STORE only (sys.path = [...] works, DELETE -> Ok(false),
+  non-delegated key -> Ok(false)).
+  VmState gained sys_path_list / sys_modules_dict /
+  sys_argv_list (Option<GcRef>) + sys_stdin/stdout/stderr +
+  sys_print_exception_builtin. sys.path is the arena list:
+  search_top_level reads it when Some (non-str entries
+  skipped), falls back to Vec<String> when None;
+  set_sys_path syncs the list object IN PLACE (identity kept).
+  sys.modules is a live dict mirror of state.modules:
+  create_and_register + remove_from_loaded (now takes ctx) +
+  register_code_inner (vm_eval.rs) all dict_store/delete the
+  mirror; builtin modules are NEVER inserted (probed).
+
+modos.zig -> src/runtime/modos.rs (715 lines) +
+  src/runtime/modos_fd.rs (374 lines): build_os_module (60
+  entries in table order; dict fixed); stateless fns urandom
+  (n<0 EINVAL, n>4096 EFBIG(27) — the Zig's 4096 stack-buffer
+  cap, verbatim), getcwd, chdir, getenv (positional + `default`
+  kwarg sharing getenv_impl), _environ (fresh dict via
+  vars_os + dict_new — see §3), putenv/unsetenv (empty name or
+  `=` -> EINVAL, since set_var/remove_var panic), unlink
+  (remove+unlink share one Value), rename, mkdir (DirBuilder
+  ::mode), rmdir, stat/lstat (attrtuple_new over the SHARED
+  ctx.types.attrtuple — probed type(os.stat('.')) is
+  type(sys.implementation), both `is tuple` False; u64 fields
+  wrap with `as i64`), listdir, readlink (truncate 4095),
+  symlink, access (invalid bits -> False; F_OK = existence;
+  R_OK/W_OK on files probe by opening, on dirs by mode bits;
+  X_OK by 0o111), chmod (set_permissions(from_mode)), getpid,
+  chown/kill/umask stubs (NotImplementedError — see §4).
+  os_getattr_stub + os_getattr_ctx (intercepted by GcRef
+  identity): "path" -> import_impl "os_path" (failure
+  propagates as ModuleNotFoundError); else import "os_ext",
+  swallow ANY failure (take_pending_raise + pending_exc=None),
+  load_attr_maybe, miss -> AttributeError "no attribute 'x'".
+  The fd builtins (open/close/read/write/lseek/fsync) are
+  fd_stub FunBuiltins in modos.rs, with real bodies in
+  modos_fd.rs run through the call_function_ctx interception
+  (they need state.os_fds): os.open inserts (fd from AsRawFd,
+  access mode from flags&3, all other flags via custom_flags
+  so O_EXCL-without-O_CREAT is ignored as open(2) ignores it);
+  os.close removes (dropping the File closes it); fds 0/1/2
+  inline via io::{stdin,stdout,stderr}; os.close(0/1/2) is
+  tracked in VmState.os_closed_stdio (the real fd cannot be
+  closed in safe Rust — later uses raise EBADF; a later
+  os.open will NOT reuse the number, see §4); os.fsync on
+  stdio -> EINVAL; os.lseek on stdio -> ESPIPE.
+  The module __getattr__ seam is wired in load_method_maybe_ctx
+  (vm_rt_name.rs): after the attr slot finds nothing, for a
+  Module with __getattr__ in its dict (and attr != __getattr__),
+  the fun is called via call_function_ctx (C13's deferred seam).
+
+print(file=...) -> src/runtime/vm_builtins.rs (248 lines):
+  print_impl parses file/flush kwargs (dup -> terse TypeError);
+  an explicit file (incl. None) routes through
+  get_stream_raise(file, WRITE) + stream_write_adaptor per
+  piece; flush=True loads the file's `flush` method via
+  load_method (next_obj None) and calls it with 0 args via
+  call_method_n_kw; flush truthiness via obj_is_true
+  (MicroPython's MP_ARG_BOOL); no file kwarg keeps the
+  MP_PLAT_PRINT path. rt_to_pyerror converts the flush call's
+  RtError (named variants recorded on ctx; PyRaise /
+  OutOfMemory / Raised(v) follow the codebase's to_pyerror()
+  convention — see §4).
+
+Shared attrtuple type: BuiltinTypes gained attrtuple;
+  build_vm_types builds it once (empty dict +
+  attrtuple_type_data), adds it to the header fix-up list.
+  modsys.rs uses ctx.types.attrtuple for implementation.
+
+vm.rs split (cap): build_d2_modules -> new
+  src/runtime/vm_modules.rs (35 lines); frame_roots_of +
+  sync_frame_roots -> new src/runtime/vm_roots.rs (44 lines);
+  call sites updated (vm_dispatch.rs, vm_gen.rs). vm.rs 842 ->
+  789 lines.
+
+Tests (33 new):
+  src/runtime/modsys_tests.rs (391): sys_constants,
+  sys_stdio_objects, sys_exc_info_always_none, sys_exit_forms,
+  sys_intern, sys_recursionlimit, sys_path_delegation,
+  sys_modules_sync_and_path_append, sys_print_exception_to_stream,
+  set_sys_path_syncs_list_object.
+  src/runtime/modos_tests.rs (419): os_constants,
+  os_getcwd_listdir, os_stat_is_attrtuple, os_urandom_limits,
+  os_urandom_len_ctx, os_environ_getenv, os_access_bool,
+  os_mkdir_rmdir_rename_remove, os_getattr_and_fixed_dict,
+  os_fd_roundtrip, os_fd_lseek_whence, os_unimplemented_stubs.
+  src/runtime/vm_builtins_tests.rs (157): print_to_stringio,
+  print_to_sys_stdout_stderr, print_file_nonstream_raises.
+  src/objects/containers/objfileio_tests.rs (280): ctx-level
+  open round-trips (text/binary), open_missing (ENOENT),
+  open_bad_mode (EINVAL), open_kwargs_ignored,
+  closed_ops_raise_ebadf, fileno_and_print_forms,
+  stdio_objects_shapes.
+  Two stale-test premises updated: vm_tests.rs
+  dispatch_import_error now imports nosuchmodule_xyz (import os
+  succeeds since D2 registers the real module);
+  builtinhelp_tests.rs help_modules_list_columns also retains
+  out the real `os` (like io/sys).
+
+§2 — Reference-binary probes (2026-11-18, /tmp/probe_*.py)
+------------------------------------------------------------
+sys: version string matches the Zig constant; version_info
+  (3,4,0); implementation (name='micropython', version=
+  (1,28,0,'preview'), _machine='petitpy [GCC 4.2.1 (Apple Inc.
+  build 5658) (LLVM build)] version', _mpy=413773); platform
+  "linux"; byteorder "little"; maxsize 9223372036854775807;
+  sys.path ['', '/home/hatch/.petitpy/lib'] (entry overwrote
+  [0] + appended PETITPY_LIB — Phase E); sys.argv
+  ['probe_d2.py']; getrecursionlimit 1000.
+  sys.exc_info() ALWAYS (None,None,None) — top level, inside
+  except ValueError, nested except, after a call from except.
+  sys.stdin/stdout/stderr print as <io.TextIOWrapper 0/1/2>;
+  .buffer -> <io.FileIO 0>; sys.stdin.buffer is
+  sys.stdin.buffer True.
+  sys.modules: builtin modules NEVER registered (after `import
+  os`, sys.modules is still {}, "os" in sys.modules False;
+  same for sys and io). Only file-loaded modules register.
+  sys.ps1/ps2 do NOT exist (hasattr False, sys.ps1 ->
+  AttributeError). sys.stdout = s -> AttributeError (sys is a
+  fixed dict; stdout is NOT delegated). sys.path = [...] works;
+  del sys.path -> AttributeError; sys.foo = 42 -> AttributeError;
+  'path'/'ps1' NOT in sys.__dict__, 'modules'/'argv' ARE.
+os: name "posix", sep "/", altsep '' (empty str, NOT None),
+  linesep "\n", curdir ".", pardir "..", extsep "."; F_OK=0,
+  R_OK=4, W_OK=2, X_OK=1; O_RDONLY=0, O_WRONLY=1, O_RDWR=2,
+  O_CREAT=64, O_TRUNC=512, O_APPEND=1024, O_EXCL=128; SEEK 0/1/2.
+  os dict IS fixed (os.foo = 42 / del os.sep -> AttributeError).
+  urandom(16) len 16, urandom(0) len 0; os._environ()["HOME"]
+  present; os.stat missing -> OSError [Errno 2] ENOENT;
+  urandom(-1) -> [Errno 22] EINVAL; urandom(5000) and
+  os.read(0, 5000) -> OSError(27,) (EFBIG, bare number);
+  os.write(1, 123) -> TypeError "can't convert to str
+  implicitly"; os.write(1, "hi\n") -> 3; os.write(0, b"x") /
+  os.read(1, 5) / os.read(999, 5) / os.close(999) -> EBADF;
+  os.lseek(1, 0, 0) -> OSError '29' (ESPIPE); os.fsync(1) ->
+  OSError [Errno 22] EINVAL (fsync on a pipe); os.stat(123) /
+  os.stat(None) / os.stat([1]) -> ENOENT (str() fallback);
+  os.getenv(123) -> None; os.open(123, O_RDONLY) -> ENOENT;
+  os.open("/tmp", "x") -> TypeError "can't convert to int";
+  os.mkdir("/tmp") -> EEXIST; os.chdir("/nonexistent_xyz") ->
+  ENOENT; os.readlink("/tmp") -> EINVAL; os.symlink("/tmp",
+  "/tmp") -> EEXIST; os.unlink("/nonexistent_xyz") -> ENOENT;
+  os.rename("/nonexistent_xyz", "/tmp/x") -> OSError '18'
+  (EXDEV); os.chmod(missing) -> ENOENT; os.urandom(-1) /
+  os.read(0, -1) -> EINVAL; os.lseek(0, 0, 99) -> EINVAL;
+  os.getenv 2-positional and default= kwarg both work;
+  os.getenv("HOME") -> '/home/hatch'. os.umask(0o022) -> 7
+  then 18; os.kill(pid, 0) -> None; os.chown("/tmp", 0, 0) ->
+  None. os.access("/tmp", 8) -> False; os.access("/tmp", -1)
+  -> False; os.open("/tmp", O_RDONLY|O_EXCL) -> 3 (O_EXCL
+  without O_CREAT ignored).
+  os.__getattr__: hasattr(os, "environ") -> False (os_ext
+  import fails silently -> AttributeError); hasattr(os,
+  "path") RAISES ModuleNotFoundError "No module named
+  'os_path'" (os_path.py exists in petitpy-lib but is NOT
+  installed in ~/.petitpy/lib); os.nonexistent_xyz ->
+  AttributeError. No corpus/golden file uses os.path.
+  type(os.stat(".")) is type(sys.implementation) True; both
+  `is tuple` False — the two attrtuples SHARE one type object.
+OSError errno-name table (OSError(n), n in 1..40, 999):
+  NAMED ("[Errno N] NAME") — 1 EPERM, 2 ENOENT, 5 EIO, 9 EBADF,
+  11 EAGAIN, 12 ENOMEM, 13 EACCES, 17 EEXIST, 21 EISDIR, 22 EINVAL;
+  UNNAMED (bare number) — 3, 4, 6, 20, 24, 27 (EFBIG), 28, 30,
+  32, 36, 39, 40, 999. The Rust table in objexcept.rs:392-408
+  already matches exactly.
+open() on the reference: type(f) is TextIOWrapper for "w"/"r"/
+  "a", FileIO for "rb"; write/read/seek/tell/readline/readlines
+  work; closed read -> OSError [Errno 9] EBADF; open missing ->
+  OSError(2,); bad mode "z" -> OSError [Errno 22] EINVAL;
+  g.read() after full read returns "" (text) / b'' (binary);
+  closed file prints <io.TextIOWrapper -1>; seek/tell/fileno/
+  write/flush/read on a closed file -> EBADF; close() -> None;
+  read(-5) ABORTS rc=134 (stream.zig:303 @intCast panic);
+  read(0) -> ""; read(-1) -> full; seek bad whence/negative ->
+  EINVAL; open(123) -> bare TypeError; open(p,'z') -> EINVAL;
+  open(p,'rr') succeeds (fd 6); open missing w/r -> ENOENT.
+print(file=...): print("b", file=sys.stderr) works;
+  print("hello", file=io.StringIO()) -> s.getvalue() ==
+  'hello\n'; print("a", file=None) ABORTS rc=134 (Zig
+  mp_get_stream_raise @panic, support/stream.zig:146, from
+  modbuiltins.zig:705); print("x", file=123) also ABORTS
+  rc=134 the same way.
+
+§3 — Bugs found + brief-premise corrections
+-------------------------------------------
+1. [BRIEF PREMISE CORRECTED] sys.exc_info() is ALWAYS
+   (None,None,None). The brief assumed a cur_exception slot;
+   grep found NO `cur_exception =` assignment anywhere in src/
+   or vendor/; src/runtime/vm.zig:187 says "SYS_EXC_INFO=0 ->
+   no MP_STATE_VM(cur_exception) write"; full_stubs.zig exports
+   a null storage slot. Implemented as a constant
+   (None,None,None), NO VmState slot.
+2. [BRIEF PREMISE CORRECTED — pre-existing divergence, now
+   visible] The entry module registers into state.modules
+   (load_module_from_mpy calls register_mpy_code(..., true)),
+   so D2's live sys.modules mirror shows "<test>" (and every
+   entry module). The reference prints sys.modules == {} for
+   BOTH petitpy-vm (entry.mpy) and petitpy (script). The mirror
+   faithfully reflects state.modules; the fix belongs to Phase E
+   entry work (decide whether the entry module registers).
+3. attrtuple attr slot never wired: attrtuple_type_data set
+   attr: None although attrtuple_attr (objattrtuple.rs:105)
+   exists — sys.implementation.name raised AttributeError at
+   the VM level. Fixed: attrtuple_attr_fn adapter +
+   attr: Some(attrtuple_attr_fn). (Check D1 overlap at rebase —
+   D1's notes do not mention it.)
+4. STORE_ATTR pop order swapped + store_attr_ctx a stub:
+   store_attr_ctx always raised AttributeError; the dispatch
+   popped value first then base, but the Zig's mp_store_attr
+   (vm.zig:657-661) has stack [value, base] with BASE on top.
+   Fixed in-lane. DUPLICATE of D1's later merge (2026-11-18
+   ~08:28, commit 2140ecf) — at rebase take D1's version (C14's
+   full runtime_method::store_attr) and DROP D2's hunks
+   (vm_rt_name.rs module branch, vm_dispatch.rs pop-order).
+5. ROT_TWO/ROT_THREE destroyed NULL slots: sset always wrote
+   Some(v), both arms used unwrap_or(Value::None) — so
+   LOAD_NULL; ROT_TWO; STORE_ATTR (del x.attr) arrived as a
+   store of the None object, and `del sys.path` silently
+   succeeded. Fixed: sset takes Option<Value> and writes it
+   raw; ROT_TWO/ROT_THREE pass sget results through unchanged.
+   UNIQUE to D2 (D1's merge notes do not mention it) — KEEP at
+   rebase.
+6. [BUG, found by the _environ tests] os._environ() hand-rolled
+   its dict with ctx.alloc(None, ...) — header None, so type
+   dispatch could not see it as a dict: e1 == e2 was False
+   (fell back to identity) and e1[...] raised TypeError
+   "object isn't subscriptable". Fixed: build with dict_new
+   (proper dict type header). Lesson: never hand-roll a dict
+   (or any typed object) with a None header.
+7. [TEST-HARNESS RACE, not an implementation bug] The
+   objfileio tests first shared one temp dir across parallel
+   test threads — cleanup raced (DirectoryNotEmpty / NotFound).
+   Fixed: per-test temp dirs (pid + test tag).
+
+§4 — Not done, divergences, handovers
+--------------------------------------
+For the main agent at rebase onto master 2140ecf (D1 merged):
+- Take D1's store_attr_ctx (C14's full store_attr) + STORE_ATTR
+  pop-order fix; DROP D2's duplicates (see §3.4). KEEP D2's
+  ROT_TWO/sset fix (§3.5) and the attrtuple attr-slot wiring
+  (§3.3, check D1 overlap). Wire D2's open_impl into D1's
+  open_builtin/open_builtin_kw stubs in builtin_fns.rs (D2's
+  open_builtin in objfileio.rs is the implementation; D1 binds
+  it with kw_func: Some(open_builtin_kw)). D1's import io
+  registration + len/repr(None)/isinstance fixes mean D2's Sx
+  test harness (which pre-registers io) and any len-avoiding
+  test workarounds can be simplified at rebase.
+- vm.rs (792 on master) + vm_call.rs (790 on master): D2 adds
+  VmState fields (sys_*, os_*) and interception branches; this
+  lane already split vm.rs once (vm_roots/vm_modules, now 789
+  in-tree) — a further split of vm_call.rs (776 in-tree) is
+  likely needed before the 800 cap is breached.
+- `import os.path` gap (KNOWN): goes through C14's
+  load_attr_maybe (builtinimport.rs parent branch), which calls
+  the type's attr slot with seam None — __getattr__ does NOT
+  fire there, so `import os.path` raises ModuleNotFoundError
+  "No module named 'os.path'" (vs the reference's 'os_path'
+  name) until the AttrFn seam is threaded through C14's loader.
+  The exception TYPE matches; only the message name differs.
+- os.kill / os.umask / os.chown are NotImplementedError stubs
+  (no std API): the reference implements all three (umask
+  returns the previous mask, kill(pid, 0) -> None, chown ->
+  None). A future lane needs libc-level syscalls or a
+  documented permanent stub. Tests assert the stub raises.
+- os.fsync on stdio returns EINVAL (no safe std fsync for fd
+  0/1/2); the reference returns EINVAL on pipes/ttys (the test
+  environment) but succeeds when stdout is a regular file —
+  diverges there.
+- os.close(0/1/2) does not close the real fd (tracked in
+  os_closed_stdio instead); a later os.open will NOT reuse the
+  number (the reference's close(0) frees it for reuse).
+- os.lseek on stdio is always ESPIPE (std::io::Stdin has no
+  Seek); the reference seeks when stdin is a redirected regular
+  file. Same divergence already recorded for sys.stdin.seek.
+- os.access is an approximation (uid/gid checks via open/mode
+  bits; root-correct, not a full access(2) emulation).
+- os.read(<-1) inherits C16's stream_read_generic -> MemoryError;
+  the reference ABORTS rc=134. read(-1) -> readall, read(0) ->
+  empty, both match.
+- sys.stdin.flush() is a no-op (glibc fflush(stdin) discards
+  buffered input, inexpressible in safe std). Embedding-host
+  output sink is Phase F.
+- stat out-of-window ints: u64 fields wrap with `as i64` (the
+  Zig's @intCast) — matches for in-range values; a file with
+  st_size > 2^63 is out of the small-int window in both.
+- print(file=<non-stream>) / print(file=None): reference ABORTS
+  rc=134; Rust raises OSError("stream operation not supported")
+  (vendor C behavior). print flush when the flush method itself
+  raises an exception object: RtError::Raised(v) cannot be
+  carried through the PyResult slot convention (the pending
+  slot holds name+arg, not an object) — falls back to
+  to_pyerror(), so the caller builds a generic TypeError. A
+  stream with write but NO flush method raises AttributeError
+  "no attribute 'flush'" (correct per the Zig); no such stream
+  exists in this tree to test it end-to-end.
+- DUP_TOP_TWO latent NULL bug (NOT fixed, same class as §3.5):
+  vm_dispatch.rs ~:426 pushes two NULLs when EITHER top slot
+  is NULL instead of duplicating both slots raw. Not on D2's
+  paths; needs a Phase E test.
+- Phase E entry items: fill sys.path[0]/argv via set_sys_path /
+  the argv dict entry (see §2 sys.path probe); decide the
+  entry-module registration question (§3.2); KNOWN divergence:
+  `sys.path = <new list>` rebinding does not re-point the
+  import search (the search reads the ORIGINAL list object).
+- Cap debt remaining: map.rs 860 (pre-existing, unscheduled);
+  value.rs debt CLOSED by this lane (886 -> 520).

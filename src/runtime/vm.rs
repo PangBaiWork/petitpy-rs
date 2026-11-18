@@ -110,6 +110,19 @@ pub struct VmTypes {
     pub enumerate: GcRef,
 }
 
+/// The six `os` builtins that need VM state (the fd table),
+/// for the `call_function_ctx` interception (D2). The `func`s
+/// are stubs; the real bodies live in `modos_fd.rs`.
+#[derive(Clone, Copy, Debug)]
+pub struct OsFdBuiltins {
+    pub open: Value,
+    pub close: Value,
+    pub read: Value,
+    pub write: Value,
+    pub lseek: Value,
+    pub fsync: Value,
+}
+
 /// The VM's mutable state (the `Ctx` + `mp_state_ctx` pieces
 /// `execute_frame` needs). `Vm` splits into a `CallCtx` (arena /
 /// roots / types / pool / pending_raise) and this state — disjoint
@@ -212,6 +225,63 @@ pub struct VmState {
     /// C15b. A `Vec<String>` (not a Python list object — the
     /// `sys` module that exposes it is D's `modsys`).
     pub sys_path: Vec<String>,
+    /// The `sys.path` list OBJECT (`sys_mutable[0]`'s value,
+    /// `modsys.zig`): the same list `sys_path` is built from.
+    /// Python `sys.path.append(x)` mutates this object, and
+    /// the import search reads it (see `search_top_level`);
+    /// `set_sys_path` syncs it in place. `None` until D2's
+    /// module step builds it. Added by D2.
+    pub sys_path_list: Option<GcRef>,
+    /// The live `sys.modules` dict object
+    /// (`mp_loaded_modules_dict`, `modsys.zig`): the sys
+    /// dict's `modules` entry points at this dict, and the
+    /// import system keeps it in sync with `modules` (file
+    /// modules only — builtin modules are never registered,
+    /// probed). `None` until D2's module step builds it.
+    /// Added by D2.
+    pub sys_modules_dict: Option<GcRef>,
+    /// The `sys.argv` list object (`modsys.zig`): default
+    /// `[]`; Phase E's entry fills it in place. `None` until
+    /// D2's module step builds it. Added by D2.
+    pub sys_argv_list: Option<GcRef>,
+    /// The stdio stream objects (`npy_file_io_init`,
+    /// `file_io.zig`): `TextIOWrapper` over fds 0/1/2.
+    /// `sys.print_exception`'s default target is `sys_stdout`
+    /// (the ROM object — `sys.stdout` cannot be rebound,
+    /// probed 2026-11-18); D1's `input()` reads `sys_stdin`.
+    /// `Value::None` until D2's module step builds them.
+    /// Added by D2.
+    pub sys_stdin: Value,
+    pub sys_stdout: Value,
+    pub sys_stderr: Value,
+    /// The `sys.print_exception` builtin (intercepted by
+    /// GcRef identity in `call_function_ctx` — it needs the
+    /// VM's `sys_stdout` for its default target; its `func`
+    /// is a stub, like `next`'s). Added by D2.
+    pub sys_print_exception_builtin: Value,
+    /// The `os.open` fd table: fd → open `File`. `os.open`
+    /// inserts, `os.close` removes (closing the file),
+    /// `os.read`/`os.write`/`os.lseek`/`os.fsync` look up.
+    /// There is no safe `std` API for an arbitrary fd
+    /// (`from_raw_fd` is `unsafe`), so VM-opened files are
+    /// tracked here; fds 0/1/2 are handled inline via
+    /// `std::io::{stdin, stdout, stderr}`. Added by D2.
+    pub os_fds: HashMap<i32, std::fs::File>,
+    /// Stdio fds closed by `os.close(0/1/2)` — the real fd
+    /// cannot be closed in safe Rust, so the closure is
+    /// tracked here and every later use raises EBADF
+    /// (`modos_fd.rs`). Added by D2.
+    pub os_closed_stdio: std::collections::HashSet<i32>,
+    /// The `os.open`/`os.close`/`os.read`/`os.write`/
+    /// `os.lseek`/`os.fsync` builtins (intercepted by GcRef
+    /// identity in `call_function_ctx` — they need
+    /// `state.os_fds`; their `func`s are stubs, like
+    /// `next`'s). Added by D2.
+    pub os_fd_builtins: OsFdBuiltins,
+    /// The `os.__getattr__` builtin (intercepted by GcRef
+    /// identity — it needs the VM's import machinery, see
+    /// `modos.rs`). Added by D2.
+    pub os_getattr_builtin: Value,
     /// The frozen-module table (`frozen_modules.zig`): `(dotted
     /// name, .mpy bytes)` pairs. Empty by default (the default
     /// build has `MICROPY_FROZEN_TINY_ENABLED=0`); Phase D fills
@@ -312,6 +382,9 @@ impl Vm {
             dict: GcRef(0),
             array: GcRef(0),
             bytearray: GcRef(0),
+            fileio: GcRef(0),
+            textio: GcRef(0),
+            attrtuple: GcRef(0),
             type_: GcRef(0),
             object: GcRef(0),
             super_: GcRef(0),
@@ -368,6 +441,24 @@ impl Vm {
                 not_implemented: Value::None,
                 pending_sched: None,
                 sys_path: vec![String::new()],
+                sys_path_list: None,
+                sys_modules_dict: None,
+                sys_argv_list: None,
+                sys_stdin: Value::None,
+                sys_stdout: Value::None,
+                sys_stderr: Value::None,
+                sys_print_exception_builtin: Value::None,
+                os_fds: HashMap::new(),
+            os_closed_stdio: std::collections::HashSet::new(),
+                os_fd_builtins: OsFdBuiltins {
+                    open: Value::None,
+                    close: Value::None,
+                    read: Value::None,
+                    write: Value::None,
+                    lseek: Value::None,
+                    fsync: Value::None,
+                },
+                os_getattr_builtin: Value::None,
                 frozen_modules: crate::runtime::frozen_modules::FrozenTable::new(),
                 builtin_modules: Vec::new(),
                 extensible_modules: Vec::new(),
@@ -377,6 +468,7 @@ impl Vm {
             },
         };
         vm.build_builtins();
+        crate::runtime::vm_modules::build_d2_modules(&mut vm);
         vm
     }
 
@@ -410,7 +502,7 @@ impl Vm {
     pub fn rebuild_frame_roots(&mut self) {
         self.roots.extra.truncate(self.state.extra_base);
         for frame in self.state.frames.values() {
-            for v in frame_roots_of(frame) {
+            for v in crate::runtime::vm_roots::frame_roots_of(frame) {
                 self.roots.extra.push(v);
             }
         }
@@ -695,6 +787,16 @@ impl Vm {
         }
     }
 
+    /// D2: build the `os`/`sys` modules + the stdio objects and
+    /// register them as builtin modules (the original's `mp_init`
+    /// registers ALL builtin modules at startup; D1's registration
+    /// owns the `io` module only — different names, so the
+    /// appends cannot collide). The stdio objects are reachable
+    /// from the sys dict (`stdin`/`stdout`/`stderr` entries)
+    /// and the `.buffer` siblings via `Obj::children()`, so
+    /// pinning `sys` roots them; the shared attrtuple type
+    /// (`os.stat` results + `sys.implementation` headers) is
+    /// pinned explicitly (header types are not traced).
     /// Load a module from source text: compile (bridge,
     /// `debug_mode` false — the `petitpy` entry point), read the
     /// `.mpy`, register it, and run the module body. Returns the
@@ -760,34 +862,3 @@ pub enum VmError {
     Raised(Value),
 }
 
-/// The live values of one frame, for rooting (stack + state +
-/// `fun` + the exc-stack `prev_exc`s).
-pub(crate) fn frame_roots_of(frame: &CodeState) -> Vec<Value> {
-    let mut out = Vec::new();
-    out.push(Value::Heap(frame.fun));
-    for v in &frame.state {
-        if let Some(v) = v {
-            out.push(*v);
-        }
-    }
-    for v in &frame.stack {
-        if let Some(v) = v {
-            out.push(*v);
-        }
-    }
-    for b in &frame.exc_stack {
-        if let Some(v) = b.prev_exc {
-            out.push(v);
-        }
-    }
-    out
-}
-
-/// Sync the current frame's live values into `ctx.roots.stack`
-/// (the dispatch calls this at the top of every iteration — see
-/// the module docs). `mark` is the `roots.stack` length on
-/// `execute_frame` entry.
-pub(crate) fn sync_frame_roots(ctx: &mut CallCtx, frame: &CodeState, mark: usize) {
-    ctx.roots.stack.truncate(mark);
-    ctx.roots.stack.extend(frame_roots_of(frame));
-}

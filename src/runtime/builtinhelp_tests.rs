@@ -194,10 +194,16 @@ fn help_modules_list_columns() {
     let (mut ctx, state) = fx.vm.split();
     // Fake registrations: two builtin, one extensible, two
     // frozen — the output is the sorted union, column-first.
+    // (D2 registers the real `sys` and `os` modules in
+    // `builtin_modules` at `Vm::new`, so they are retained
+    // out first, like `io`.)
     let io_id = static_qstr_id(b"io").expect("io is a static qstr");
     let sys_id = static_qstr_id(b"sys").expect("sys is a static qstr");
+    let os_id = static_qstr_id(b"os").expect("os is a static qstr");
     let math_id = static_qstr_id(b"math").expect("math is a static qstr");
-    state.builtin_modules.retain(|(q, _)| *q != io_id);
+    state
+        .builtin_modules
+        .retain(|(q, _)| *q != io_id && *q != sys_id && *q != os_id);
     state.builtin_modules.push((sys_id, Value::None));
     state.builtin_modules.push((math_id, Value::None));
     state.extensible_modules.push((io_id, Value::None));

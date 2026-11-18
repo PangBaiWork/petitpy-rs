@@ -514,20 +514,20 @@ pub fn round_builtin_kw(
     round_impl(ctx, args, ndigits_kw)
 }
 
-/// `mp_builtin_open` — STUB for D2 (`file_io.zig`): the real
-/// `open()` needs the file stream types D2 builds. Raises
-/// `NotImplementedError` (the `compile()` precedent); D2 fills
-/// this body in place and documents the seam in its result.
-pub fn open_builtin(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> {
-    Err(raise_not_implemented(ctx, Some("open() not implemented yet (D2)")))
+/// `mp_builtin_open` — D2's `file_io.zig` implementation
+/// (`objfileio::open_builtin`): `open(path, mode="r")`,
+/// returning a `TextIOWrapper` (text) or `FileIO`
+/// (binary); `fopen` failure → `OSError(errno)`.
+pub fn open_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    crate::objects::containers::objfileio::open_builtin(ctx, args)
 }
 
 pub fn open_builtin_kw(
     ctx: &mut CallCtx,
-    _args: &[Value],
-    _kwargs: &[(u32, Value)],
+    args: &[Value],
+    kwargs: &[(u32, Value)],
 ) -> PyResult<Value> {
-    Err(raise_not_implemented(ctx, Some("open() not implemented yet (D2)")))
+    crate::objects::containers::objfileio::open_builtin_kw(ctx, args, kwargs)
 }
 
 /// `mp_builtin_input` (`modbuiltins.zig:837-855`): print the

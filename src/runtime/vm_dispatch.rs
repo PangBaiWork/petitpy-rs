@@ -55,7 +55,8 @@ use crate::objects::primitives::objcell::{cell_get, cell_set};
 use crate::objects::slots::SubscrArg;
 use crate::objects::value::{Obj, Value};
 use crate::runtime::bc::CodeState;
-use crate::runtime::vm::{sync_frame_roots, VmState};
+use crate::runtime::vm::VmState;
+use crate::runtime::vm_roots::sync_frame_roots;
 use crate::runtime::vm_dispatch_exec::dispatch_exec;
 pub use crate::runtime::vm_dispatch_util::DispatchOutcome;
 use crate::runtime::vm_dispatch_util::{
@@ -345,10 +346,20 @@ pub(crate) fn dispatch_loop(
                 // the BASE on top (the compiler pushes the value
                 // first, as for `STORE_SUBSCR`'s `[value, base,
                 // index]` — C13's note). Pop the base first.
+                // The old code popped them swapped; it was
+                // unobservable while `store_attr_ctx` was a stub
+                // (it raised for every base), and D2's module
+                // store exposed it. `spop` returns `None` for a
+                // NULL slot — that IS `del x.attr` (LOAD_NULL;
+                // STORE_ATTR), so the `Option` is passed through,
+                // not coerced to the `None` object (D1's version
+                // stored None instead of deleting; the reference
+                // deletes — probed 2026-11-18: hasattr False
+                // after `del c.x`).
                 let q = decode_qstr(state, code_idx, &mut ip);
                 let base = spop(frame).unwrap_or(Value::None);
-                let v = spop(frame).unwrap_or(Value::None);
-                if let Err(e) = store_attr_ctx(ctx, state, base, q, Some(v)) {
+                let v = spop(frame);
+                if let Err(e) = store_attr_ctx(ctx, state, base, q, v) {
                     return DispatchOutcome::Raised(e);
                 }
             }
@@ -435,18 +446,20 @@ pub(crate) fn dispatch_loop(
                 spop(frame);
             }
             MP_BC_ROT_TWO => {
+                // Swap the raw slots (NULL survives — see
+                // `sset`'s doc).
                 let a = sget(frame, 0);
                 let b = sget(frame, 1);
-                sset(frame, 0, b.unwrap_or(Value::None));
-                sset(frame, 1, a.unwrap_or(Value::None));
+                sset(frame, 0, b);
+                sset(frame, 1, a);
             }
             MP_BC_ROT_THREE => {
                 let a = sget(frame, 0);
                 let b = sget(frame, 1);
                 let c = sget(frame, 2);
-                sset(frame, 0, b.unwrap_or(Value::None));
-                sset(frame, 1, c.unwrap_or(Value::None));
-                sset(frame, 2, a.unwrap_or(Value::None));
+                sset(frame, 0, b);
+                sset(frame, 1, c);
+                sset(frame, 2, a);
             }
             // ── jumps ──
             MP_BC_UNWIND_JUMP => {

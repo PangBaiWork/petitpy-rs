@@ -133,7 +133,7 @@ where
     // Root the suspended frame's values across the resume (the
     // GC only runs inside `alloc`, using these roots).
     let mark = ctx.roots.stack.len();
-    crate::runtime::vm::sync_frame_roots(ctx, &frame, mark);
+    crate::runtime::vm_roots::sync_frame_roots(ctx, &frame, mark);
     let mut runner =
         |ctx: &mut CallCtx, frame: &mut CodeState, send: Value, throw: Option<Value>| {
             execute_frame(ctx, state, frame, send, throw)
@@ -149,7 +149,7 @@ where
         let extra_base = state.extra_base;
         ctx.roots.extra.truncate(extra_base);
         for fr in state.frames.values() {
-            for v in crate::runtime::vm::frame_roots_of(fr) {
+            for v in crate::runtime::vm_roots::frame_roots_of(fr) {
                 ctx.roots.extra.push(v);
             }
         }

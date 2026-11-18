@@ -72,11 +72,16 @@ pub(crate) fn sget(frame: &CodeState, depth: usize) -> Option<Value> {
     }
 }
 
-/// `sp[-depth] = v`.
-pub(crate) fn sset(frame: &mut CodeState, depth: usize, v: Value) {
+/// `sp[-depth] = v` — the slot keeps `None` (NULL) when `v`
+/// is `None`: `ROT_TWO` / `ROT_THREE` must NOT coerce NULL
+/// into the `None` object (D2: `del x.attr` compiles to
+/// `LOAD_NULL; ROT_TWO; STORE_ATTR`, and the NULL has to
+/// survive the rotation — the Zig's `sp` holds raw `Obj`
+/// slots, 0 == NULL).
+pub(crate) fn sset(frame: &mut CodeState, depth: usize, v: Option<Value>) {
     let len = frame.stack.len();
     if depth < len {
-        frame.stack[len - 1 - depth] = Some(v);
+        frame.stack[len - 1 - depth] = v;
     }
 }
 

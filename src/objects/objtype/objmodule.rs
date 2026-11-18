@@ -115,7 +115,7 @@ pub fn new_module(ctx: &mut CallCtx, name: u32, module_type: GcRef) -> Value {
     ctx.roots.push(Value::Heap(dict));
     let module = ctx.alloc(
         Some(module_type),
-        Obj::Module(ModuleData { name, dict }),
+        Obj::Module(ModuleData { name, dict, delegation: None }),
     );
     ctx.roots.push(Value::Heap(module));
     let name_id = static_qstr_id(b"__name__").expect("__name__ is a static qstr");
@@ -284,8 +284,21 @@ pub fn module_attr_load(
             }
         }
     }
-    // Module delegation (npy_mod_attr_try_delegation) — no table
-    // in Rust yet (see module docs).
+    // Module delegation (`npy_mod_attr_try_delegation` → the
+    // vendor `mp_module_generic_attr`, `objmodule.zig:64`):
+    // only the `sys` module carries a table ([path, ps1, ps2]).
+    // A `None` slot is the C's NULL — attribute absent.
+    if let Value::Heap(r) = module {
+        if let Obj::Module(m) = ctx.arena.get(r) {
+            if let Some(d) = &m.delegation {
+                for (i, k) in d.keys.iter().enumerate() {
+                    if *k == attr {
+                        return Ok(d.values[i]);
+                    }
+                }
+            }
+        }
+    }
     Ok(None)
 }
 
@@ -341,7 +354,27 @@ pub fn module_store_attr(
             }
             target = Value::Heap(override_dict.expect("override dict just created"));
         } else {
-            // Delegation (npy_mod_attr_try_delegation) — unhandled.
+            // Delegation store (`mp_module_generic_attr` via
+            // `npy_mod_attr_try_delegation`): only a STORE to a
+            // delegated key is handled (`sys.path = [...]`
+            // works, probed 2026-11-18); a DELETE is not
+            // (`del sys.path` → AttributeError, probed), and
+            // neither is a store to a non-delegated key
+            // (`sys.foo = 42` → AttributeError, probed).
+            if let Some(v) = value {
+                if let Value::Heap(r) = module {
+                    if let Obj::Module(m) = ctx.arena.get_mut(r) {
+                        if let Some(d) = &mut m.delegation {
+                            for (i, k) in d.keys.iter().enumerate() {
+                                if *k == attr {
+                                    d.values[i] = Some(v);
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             return Ok(false);
         }
     }

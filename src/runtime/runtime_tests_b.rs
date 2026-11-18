@@ -324,6 +324,7 @@ fn store_attr_instance_type_module() {
             Obj::Module(ModuleData {
                 name: sys_q,
                 dict: d,
+                delegation: None,
             }),
         ))
     };

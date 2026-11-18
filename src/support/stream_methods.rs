@@ -324,7 +324,7 @@ pub(crate) fn stream_unbuffered_readline_builtin(ctx: &mut CallCtx, args: &[Valu
     stream_unbuffered_readline(ctx, args)
 }
 
-fn stream_unbuffered_readlines_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+pub(crate) fn stream_unbuffered_readlines_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     stream_unbuffered_readlines(ctx, args[0])
 }
 

@@ -12,6 +12,7 @@ pub mod primitives;
 pub mod slots;
 pub mod strings;
 pub mod value;
+pub mod value_data;
 
 #[cfg(test)]
 mod obj_ops_tests;

@@ -150,6 +150,39 @@ pub fn call_function_ctx(
     }
     if fun == state.sum_builtin {
         return crate::runtime::builtin_vm::call_sum_ctx(ctx, state, n_args, n_kw, args);
+    // `sys.print_exception` is intercepted the same way (D2):
+    // its default target is the VM's `sys_stdout`, which a
+    // `FunBuiltin` slot cannot see.
+    if fun == state.sys_print_exception_builtin {
+        return crate::runtime::modsys::print_exception_ctx(ctx, state, n_args, n_kw, args)
+            .map_err(|e| exc_from_pyerror(ctx, state, e));
+    }
+    // The `os` fd builtins are intercepted the same way (D2):
+    // they need `state.os_fds`, which a `FunBuiltin` slot
+    // cannot see.
+    if fun == state.os_fd_builtins.open {
+        return crate::runtime::modos_fd::os_open_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.os_fd_builtins.close {
+        return crate::runtime::modos_fd::os_close_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.os_fd_builtins.read {
+        return crate::runtime::modos_fd::os_read_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.os_fd_builtins.write {
+        return crate::runtime::modos_fd::os_write_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.os_fd_builtins.lseek {
+        return crate::runtime::modos_fd::os_lseek_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.os_fd_builtins.fsync {
+        return crate::runtime::modos_fd::os_fsync_ctx(ctx, state, n_args, n_kw, args);
+    }
+    // `os.__getattr__` is intercepted the same way (D2): it
+    // imports `os_path` / `os_ext` through the VM's import
+    // machinery, which a `FunBuiltin` slot cannot see.
+    if fun == state.os_getattr_builtin {
+        return crate::runtime::modos::os_getattr_ctx(ctx, state, n_args, n_kw, args);
     }
     match fun {
         Value::Heap(r) => match ctx.arena.get(r) {

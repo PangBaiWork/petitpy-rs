@@ -671,6 +671,8 @@ pub fn load_attr(vm: &mut Vm, base: Value, attr: u32) -> Result<Value, Value> {
 
 pub fn store_attr(vm: &mut Vm, base: Value, attr: u32, value: Value) -> Result<(), Value> {
     let (mut ctx, mut state) = vm.split();
+    // The `Vm`-level wrapper is a plain store (never a delete),
+    // so the value is always `Some`.
     store_attr_ctx(&mut ctx, &mut state, base, attr, Some(value))
 }
 

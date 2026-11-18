@@ -477,7 +477,38 @@ fn stub_subscr(
     let t = obj_get_type(ctx.arena, ctx.types, b);
     match call_subscr(ctx, t, b, i, a) {
         Ok(SlotOutcome::Value(v)) => Ok(v),
-        Ok(SlotOutcome::NotImplemented) => Err(SubscrError::Raise(PyError::PyRaise)),
+        Ok(SlotOutcome::NotImplemented) => {
+            // F4: a dict Get miss records `KeyError(key)` on the
+            // pending raise (`dict_subscr`'s `record_typed`)
+            // and reports it as `NotImplemented` here
+            // (`call_subscr` collapses every `PyRaise`).
+            // Take it: a `KeyError` becomes the `__missing__`
+            // trigger for `instance_subscr` (`SubscrError::
+            // KeyError` exists for exactly this); anything else
+            // is re-recorded verbatim. Only for Get —
+            // `instance_subscr` consults `__missing__` on Get
+            // only, and a Set/Delete miss must keep its
+            // recorded raise.
+            if matches!(a, SubscrArg::Get) {
+                if let Some(pr) = ctx.take_pending_raise() {
+                    let is_key_error = pr.exc_name == "KeyError";
+                    // Re-record verbatim: taking here only
+                    // INSPECTS the raise — the caller
+                    // (`instance_subscr`) owns the record's
+                    // lifecycle (it discards the record when
+                    // `__missing__` handles the miss and leaves
+                    // it for the drain when it doesn't).
+                    match pr.arg {
+                        Some(v) => ctx.record_raise_value(pr.exc_name, v),
+                        None => ctx.record_raise(pr.exc_name, pr.message.as_deref()),
+                    }
+                    if is_key_error {
+                        return Err(SubscrError::KeyError);
+                    }
+                }
+            }
+            Err(SubscrError::Raise(PyError::PyRaise))
+        }
         Err(ObjError::OutOfMemory) => Err(SubscrError::Raise(PyError::OutOfMemory)),
         Err(e) => Err(SubscrError::Raise(e.to_pyerror())),
     }

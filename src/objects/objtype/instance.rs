@@ -420,6 +420,21 @@ pub fn instance_subscr(
                     // would shadow the `__missing__` member.
                     match class_lookup(ctx, Some(self_in), missing_q, None, false, type_, seams) {
                         Some(LookupHit::Member(fun, bound)) => {
+                            // The miss's recorded `KeyError` is
+                            // consumed by the `__missing__`
+                            // consultation: discard it BEFORE the
+                            // call, so a raise from `__missing__`
+                            // (which travels on the hook's
+                            // `pending_exc`) is not shadowed by a
+                            // stale record — the dispatch loop
+                            // polls the recorded raise at the top
+                            // of every iteration and would fire
+                            // the `KeyError` instead of the real
+                            // raise. When no `__missing__` member
+                            // exists (the arm below) the record is
+                            // left in place for the drain, so the
+                            // miss still raises `KeyError`.
+                            let _ = ctx.take_pending_raise();
                             seams.call_pair(ctx, fun, bound, 1, 0, &[index])
                         }
                         _ => Err(PyError::PyRaise),

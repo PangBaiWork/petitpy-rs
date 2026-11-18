@@ -13,9 +13,9 @@
 //! | `py_os_lseek` (3) | stub in `modos_fd.rs` | stdio seek → ESPIPE(29, probed) |
 //! | `py_os_fsync` (1) | stub in `modos_fd.rs` | owned fds → `sync_all`; stdio fds → EINVAL (no safe std `fsync` for fd 0/1/2 — the reference calls `fsync(2)`, which returns EINVAL on the pipes/ttys stdout is in the test environment; see §4) |
 //! | `py_os_chmod` (2) | `os_chmod_builtin` | `set_permissions(from_mode(mode))` |
-//! | `py_os_chown` (3) | `os_chown_builtin` | NOT IMPLEMENTED — no std `chown` API (pure-std rule); raises `NotImplementedError` (the reference chowns; see §4) |
+//! | `py_os_chown` (3) | `os_chown_builtin` | `/bin/chown <uid>:<gid> <path>` (F5b — stderr's strerror text maps back to the errno; `-1` per side means "leave unchanged") |
 //! | `py_os_getpid` (0) | `os_getpid_builtin` | `std::process::id()` |
-//! | `py_os_kill` (2) | `os_kill_builtin` | NOT IMPLEMENTED — no std `kill` API; raises `NotImplementedError` (see §4) |
+//! | `py_os_kill` (2) | `os_kill_builtin` | `/bin/kill -s <sig> -- <pid>` (F5b — stderr's strerror text maps back to the errno; the `--` keeps a negative pid from being parsed as an option) |
 //! | `py_os_umask` (1) | `os_umask_builtin` | NOT IMPLEMENTED — no std `umask` API; raises `NotImplementedError` (see §4) |
 //! | `py_os_getcwd` (0) | `os_getcwd_builtin` | `current_dir`, raw bytes via `OsStrExt` |
 //! | `py_os_chdir` (1) | `os_chdir_builtin` | `set_current_dir` |
@@ -108,11 +108,68 @@ pub(crate) fn arg_int(ctx: &mut CallCtx, v: Value) -> PyResult<i64> {
     arg_as_int(ctx.arena, ctx.types, v).map_err(|e| ctx.record_typed(e))
 }
 
-/// A `NotImplementedError` for the three syscalls pure std
-/// cannot express (`chown`/`kill`/`umask` — see §4).
+/// A `NotImplementedError` for the syscalls pure std
+/// cannot express (`umask` — `chown`/`kill` shell out to
+/// `/bin` helpers instead, see `run_bin`).
 fn not_impl(ctx: &mut CallCtx, what: &'static str) -> PyError {
     ctx.record_raise("NotImplementedError", Some(what));
     PyError::PyRaise
+}
+
+/// Map a `/bin/kill` / `/bin/chown` stderr line to the errno
+/// the reference's libc call would have set (the child prints
+/// the strerror text, e.g. "No such process" / "No such file
+/// or directory"). Unknown text → EPERM (the most common
+/// residual failure for these two calls).
+fn errno_from_child_stderr(stderr: &[u8]) -> i32 {
+    let text = String::from_utf8_lossy(stderr);
+    if text.contains("No such process") {
+        3 // ESRCH
+    } else if text.contains("No such file or directory") {
+        2 // ENOENT
+    } else if text.contains("Not a directory") {
+        20 // ENOTDIR
+    } else if text.contains("Permission denied") {
+        13 // EACCES
+    } else if text.contains("Operation not permitted") {
+        1 // EPERM
+    } else if text.contains("Invalid argument") {
+        22 // EINVAL
+    } else {
+        1 // EPERM (fallback)
+    }
+}
+
+/// Run `/bin/<tool>` with `args` (stdin/stdout nulled,
+/// stderr piped): `Ok(())` on exit 0, else the child's
+/// stderr mapped to the reference's errno. A spawn failure
+/// maps through `os_err` (raw errno, e.g. ENOENT when the
+/// helper binary is missing); `/bin` is tried first, then
+/// the bare name via `PATH`.
+fn run_bin(ctx: &mut CallCtx, tool: &str, args: &[&std::ffi::OsStr]) -> PyResult<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(format!("/bin/{tool}"));
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => {
+            let mut fallback = Command::new(tool);
+            fallback
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            fallback.output().map_err(|e| os_err(ctx, &e))?
+        }
+    };
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(raise_os_error(ctx, errno_from_child_stderr(&out.stderr)))
+    }
 }
 
 /// Allocate a `FunBuiltin` for an os entry (the
@@ -479,9 +536,33 @@ pub fn os_chmod_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     Ok(Value::None)
 }
 
-/// `os.chown(path, uid, gid)` — NOT IMPLEMENTED (no std API).
-pub fn os_chown_builtin(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> {
-    Err(not_impl(ctx, "os.chown is not implemented (no std chown API)"))
+/// `os.chown(path, uid, gid)` (`modos.zig:363-370`): the
+/// reference is a direct libc `chown(2)` + `raiseOSError(errno)`.
+/// Pure std has no chown, so this shells out to `/bin/chown`
+/// (see `run_bin`); stderr's strerror text maps back to the
+/// errno (`No such file or directory` → ENOENT 2,
+/// `Operation not permitted` → EPERM 1). A `-1` uid/gid means
+/// "leave unchanged" in the libc call — GNU chown has no `-1`
+/// spelling, so the spec is built per side (`uid` alone,
+/// `:gid` alone, `uid:gid`, or a no-op when both are `-1`).
+/// Probed on the reference: chown of a file to its own uid/gid
+/// succeeds; a missing path → OSError(2).
+pub fn os_chown_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    let path = path_arg(ctx, args[0])?;
+    let uid = arg_int(ctx, args[1])?;
+    let gid = arg_int(ctx, args[2])?;
+    let spec = match (uid == -1, gid == -1) {
+        (true, true) => return Ok(Value::None),
+        (true, false) => format!(":{gid}"),
+        (false, true) => format!("{uid}"),
+        (false, false) => format!("{uid}:{gid}"),
+    };
+    run_bin(
+        ctx,
+        "chown",
+        &[std::ffi::OsStr::new(&spec), std::ffi::OsStr::from_bytes(&path)],
+    )?;
+    Ok(Value::None)
 }
 
 /// `os.getpid()` (`modos.zig:374-376`).
@@ -490,9 +571,29 @@ pub fn os_getpid_builtin(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> 
     Ok(Value::SmallInt(std::process::id() as i64))
 }
 
-/// `os.kill(pid, sig)` — NOT IMPLEMENTED (no std API).
-pub fn os_kill_builtin(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> {
-    Err(not_impl(ctx, "os.kill is not implemented (no std kill API)"))
+/// `os.kill(pid, sig)` (`modos.zig:375-380`): the reference
+/// is a direct libc `kill(2)` + `raiseOSError(errno)`. Pure
+/// std has no kill, so this shells out to `/bin/kill -s <sig>
+/// -- <pid>` (see `run_bin`); the `--` keeps a negative pid
+/// from being parsed as an option — without it procps `kill`
+/// silently succeeds on a nonexistent group. Probed on the
+/// reference: `kill(-99999, 0)` → OSError(3, ESRCH);
+/// `kill(pid, 999)` → OSError(22, EINVAL); `kill(-1, 0)` /
+/// `kill(0, 0)` → no error.
+pub fn os_kill_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    let pid = arg_int(ctx, args[0])?;
+    let sig = arg_int(ctx, args[1])?;
+    run_bin(
+        ctx,
+        "kill",
+        &[
+            std::ffi::OsStr::new("-s"),
+            std::ffi::OsStr::new(&sig.to_string()),
+            std::ffi::OsStr::new("--"),
+            std::ffi::OsStr::new(&pid.to_string()),
+        ],
+    )?;
+    Ok(Value::None)
 }
 
 /// `os.umask(mask)` — NOT IMPLEMENTED (no std API).

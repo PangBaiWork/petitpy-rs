@@ -1,0 +1,176 @@
+F5b 杂项单点 — 结果报告
+====================
+Lane: lane/f5b-misc, worktree ~/workspace/petitpy-rs-f5b-misc
+Base: master 881627b (F3 已合并; full 545/552 GREEN, integration 192/202,
+golden 585/585, capability GREEN, stdlib 8/8, nano 454/541, lib 1669+3)
+注意: 本 lane 执行期间 master 前进到 aa18a95 (F5a 合并, integration
+193/202, lib 1680+3)。本文件数字以 lane base 881627b 为准; rebase 后
+预期: integration 193→198/202 (本 lane 5 个目标 + F5a 的 runtime_annotations)。
+
+§1 验收数字 (全部在本 worktree 实测, 非转述)
+----------------------------------------------
+- lib: 1677 passed / 0 failed / 3 ignored
+  (base 1669 + 7 个新 f5b 测试 + 1 个新 subprocess 合并测试)
+- bins: 9 passed; entry_cli: 45 passed
+- 0 warnings (touch src/lib.rs 强制重编); 0 unsafe 代码
+  (diff 中 "unsafe" 命中全部是 doc 注释里提到该词, 无 unsafe 块)
+- 最大改动文件 src/runtime/modos.rs 816 行 < 2500
+- check_compile_mpy.py PASS (byte mismatches: 0)
+- check_frozen.py PASS (38141 bytes, 23 .mpy)
+- full gate: GREEN (7 known-fails, 与 baseline 完全一致)
+- integration: 192 → 197/202, 仅 5 个目标 case 翻转, 0 回归
+  剩余 fails (5): runtime_annotations (F5a 的, rebase 后翻转),
+  gc_reclaims_garbage + gc_closes_dropped_files_and_sockets (F6),
+  select_timeout_zero_returns_promptly + select_readable_fd_is_ready
+  (stretch, 见 §4 — 已定为 documented divergence)
+- golden: 585/585; capability: GREEN; stdlib: 8/8; nano: 454/541 (report-only)
+
+§2 机制 (四个, 各对照原文)
+----------------------------
+(1) itertools — 导入模块里的 generator 解析不到模块全局变量
+    根因 (主代理 2026-11-19 ~04:1x 定位, 本 lane 验证):
+    vendor src/objects/callables/objgenerator.zig:221-227,
+    mp_obj_gen_resume 在 mp_execute_bytecode 前后把 globals 切换成
+    generator 函数的模块全局 (fun_bc.context → module → globals)
+    再恢复。Rust 的普通调用路径 call_fun_bc_ctx
+    (src/runtime/vm_call.rs) 做了同样切换, 但 gen_wrap 路径把
+    frame 存进 VmState.frames 时没记录 globals, run_gen_frame_ctx
+    在调用者的 globals 下恢复执行。
+    改动: src/runtime/vm_gen.rs run_gen_frame_ctx — 从 frame.fun
+    (FunBc.context → module dict, 与 call_fun_bc_ctx 同形; None
+    时保持当前 globals, 兼容测试构造的函数) 派生模块全局变量,
+    在 f(...) 调用前后切换/恢复 state.globals。
+    覆盖: f5b_gen_globals_before_first_yield,
+    f5b_gen_globals_after_yield_and_yield_from,
+    f5b_itertools_zip_longest_repeat。itertools.py 本身未动。
+
+(2) socket.fromfd — SocketState::Foreign
+    参考语义 (实测, 见 §3): fileno() == fd; close() 后 fileno() 为
+    -1 且原 fd 已关闭 (Zig 直接 wrap fd, 不 dup; 与 CPython 不同)。
+    D3 的 SOCKETS 表是进程全局 HashMap<RawFd, SocketState>;
+    取所有权需要 from_raw_fd/borrow_raw, 都是 unsafe, 纯 std 无路。
+    改动: src/modules/modsocket.rs — 新变体 SocketState::Foreign
+    (无自有对象, fd 仅作表键); socket_fromfd 对 fd >= 0 插入
+    Foreign (fd < 0 保持旧的无条目 closed-socket 行为);
+    fileno() 返回 fd; close() 删条目并记 -1; dup_fd /
+    sock_setblocking 对 Foreign 返回 EBADF。
+    覆盖: src/modules/modsocket_tests.rs socket_fromfd 改写
+    (原断言 NotImplementedError, 现断言 fileno == fd 再 -1),
+    f5b_socket_fromfd_fileno。
+    Divergence: close() 不关闭 OS fd (见 §4)。
+
+(3) subprocess stderr=STDOUT 合并
+    参考语义: Zig src/modules/mod_subprocess.zig:188 对 STDOUT
+    做 dup2(1, fd) — 在 stdout 已建好之后 (循环顺序 i=0,1,2),
+    所以子进程 stderr 汇入子进程的 stdout 流 (stdout==PIPE 时即
+    该 pipe)。Rust bug: stdio_for 的 STDOUT 分支 dup 的是父进程
+    的 fd 1, stdout=PIPE 时子进程 stderr 去了父进程 stdout 而不
+    是 pipe。
+    改动: src/modules/modsubprocess.rs — spawn_and_wait 中
+    stdout==PIPE 且 stderr==STDOUT 时, 两路共享一个
+    UnixStream::pair: 写端 dup 两次成 OwnedFd (as_fd +
+    try_clone_to_owned, socket 模块的安全模式; Stdio 没有
+    From<UnixStream>, 首次尝试 E0277) 分别作 stdout/stderr
+    Stdio, 父进程用既有 drain_thread 读读端 (合并字节, 写顺序
+    保留); 新 helper stderr_stdio_for 处理非 pipe 情形
+    (stdout=DEVNULL → null; stdout=fd → 重开 /proc/self/fd/<fd>
+    只写; stdout=INHERIT/STDOUT → dup 父 fd 1, 旧分支)。
+    关键 bug 修复: spawn 后必须立即 drop(cmd) — Command 持有
+    Stdio 的父进程端 fd 副本直到函数返回, 不 drop 则 drain 线程
+    永远等不到 EOF, finish 的 rx.recv() 永久阻塞
+    (subprocess_stderr_stdout_merged 曾挂 60s+; 用 /proc/<pid>/fd
+    确认父进程持有两份写端 socket:[...] 后定位)。
+    覆盖: modsubprocess_tests.rs 新测试
+    subprocess_stderr_stdout_merged (期望 (0, Some(b"out\nerr\n"),
+    None, false)), f5b_subprocess_stderr_stdout_text。
+
+(4) os.kill / os.chown — /bin 助手进程
+    参考语义: Zig src/modules/modos.zig:363-380 直接 libc
+    chown(2)/kill(2) + raiseOSError(errno) → OSError (errno,)
+    单元素元组。实测: kill(-99999,0) → OSError(3,);
+    kill(pid,999)/kill(pid,-1) → OSError(22,);
+    kill(-1,0)/kill(0,0)/kill(自身,0) 无错; chown 自身 uid/gid
+    成功, 缺失路径 OSError(2,)。
+    改动: src/runtime/modos.rs — 新 helper run_bin (先试
+    /bin/<tool>, 失败则 PATH 找同名; stdin/stdout 置空, stderr
+    管道; 退出 0 → Ok, 否则 stderr 文本 → errno:
+    "No such process"→3 ESRCH, "No such file or directory"→2,
+    "Not a directory"→20, "Permission denied"→13,
+    "Operation not permitted"→1, "Invalid argument"→22, 未知→1);
+    os_kill_builtin = /bin/kill -s <sig> -- <pid> (-- 不可省:
+    无 -- 时负 pid 被当作选项静默返回 0, 危险);
+    os_chown_builtin = /bin/chown <spec> <path>, spec 按侧拼
+    (仅 uid / :gid / uid:gid, 两侧都 -1 时不调用, 因 -1 在 libc
+    调用中意为"保持不变", 而 /bin/chown 不接受 -1)。
+    raise_os_error (src/runtime/raise.rs:55) 记录单元素 errno
+    OSError, 与参考 (errno,) 同形。
+    覆盖: modos_tests.rs os_unimplemented_stubs 改写 (umask 仍
+    NotImplementedError; kill(1,0) + chown("/tmp",0,0) 现为
+    run_ok), f5b_os_kill_esrch_raises,
+    f5b_os_chown_self_noop。
+    注意: 未伪造 ProcessLookupError 等异常类型 — petitpy 里没有
+    该名字, case 捕获的是 OSError。
+
+§3 探针表 (REF vs Rust, stdout+stderr+rc 字节比较;
+探针 ~/workspace/f5b_probe/, 输出 ~/workspace/f5b_verify/)
+------------------------------------------------------------
+- p_itertools_cpython_functions.py (integration case 原文):
+  IDENTICAL (rc=0)
+- p_socket_fromfd_wraps_fd.py (integration case 原文): IDENTICAL (rc=0)
+- p_subprocess_streams_env_cwd_text.py (integration case 原文):
+  IDENTICAL (rc=0) — 期望输出
+  inherited / 'e1\nerr\n' None / / / None / b'co\n' 全对
+- p_os_kill_esrch_raises.py (integration case 原文): IDENTICAL (rc=0)
+- p_os_chown_self_noop.py (integration case 原文): IDENTICAL (rc=0)
+- p_select_timeout_zero_returns_promptly.py: DIFFERS
+  (REF True rc=0; Rust NotImplementedError rc=1) — 见 §4
+- p_select_readable_fd_is_ready.py: DIFFERS
+  (REF True rc=0; Rust NotImplementedError rc=1) — 见 §4
+- run2.py / run.py (最小复现 mymod2.py / mymod.py):
+  IDENTICAL — REF [10]/[20] 与 30/[1,70], Rust 同
+
+§4 遗留 (未完成 / 已知 divergence)
+--------------------------------------
+(a) select ×2 — DOCUMENTED DIVERGENCE (stretch 放弃, 按 brief 决定)。
+    原因: 纯 std 没有 select(2)/poll(2); Command 子进程不继承
+    非 stdio fd (std 会关闭), 故也不能把 fd 交给 python3 助手做
+    poll; 线程读一字节再藏起来的做法被 brief 明文禁止
+    (会破坏后续 os.read 语义); listener 上 accept 再藏起来同理
+    会消费一个挂起连接 (D4 modselect.rs 文档已记录该点)。
+    唯一无读的纯 std 判定 (常规文件总可读) 只能覆盖 /dev/null
+    一种情形且需 /proc 启发式, 不干净, 故不做。
+    影响: integration 天花板为 200/202 (F6 翻转 2 个 gc case 后);
+    任务书 §3.5 的 200/202 上限保持不变, select 两项即其缺口。
+(b) socket.fromfd 不拥有 OS fd: close() 不关闭底层 fd
+    (参考会关闭; 纯 std 无 from_raw_fd 的安全替代)。
+    影响: 集成 case 只断言 fileno() == fd, 通过; 但关闭后原 fd
+    仍可被 os.close(fd) 再次使用, 与参考行为不同。已记录在
+    SocketState::Foreign 文档与模块文档中。
+(c) subprocess 超时 kill 信号: D3 已记录 — Rust 用 SIGKILL(-9),
+    参考 SIGTERM(-15)。未动。
+(d) os.umask 仍为 NotImplementedError stub (D2 遗留); kill/chown
+    现走 /bin 助手, umask 未动。
+(e) Stale-base 说明: 本 lane 基线 881627b; master 现为 aa18a95
+    (F5a)。Rebase 时预期冲突: src/runtime/mod.rs —
+    F5a 加了 `mod vm_tests_f5a`, 本 lane 在同区域加了
+    `mod vm_tests_f5b`; 按 E2i 教训, 解决后必须逐项核对两个
+    #[cfg(test)] 属性都存活。Rebase 后预期 integration 198/202
+    (5 个本 lane 目标 + F5a 的 runtime_annotations), lib 1688+3
+    (aa18a95 的 1680 + 本 lane 8 个新测试)。
+(f) F4 §4 遗留未动: super_make_new 仍丢错误信息; ctx-only
+    __missing__ 路径仍 bare TypeError。
+
+§5 改动文件 (本次提交, 9 个; 不含 brief)
+-----------------------------------------
+- src/runtime/vm_gen.rs (+22): generator 恢复时切换模块全局变量
+- src/runtime/vm_tests_f5b.rs (NEW, 233): 7 个 f5b 测试
+- src/runtime/mod.rs (+2): 注册 vm_tests_f5b
+- src/modules/modsocket.rs (+56/-): SocketState::Foreign + 文档
+- src/modules/modsocket_tests.rs (+23/-): fromfd 测试改写
+- src/modules/modsubprocess.rs (+92/-): 共享 pair 合并 + drop(cmd)
+  + stderr_stdio_for
+- src/modules/modsubprocess_tests.rs (+19): 合并测试
+- src/runtime/modos.rs (+121/-): run_bin + kill/chown
+- src/runtime/modos_tests.rs (+14/-): stubs 测试改写
+- scripts/f5b_result.txt (本文件)
+(brief scripts/f5b_brief.md 为 untracked, 不提交。)

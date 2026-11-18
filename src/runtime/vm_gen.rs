@@ -140,11 +140,33 @@ where
     // GC only runs inside `alloc`, using these roots).
     let mark = ctx.roots.stack.len();
     crate::runtime::vm_roots::sync_frame_roots(ctx, &frame, mark);
+    // F5b: the generator's module globals (objgenerator.zig:221-227
+    // — `mp_obj_gen_resume` sets globals to the generator
+    // function's module globals around `mp_execute_bytecode`).
+    // The frame carries no globals of its own, so without this
+    // switch a generator defined in an imported module resumes
+    // under the CALLER's globals and every LOAD_GLOBAL misses
+    // (`NameError` — e.g. `itertools.zip_longest` calling
+    // module-global `repeat`). Derived from the frame's `fun`
+    // exactly like the plain-call path in `call_fun_bc_ctx`;
+    // `None` (test-built functions) keeps the current globals.
+    let module_globals = match ctx.arena.get(frame.fun) {
+        Obj::FunBc(d) => d.context.and_then(|m| match ctx.arena.get(m) {
+            Obj::Module(md) => Some(md.dict),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let old_globals = state.globals;
+    if let Some(g) = module_globals {
+        state.globals = g;
+    }
     let mut runner =
         |ctx: &mut CallCtx, frame: &mut CodeState, send: Value, throw: Option<Value>| {
             execute_frame(ctx, state, frame, send, throw)
         };
     let result = f(ctx, &mut frame, &mut runner);
+    state.globals = old_globals;
     ctx.roots.stack.truncate(mark);
     // A yield suspends the frame: store it and re-root it (its
     // values changed during the run — the old `roots.extra`

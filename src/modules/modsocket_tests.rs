@@ -471,9 +471,12 @@ fn socket_roundtrip() {
 
 /// `fromfd(-1, ...)` behaves like a closed socket (the
 /// Zig wraps the fd directly and fails at use); `fromfd`
-/// on a real fd raises `NotImplementedError` — safe
-/// pure-`std` Rust cannot take ownership of a foreign fd
-/// (see `socket_fromfd`).
+/// on a real fd wraps it as `SocketState::Foreign` (F5b):
+/// `fileno()` returns the fd, `close()` drops the entry
+/// and stores `-1` — but the OS fd is NOT closed (taking
+/// ownership needs `from_raw_fd`, `unsafe`; the reference
+/// DOES close it — documented divergence, see the module
+/// docs and `scripts/f5b_result.txt` §4).
 #[test]
 fn socket_fromfd() {
     let mut fx = Fx::new();
@@ -488,15 +491,11 @@ fn socket_fromfd() {
     );
     let (a, _b) = UnixStream::pair().expect("pair");
     let fd = a.as_raw_fd();
-    assert_eq!(
-        fx.raised_msg(&format!(
-            "import socket\ns = socket.fromfd({fd}, socket.AF_UNIX, socket.SOCK_STREAM)"
-        )),
-        (
-            "NotImplementedError".to_string(),
-            "fromfd requires taking ownership of a foreign fd".to_string()
-        )
-    );
+    fx.run_ok(&format!(
+        "import socket\ns = socket.fromfd({fd}, socket.AF_UNIX, socket.SOCK_STREAM)\nassert s.fileno() == {fd}\ns.close()\nassert s.fileno() == -1\n"
+    ));
+    // The caller's fd is still open (the divergence): the
+    // pair's other end can still send through it.
     drop(a);
 }
 

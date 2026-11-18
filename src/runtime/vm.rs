@@ -97,6 +97,15 @@ pub struct VmState {
     pub locals: Option<GcRef>,
     /// The builtins globals dict (`mp_load_global`'s fallback).
     pub builtins: GcRef,
+    /// The `builtins.X = Y` override dict
+    /// (`mp_module_builtins_override_dict`, the Zig-side global
+    /// in objmodule.zig:55): `None` until the first store into
+    /// the (fixed) builtins module installs one (E2i — the
+    /// `Builtins::override_dict` seams in `runtime_names` /
+    /// `runtime_import` / `runtime_method` existed since C14/D1
+    /// but the VM never persisted the dict, so every override
+    /// was dropped at the end of its own `STORE_ATTR` call).
+    pub builtins_override_dict: Option<Value>,
     /// The VM-owned empty-tuple singleton (`mp_const_empty_tuple`).
     pub empty_tuple: Value,
     /// The VM-owned Ellipsis singleton (`mp_const_ellipsis_obj`).
@@ -153,6 +162,16 @@ pub struct VmState {
     /// VM's real call hook to collect the iterable first.
     pub str_join_builtin: Value,
     pub bytes_join_builtin: Value,
+    /// The `array.extend` / `bytearray.extend` method builtins
+    /// (E2i): two different `FunBuiltin` objects (each type
+    /// dict is built from its own table — see the `str.join` /
+    /// `bytes.join` note above). Intercepted by GcRef identity
+    /// in `call_function_ctx` (see `call_array_extend_ctx` in
+    /// `builtin_vm.rs`) — `array_extend` is ctx-only and its
+    /// `collect_iterable` cannot resume a generator, so
+    /// `a.extend(gen())` needs the VM's real call hook.
+    pub array_extend_builtin: Value,
+    pub bytearray_extend_builtin: Value,
     /// The `list.sort` method builtin (E2c): the `FunBuiltin`
     /// from the list type dict. Intercepted by GcRef identity
     /// in `call_function_ctx` (see `call_list_sort_ctx` in
@@ -424,6 +443,7 @@ impl Vm {
                 globals: GcRef(0),
                 locals: None,
                 builtins: GcRef(0),
+                builtins_override_dict: None,
                 empty_tuple,
                 ellipsis,
                 frames: HashMap::new(),
@@ -442,6 +462,8 @@ impl Vm {
                 sorted_builtin: Value::None,
                 str_join_builtin: Value::None,
                 bytes_join_builtin: Value::None,
+                array_extend_builtin: Value::None,
+                bytearray_extend_builtin: Value::None,
                 list_sort_builtin: Value::None,
                 hash_builtin: Value::None,
                 min_builtin: Value::None,

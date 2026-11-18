@@ -16,12 +16,13 @@
 //! (`mp_obj_get_int` bounds — probed).
 
 use super::iter::{
-    getiter, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
+    getiter_hook, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
     ENUMERATE_ITER_TAG, FLAG_ITER_IS_ITERNEXT, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objtuple::new_tuple;
 use crate::objects::obj::obj_get_int;
+use crate::objects::slots::CallHook;
 use crate::objects::objtype::make_new::enumerate_make_new_slot;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{GcRef, IteratorData, Obj, TypeData, Value};
@@ -35,6 +36,7 @@ pub fn enumerate_make_new(
     ctx: &mut CallCtx,
     args: &[Value],
     n_kw: usize,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<Value, IterError> {
     let Some(n_pos) = args.len().checked_sub(n_kw * 2) else {
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
@@ -84,7 +86,7 @@ pub fn enumerate_make_new(
         Some(v) => obj_get_int(ctx, ctx.types, v).map_err(IterError::from)?,
         None => 0,
     };
-    let iter = getiter(ctx, iterable)?;
+    let iter = getiter_hook(ctx, iterable, hook.as_deref_mut())?;
     let cur = Value::int(ctx.arena, Some(ctx.types.int), ctx.roots, start_n);
     Ok(new_iter(
         ctx,
@@ -193,7 +195,7 @@ mod tests {
         ]);
         let mut ctx = fx.ctx();
         let mut ps = PanicSeams::new();
-        let e = enumerate_make_new(&mut ctx, &[list], 0).unwrap();
+        let e = enumerate_make_new(&mut ctx, &[list], 0, None).unwrap();
         let items = collect_all(&mut ctx, e, &mut ps.seams()).unwrap();
         assert_eq!(items.len(), 3);
         assert_eq!(
@@ -205,14 +207,14 @@ mod tests {
             vec![Value::SmallInt(2), Value::SmallInt(30)]
         );
         // start = 5 (positional).
-        let e5 = enumerate_make_new(&mut ctx, &[list, Value::SmallInt(5)], 0).unwrap();
+        let e5 = enumerate_make_new(&mut ctx, &[list, Value::SmallInt(5)], 0, None).unwrap();
         let items = collect_all(&mut ctx, e5, &mut ps.seams()).unwrap();
         assert_eq!(
             tuple_items(&ctx, items[0]),
             vec![Value::SmallInt(5), Value::SmallInt(10)]
         );
         // start = -1.
-        let em = enumerate_make_new(&mut ctx, &[list, Value::SmallInt(-1)], 0).unwrap();
+        let em = enumerate_make_new(&mut ctx, &[list, Value::SmallInt(-1)], 0, None).unwrap();
         let items = collect_all(&mut ctx, em, &mut ps.seams()).unwrap();
         assert_eq!(
             tuple_items(&ctx, items[0]),
@@ -229,7 +231,7 @@ mod tests {
         // counter becomes a heap Int (the Zig's raw shift would
         // be garbage here — Rust keeps the true value).
         let big = Value::int(ctx.arena, Some(ctx.types.int), ctx.roots, 1i64 << 62);
-        let e = enumerate_make_new(&mut ctx, &[list, big], 0).unwrap();
+        let e = enumerate_make_new(&mut ctx, &[list, big], 0, None).unwrap();
         let mut ps = PanicSeams::new();
         let items = collect_all(&mut ctx, e, &mut ps.seams()).unwrap();
         assert_eq!(items.len(), 1);
@@ -259,6 +261,7 @@ mod tests {
             &mut ctx,
             &[list, Value::Qstr(start_id), Value::SmallInt(3)],
             1,
+            None
         )
         .unwrap();
         let items = collect_all(&mut ctx, e, &mut ps.seams()).unwrap();
@@ -271,6 +274,7 @@ mod tests {
             &mut ctx,
             &[Value::Qstr(iter_id), other, Value::Qstr(start_id), Value::SmallInt(4)],
             2,
+            None
         )
         .unwrap();
         let items = collect_all(&mut ctx, e, &mut ps.seams()).unwrap();
@@ -283,7 +287,8 @@ mod tests {
             enumerate_make_new(
                 &mut ctx,
                 &[list, Value::SmallInt(1), Value::Qstr(start_id), Value::SmallInt(2)],
-                1
+                1,
+                None
             ),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
@@ -292,7 +297,8 @@ mod tests {
             enumerate_make_new(
                 &mut ctx,
                 &[list, Value::Qstr(bad_id), Value::SmallInt(2)],
-                1
+                1,
+                None
             ),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
@@ -301,12 +307,13 @@ mod tests {
             enumerate_make_new(
                 &mut ctx,
                 &[list, Value::SmallInt(1), Value::SmallInt(2)],
-                0
+                0,
+                None
             ),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
         assert_eq!(
-            enumerate_make_new(&mut ctx, &[], 0),
+            enumerate_make_new(&mut ctx, &[], 0, None),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
     }
@@ -320,20 +327,20 @@ mod tests {
         let mut ctx = fx.ctx();
         // 2**70 → OverflowError (probed).
         assert_eq!(
-            enumerate_make_new(&mut ctx, &[list, big], 0),
+            enumerate_make_new(&mut ctx, &[list, big], 0, None),
             Err(IterError::Obj(crate::objects::obj::ObjError::Overflow))
         );
         // Non-int start → "can't convert to int" (probed for a
         // float start; the str goes through the same conversion).
         assert_eq!(
-            enumerate_make_new(&mut ctx, &[list, not_int], 0),
+            enumerate_make_new(&mut ctx, &[list, not_int], 0, None),
             Err(IterError::Obj(
                 crate::objects::obj::ObjError::IntConversion
             ))
         );
         // Non-iterable → "object not iterable".
         assert_eq!(
-            enumerate_make_new(&mut ctx, &[Value::SmallInt(5)], 0),
+            enumerate_make_new(&mut ctx, &[Value::SmallInt(5)], 0, None),
             Err(IterError::TypeError("object not iterable"))
         );
     }

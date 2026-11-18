@@ -109,6 +109,16 @@ pub(crate) fn intercept_builtin_call(
     if fun == state.str_join_builtin || fun == state.bytes_join_builtin {
         return Some(crate::runtime::builtin_vm::call_join_ctx(ctx, state, n_args, n_kw, args));
     }
+    // `array.extend` / `bytearray.extend` (E2i): intercepted
+    // by GcRef identity so a generator / genexpr iterable is
+    // collected through the VM's real call hook before the
+    // ctx-only `array_extend` runs (see
+    // `call_array_extend_ctx`).
+    if fun == state.array_extend_builtin || fun == state.bytearray_extend_builtin {
+        return Some(crate::runtime::builtin_vm::call_array_extend_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     // `list.sort` (E2c): intercepted by GcRef identity so a
     // non-`None` key runs through the VM's real call hook (see
     // `call_list_sort_ctx`); a `None` key delegates to the

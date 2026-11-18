@@ -11,12 +11,13 @@
 //! (the Zig has none — `zip(…, strict=True)` is a sig error).
 
 use super::iter::{
-    getiter, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
+    getiter_hook, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
     FLAG_ITER_IS_ITERNEXT, ZIP_ITER_TAG, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objtuple::new_tuple;
 use crate::objects::objtype::make_new::zip_make_new_slot;
+use crate::objects::slots::CallHook;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{GcRef, IteratorData, Obj, TypeData, Value};
 
@@ -28,6 +29,7 @@ pub fn zip_make_new(
     ctx: &mut CallCtx,
     args: &[Value],
     n_kw: usize,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<Value, IterError> {
     let Some(n_pos) = args.len().checked_sub(n_kw * 2) else {
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
@@ -37,7 +39,7 @@ pub fn zip_make_new(
     let sig_err = n_kw > 0;
     let mut iters = Vec::with_capacity(n_pos);
     for &arg in &args[..n_pos] {
-        iters.push(getiter(ctx, arg)?);
+        iters.push(getiter_hook(ctx, arg, hook.as_deref_mut())?);
     }
     if sig_err {
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
@@ -155,7 +157,7 @@ mod tests {
         let mut ctx = fx.ctx();
         let mut ps = PanicSeams::new();
         // zip([1,2],[3]) → [(1,3)].
-        let z = zip_make_new(&mut ctx, &[a, b], 0).unwrap();
+        let z = zip_make_new(&mut ctx, &[a, b], 0, None).unwrap();
         let items = collect_all(&mut ctx, z, &mut ps.seams()).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -163,17 +165,17 @@ mod tests {
             vec![Value::SmallInt(1), Value::SmallInt(3)]
         );
         // zip([1,2]) → [(1,),(2,)].
-        let z = zip_make_new(&mut ctx, &[a], 0).unwrap();
+        let z = zip_make_new(&mut ctx, &[a], 0, None).unwrap();
         let items = collect_all(&mut ctx, z, &mut ps.seams()).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(tuple_items(&ctx, items[0]), vec![Value::SmallInt(1)]);
         assert_eq!(tuple_items(&ctx, items[1]), vec![Value::SmallInt(2)]);
         // zip() → [].
-        let z = zip_make_new(&mut ctx, &[], 0).unwrap();
+        let z = zip_make_new(&mut ctx, &[], 0, None).unwrap();
         let items = collect_all(&mut ctx, z, &mut ps.seams()).unwrap();
         assert!(items.is_empty());
         // Three iterables stop at the shortest.
-        let z = zip_make_new(&mut ctx, &[a, b, c], 0).unwrap();
+        let z = zip_make_new(&mut ctx, &[a, b, c], 0, None).unwrap();
         let items = collect_all(&mut ctx, z, &mut ps.seams()).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -193,13 +195,14 @@ mod tests {
             zip_make_new(
                 &mut ctx,
                 &[a, Value::Qstr(strict_id), Value::Bool(true)],
-                1
+                1,
+                None
             ),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
         // Non-iterable → "object not iterable" at construction.
         assert_eq!(
-            zip_make_new(&mut ctx, &[a, Value::SmallInt(5)], 0),
+            zip_make_new(&mut ctx, &[a, Value::SmallInt(5)], 0, None),
             Err(IterError::TypeError("object not iterable"))
         );
     }
@@ -212,8 +215,8 @@ mod tests {
         let b = fx.heap_list(vec![Value::SmallInt(10), Value::SmallInt(20)]);
         let c = fx.heap_list(vec![Value::SmallInt(100), Value::SmallInt(200)]);
         let mut ctx = fx.ctx();
-        let m = map_make_new(&mut ctx, &[Value::Qstr(add_id), a, b], 0).unwrap();
-        let z = zip_make_new(&mut ctx, &[m, c], 0).unwrap();
+        let m = map_make_new(&mut ctx, &[Value::Qstr(add_id), a, b], 0, None).unwrap();
+        let z = zip_make_new(&mut ctx, &[m, c], 0, None).unwrap();
         let mut call = |ctx: &mut CallCtx, fun: Value, args: &[Value]| -> CallOutcome {
             match token_bytes(ctx, fun) {
                 Some(b"add") => {

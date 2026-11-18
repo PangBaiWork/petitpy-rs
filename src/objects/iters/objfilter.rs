@@ -11,12 +11,13 @@
 //! keep the item when the result is truthy.
 
 use super::iter::{
-    getiter, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams,
+    getiter_hook, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams,
     FILTER_ITER_TAG, FLAG_ITER_IS_ITERNEXT, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
 use crate::objects::obj::obj_is_true;
 use crate::objects::objtype::make_new::filter_make_new_slot;
+use crate::objects::slots::CallHook;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{GcRef, IteratorData, Obj, TypeData, Value};
 
@@ -28,6 +29,7 @@ pub fn filter_make_new(
     ctx: &mut CallCtx,
     args: &[Value],
     n_kw: usize,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<Value, IterError> {
     let sig_err = n_kw > 0 || args.len() != 2;
     if args.len() < 2 {
@@ -35,7 +37,7 @@ pub fn filter_make_new(
         // is the only possible outcome.
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
     }
-    let iter = getiter(ctx, args[1])?;
+    let iter = getiter_hook(ctx, args[1], hook.as_deref_mut())?;
     if sig_err {
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
     }
@@ -181,7 +183,7 @@ mod tests {
             a_str,
         ]);
         let mut ctx = fx.ctx();
-        let f = filter_make_new(&mut ctx, &[Value::None, list], 0).unwrap();
+        let f = filter_make_new(&mut ctx, &[Value::None, list], 0, None).unwrap();
         let mut call = call_seam();
         let mut getitem = no_getitem();
         let items = collect_all(&mut ctx, f, &mut seams(&mut call, &mut getitem)).unwrap();
@@ -202,7 +204,7 @@ mod tests {
             Value::SmallInt(4),
         ]);
         let mut ctx = fx.ctx();
-        let f = filter_make_new(&mut ctx, &[Value::Qstr(pred_id), list], 0).unwrap();
+        let f = filter_make_new(&mut ctx, &[Value::Qstr(pred_id), list], 0, None).unwrap();
         let mut call = call_seam();
         let mut getitem = no_getitem();
         let items = collect_all(&mut ctx, f, &mut seams(&mut call, &mut getitem)).unwrap();
@@ -217,24 +219,25 @@ mod tests {
         let mut ctx = fx.ctx();
         // 1 arg / 3 args / kwargs → sig error.
         assert_eq!(
-            filter_make_new(&mut ctx, &[Value::Qstr(pred_id)], 0),
+            filter_make_new(&mut ctx, &[Value::Qstr(pred_id)], 0, None),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
         assert_eq!(
             filter_make_new(
                 &mut ctx,
                 &[Value::Qstr(pred_id), list, list],
-                0
+                0,
+                None
             ),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
         assert_eq!(
-            filter_make_new(&mut ctx, &[Value::Qstr(pred_id), list], 1),
+            filter_make_new(&mut ctx, &[Value::Qstr(pred_id), list], 1, None),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
         // Non-iterable → "object not iterable" at construction.
         assert_eq!(
-            filter_make_new(&mut ctx, &[Value::Qstr(pred_id), Value::SmallInt(5)], 0),
+            filter_make_new(&mut ctx, &[Value::Qstr(pred_id), Value::SmallInt(5)], 0, None),
             Err(IterError::TypeError("object not iterable"))
         );
     }
@@ -247,7 +250,7 @@ mod tests {
         let list = fx.heap_list(vec![Value::SmallInt(1)]);
         let mut ctx = fx.ctx();
         for fun in [Value::Qstr(raises_id), Value::Qstr(stops_id)] {
-            let f = filter_make_new(&mut ctx, &[fun, list], 0).unwrap();
+            let f = filter_make_new(&mut ctx, &[fun, list], 0, None).unwrap();
             let mut call = call_seam();
             let mut getitem = no_getitem();
             let out = collect_all(&mut ctx, f, &mut seams(&mut call, &mut getitem));

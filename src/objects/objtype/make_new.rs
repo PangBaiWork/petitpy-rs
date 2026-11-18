@@ -215,9 +215,9 @@ pub fn map_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    let v = map_make_new(ctx, args, n_kw).map_err(|e| ctx.record_typed(e))?;
+    let v = map_make_new(ctx, args, n_kw, call).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {
         ctx.arena.set_header_type(r, Some(type_));
     }
@@ -230,9 +230,9 @@ pub fn filter_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    let v = filter_make_new(ctx, args, n_kw).map_err(|e| ctx.record_typed(e))?;
+    let v = filter_make_new(ctx, args, n_kw, call).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {
         ctx.arena.set_header_type(r, Some(type_));
     }
@@ -312,9 +312,9 @@ pub fn zip_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    let v = zip_make_new(ctx, args, n_kw).map_err(|e| ctx.record_typed(e))?;
+    let v = zip_make_new(ctx, args, n_kw, call).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {
         ctx.arena.set_header_type(r, Some(type_));
     }
@@ -327,9 +327,9 @@ pub fn enumerate_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    let v = enumerate_make_new(ctx, args, n_kw).map_err(|e| ctx.record_typed(e))?;
+    let v = enumerate_make_new(ctx, args, n_kw, call).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {
         ctx.arena.set_header_type(r, Some(type_));
     }

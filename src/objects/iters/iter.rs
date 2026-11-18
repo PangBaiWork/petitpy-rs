@@ -443,6 +443,64 @@ pub fn getiter(ctx: &mut CallCtx, value: Value) -> Result<Value, IterError> {
     Err(IterError::TypeError(NOT_ITERABLE))
 }
 
+/// `getiter` through the VM hook (E2i): the ctx-only `getiter`
+/// resolves an instance's `__iter__` through the STUB seams,
+/// which cannot run a `FunBc` — it fails with an unrecorded
+/// `PyRaise`, and `getiter` then falls through to the GETITEM
+/// iterator (every user type carries a `subscr` slot), which
+/// fails later with a bare `TypeError` when the class has no
+/// `__getitem__` (`next(enumerate(A()))`, `stopiteration.py`
+/// lines 3–5). With a hook, an instance that HAS an `__iter__`
+/// member is resolved through `instance_getiter` with the hook
+/// seams (the `try_instance_getiter` shape, but the slot has no
+/// `&mut VmState` to drain through — a raise from `__iter__`
+/// stays stashed on the hook and the slot returns the bare
+/// `PyRaise`, which `call_type_ctx` drains from `pending_exc`
+/// first). Without a hook, or when the instance has no
+/// `__iter__` member, this is exactly `getiter`.
+pub(crate) fn getiter_hook(
+    ctx: &mut CallCtx,
+    value: Value,
+    hook: Option<crate::objects::slots::CallHook<'_, '_>>,
+) -> Result<Value, IterError> {
+    if let Some(h) = hook {
+        if crate::runtime::vm_seams::is_instance(ctx.arena, value) {
+            // The lookup only (no call) — a `FunBc` member is
+            // found here; the stub seams fail only when RUNNING
+            // it, which is exactly the case this hook path fixes.
+            let has_iter = crate::objects::objtype::seams::with_stub_seams(|seams| {
+                let Some(type_) = obj_get_type(ctx.arena, ctx.types, value) else {
+                    return false;
+                };
+                let Some(q) = crate::objects::primitives::ops::static_qstr_id(b"__iter__")
+                else {
+                    return false;
+                };
+                crate::objects::objtype::lookup::class_lookup(
+                    ctx,
+                    Some(value),
+                    q,
+                    Some(crate::objects::objtype::lookup::SlotKind::Iter),
+                    false,
+                    type_,
+                    seams,
+                )
+                .is_some()
+            });
+            if has_iter {
+                return match crate::objects::objtype::seams::with_call_hook_seams(h, |seams| {
+                    crate::objects::objtype::instance::instance_getiter(ctx, value, seams)
+                }) {
+                    Ok(v) => Ok(v),
+                    Err(PyError::OutOfMemory) => Err(IterError::OutOfMemory),
+                    Err(PyError::PyRaise) => Err(IterError::PyRaise),
+                };
+            }
+        }
+    }
+    getiter(ctx, value)
+}
+
 /// `mp_iternext` (`runtime.zig:1326+`, `mpIternextImpl`):
 /// the next item, or `None` at exhaustion. Dispatches on the
 /// `IteratorData` tag (see the module docs for the `len == 2`
@@ -485,9 +543,14 @@ pub fn iternext(
         // only recognising `Iterator` made `next(map(f, gen))`
         // raise "object not an iterator"). A range's `extra[1]`
         // is a `SmallInt` and enumerate's is its counter, so
-        // neither is affected.
+        // neither is affected. E2i: OR an `Obj::Instance` — a
+        // user iterator's `__iter__` returns the instance
+        // itself (`next(map(f, A()))`, `stopiteration.py`),
+        // which `getiter_hook` now stores verbatim; a range's
+        // `extra[1]` is still a `SmallInt`, never an instance,
+        // so the range collision is unaffected.
         let second_is_iter = matches!(extra[1], Value::Heap(rr)
-            if matches!(ctx.arena.get(rr), Obj::Iterator(_) | Obj::Generator(_)));
+            if matches!(ctx.arena.get(rr), Obj::Iterator(_) | Obj::Generator(_) | Obj::Instance(_)));
         if second_is_iter {
             return match extra[0] {
                 Value::SmallInt(MAP_ITER_TAG) => map_iternext(ctx, it, seams),

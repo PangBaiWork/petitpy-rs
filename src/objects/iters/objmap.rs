@@ -12,12 +12,13 @@
 //! then calls the function on the pulled items.
 
 use super::iter::{
-    getiter, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams,
+    getiter_hook, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams,
     FLAG_ITER_IS_ITERNEXT, MAP_ITER_TAG, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
 use crate::objects::objtype::make_new::map_make_new_slot;
 use crate::objects::primitives::ops::static_qstr_id;
+use crate::objects::slots::CallHook;
 use crate::objects::value::{GcRef, IteratorData, TypeData, Value};
 
 /// `mp_obj_map_make_new` (`objmap.zig:19-44`): the sig check is
@@ -30,6 +31,7 @@ pub fn map_make_new(
     ctx: &mut CallCtx,
     args: &[Value],
     n_kw: usize,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<Value, IterError> {
     let Some(n_pos) = args.len().checked_sub(n_kw * 2) else {
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
@@ -50,7 +52,7 @@ pub fn map_make_new(
         // (probed: `map(str, [1], 5)` → "object not iterable",
         // not the sig error — but `map(str)` alone, with no
         // getiter to fail, reports the sig error).
-        iters.push(getiter(ctx, arg)?);
+        iters.push(getiter_hook(ctx, arg, hook.as_deref_mut())?);
     }
     if sig_err {
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
@@ -188,7 +190,7 @@ mod tests {
         let str_id = fx.pool.from_str("str").unwrap() as u32;
         let list = fx.heap_list(vec![Value::SmallInt(1), Value::SmallInt(2)]);
         let mut ctx = fx.ctx();
-        let m = map_make_new(&mut ctx, &[Value::Qstr(str_id), list], 0).unwrap();
+        let m = map_make_new(&mut ctx, &[Value::Qstr(str_id), list], 0, None).unwrap();
         let mut call = call_seam();
         let mut getitem = |_: &mut CallCtx, _: Value, _: i64| -> CallOutcome {
             panic!("map must not call the getitem seam")
@@ -216,7 +218,7 @@ mod tests {
             Value::SmallInt(30),
         ]);
         let mut ctx = fx.ctx();
-        let m = map_make_new(&mut ctx, &[Value::Qstr(add_id), a, b], 0).unwrap();
+        let m = map_make_new(&mut ctx, &[Value::Qstr(add_id), a, b], 0, None).unwrap();
         let mut call = call_seam();
         let mut getitem = |_: &mut CallCtx, _: Value, _: i64| -> CallOutcome {
             panic!("map must not call the getitem seam")
@@ -239,24 +241,24 @@ mod tests {
         let mut ctx = fx.ctx();
         // 0 iters → sig error.
         assert_eq!(
-            map_make_new(&mut ctx, &[Value::Qstr(str_id)], 0),
+            map_make_new(&mut ctx, &[Value::Qstr(str_id)], 0, None),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
         // 0 args → sig error.
         assert_eq!(
-            map_make_new(&mut ctx, &[], 0),
+            map_make_new(&mut ctx, &[], 0, None),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
         // Kwargs → sig error (the Zig's `takes_kw = false`).
         assert_eq!(
-            map_make_new(&mut ctx, &[Value::Qstr(str_id), list], 1),
+            map_make_new(&mut ctx, &[Value::Qstr(str_id), list], 1, None),
             Err(IterError::TypeError("argument num/types mismatch"))
         );
         // A getiter failure OVERWRITES the polled sig error only
         // when the sig is fine; here the sig is fine and the
         // non-iterable raises at construction (probed).
         assert_eq!(
-            map_make_new(&mut ctx, &[Value::Qstr(str_id), list, Value::SmallInt(5)], 0),
+            map_make_new(&mut ctx, &[Value::Qstr(str_id), list, Value::SmallInt(5)], 0, None),
             Err(IterError::TypeError(NOT_ITERABLE))
         );
     }
@@ -269,7 +271,7 @@ mod tests {
         let list = fx.heap_list(vec![Value::SmallInt(1)]);
         let mut ctx = fx.ctx();
         for fun in [Value::Qstr(raises_id), Value::Qstr(stops_id), Value::None] {
-            let m = map_make_new(&mut ctx, &[fun, list], 0).unwrap();
+            let m = map_make_new(&mut ctx, &[fun, list], 0, None).unwrap();
             let mut call = call_seam();
             let mut getitem = |_: &mut CallCtx, _: Value, _: i64| -> CallOutcome {
                 panic!("map must not call the getitem seam")
@@ -297,8 +299,8 @@ mod tests {
         let a = fx.heap_list(vec![Value::SmallInt(1)]);
         let b = fx.heap_list(vec![Value::SmallInt(10)]);
         let mut ctx = fx.ctx();
-        let inner = map_make_new(&mut ctx, &[Value::Qstr(add_id), a, b], 0).unwrap();
-        let outer = map_make_new(&mut ctx, &[Value::Qstr(str_id), inner], 0).unwrap();
+        let inner = map_make_new(&mut ctx, &[Value::Qstr(add_id), a, b], 0, None).unwrap();
+        let outer = map_make_new(&mut ctx, &[Value::Qstr(str_id), inner], 0, None).unwrap();
         let mut call = call_seam();
         let mut getitem = |_: &mut CallCtx, _: Value, _: i64| -> CallOutcome {
             panic!("map must not call the getitem seam")

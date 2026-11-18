@@ -408,13 +408,13 @@ fn array_append_extend() {
         Value::SmallInt(4)
     );
     // `extend([4,5])` — the iter path.
-    array_extend(ctx, a, items_45).unwrap();
+    array_extend(ctx, a, items_45, None).unwrap();
     assert_eq!(elems_of(ctx, a), ints(&[1, 2, 3, 5, 4, 5]));
     // `extend(b'\x06\x00\x00\x00')` — the bulk memcpy path.
-    array_extend(ctx, a, b_06).unwrap();
+    array_extend(ctx, a, b_06, None).unwrap();
     assert_eq!(elems_of(ctx, a), ints(&[1, 2, 3, 5, 4, 5, 6]));
     // Self-extend doubles.
-    array_extend(ctx, a, a).unwrap();
+    array_extend(ctx, a, a, None).unwrap();
     assert_eq!(
         array_unary_op(ctx, UnaryOp::Len, a).unwrap(),
         Value::SmallInt(14)

@@ -46,15 +46,21 @@ pub fn load_name_ctx(ctx: &mut CallCtx, state: &mut VmState, qst: u32) -> Result
 }
 
 /// `mp_load_global` (`runtime.zig:301-324`): the module globals
-/// dict, then the builtins globals dict (the `override_dict`
-/// step is D1's `builtins.X = Y` support — the builtins dict
-/// IS `state.builtins` here), else `NameError("name '%q'
-/// isn't defined")`.
+/// dict, then the builtins override dict (`builtins.X = Y` —
+/// E2i wires the `VmState.builtins_override_dict` the VM
+/// persists, so a store into the builtins module is visible
+/// here), then the builtins globals dict, else
+/// `NameError("name '%q' isn't defined")`.
 pub fn load_global_ctx(ctx: &mut CallCtx, state: &mut VmState, qst: u32) -> Result<Value, Value> {
     use crate::objects::containers::objdict::dict_get_value;
     let key = Value::Qstr(qst);
     if let Ok(v) = dict_get_value(ctx, Value::Heap(state.globals), key) {
         return Ok(v);
+    }
+    if let Some(od) = state.builtins_override_dict {
+        if let Ok(v) = dict_get_value(ctx, od, key) {
+            return Ok(v);
+        }
     }
     if let Ok(v) = dict_get_value(ctx, Value::Heap(state.builtins), key) {
         return Ok(v);
@@ -436,7 +442,7 @@ pub fn store_attr_ctx(
     let mut seams = RuntimeSeams::stub();
     let mut builtins = Builtins {
         globals: Value::Heap(state.builtins),
-        override_dict: None,
+        override_dict: state.builtins_override_dict,
     };
     let globals = Value::Heap(state.globals);
     let next_obj = state.next_builtin;
@@ -458,6 +464,10 @@ pub fn store_attr_ctx(
             Some(&mut hook),
         )
     };
+    // A store into the builtins module installs the override
+    // dict — persist it on the VM (E2i), or the next global
+    // load / import would not see the override.
+    state.builtins_override_dict = builtins.override_dict;
     result.map_err(|e| match e {
         RtError::PyRaise => drain_seam_raise(ctx, state),
         other => rt_error_to_value(ctx, state, other),

@@ -37,7 +37,7 @@
 //!   too (`from_strn` takes `&self` since C15b).
 
 use crate::memory::gc::CallCtx;
-use crate::objects::containers::objdict::dict_store;
+use crate::objects::containers::objdict::{dict_get_value, dict_store};
 use crate::objects::obj::obj_get_type;
 use crate::objects::objtype::objexcept::new_exception_msg;
 use crate::objects::value::{Obj, Value};
@@ -166,6 +166,19 @@ fn process_component(
     // Already loaded? Reuse.
     if let Some(cached) = loaded_lookup_by_bytes(ctx, state, full_slice) {
         return Ok(cached);
+    }
+    // A user-stuffed `sys.modules` entry (`sys.modules["mod"] =
+    // A(1)`, import_instance_method): the live dict mirrors
+    // `state.modules`, but a write through the dict bypasses
+    // it — consult the dict here and return the value as-is,
+    // module or not (the vendor's loaded-modules dict lookup
+    // returns whatever is registered there). The stored key
+    // may be a heap Str while the query is a Qstr —
+    // `dict_get_value` bridges them (`str_equal`).
+    if let Some(mirror) = state.sys_modules_dict {
+        if let Ok(v) = dict_get_value(ctx, Value::Heap(mirror), Value::Qstr(full_qstr)) {
+            return Ok(v);
+        }
     }
     if parent.is_none() {
         // D4: `import __main__` resolves to the entry module

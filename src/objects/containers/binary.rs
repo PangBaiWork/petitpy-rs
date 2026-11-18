@@ -613,6 +613,17 @@ pub fn buffer_bytes(ctx: &CallCtx, value: Value) -> Option<(Vec<u8>, u8)> {
         return None;
     };
     match ctx.arena.get(r) {
+        // E2i: a user instance of a native type (e.g.
+        // `class X(array.array)`) stores the native object in
+        // `subobj[0]` — the vendor's `instance_get_buffer`
+        // (`objtype.c:925-940`) delegates the buffer slot to
+        // exactly that sub-object, so `bytes(X(...))` reads the
+        // array's bytes. A plain user instance has an empty
+        // `subobj` and no buffer (the vendor's `return 1`).
+        Obj::Instance(d) => match d.subobj.first() {
+            Some(&sub) => buffer_bytes(ctx, sub),
+            None => None,
+        },
         Obj::Array(a) => {
             let tc = a.typecode & TYPECODE_MASK;
             let sz = array_item_size(tc).ok()?;

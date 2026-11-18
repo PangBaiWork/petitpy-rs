@@ -31,6 +31,7 @@
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objboundmeth::new_bound_meth;
 use crate::objects::containers::map::{hash_of_hook, map_of, MapError};
+use crate::objects::containers::objarray_methods::array_extend;
 use crate::objects::containers::objdict_collect::collect_iterable;
 use crate::objects::containers::objlist::new_list;
 use crate::objects::strings::objstr_methods_c::KwArg;
@@ -231,6 +232,7 @@ pub fn call_join_ctx(
     })
 }
 
+
 /// `mp_builtin_hash` (`modbuiltins.zig`) with the VM hook (E2h):
 /// the hash goes through `hash_of_hook` — a user-class instance
 /// runs its `__hash__` through the VM's real call hook (the
@@ -260,6 +262,38 @@ pub fn call_hash_ctx(
         Err(MapError::OutOfMemory) => Err(exc_from_pyerror(ctx, state, PyError::OutOfMemory)),
         Err(MapError::PyRaise) => Err(exc_from_pyerror(ctx, state, PyError::PyRaise)),
     }
+}
+
+
+/// `array.extend` / `bytearray.extend` (E2i): the ctx-only
+/// `array_extend` collects its iterable with a `None` hook,
+/// so a generator arg raises "object not iterable". The
+/// intercept routes the method through here so the iterable
+/// is collected with the VM's real call hook first (the
+/// `str.join` precedent — see `call_join_ctx`); the buffer
+/// fast path inside `array_extend` is unaffected (a bytes /
+/// array / bytearray arg never reaches the hook). Arity is
+/// checked here (interception bypasses `call_fun_builtin`'s
+/// sig check — probed: the arity errors are `TypeError:
+/// argument num/types mismatch`).
+pub fn call_array_extend_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if n_args != 2 || n_kw != 0 {
+        return Err(mismatch(ctx, state));
+    }
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
+    array_extend(ctx, args[0], args[1], Some(&mut hook)).map_err(|e| {
+        if let Some(exc) = state.pending_exc.take() {
+            return exc;
+        }
+        let pe = ctx.record_typed(e);
+        exc_from_pyerror(ctx, state, pe)
+    })
 }
 
 /// `mp_builtin_min` / `mp_builtin_max` (`modbuiltins.zig:763+`):

@@ -311,6 +311,21 @@ pub fn list_unary_op(
     }
 }
 
+/// The vendor's `MAX_ALLOC` (16 MiB, `gc.zig:69`): a list's
+/// item buffer is `len × 8` bytes (`mp_obj_t` is a word), so
+/// no list can hold more than 2,097,152 elements — any growth
+/// past it raises `MemoryError` (probed on the reference:
+/// `[1] * 2097152` ok, `* 2097153` `MemoryError`; append past
+/// it `MemoryError`; `list(range(2097153))` `MemoryError`;
+/// `[].extend(range(1000000000))` `MemoryError`).
+/// `saturating_add` — the incoming count can be `i64::MAX`
+/// (`range(0, 2**62)`), which must not wrap the check.
+pub const MAX_LIST_ITEMS: usize = 2_097_152;
+
+pub(crate) fn list_growth_overflows(current: usize, add: usize) -> bool {
+    current.saturating_add(add) > MAX_LIST_ITEMS
+}
+
 /// `npy_lst_binary_op` (`objlist.zig:255-298`): ADD /
 /// INPLACE_ADD / MULTIPLY / comparisons — anything else
 /// answers NULL.
@@ -346,6 +361,19 @@ pub fn list_binary_op(
                 _ => return Err(PyError::PyRaise),
             };
             let n = n.max(0);
+            // E2i: the `MAX_ALLOC` cap (`MAX_LIST_ITEMS`) —
+            // `seq_multiply` would happily reserve the buffer
+            // on this 6 GiB VM (a 3M-element repeat is 48 MiB
+            // in Rust), but the vendor fails the allocation.
+            // `checked_mul` keeps the `i64::MAX` case an
+            // `OutOfMemory` (the `sequence_tests` pin).
+            let total = match items.len().checked_mul(n as usize) {
+                Some(t) => t,
+                None => return Err(PyError::OutOfMemory),
+            };
+            if total > MAX_LIST_ITEMS {
+                return Err(PyError::OutOfMemory);
+            }
             let out = match crate::objects::containers::sequence::seq_multiply(&items, n) {
                 Some(out) => out,
                 None => return Err(PyError::OutOfMemory),

@@ -21,7 +21,9 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objdict_methods::collect_iterable;
-use crate::objects::containers::objlist::{is_exact_list, list_items_vec, list_len, ListError};
+use crate::objects::containers::objlist::{
+    is_exact_list, list_growth_overflows, list_items_vec, list_len, ListError,
+};
 use crate::objects::containers::sequence::{seq_count_obj, seq_index_obj};
 use crate::objects::obj::obj_is_true;
 use crate::objects::obj_ops::{get_index, obj_binary_op, obj_type_name};
@@ -58,6 +60,13 @@ pub fn list_append(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<Value,
     let Value::Heap(r) = self_ else {
         return Err(ListError::PyRaise);
     };
+    // E2i: the `MAX_ALLOC` cap (`MAX_LIST_ITEMS`) — the vendor
+    // fails the realloc past 2,097,152 elements.
+    if let Obj::List(l) = ctx.arena.get(r) {
+        if list_growth_overflows(l.items.len(), 1) {
+            return Err(ListError::OutOfMemory);
+        }
+    }
     if let Obj::List(l) = ctx.arena.get_mut(r) {
         l.items.push(arg);
     }
@@ -75,6 +84,12 @@ pub fn list_extend(
     call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, ListError> {
     let types = ctx.types;
+    // E2i: the `MAX_ALLOC` cap (`MAX_LIST_ITEMS`) — checked
+    // BEFORE growing, so a huge source (a 1e9 range) fails
+    // fast instead of materialising it. A range's length is
+    // computable and an exact list's too; anything else is
+    // collected first and checked before the copy (the same
+    // observable `MemoryError`, only with transient memory).
     if is_exact_list(ctx, types.list, arg) {
         // Clone first: `self.extend(self)` must see the old
         // items (the Zig copies from the same buffer after the
@@ -83,14 +98,38 @@ pub fn list_extend(
         let Value::Heap(r) = self_ else {
             return Err(ListError::PyRaise);
         };
+        if let Obj::List(l) = ctx.arena.get(r) {
+            if list_growth_overflows(l.items.len(), arg_items.len()) {
+                return Err(ListError::OutOfMemory);
+            }
+        }
         if let Obj::List(l) = ctx.arena.get_mut(r) {
             l.items.extend_from_slice(&arg_items);
         }
     } else {
+        if let Value::Heap(ar) = arg {
+            if let Obj::Range(d) = ctx.arena.get(ar) {
+                let n =
+                    crate::objects::containers::objrange::range_len(d.start, d.stop, d.step);
+                let Value::Heap(r) = self_ else {
+                    return Err(ListError::PyRaise);
+                };
+                if let Obj::List(l) = ctx.arena.get(r) {
+                    if list_growth_overflows(l.items.len(), n.max(0) as usize) {
+                        return Err(ListError::OutOfMemory);
+                    }
+                }
+            }
+        }
         let items = collect_iterable(ctx, arg, call)?;
         let Value::Heap(r) = self_ else {
             return Err(ListError::PyRaise);
         };
+        if let Obj::List(l) = ctx.arena.get(r) {
+            if list_growth_overflows(l.items.len(), items.len()) {
+                return Err(ListError::OutOfMemory);
+            }
+        }
         if let Obj::List(l) = ctx.arena.get_mut(r) {
             l.items.extend_from_slice(&items);
         }

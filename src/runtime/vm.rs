@@ -101,19 +101,8 @@ pub struct VmTypes {
     /// The `enumerate` type (bound as `enumerate` in builtins,
     /// C13b).
     pub enumerate: GcRef,
-}
-
-/// The six `os` builtins that need VM state (the fd table),
-/// for the `call_function_ctx` interception (D2). The `func`s
-/// are stubs; the real bodies live in `modos_fd.rs`.
-#[derive(Clone, Copy, Debug)]
-pub struct OsFdBuiltins {
-    pub open: Value,
-    pub close: Value,
-    pub read: Value,
-    pub write: Value,
-    pub lseek: Value,
-    pub fsync: Value,
+    /// The `reversed` type (bound as `reversed` in builtins, D5).
+    pub reversed: GcRef,
 }
 
 /// The VM's mutable state (the `Ctx` + `mp_state_ctx` pieces
@@ -270,7 +259,7 @@ pub struct VmState {
     /// identity in `call_function_ctx` — they need
     /// `state.os_fds`; their `func`s are stubs, like
     /// `next`'s). Added by D2.
-    pub os_fd_builtins: OsFdBuiltins,
+    pub os_fd_builtins: crate::runtime::modos_fd::OsFdBuiltins,
     /// The `os.__getattr__` builtin (intercepted by GcRef
     /// identity — it needs the VM's import machinery, see
     /// `modos.rs`). Added by D2.
@@ -293,6 +282,13 @@ pub struct VmState {
     /// `__main__` module, the `signal` handler table — see
     /// `d4state.rs`). Added by D4.
     pub d4: crate::runtime::d4state::D4State,
+    /// The intercepted `re.sub` builtin (D5): the module/type
+    /// dicts hold a bare-raise stub `FunBuiltin` for `sub`
+    /// (it calls user code — a callable replacement — so the
+    /// real body lives in `modre::call_sub_ctx`, reached by
+    /// GcRef identity here, the D1/D4 pattern). `Value::None`
+    /// until `build_d5_modules` stores the real builtin.
+    pub re_sub_builtin: Value,
     /// Loaded modules by name qstr (C15 fills this via imports).
     pub modules: HashMap<u32, GcRef>,
     /// The VM-owned type objects (fun_bc, gen_wrap, …) — kept in
@@ -396,6 +392,8 @@ impl Vm {
             deque: None,
             ordereddict: None,
             namedtuple_fn: None,
+            re_type: None,
+            match_type: None,
         };
         let (types, vm_types, exc, empty_tuple, ellipsis) = {
             let mut ctx = CallCtx::new(&mut arena, &mut roots, &dummy, &pool, &mut pending_raise);
@@ -450,7 +448,7 @@ impl Vm {
                 sys_print_exception_builtin: Value::None,
                 os_fds: HashMap::new(),
             os_closed_stdio: std::collections::HashSet::new(),
-                os_fd_builtins: OsFdBuiltins {
+                os_fd_builtins: crate::runtime::modos_fd::OsFdBuiltins {
                     open: Value::None,
                     close: Value::None,
                     read: Value::None,
@@ -459,10 +457,11 @@ impl Vm {
                     fsync: Value::None,
                 },
                 os_getattr_builtin: Value::None,
-                frozen_modules: crate::runtime::frozen_modules::FrozenTable::new(),
+                frozen_modules: crate::runtime::frozen_bundle::frozen_table(),
                 builtin_modules: Vec::new(),
                 extensible_modules: Vec::new(),
                 d4: crate::runtime::d4state::D4State::default(),
+                re_sub_builtin: Value::None,
                 modules: HashMap::new(),
                 vm_types,
                 extra_base: 0,
@@ -471,6 +470,7 @@ impl Vm {
         vm.build_builtins();
         crate::runtime::vm_modules::build_d2_modules(&mut vm);
         crate::runtime::vm_modules::build_d4_modules(&mut vm);
+        crate::runtime::vm_modules::build_d5_modules(&mut vm);
         vm
     }
 

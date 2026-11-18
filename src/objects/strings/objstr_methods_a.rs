@@ -35,9 +35,9 @@ pub fn get_substring_data(
     args: &[Value],
 ) -> Result<(usize, usize), StrError> {
     // Copy first: `str_data` borrows the arena, but
-    // `str_index_to_ptr` below takes `&mut CallCtx`.
-    let data = str_data(ctx.arena, obj).ok_or(StrError::BadImplicitConversion)?;
-    let data = data.to_vec();
+    // `str_index_to_ptr` below takes `&mut CallCtx`. Pool-aware:
+    // the subject is often a dynamic-qstr literal (D5).
+    let data = str_data_pool(ctx.arena, ctx.pool, obj).ok_or(StrError::BadImplicitConversion)?;
     let is_bytes = is_bytes_type(ctx.arena, types, obj);
     let mut start = 0usize;
     let mut len = data.len();
@@ -73,11 +73,10 @@ pub fn str_finder(
     let self_type = obj_get_type(ctx.arena, types, self_value);
     str_check_arg_type(ctx.arena, types, self_type, args[1])?;
     // Copy first: `str_data` borrows the arena, but
-    // `str_index_to_ptr` below takes `&mut CallCtx`.
-    let haystack = str_data(ctx.arena, self_value).ok_or(StrError::BadImplicitConversion)?;
-    let haystack = haystack.to_vec();
-    let needle = str_data(ctx.arena, args[1]).ok_or(StrError::BadImplicitConversion)?;
-    let needle = needle.to_vec();
+    // `str_index_to_ptr` below takes `&mut CallCtx`. Pool-aware
+    // (D5): the haystack/needle are often dynamic-qstr literals.
+    let haystack = str_data_pool(ctx.arena, ctx.pool, self_value).ok_or(StrError::BadImplicitConversion)?;
+    let needle = str_data_pool(ctx.arena, ctx.pool, args[1]).ok_or(StrError::BadImplicitConversion)?;
     let is_bytes = is_bytes_type(ctx.arena, types, self_value);
     let is_str = is_str_type(ctx.arena, types, self_value);
 
@@ -163,7 +162,9 @@ fn str_startendswith(
     ends_with: bool,
 ) -> Result<Value, StrError> {
     let (start, str_len) = get_substring_data(ctx, types, args[0], &args[2..])?;
-    let data = str_data(ctx.arena, args[0]).ok_or(StrError::BadImplicitConversion)?;
+    // Pool-aware (D5): subject and prefix are often dynamic-qstr
+    // literals — the arena-only `str_data` returns `None` for them.
+    let data = str_data_pool(ctx.arena, ctx.pool, args[0]).ok_or(StrError::BadImplicitConversion)?;
     let mut prefixes: Vec<Value> = vec![args[1]];
     if let Value::Heap(r) = args[1] {
         if let Obj::Tuple(items) = ctx.arena.get(r) {
@@ -171,7 +172,7 @@ fn str_startendswith(
         }
     }
     for prefix in prefixes {
-        let prefix_data = str_data(ctx.arena, prefix).ok_or(StrError::BadImplicitConversion)?;
+        let prefix_data = str_data_pool(ctx.arena, ctx.pool, prefix).ok_or(StrError::BadImplicitConversion)?;
         let prefix_len = prefix_data.len();
         let s_offset = if ends_with {
             if str_len >= prefix_len {
@@ -283,18 +284,18 @@ pub fn str_replace(
     let self_type = obj_get_type(ctx.arena, types, args[0]);
     str_check_arg_type(ctx.arena, types, self_type, args[1])?;
     str_check_arg_type(ctx.arena, types, self_type, args[2])?;
-    let s = str_data(ctx.arena, args[0]).ok_or(StrError::BadImplicitConversion)?;
-    let old = str_data(ctx.arena, args[1]).ok_or(StrError::BadImplicitConversion)?;
-    let new = str_data(ctx.arena, args[2]).ok_or(StrError::BadImplicitConversion)?;
+    let s = str_data_pool(ctx.arena, ctx.pool, args[0]).ok_or(StrError::BadImplicitConversion)?;
+    let old = str_data_pool(ctx.arena, ctx.pool, args[1]).ok_or(StrError::BadImplicitConversion)?;
+    let new = str_data_pool(ctx.arena, ctx.pool, args[2]).ok_or(StrError::BadImplicitConversion)?;
     if old.len() > s.len() {
         return Ok(args[0]);
     }
-    let (out_len, n_rep) = replace_pass(s, old, new, max_rep, None);
+    let (out_len, n_rep) = replace_pass(&s, &old, &new, max_rep, None);
     if n_rep == 0 {
         return Ok(args[0]);
     }
     let mut out = Vec::with_capacity(out_len);
-    let _ = replace_pass(s, old, new, max_rep, Some(&mut out));
+    let _ = replace_pass(&s, &old, &new, max_rep, Some(&mut out));
     debug_assert_eq!(out.len(), out_len);
     let is_str = is_str_value(ctx.arena, args[0]);
     Ok(new_str_of_type(
@@ -319,8 +320,11 @@ pub fn str_join(
 ) -> Result<Value, StrError> {
     let self_value = args[0];
     let self_type = obj_get_type(ctx.arena, types, self_value);
-    let sep = str_data(ctx.arena, self_value).ok_or(StrError::BadImplicitConversion)?;
-    let sep = sep.to_vec();
+    // Pool-aware: the separator is usually a string literal,
+    // which loads as a DYNAMIC qstr — the arena-only `str_data`
+    // returns `None` for it (the C13-class dynamic-qstr gap;
+    // same fix as D1's `len('abc')` and C13b's `str_equal`).
+    let sep = str_data_pool(ctx.arena, ctx.pool, self_value).ok_or(StrError::BadImplicitConversion)?;
     let items = iter_items(ctx, types, args[1])?;
     let mut out: Vec<u8> = Vec::new();
     let mut first = true;
@@ -334,8 +338,8 @@ pub fn str_join(
             out.extend_from_slice(&sep);
         }
         first = false;
-        let d = str_data(ctx.arena, *item).ok_or(StrError::BadImplicitConversion)?;
-        out.extend_from_slice(d);
+        let d = str_data_pool(ctx.arena, ctx.pool, *item).ok_or(StrError::BadImplicitConversion)?;
+        out.extend_from_slice(&d);
     }
     let is_str = is_str_value(ctx.arena, self_value);
     Ok(new_str_of_type(
@@ -366,8 +370,7 @@ pub fn str_split(
             splits = obj_get_int(ctx, types, args[2])?;
         }
     }
-    let s = str_data(ctx.arena, args[0]).ok_or(StrError::BadImplicitConversion)?;
-    let s = s.to_vec();
+    let s = str_data_pool(ctx.arena, ctx.pool, args[0]).ok_or(StrError::BadImplicitConversion)?;
     let is_str = is_str_value(ctx.arena, args[0]);
     let result_type = result_type(types, self_type, is_str);
     let mut items: Vec<Value> = Vec::new();
@@ -399,8 +402,8 @@ pub fn str_split(
         }
     } else {
         str_check_arg_type(ctx.arena, types, self_type, sep)?;
-        let sep_data = str_data(ctx.arena, sep).ok_or(StrError::BadImplicitConversion)?;
-        let sep_data = sep_data.to_vec();
+        // Pool-aware (D5): the separator is often a dynamic-qstr literal.
+        let sep_data = str_data_pool(ctx.arena, ctx.pool, sep).ok_or(StrError::BadImplicitConversion)?;
         if sep_data.is_empty() {
             return Err(StrError::EmptySeparator);
         }
@@ -450,8 +453,8 @@ pub fn str_rsplit(
     }
     let self_type = obj_get_type(ctx.arena, types, args[0]);
     let sep = args[1];
-    let s = str_data(ctx.arena, args[0]).ok_or(StrError::BadImplicitConversion)?;
-    let s = s.to_vec();
+    // Pool-aware (D5): subject and separator are often dynamic-qstr literals.
+    let s = str_data_pool(ctx.arena, ctx.pool, args[0]).ok_or(StrError::BadImplicitConversion)?;
     let mut splits = obj_get_int(ctx, types, args[2])?;
     if splits < 0 {
         return str_split(ctx, types, args);
@@ -459,8 +462,7 @@ pub fn str_rsplit(
     if sep == Value::None {
         return Err(StrError::RsplitNone);
     }
-    let sep_data = str_data(ctx.arena, sep).ok_or(StrError::BadImplicitConversion)?;
-    let sep_data = sep_data.to_vec();
+    let sep_data = str_data_pool(ctx.arena, ctx.pool, sep).ok_or(StrError::BadImplicitConversion)?;
     if sep_data.is_empty() {
         return Err(StrError::EmptySeparator);
     }
@@ -525,15 +527,14 @@ fn str_uni_strip(
 ) -> Result<Value, StrError> {
     let self_type = obj_get_type(ctx.arena, types, args[0]);
     let ws: &[u8] = b" \t\n\r\x0b\x0c";
-    let chars: &[u8] = if args.len() == 1 {
-        ws
+    // Pool-aware (D5): the strip-chars arg is often a dynamic-qstr literal.
+    let chars: Vec<u8> = if args.len() == 1 {
+        ws.to_vec()
     } else {
         str_check_arg_type(ctx.arena, types, self_type, args[1])?;
-        str_data(ctx.arena, args[1]).ok_or(StrError::BadImplicitConversion)?
+        str_data_pool(ctx.arena, ctx.pool, args[1]).ok_or(StrError::BadImplicitConversion)?
     };
-    let chars = chars.to_vec();
-    let s = str_data(ctx.arena, args[0]).ok_or(StrError::BadImplicitConversion)?;
-    let s = s.to_vec();
+    let s = str_data_pool(ctx.arena, ctx.pool, args[0]).ok_or(StrError::BadImplicitConversion)?;
     let is_str = is_str_value(ctx.arena, args[0]);
     let orig_len = s.len();
     let mut first_good: Option<usize> = None;

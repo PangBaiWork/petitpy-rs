@@ -189,5 +189,15 @@ pub(crate) fn intercept_builtin_call(
             ctx, state, n_args, n_kw, args,
         ));
     }
+    // `re.sub` is intercepted the same way (D5): it is the
+    // only `re` entry point that calls user code (a callable
+    // replacement), so the real body lives in
+    // `modre::call_sub_ctx`. The module/type dicts hold a
+    // bare-raise stub `FunBuiltin` for it.
+    if fun == state.re_sub_builtin {
+        return Some(crate::modules::modre::call_sub_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     None
 }

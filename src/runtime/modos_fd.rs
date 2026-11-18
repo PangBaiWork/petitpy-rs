@@ -37,6 +37,19 @@
 //! always ESPIPE (`std::io::Stdin` has no `Seek` — the same
 //! divergence `sys.stdin.seek` already records).
 
+/// The six `os` builtins that need VM state (the fd table),
+/// for the `call_function_ctx` interception (D2). The `func`s
+/// are stubs; the real bodies live below in this file.
+#[derive(Clone, Copy, Debug)]
+pub struct OsFdBuiltins {
+    pub open: Value,
+    pub close: Value,
+    pub read: Value,
+    pub write: Value,
+    pub lseek: Value,
+    pub fsync: Value,
+}
+
 use crate::memory::gc::CallCtx;
 use crate::objects::primitives::objint::fun_n_args;
 use crate::objects::primitives::ops::static_qstr_id;

@@ -25,13 +25,43 @@
 
 use super::iter::{
     new_iter, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams, NOT_AN_ITERATOR,
-    REVERSED_ITER_TAG,
+    REVERSED_ITER_TAG, FLAG_ITER_IS_ITERNEXT,
 };
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objdict::{dict_get_value, DictError};
 use crate::objects::obj::{obj_get_int, obj_get_type, obj_len, ObjError};
+use crate::objects::objtype::make_new::reversed_make_new_slot;
+use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::SubscrArg;
-use crate::objects::value::{IteratorData, Obj, Value};
+use crate::objects::value::{GcRef, IteratorData, Obj, TypeData, Value};
+
+/// The `reversed` ROM type (`objreversed.zig`, `MP_TYPE_FLAG_ITER_IS_ITERNEXT` —
+/// the object is its own iterator; `make_new` + `getiter`, no
+/// locals dict, no print slot — the VM's default print renders
+/// `<reversed>`, as the reference does). Bound as the `reversed`
+/// builtin in `Vm::build_builtins` (D5: the original registers
+/// it in `modbuiltins.zig:1082`).
+pub fn reversed_type_data(dict: GcRef) -> TypeData {
+    TypeData {
+        name: static_qstr_id(b"reversed").expect("reversed is a static qstr"),
+        flags: FLAG_ITER_IS_ITERNEXT,
+        base: None,
+        mro: Vec::new(),
+        dict,
+        attr: None,
+        make_new: Some(reversed_make_new_slot),
+        bases: None,
+        unary_op: None,
+        binary_op: None,
+        call: None,
+        getiter: Some(|_ctx: &mut CallCtx, self_: Value| Ok(self_)),
+        subscr: None,
+        buffer: None,
+        print: None,
+        namedtuple_fields: None,
+        protocol: None,
+    }
+}
 
 /// `mp_obj_reversed_make_new` (`objreversed.zig:17-51`).
 pub fn reversed_make_new(

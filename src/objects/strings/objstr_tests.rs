@@ -196,6 +196,8 @@ impl Fx {
             deque: None,
             ordereddict: None,
             namedtuple_fn: None,
+            re_type: None,
+            match_type: None,
             empty_tuple,
             empty_bytes,
             native_init_wrapper,

@@ -18,6 +18,9 @@ pub mod modmain;
 pub mod modmath;
 pub mod modmicropython;
 pub mod modpwd;
+pub mod modre;
+pub mod modre_match;
+pub mod modre_types;
 pub mod modselect;
 pub mod modsignal;
 pub mod modsocket;
@@ -38,6 +41,10 @@ mod modstruct_tests;
 mod modsubprocess_tests;
 #[cfg(test)]
 mod modd4_tests;
+#[cfg(test)]
+mod modre_tests;
+#[cfg(test)]
+mod modre_frozen_tests;
 
 // ── Lane D4 shared builder helpers ──────────────────────────────────
 // The D4 small modules share the D2/D3 builder shape

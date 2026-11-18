@@ -23,10 +23,13 @@ use crate::modules::modcollections::build_collections_module;
 use crate::modules::moderrno::build_errno_module;
 use crate::modules::modgc::build_gc_module;
 use crate::modules::modgrp::build_grp_module;
+use crate::modules::modjson::build_json_module;
 use crate::modules::modmicropython::build_micropython_module;
 use crate::modules::modpwd::build_pwd_module;
+use crate::modules::modre::build_re_module;
 use crate::modules::modselect::build_select_module;
 use crate::modules::modsignal::build_signal_module;
+use crate::modules::modsubprocess::build_subprocess_module;
 use crate::modules::modtime::build_time_module;
 use crate::objects::containers::objfileio::build_stdio_objects;
 use crate::objects::primitives::ops::static_qstr_id;
@@ -127,6 +130,58 @@ pub fn build_d4_modules(vm: &mut Vm) {
         vm.types.namedtuple_fn = Some(r);
     }
     for module in [time, select, gc, signal, pwd, grp, micropython, errno, collections, array] {
+        vm.pin(module);
+    }
+}
+
+/// Build the D5 modules, register them, store the `re` type
+/// refs in `vm.types`, and pin all three modules in the VM's
+/// roots.
+///
+/// - `_json` and `_subprocess` (D3's builders) register as
+///   BUILTIN modules — both are `MP_REGISTER_MODULE` in the
+///   original, so `import _json` / `import _subprocess` finds
+///   them before any filesystem search, and the frozen
+///   `json.py` / `subprocess.py` layers (which `import _json`
+///   / `import _subprocess`) resolve through them. The other
+///   three D3 builders (math/socket/struct) are NOT
+///   registered here — that is Phase E entry work.
+/// - `re` registers as EXTENSIBLE under the name `re` ONLY
+///   (`MP_REGISTER_EXTENSIBLE_MODULE(MP_QSTR_re, ...)`).
+///   `import ure` resolves to the SAME module object through
+///   the import path's existing u-strip (D4) — no second
+///   registration (registering both would wrongly list `ure`
+///   as a separate module).
+///
+/// The builders return `PyResult` (the D3 shape) but cannot
+/// fail on a fresh dict — the `expect` documents that (the
+/// same shape as the D2 `store` helper).
+pub fn build_d5_modules(vm: &mut Vm) {
+    let (mut ctx, state) = vm.split();
+    let fun_builtin_var = state.vm_types.fun_builtin_var;
+    let module_type = state.vm_types.module;
+    let json = build_json_module(&mut ctx, fun_builtin_var, module_type)
+        .expect("D5 _json module build cannot fail");
+    let subprocess = build_subprocess_module(&mut ctx, fun_builtin_var, module_type)
+        .expect("D5 _subprocess module build cannot fail");
+    let (re, re_type, match_type, sub_fn) =
+        build_re_module(&mut ctx, fun_builtin_var, module_type)
+            .expect("D5 re module build cannot fail");
+    for (name, module) in [("_json", json), ("_subprocess", subprocess)] {
+        let id = static_qstr_id(name.as_bytes())
+            .unwrap_or_else(|| panic!("D5 module name is not a static qstr: {name}"));
+        state.builtin_modules.push((id, module));
+    }
+    let re_id = static_qstr_id(b"re").expect("re is a static qstr");
+    state.extensible_modules.push((re_id, re));
+    state.re_sub_builtin = sub_fn;
+    drop(ctx);
+    // The `re` / `match` type refs (the D3 `socket`
+    // precedent — stored after `drop(ctx)` since
+    // `ctx.types` borrows `vm.types`).
+    vm.types.re_type = Some(re_type);
+    vm.types.match_type = Some(match_type);
+    for module in [json, subprocess, re] {
         vm.pin(module);
     }
 }

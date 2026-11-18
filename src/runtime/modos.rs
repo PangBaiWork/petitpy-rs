@@ -631,7 +631,7 @@ pub fn build_os_module(ctx: &mut CallCtx, state: &mut VmState) -> Value {
     let fd_write = fd_stub(ctx, fun_builtin_var, "write", 2, 2);
     let fd_lseek = fd_stub(ctx, fun_builtin_var, "lseek", 3, 3);
     let fd_fsync = fd_stub(ctx, fun_builtin_var, "fsync", 1, 1);
-    state.os_fd_builtins = crate::runtime::vm::OsFdBuiltins {
+    state.os_fd_builtins = crate::runtime::modos_fd::OsFdBuiltins {
         open: fd_open,
         close: fd_close,
         read: fd_read,

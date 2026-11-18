@@ -51,6 +51,7 @@ use crate::objects::iters::objenumerate::enumerate_make_new;
 use crate::objects::iters::objfilter::filter_make_new;
 use crate::objects::iters::objmap::map_make_new;
 use crate::objects::iters::objnamedtuple::namedtuple_make_new;
+use crate::objects::iters::objreversed::reversed_make_new;
 use crate::objects::iters::objzip::zip_make_new;
 use crate::objects::primitives::objbool::bool_make_new;
 use crate::objects::primitives::objcomplex::complex_make_new;
@@ -216,6 +217,38 @@ pub fn filter_make_new_slot(
     n_kw: usize,
 ) -> PyResult<Value> {
     let v = filter_make_new(ctx, args, n_kw).map_err(|e| ctx.record_typed(e))?;
+    if let Value::Heap(r) = v {
+        ctx.arena.set_header_type(r, Some(type_));
+    }
+    Ok(v)
+}
+
+/// `reversed` (`objreversed.rs:17-51`): the `__reversed__`
+/// delegation needs a call seam at construction time, but a
+/// `MakeNewFn` slot has no `VmState` access, so the seam is a
+/// stub (the C13b class of gap: a user class whose
+/// `__reversed__` is a Python method raises a bare `TypeError`
+/// instead of being called — the VM-seam runner of Phase E owns
+/// the real call). No builtin sequence defines `__reversed__`
+/// in its type dict (verified against the original sources), so
+/// the delegation is skipped for `list`/`tuple`/`str`/`range`/
+/// `dict` and the length+subscript path runs seam-free.
+pub fn reversed_make_new_slot(
+    ctx: &mut CallCtx,
+    type_: GcRef,
+    args: &[Value],
+    n_kw: usize,
+) -> PyResult<Value> {
+    use crate::objects::iters::iter::{CallOutcome, IterSeams};
+    let mut call =
+        |_: &mut CallCtx, _: Value, _: &[Value]| -> CallOutcome { CallOutcome::Raise };
+    let mut getitem =
+        |_: &mut CallCtx, _: Value, _: i64| -> CallOutcome { CallOutcome::Raise };
+    let mut seams = IterSeams {
+        call: &mut call,
+        getitem: &mut getitem,
+    };
+    let v = reversed_make_new(ctx, args, n_kw, &mut seams).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {
         ctx.arena.set_header_type(r, Some(type_));
     }

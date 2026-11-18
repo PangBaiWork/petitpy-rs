@@ -11,6 +11,7 @@ use crate::objects::slots::{
     PrintFn, StreamP, SubscrFn, UnaryOpFn,
 };
 use crate::objects::value::{GcRef, Value};
+use crate::vendor::re15::{ByteProg, Sub};
 
 // ── Payload structs (lane-owned; simple initial forms) ─────────────
 
@@ -131,6 +132,32 @@ pub struct StringIoData {
     pub buf: Vec<u8>,
     pub pos: usize,
     pub closed: bool,
+}
+
+/// Compiled regex object (D5 owns; `extmod/modre.c`
+/// `mp_obj_re_t`). `prog` is the RE15 bytecode program
+/// (RE15 lane: `crate::vendor::re15::ByteProg`); `prog.sub`
+/// is the capture-group count. Leaf payload — no `Value`
+/// children, so `children()` needs no arm for it.
+#[derive(Clone, Debug)]
+pub struct ReData {
+    pub prog: ByteProg,
+}
+
+/// Regex match object (D5 owns; `extmod/modre.c`
+/// `mp_obj_match_t`). `caps` is the flat capture array
+/// (`sub + 1` [`Sub`]s — slot 0 is the whole match, slot `i`
+/// is group `i`; `start == None` means the group did not
+/// participate); `num_matches` is `caps.len()` (the C's
+/// `num_matches`, printed as `<match num=N>`); `subject` is
+/// the matched-against value (str or bytes — group results
+/// take their type from it, the C's `mp_obj_new_str_of_type`).
+/// The subject is a child (GC arm in `value.rs`).
+#[derive(Clone, Debug)]
+pub struct MatchData {
+    pub caps: Vec<Sub>,
+    pub num_matches: usize,
+    pub subject: Value,
 }
 
 /// Range object. C9 owns.

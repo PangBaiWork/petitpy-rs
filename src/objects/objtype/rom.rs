@@ -56,6 +56,7 @@
 //! (the Zig's `object()` never consults `__new__`).
 
 use crate::memory::gc::CallCtx;
+use crate::objects::slots::CallHook;
 use crate::objects::callables::objboundmeth::bound_meth_type_data;
 use crate::objects::containers::objdict::dict_new_typed;
 use crate::objects::containers::objproperty::property_type_data;
@@ -71,7 +72,8 @@ use super::instance_create::{
 use super::objobject::{object_locals_dict, object_type_data};
 use super::subclass::{isinstance_fun_obj, issubclass_fun_obj};
 use super::typecreate::{
-    super_attr, super_make_new, super_print, type_attr, type_call, type_make_new, type_print,
+    super_attr, super_make_new, super_print, type_attr, type_call_slot_fn, type_make_new,
+    type_print,
 };
 
 /// The ROM registry: the objtype-owned builtin types +
@@ -115,7 +117,7 @@ pub fn type_type_data(dict: GcRef) -> TypeData {
         protocol: None,
         unary_op: None,
         binary_op: None,
-        call: Some(type_call),
+        call: Some(type_call_slot_fn),
         getiter: None,
         subscr: None,
         buffer: None,
@@ -217,6 +219,7 @@ pub fn object_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let n_pos = args.len().saturating_sub(2 * n_kw);
     if let Some(e) = arg_check_num_sig(n_pos, n_kw, 0, 0, false) {

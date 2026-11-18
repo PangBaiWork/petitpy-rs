@@ -1,0 +1,235 @@
+# Lane E2 result — acceptance gates harness (Phase E)
+# Branch lane/e2-gates, base master 5e3fd30 (E1 merged).
+# One commit "Lane E2: acceptance gates". The brief (scripts/e2_brief.md)
+# stays untracked and is NOT committed.
+#
+# Gate progression in this lane (full corpus): 399 -> 412 (Fix A+B) ->
+# 422 (Fix C core) -> 424 (__getattr__) -> 427 (type __dict__) ->
+# 434 (str/repr/bool/len/print) -> 438 (del_*) -> 440 (floordivide) ->
+# 448 (fun_name/namedtuple/str methods) -> 451 (dict views) ->
+# 454 (getattr/hasattr/property) -> 456 (caseconv + enumerate-collect)
+# -> 459 (dict.fromkeys classmethod + dict.update kwargs). 0 regressions
+# at every step (each gate run compared against the previous fail list).
+#
+# Binaries (release, rebuilt at the end): petitpy-rs 1,851,048 B,
+# petitpy-vm 1,838,088 B (E1: 1,824,112 / 1,811,136).
+
+## §1 — Runners and the comparison rule of each gate (as read from the original)
+
+(a) Corpus full gate — scripts/run_full_gate.py (exists since the
+lane's start; imports the original's tools/full_gate.py, overrides
+full_gate.BIN, calls its entry point). Rule (full_gate.py:40-90):
+run [BIN, script], compare stdout+stderr+"\n[exit N]\n" byte-for-byte
+against corpus/full/basics/<name>.out, timeout 10s; bidirectional vs
+corpus/full-known-fails.txt (7 names). Verified vs the reference
+binary first: exactly 545/552 with the same 7 fails.
+Second view: tools/corpus.py verify --config full <BIN> — DUPLICATES
+(a) (same goldens, cwd=script's parent, timeout 30s instead of 10s);
+run once as a confirmation: PASS 459/552 FAIL 93, identical to (a).
+Its "standard oracle" (the default reference for `gen`) is the vendor
+MicroPython build-standard binary, which does NOT exist in this VM.
+
+(b) Integration — scripts/run_integration.py (thin wrapper around the
+original's tests/integration.py, run from the original repo root).
+Rule (tests/_integration_runner.py): run [binary, tmpfile.py], stdout
+compared exactly (expected=None skips the stdout check), exit code
+checked when given as the 4th tuple element, timeout 30s, config full.
+202 cases (CORE + OS).
+
+(c) Golden programs — scripts/run_golden.py. There is NO
+tools/golden_run.py (README reference stale; only
+tools/golden_bootstrap.py exists). The bootstrap's rule
+(evaluate_program): a petitpy run "passes" if its COMBINED
+stdout+stderr, normalized (rstrip per line, strip overall), matches
+EITHER MicroPython's OR CPython's, and did not time out
+(TIMEOUT_SECONDS=10, cwd=script's parent dir). ADAPTATION, recorded
+here deliberately: the vendor MicroPython oracle does not exist in
+this VM, and matching CPython alone would measure CPython-divergence,
+not petitpy-fidelity (petitpy deliberately differs from CPython, e.g.
+hash(2**70)==0). So the oracle here is the REFERENCE petitpy binary
+itself, with CPython kept as a second, informational column
+(rust==cpython count): PASS iff the Rust run's normalized combined
+output equals the reference petitpy run's (no timeout on either side).
+Verified vs the reference first (bin=reference): 584/584 + 1/1.
+File counts verified: works/ 584 .py, works-native-only/ 1 .py.
+
+(d) Capability — scripts/run_capability.py (imports the original's
+tools/capability_matrix.py, overrides ZIGPY/VM to the Rust
+zigpy-compile / petitpy-vm binaries, calls main(["--gate"])).
+Rule: for each of the 67 CONSTRUCTS, compile with the front-end to
+.mpy, run the back-end (petitpy-vm) on it, stdout must equal CPython's
+stdout exactly (rc != 0 -> FAIL, else ok/diff); gate is bidirectional
+vs corpus/capability-known.txt (baseline EMPTY — only comments).
+Only back-end gaps (FAIL), back-end splits, and front-end splits are
+gated; a front-end gap is a measurement, not a defect, and a CPYTHON
+DIFF (back-ends agree, differ from CPython) is not gated either.
+`compile_pyfront` is stubbed to return False: pyfront needs
+`uv run --project projects/pyfront`, and `uv` is NOT installed in
+this VM, so that column is unmeasurable here (the original's
+compile_pyfront would raise FileNotFoundError). The vendor
+MicroPython column (UPY) is absent too (no
+vendor/micropython/ports/unix/build-standard/micropython), so that
+column is always None. Verified vs the reference first (reference
+zigpy-compile + petitpy-vm): GATE: GREEN, with 1 CPYTHON DIFF
+(async_def — not gated).
+
+(e) test-stdlib — scripts/run_stdlib.py (the Makefile test-stdlib
+rule verbatim: for f in tests/stdlib/test_*.py; do <BIN> $f; done,
+each must exit 0, timeout 30s). The tests do
+`sys.path.insert(0, "petitpy-lib")` — a path relative to the repo
+root — so they MUST run with cwd=the original repo root, exactly as
+`make test-stdlib` runs them (running from any other cwd fails every
+file with ModuleNotFoundError: No module named 'pytest'). 8 files.
+Verified vs the reference first: 8/8.
+
+(f) Corpus nano — scripts/run_nano.py (thin wrapper around
+python3 tools/progress.py --config nano --strict <BIN>). INVARIANT
+CHECK ONLY: the Rust project has NO nano build; the full binary is
+the only binary. Divergences from full-vs-nano config differences
+(ROM_LEVEL, frozen set, module tables) are documented in §4, not
+fixed here. Calibration: the reference FULL binary scores 454/541
+against the nano goldens (fails dominated by int_big* — nano has no
+bigints — plus io_bytesio/io_stringio/sys_stdio); the reference NANO
+build itself was not built here (it would be 541/541 by construction
+of the goldens).
+
+## §2 — Gate numbers (all measured against the final release binaries)
+
+- Full corpus: 459/552 (83.2%). 93 actual fails = 86 regressions +
+  7 known-fails (exactly the 7 in corpus/full-known-fails.txt, no
+  stale entries: class_inplace_op2 now PASSES on Rust — Rust is more
+  conformant than the reference there — and is NOT in the list).
+  Reference: 545/552. corpus.py verify confirms 459/552 FAIL 93.
+  Regressions (86): array1 array_add array_construct2 array_intbig
+  array_micropython builtin_callable builtin_hash builtin_hash_intbig
+  builtin_map builtin_override builtin_range builtin_range_attrs
+  builtin_range_maxsize builtin_reversed builtin_str_hex builtin_zip
+  bytearray1 bytearray_byte_operations bytearray_center
+  bytearray_construct bytearray_count bytearray_decode
+  bytearray_partition bytes bytes_add_array bytes_add_bytearray
+  bytes_add_endian bytes_compare_array bytes_compare_bytearray
+  bytes_construct_array bytes_construct_bytearray
+  bytes_construct_endian bytes_gen class_delattr_setattr
+  class_descriptor class_new class_notimpl class_setname_hazard
+  class_setname_hazard_rand class_store_class class_super_closure
+  deque1 deque2 fun_calldblstar3 fun_callstardblstar gen_yield_from
+  gen_yield_from_close gen_yield_from_ducktype gen_yield_from_exc
+  gen_yield_from_iter gen_yield_from_throw3 generator_args
+  generator_close generator_pend_throw generator_return generator_send
+  getitem import_instance_method int_big_rshift int_bytes_intbig
+  int_parse io_iobase iter0 iter1 iter2 list_sort memoryerror
+  memoryview_gc object_new ordereddict1 set_iter_of_iter slice_attrs
+  special_methods special_methods_intbig stopiteration string_format
+  string_format_modulo string_join subclass_native2_tuple
+  subclass_native3 subclass_native_buffer subclass_native_cmp
+  subclass_native_exc_new subclass_native_init subclass_native_iter
+  subclass_native_specmeth
+- Nano (invariant check only): 390/541. Reference full binary: 454/541.
+  The 64 gap is the full-gate regressions manifesting on nano
+  goldens; no NEW Rust bug class appears on nano beyond §4.
+- Integration: 168/202. Reference: 201/202 — the reference itself
+  fails os_stat_dir_vs_file (the Zig's statInt panics, @intCast, on
+  os.stat('/etc'); a reference bug, not a gate target). Rust passes
+  os_stat_dir_vs_file. 34 Rust fails (the first run had 37; the 3
+  bytes_fromhex cases were fixed in this lane, see §3):
+  enum_members init_subclass
+  native_subclass_operands runtime_annotations json_cpython_behaviour
+  cpython_platform_import_slice_mro generator genexpr_filter
+  class_repr bytes_interop deque_cpython_idiom itertools_count_islice
+  itertools_chain itertools_accumulate string_capwords
+  re_long_alternation_compiles itertools_cpython_functions
+  builtin_keyword_args collections_abc_import dict_missing_basic
+  dict_missing_counter_pattern object_setattr_method_available
+  str_join_bytes_bytearray uuid4_shape
+  index_error_store_leaves_container_intact gc_reclaims_garbage
+  gc_closes_dropped_files_and_sockets os_kill_esrch_raises
+  os_chown_self_noop socket_fromfd_wraps_fd
+  select_timeout_zero_returns_promptly select_readable_fd_is_ready
+  subprocess_check_raises_on_nonzero subprocess_streams_env_cwd_text.
+- Golden: 510/585 (works 509/584 + works-native-only 1/1;
+  rust==cpython on 503/585). Reference: 585/585 (rust==cpython on
+  576/585 — 9 programs diverge from CPython even on the reference).
+  The 75 works failures overlap the corpus fail list almost
+  exactly (same root causes); golden-only failures:
+  generator_expr generators sort_advanced sorted_comprehensive
+  sorted_numbers special_methods_micropython test_bellman_ford
+  test_kmp test_lis.
+- Capability: 65/67. 2 back-end gaps (FAIL): generator,
+  generator_send_less (both `list(g())` — the generator-collection
+  gap, §4). 1 CPYTHON DIFF: async_def (same as the reference —
+  not gated). 0 front-end gaps, 0 splits, 0 not measured.
+  Reference: GATE GREEN.
+- test-stdlib: 3/8 (test_contextlib, test_functools, test_logging
+  pass). Failing files with their inner failures:
+  test_abc (5: test_abc_with_no_abstract_can_instantiate,
+  test_concrete_methods_on_abc_work_in_subclass,
+  test_realistic_shape_hierarchy,
+  test_subclass_that_overrides_can_instantiate, test_two_level_subclass
+  — all "argument num/types mismatch" instantiating a concrete ABC
+  subclass), test_argparse (1: test_choices_rejects_invalid —
+  "object not iterable"), test_dataclasses (2:
+  test_default_factory_creates_independent_instances —
+  AttributeError "no attribute 'append'";
+  test_required_field_raises_when_missing — DID NOT RAISE TypeError),
+  test_enum (1: test_members_are_hashable — "unsupported type for
+  operator"), test_pytest_lite (1: test_inline_skip — no message).
+  Reference: 8/8.
+- lib: 1505 passed, 0 failed, 7 ignored (1479 at E1 base + 26 new
+  e2_ regression tests). bins: 9. tests/entry_cli.rs: 45. 0 warnings.
+  No unsafe in the diff. Every file < 800 lines (vm_call.rs 748,
+  vm_types.rs 696, objstr_a.rs 770, objdict_methods.rs 746;
+  vm_tests_b.rs was 895 — split by E2 into vm_tests_b.rs 591 +
+  vm_tests_e2.rs 439). Pre-existing cap debt unchanged: map.rs 860,
+  gc.rs 830.
+- scripts/check_compile_mpy.py: PASS (0 byte mismatches, 552/552).
+  scripts/check_frozen.py: PASS (23/23, 38,141 bytes).
+- `git -C ~/workspace/petitpy-orig status --short`: empty (the
+  __pycache__ dirs the runners created there were removed).
+
+## §3 — Bugs fixed in this lane (with probes)
+
+Fix A — `CallHook` through `type_call` -> `MakeNewFn` (the FunBc
+`__init__`/`__new__` stub-seam gap; the D5 4 ignored tests' owner).
+A call hook is threaded as a PARAMETER, never stored in `CallCtx`
+(storing a closure borrowing `&mut VmState` fails: `Vm::split()`
+cannot both return `&mut VmState` and store a closure borrowing it).
+`CallHook<'r, 'h> = &'r mut (dyn FnMut(&mut CallCtx, Value, usize,
+usize, &[Value]) -> PyResult<Value> + 'h)` (src/objects/slots.rs) —
+TWO lifetimes deliberately: `'r` is the reference borrow (shortened
+on every reborrow), `'h` the closure's own lifetime; a
+single-lifetime alias failed to compile (E0597/E0499). `MakeNewFn =
+for<'a, 'r, 'h> fn(&mut CallCtx<'a>, GcRef, &[Value], usize,
+Option<CallHook<'r, 'h>>) -> PyResult<Value>`. `type_call` gains the
+hook param; `call_type_ctx` (vm_call.rs) builds it from
+`call_function_ctx` + the `state.pending_exc` stash (the C14
+side-channel idiom); `instance_make_new` uses `with_call_hook_seams`
+when hook is Some, else stub seams. Exception types keep the direct
+`exception_make_new` path (no `__init__` call — matches the Zig).
+Fixed: class2, class_inherit1, class_inherit_mul, class_super,
+class_super_object, with_raise, with_return, object_dict,
+subclass_native2_list, builtin_dir, builtin_filter, builtin_next_arg2,
+async_for2. Probed reference behavior pinned: `__new__` returning a
+non-class-type skips `__init__`.
+Fix B — hook through `collect_iterable` (`list(map(f, xs))` etc. with
+a FunBc `f`): `collect_iterable` gains `mut call:
+Option<CallHook<'_, '_>>`, threaded through the CONSTRUCTOR paths
+only (list/tuple/dict/set/deque make_new); method paths pass None.
+`call_sorted_ctx` also builds the hook, so `sorted(map(f, xs))`
+works; the sort KEY function via `call_function_n_kw` (stub) remains
+a separate gap (see §4 list_sort). Fixed: builtin_filter (again),
+class_inplace_op2 now passes (Rust more conformant than the ref).
+Limitation: a `StopIteration` raised by a FunBc through the hook is
+NOT classified as exhaustion in collect_iterable's call seam (the
+exception object is stashed on `state.pending_exc`, which the
+ctx-only fn cannot see).
+Fix C — instance dunders through the VM opcode paths (new
+src/runtime/vm_seams.rs): `is_instance`, `drain_hook_raise`,
+`make_hook`, and `try_instance_binary_op` / `try_instance_unary_op` /
+`try_instance_bool` / `try_instance_subscr` / `try_instance_call` /
+`try_instance_load_attr` — each Ok(Some(v)) = handled, Ok(None) = no
+such dunder (fall through), Err(exc) = drained exception. Wired into
+`binary_op_ctx` (incl. the EQUAL/NOT_EQUAL branch via
+`obj_equal_not_equal`'s hook param), `unary_op_ctx`, `is_true_ctx`
+(`__bool__` returning 1 / "x" / 0 is all False — probed),
+LOAD/STORE_SUBSCR, `call_function_ctx` (`__call__`), 
+...[truncated 20880 chars]

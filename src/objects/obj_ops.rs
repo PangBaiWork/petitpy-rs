@@ -13,9 +13,11 @@ use crate::objects::obj::{
     buffer_slot, call_binary, call_subscr, call_unary, is_bytes, is_str, obj_get_int_maybe,
     obj_get_type, obj_is_true, print_slot, qstr_bytes, type_data, BuiltinTypes, ObjError,
     SlotOutcome, BUFFER_RAISE_IF_UNSUPPORTED, BUFFER_RW, FLAG_EQ_CHECKS_OTHER_TYPE,
-    FLAG_EQ_HAS_NEQ_TEST, FLAG_EQ_NOT_REFLEXIVE,
+    FLAG_EQ_HAS_NEQ_TEST, FLAG_EQ_NOT_REFLEXIVE, FLAG_INSTANCE_TYPE,
 };
-use crate::objects::slots::{BinaryOp, BufferInfo, PrintKind, SubscrArg, UnaryOp};
+use crate::objects::objtype::instance::instance_binary_op;
+use crate::objects::objtype::seams::with_call_hook_seams;
+use crate::objects::slots::{BinaryOp, BufferInfo, CallHook, PrintKind, SubscrArg, UnaryOp};
 use crate::objects::value::{Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::qstr::RuntimeQstr;
@@ -74,13 +76,18 @@ fn warn_str_bytes_cmp() {
 /// `mp_obj_equal_not_equal` (`obj.zig:309-368`): the general
 /// equality dispatch. `op` must be EQUAL or NOT_EQUAL (anything
 /// else is a caller bug — the original takes a `c_int` op and only
-/// these two reach here).
+/// these two reach here). `call` is the VM's call hook (E2):
+/// `Some` on the VM's equality path, so an instance's `__eq__` /
+/// `__ne__` actually runs; `None` on ctx-only paths (the
+/// pre-E2 behaviour — the stub slot raises, the loop falls
+/// through to pointer comparison).
 pub fn obj_equal_not_equal(
     ctx: &mut CallCtx,
     types: &BuiltinTypes,
     op: BinaryOp,
     o1_in: Value,
     o2_in: Value,
+    mut call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     debug_assert!(op == BinaryOp::Equal || op == BinaryOp::NotEqual);
     let mut o1 = o1_in;
@@ -157,10 +164,35 @@ pub fn obj_equal_not_equal(
                 let cross_ok = flags & FLAG_EQ_CHECKS_OTHER_TYPE != 0;
                 let same_type = obj_get_type(ctx.arena, types, o2) == t;
                 if cross_ok || same_type {
+                    // The slot invocation (E2): an instance type
+                    // runs its dunder through the VM's real call
+                    // hook when one is passed (a `FunBc` `__eq__`
+                    // / `__ne__` actually executes); otherwise the
+                    // type's slot fn (the stub seams for
+                    // instances). `Ok(None)` from the instance
+                    // path is the slot's NULL — keep looking.
+                    let mut invoke = |ctx: &mut CallCtx, try_op: BinaryOp| -> PyResult<Value> {
+                        if flags & FLAG_INSTANCE_TYPE != 0 {
+                            match call.as_deref_mut() {
+                                Some(hook) => {
+                                    match with_call_hook_seams(hook, |seams| {
+                                        instance_binary_op(ctx, try_op, o1, o2, seams)
+                                    }) {
+                                        Ok(Some(v)) => Ok(v),
+                                        Ok(None) => Err(PyError::PyRaise),
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                None => bin(ctx, try_op, o1, o2),
+                            }
+                        } else {
+                            bin(ctx, try_op, o1, o2)
+                        }
+                    };
                     // CPython asymmetry: try `__ne__` first for
                     // NOT_EQUAL when the type has a neq test.
                     if op == BinaryOp::NotEqual && flags & FLAG_EQ_HAS_NEQ_TEST != 0 {
-                        match bin(ctx, BinaryOp::NotEqual, o1, o2) {
+                        match invoke(ctx, BinaryOp::NotEqual) {
                             Ok(r) => return Ok(r),
                             Err(PyError::OutOfMemory) => {
                                 return Err(PyError::OutOfMemory)
@@ -168,7 +200,7 @@ pub fn obj_equal_not_equal(
                             Err(PyError::PyRaise) => {} // NULL → keep looking
                         }
                     }
-                    match bin(ctx, BinaryOp::Equal, o1, o2) {
+                    match invoke(ctx, BinaryOp::Equal) {
                         Ok(r) => {
                             if op == BinaryOp::Equal {
                                 return Ok(r);
@@ -202,7 +234,7 @@ pub fn obj_equal(
     o1: Value,
     o2: Value,
 ) -> PyResult<bool> {
-    let r = obj_equal_not_equal(ctx, types, BinaryOp::Equal, o1, o2)?;
+    let r = obj_equal_not_equal(ctx, types, BinaryOp::Equal, o1, o2, None)?;
     obj_is_true(ctx, types, r)
 }
 

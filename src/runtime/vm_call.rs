@@ -21,6 +21,7 @@ use crate::objects::objtype::typecreate::type_call;
 use crate::objects::primitives::objcell::cell_set;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{DictData, GcRef, MapData, Obj, Value};
+use crate::pyerr::PyError;
 use crate::runtime::runner::RunOutcome;
 use crate::runtime::vm::VmState;
 use crate::runtime::vm_gen::{close_generator_ctx, resume_generator_value_ctx};
@@ -73,9 +74,28 @@ pub fn call_function_ctx(
                 call_function_ctx(ctx, state, Value::Heap(func), n_args + n_cells, n_kw, &full)
             }
             Obj::Type(_) => call_type_ctx(ctx, state, r, n_args, n_kw, args),
-            _ => call_via_type_slot_ctx(ctx, state, fun, n_args, n_kw, args),
+            // An instance tries its `__call__` first, with the
+            // VM's real call hook (E2); no `__call__` falls
+            // through to the type's call slot (which raises
+            // "object not callable" for instances).
+            _ => match crate::runtime::vm_seams::try_instance_call(
+                ctx, state, fun, n_args, n_kw, args,
+            ) {
+                Ok(Some(v)) => Ok(v),
+                Ok(None) => call_via_type_slot_ctx(ctx, state, fun, n_args, n_kw, args),
+                Err(exc) => Err(exc),
+            },
         },
-        _ => call_via_type_slot_ctx(ctx, state, fun, n_args, n_kw, args),
+        // Non-heap values (small ints, bools, …) have no
+        // `__call__`, but route through the same try for
+        // uniformity — it returns `None` for non-instances.
+        _ => match crate::runtime::vm_seams::try_instance_call(
+            ctx, state, fun, n_args, n_kw, args,
+        ) {
+            Ok(Some(v)) => Ok(v),
+            Ok(None) => call_via_type_slot_ctx(ctx, state, fun, n_args, n_kw, args),
+            Err(exc) => Err(exc),
+        },
     }
 }
 
@@ -112,6 +132,22 @@ fn call_fun_bc_ctx(
     let empty_tuple = state.empty_tuple;
     if is_gen_wrap {
         let gen_type = state.vm_types.gen_instance;
+        // E2: a generator function called with missing defaulted
+        // args panicked in `setup_code_state` (`extra_args` index
+        // out of bounds) — the wrap passed `&[]` instead of the
+        // `FunBc`'s defaults. The plain path (`fun_bc_prepare_call`)
+        // builds `extra_args` from `def_pos` (+ `def_kw`); the wrap
+        // must do the same (`count(10)`, `islice([..], 2)`).
+        let extra_args: Vec<Value> = match ctx.arena.get(fun) {
+            Obj::FunBc(d) => {
+                let mut v = d.def_pos.clone();
+                if let Some(kw) = d.def_kw {
+                    v.push(kw);
+                }
+                v
+            }
+            _ => Vec::new(),
+        };
         // The prepare borrows the code store (shared) while the
         // error mapping borrows the state (mutable) — so the
         // `gen_wrap_call` runs in a block whose borrows end
@@ -124,7 +160,7 @@ fn call_fun_bc_ctx(
                 fun,
                 code,
                 qstr_table,
-                &[],
+                &extra_args,
                 empty_tuple,
                 gen_type,
                 n_args,
@@ -308,7 +344,7 @@ fn resume_via_method_ctx(
 /// types keep their direct path (`exception_make_new` — their
 /// `make_new` slot is the same fn, but the direct call
 /// preserves the pre-C13b error mapping, pinned by `vm_tests`).
-fn call_type_ctx(
+pub(crate) fn call_type_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
     type_: GcRef,
@@ -320,8 +356,30 @@ fn call_type_ctx(
         return exception_make_new(ctx, type_, args, n_kw)
             .map_err(|e| exc_from_typed(ctx, state, e));
     }
-    type_call(ctx, Value::Heap(type_), n_args, n_kw, args)
-        .map_err(|e| exc_from_pyerror(ctx, state, e))
+    // E2: the type call carries the VM's real call hook, so a
+    // Python `__new__` / `__init__` actually executes (a `FunBc`
+    // callee runs through `call_function_ctx` + `execute_frame`).
+    // The hook stashes the exception OBJECT on the
+    // `state.pending_exc` side channel (the C14 contract:
+    // `PyError` cannot carry an object) and returns `PyRaise`;
+    // the drain below takes it first, else falls back to the
+    // recorded `pending_raise` via `exc_from_pyerror`.
+    let mut hook = |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
+        match call_function_ctx(ctx, state, fun, n, k, a) {
+            Ok(v) => Ok(v),
+            Err(exc) => {
+                state.pending_exc = Some(exc);
+                Err(PyError::PyRaise)
+            }
+        }
+    };
+    type_call(ctx, Value::Heap(type_), n_args, n_kw, args, Some(&mut hook)).map_err(|e| {
+        if let Some(exc) = state.pending_exc.take() {
+            exc
+        } else {
+            exc_from_pyerror(ctx, state, e)
+        }
+    })
 }
 
 /// The fallback for values with no payload dispatch: the value's

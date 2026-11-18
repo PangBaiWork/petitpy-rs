@@ -156,7 +156,7 @@ fn set_make_new_table_order() {
     let list = fx.heap_list(vec![Value::SmallInt(1), Value::SmallInt(2), Value::SmallInt(3)]);
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let s = set_make_new(&mut ctx, set_t, &[list], 0).expect("make_new");
+    let s = set_make_new(&mut ctx, set_t, &[list], 0, None).expect("make_new");
     drop(ctx);
     assert_eq!(print_of(&mut fx, s), "{1, 2, 3}");
 }
@@ -166,7 +166,7 @@ fn set_make_new_empty_and_new_empty() {
     let mut fx = Fixture::new();
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let s = set_make_new(&mut ctx, set_t, &[], 0).expect("make_new()");
+    let s = set_make_new(&mut ctx, set_t, &[], 0, None).expect("make_new()");
     let e = set_new(&mut ctx, set_t, &[]).expect("new()");
     drop(ctx);
     assert_eq!(print_of(&mut fx, s), "set()");
@@ -181,7 +181,7 @@ fn set_make_new_from_str() {
     let st = fx.heap_str(b"abc");
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let s = set_make_new(&mut ctx, set_t, &[st], 0).expect("make_new");
+    let s = set_make_new(&mut ctx, set_t, &[st], 0, None).expect("make_new");
     drop(ctx);
     assert_eq!(print_of(&mut fx, s), "{'a', 'c', 'b'}");
 }
@@ -193,7 +193,7 @@ fn set_make_new_too_many_args() {
     let b = fx.heap_list(vec![Value::SmallInt(2)]);
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let e = set_make_new(&mut ctx, set_t, &[a, b], 0).unwrap_err();
+    let e = set_make_new(&mut ctx, set_t, &[a, b], 0, None).unwrap_err();
     assert_eq!(e.exc_name(), "TypeError");
     assert_eq!(e.msg(), Some("argument num/types mismatch"));
 }
@@ -205,7 +205,7 @@ fn set_make_new_not_iterable_overwrites_mismatch() {
     let mut fx = Fixture::new();
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let e = set_make_new(&mut ctx, set_t, &[Value::SmallInt(1), Value::SmallInt(2)], 0).unwrap_err();
+    let e = set_make_new(&mut ctx, set_t, &[Value::SmallInt(1), Value::SmallInt(2)], 0, None).unwrap_err();
     assert_eq!(e.exc_name(), "TypeError");
     assert_eq!(e.msg(), Some("object not iterable"));
 }
@@ -215,7 +215,7 @@ fn set_make_new_not_iterable() {
     let mut fx = Fixture::new();
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let e = set_make_new(&mut ctx, set_t, &[Value::SmallInt(1)], 0).unwrap_err();
+    let e = set_make_new(&mut ctx, set_t, &[Value::SmallInt(1)], 0, None).unwrap_err();
     assert_eq!(e.exc_name(), "TypeError");
     assert_eq!(e.msg(), Some("object not iterable"));
 }
@@ -225,7 +225,7 @@ fn set_make_new_kw_mismatch() {
     let mut fx = Fixture::new();
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let e = set_make_new(&mut ctx, set_t, &[Value::SmallInt(1), Value::SmallInt(2)], 1).unwrap_err();
+    let e = set_make_new(&mut ctx, set_t, &[Value::SmallInt(1), Value::SmallInt(2)], 1, None).unwrap_err();
     assert_eq!(e.exc_name(), "TypeError");
     assert_eq!(e.msg(), Some("argument num/types mismatch"));
 }
@@ -237,7 +237,7 @@ fn set_make_new_unhashable_item() {
     let list = fx.heap_list(vec![q]);
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let e = set_make_new(&mut ctx, set_t, &[list], 0).unwrap_err();
+    let e = set_make_new(&mut ctx, set_t, &[list], 0, None).unwrap_err();
     assert_eq!(e.exc_name(), "TypeError");
     assert_eq!(e.msg(), Some("unsupported type for operator"));
 }
@@ -378,7 +378,7 @@ fn set_pop_table_order() {
     ]);
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let s2 = set_make_new(&mut ctx, set_t, &[list], 0).expect("make_new");
+    let s2 = set_make_new(&mut ctx, set_t, &[list], 0, None).expect("make_new");
     let mut got2 = Vec::new();
     for _ in 0..5 {
         got2.push(set_pop_builtin(&mut ctx, &[s2]).expect("pop"));

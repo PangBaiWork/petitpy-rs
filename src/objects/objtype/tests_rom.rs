@@ -191,7 +191,7 @@ fn rom_object_call_and_locals() {
     // `object()` → a blank Instance (empty members, no subobj).
     let inst = {
         let mut ctx = fx.ctx();
-        type_call(&mut ctx, object_v, 0, 0, &[]).expect("object()")
+        type_call(&mut ctx, object_v, 0, 0, &[], None).expect("object()")
     };
     match fx.arena.get(match inst {
         Value::Heap(r) => r,
@@ -206,7 +206,7 @@ fn rom_object_call_and_locals() {
     // `object(1)` → the (0, 0, false) sig error.
     let e = {
         let mut ctx = fx.ctx();
-        type_call(&mut ctx, object_v, 1, 0, &[Value::SmallInt(1)])
+        type_call(&mut ctx, object_v, 1, 0, &[Value::SmallInt(1)], None)
     };
     assert!(e.is_err(), "object(1) must fail the sig check");
     // The four locals are all present on the object type, and
@@ -255,7 +255,7 @@ fn rom_object_locals_not_inherited_via_chain() {
     };
     let inst = {
         let mut ctx = fx.ctx();
-        instance_make_new(&mut ctx, class_ref, &[], 0).expect("X()")
+        instance_make_new(&mut ctx, class_ref, &[], 0, None).expect("X()")
     };
     let init_q = fx.q(b"__init__");
     // A subclass instance does NOT see `object.__init__`.
@@ -265,7 +265,7 @@ fn rom_object_locals_not_inherited_via_chain() {
     // is searched).
     let obj_inst = {
         let mut ctx = fx.ctx();
-        type_call(&mut ctx, Value::Heap(t.object), 0, 0, &[]).expect("object()")
+        type_call(&mut ctx, Value::Heap(t.object), 0, 0, &[], None).expect("object()")
     };
     let got = fx.with_seams(|ctx, seams| {
         instance_load_attr(ctx, obj_inst, init_q, seams).expect("load")

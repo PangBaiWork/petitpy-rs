@@ -231,7 +231,14 @@ fn load_attr_property_getter_and_no_getter() {
     };
     fx.set_local(c, p_q, prop2);
     let loaded = fx.with_seams(|ctx, seams| instance_load_attr(ctx, inst, p_q, seams));
-    assert_eq!(loaded, Ok(None));
+    // E2: a getter-less property RAISES (probed on the reference:
+    // `AttributeError("no attribute 'prop'")` — objtype.zig:1320
+    // leaves dest NULL without the SENTINEL, so the caller raises)
+    // instead of returning the property object or `Ok(None)`.
+    assert_eq!(loaded, Err(PyError::PyRaise));
+    let raise = fx.pending_raise.as_ref().expect("pending raise recorded");
+    assert_eq!(raise.exc_name, "AttributeError");
+    assert_eq!(raise.message.as_deref(), Some("no attribute 'p'"));
 }
 
 #[test]

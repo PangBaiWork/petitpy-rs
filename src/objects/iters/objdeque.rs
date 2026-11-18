@@ -36,6 +36,7 @@ use crate::objects::containers::objdict_methods::collect_iterable;
 use crate::objects::obj::{obj_get_int, ObjError};
 use crate::objects::obj_ops::get_index;
 use crate::objects::slots::{SubscrArg, UnaryOp};
+use crate::objects::slots::CallHook;
 use crate::objects::value::{DequeData, GcRef, Obj, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
 
@@ -117,6 +118,7 @@ pub fn deque_make_new(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    mut call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, IterError> {
     // `args` is [positionals..., kw-key, kw-value, ...]; only
     // the first `n_pos` entries are real positionals. The Zig
@@ -137,7 +139,7 @@ pub fn deque_make_new(
         // Only the iterable's error is observable (probed:
         // `deque(5)` → "object not iterable", `deque([1, 2])`
         // → the sig error).
-        let _ = collect_iterable(ctx, iterable).map_err(map_collect_err)?;
+        let _ = collect_iterable(ctx, iterable, call.as_deref_mut()).map_err(map_collect_err)?;
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
     }
     let maxlen = obj_get_int(ctx, ctx.types, args[1]).map_err(IterError::from)?;
@@ -157,7 +159,7 @@ pub fn deque_make_new(
     } else {
         0
     };
-    let items_in = collect_iterable(ctx, iterable).map_err(map_collect_err)?;
+    let items_in = collect_iterable(ctx, iterable, call.as_deref_mut()).map_err(map_collect_err)?;
     let mut data = DequeData {
         alloc,
         i_get: 0,
@@ -222,7 +224,7 @@ pub fn deque_appendleft(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<V
 /// append loop (via `collect_iterable` — see the module docs
 /// for the streaming difference).
 pub fn deque_extend(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<Value, IterError> {
-    let items = collect_iterable(ctx, arg).map_err(map_collect_err)?;
+    let items = collect_iterable(ctx, arg, None).map_err(map_collect_err)?;
     let d = deque_data(ctx, self_)?;
     for item in items {
         deque_append_inner(d, item)?;
@@ -440,7 +442,7 @@ mod tests {
         args: &[Value],
         n_kw: usize,
     ) -> Result<Value, IterError> {
-        deque_make_new(ctx, t, args, n_kw)
+        deque_make_new(ctx, t, args, n_kw, None)
     }
 
     fn len_of(ctx: &mut CallCtx, d: Value) -> i64 {

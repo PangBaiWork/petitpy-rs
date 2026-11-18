@@ -181,6 +181,8 @@ impl Fx {
             classmethod,
             boundmeth,
             property,
+            dict_view: GcRef(0),
+            dict_view_it: GcRef(0),
             socket: None,
             deque: None,
             ordereddict: None,

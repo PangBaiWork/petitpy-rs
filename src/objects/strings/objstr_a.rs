@@ -401,8 +401,14 @@ pub fn buffer_data(
     types: &BuiltinTypes,
     v: Value,
 ) -> Result<Vec<u8>, StrError> {
-    if let Some(d) = str_data(ctx.arena, v) {
-        return Ok(d.to_vec());
+    // E2: the arena-only `str_data` read returned `None` for
+    // dynamic-qstr literals (every string literal in a module), so
+    // `bytes.fromhex('00:11:22', ':')` fell through to the
+    // buffer-protocol error. The pool-aware read covers statics,
+    // dynamics, and heap str/bytes alike (D5's `str_data_pool`
+    // fix class).
+    if let Some(d) = str_data_pool(ctx.arena, ctx.pool, v) {
+        return Ok(d);
     }
     let mut info = BufferInfo::empty();
     match get_buffer(ctx, types, v, &mut info, BUFFER_READ) {
@@ -440,7 +446,10 @@ pub fn iter_items(
             Obj::List(l) => JoinSource::Items(l.items.clone()),
             Obj::Tuple(t) => JoinSource::Items(t.clone()),
             Obj::Str(_) | Obj::Bytes(_) => JoinSource::StrData(
-                str_data(ctx.arena, arg).unwrap_or(&[]).to_vec(),
+                // Pool-aware for uniformity with the `Qstr` arm
+                // below (heap `Str`/`Bytes` read identically
+                // through either — their bytes live in the arena).
+                str_data_pool(ctx.arena, ctx.pool, arg).unwrap_or_default(),
                 is_str_value(ctx.arena, arg),
             ),
             Obj::Dict(d) => JoinSource::Items(d.map.entries.iter().filter_map(|e| e.key).collect()),
@@ -448,7 +457,12 @@ pub fn iter_items(
             Obj::Range(rg) => JoinSource::Range(rg.start, rg.stop, rg.step),
             _ => return Err(StrError::ObjectNotIterable),
         },
-        Value::Qstr(id) => JoinSource::StrData(qstr_bytes(id).unwrap_or(&[]).to_vec(), true),
+        // Pool-aware (E2): `qstr_bytes` is static-only, so a
+        // dynamic-qstr literal (`''.join('abc')`) read as empty.
+        Value::Qstr(_) => JoinSource::StrData(
+            str_data_pool(ctx.arena, ctx.pool, arg).unwrap_or_default(),
+            true,
+        ),
         _ => return Err(StrError::ObjectNotIterable),
     };
     match src {

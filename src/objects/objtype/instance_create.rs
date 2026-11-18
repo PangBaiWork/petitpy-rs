@@ -12,6 +12,7 @@
 //! `Super` object the Zig allocates is unobservable).
 
 use crate::memory::gc::CallCtx;
+use crate::objects::slots::CallHook;
 use crate::objects::callables::objfun::fun_builtin_var_type_data;
 use crate::objects::obj::{obj_get_type, type_data, FLAG_INSTANCE_TYPE};
 use crate::objects::primitives::objint::fun_n_args;
@@ -23,7 +24,7 @@ use crate::pyerr::{PyError, PyResult};
 
 use super::errors::{arg_check_num_sig, ObjTypeError};
 use super::lookup::{class_lookup, LookupHit, SlotKind};
-use super::seams::{with_stub_seams, VmSeams};
+use super::seams::{with_call_hook_seams, with_stub_seams, VmSeams};
 use super::typecreate::super_attr_impl;
 
 /// A dunder name's static qstr id (`None` = not a static qstr).
@@ -142,7 +143,7 @@ pub fn native_base_init_wrapper(
     let Some(f) = make_new else {
         return Err(PyError::PyRaise);
     };
-    let result = f(ctx, native_base, &flat, kwargs.len())?;
+    let result = f(ctx, native_base, &flat, kwargs.len(), None)?;
     if !has_subobj {
         return Err(PyError::PyRaise);
     }
@@ -191,6 +192,7 @@ pub fn static_class_method_make_new(
     self_type: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let n_pos = args.len().saturating_sub(2 * n_kw);
     let sig_err = arg_check_num_sig(n_pos, n_kw, 1, 1, false);
@@ -213,14 +215,25 @@ pub fn static_class_method_make_new(
 }
 
 /// `instanceMakeNewImpl` (`objtype.zig:2124-2200`) as a `MakeNewFn`:
-/// the stub-seams adapter (see `instance_make_new_inner`).
+/// `Some` hook → the VM's real call hook drives `__new__` /
+/// `__init__` (`with_call_hook_seams` — a `FunBc` callee actually
+/// executes, E2); `None` → the stub seams (a `FunBc` callee
+/// raises `PyRaise`, the pre-E2 behaviour).
 pub fn instance_make_new(
     ctx: &mut CallCtx,
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    with_stub_seams(|seams| instance_make_new_inner(ctx, type_, args, n_kw, seams))
+    match call {
+        Some(hook) => with_call_hook_seams(hook, |seams| {
+            instance_make_new_inner(ctx, type_, args, n_kw, seams)
+        }),
+        None => {
+            with_stub_seams(|seams| instance_make_new_inner(ctx, type_, args, n_kw, seams))
+        }
+    }
 }
 
 /// `instanceMakeNewImpl` (`objtype.zig:2124-2200`): construct an
@@ -274,7 +287,12 @@ pub fn instance_make_new_inner(
                 };
                 if still_wrapper {
                     if let Some(f) = type_data(ctx.arena, nb).and_then(|d| d.make_new) {
-                        let result = f(ctx, nb, args, n_kw)?;
+                        // Forward the call seam as the hook: a
+                        // native base built from an iterable
+                        // (e.g. `class D(dict): ...; D([('k', 1)])`)
+                        // gets the same hook the `__init__` path
+                        // runs on (E2).
+                        let result = f(ctx, nb, args, n_kw, Some(&mut *seams.call))?;
                         if let Obj::Instance(d) = ctx.arena.get_mut(ir) {
                             if !d.subobj.is_empty() {
                                 d.subobj[0] = result;

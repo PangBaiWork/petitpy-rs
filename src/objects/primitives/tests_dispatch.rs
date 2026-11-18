@@ -113,6 +113,8 @@ impl SlotFixture {
             empty_bytes,
             native_init_wrapper,
             property,
+            dict_view: GcRef(0),
+            dict_view_it: GcRef(0),
             socket: None,
             deque: None,
             ordereddict: None,

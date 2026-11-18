@@ -588,3 +588,4 @@ fn del_instance_attr_opcode() {
     let mut fx = Fx::new();
     fx.run_ok("class C:\n    pass\nc = C()\nc.x = 7\nassert hasattr(c, 'x')\ndel c.x\nassert not hasattr(c, 'x')\n");
 }
+

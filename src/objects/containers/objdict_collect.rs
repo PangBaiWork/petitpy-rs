@@ -15,7 +15,7 @@ use crate::objects::iters::iter::{getiter, iternext, CallOutcome, IterError, Ite
 use crate::objects::obj::ObjError;
 use crate::objects::obj_ops::obj_subscr;
 use crate::objects::objtype::call_via_type_slot;
-use crate::objects::slots::SubscrArg;
+use crate::objects::slots::{CallHook, SubscrArg};
 use crate::objects::value::{GcRef, Obj, Value};
 use crate::pyerr::PyError;
 use super::objdict::{dict_ref_of, DictError, NOT_ITERABLE};
@@ -57,14 +57,15 @@ pub(crate) fn view_next_entry(
 /// concrete types available today — see the module docs). A
 /// non-view `Obj::Iterator` (C11's map / filter / zip / enumerate
 /// / range / list / tuple / reversed / getitem iterators) drains
-/// through the general protocol (`IterPlan::Protocol`) with stub
-/// seams: the call seam routes through `call_via_type_slot`, so
-/// builtin functions and builtin types (`map(str, …)`) work; a
-/// user function (`FunBc`) raises through the stub (the VM runner
-/// seam is C13/C15's — the `MakeNewFn` signature cannot carry a
-/// `VmState`). A type with a `getiter` slot but no direct arm here
-/// still raises `TypeError("object not iterable")` (the `__iter__`
-/// method load is C12/C14's).
+/// through the general protocol (`IterPlan::Protocol`): the call
+/// seam routes through `call_via_type_slot`, so builtin functions
+/// and builtin types (`map(str, …)`) work; a user function
+/// (`FunBc`) runs only when the caller passes the VM's call hook
+/// (`Some`, E2 — the `MakeNewFn` hook threaded down from the
+/// type call), and raises through the stub otherwise. A type with
+/// a `getiter` slot but no direct arm here still raises
+/// `TypeError("object not iterable")` (the `__iter__` method load
+/// is C12/C14's).
 /// What `collect_iterable` does, decided from an immutable borrow
 /// first so the allocations below do not borrow the arena.
 /// Shared with the set lane (C9c: `set` construction / `update` /
@@ -87,7 +88,11 @@ enum IterPlan {
     Protocol(Value),
 }
 
-pub(crate) fn collect_iterable(ctx: &mut CallCtx, value: Value) -> Result<Vec<Value>, DictError> {
+pub(crate) fn collect_iterable(
+    ctx: &mut CallCtx,
+    value: Value,
+    mut call: Option<CallHook<'_, '_>>,
+) -> Result<Vec<Value>, DictError> {
     // Decide the plan from an immutable borrow (cloning payloads);
     // the allocations happen after the borrow ends.
     let plan = match value {
@@ -193,13 +198,27 @@ pub(crate) fn collect_iterable(ctx: &mut CallCtx, value: Value) -> Result<Vec<Va
             .collect()),
         IterPlan::Protocol(it) => {
             let it = getiter(ctx, it).map_err(|e| iter_err_to_dict(ctx, e))?;
-            // Stub seams (see the `fn` docs): the call seam routes
-            // through the type's `call` slot — builtins and builtin
-            // types only. A `StopIteration` raised by the called
+            // The call seam (E2): `Some` hook → the VM's real
+            // call hook (a `FunBc` callee actually executes, so
+            // `list(map(f, xs))` works); `None` → the builtin-live
+            // `call_via_type_slot` (builtins and builtin types
+            // only). A `StopIteration` raised by the called
             // function is exhaustion (the Zig's `mp_iternext`
             // classification) — drain the recorded raise and stop.
+            // NOTE: a `StopIteration` raised by a `FunBc` through
+            // the hook is NOT classified here — the exception
+            // object is stashed on `state.pending_exc`, which this
+            // ctx-only fn cannot see, so it surfaces as a raise.
+            let mut hook = call.as_deref_mut();
             let mut call_seam =
                 |ctx2: &mut CallCtx, fun: Value, args: &[Value]| -> CallOutcome {
+                    if let Some(h) = hook.as_deref_mut() {
+                        return match h(ctx2, fun, args.len(), 0, args) {
+                            Ok(v) => CallOutcome::Value(v),
+                            Err(PyError::OutOfMemory) => CallOutcome::Raise,
+                            Err(PyError::PyRaise) => CallOutcome::Raise,
+                        };
+                    }
                     match call_via_type_slot(ctx2, fun, args.len(), 0, args) {
                         Ok(v) => CallOutcome::Value(v),
                         Err(PyError::OutOfMemory) => CallOutcome::Raise,
@@ -224,8 +243,33 @@ pub(crate) fn collect_iterable(ctx: &mut CallCtx, value: Value) -> Result<Vec<Va
                         Ok(v) => CallOutcome::Value(v),
                         Err(ObjError::IndexOutOfRange) => CallOutcome::Stop,
                         Err(e) => {
-                            let _ = ctx2.record_typed(e);
-                            CallOutcome::Raise
+                            // E2: the slot collapses its error into a
+                            // recorded raise (`call_subscr` turns a
+                            // slot `PyRaise` into `NotImplemented`,
+                            // so `obj_subscr` never returns
+                            // `IndexOutOfRange` here — e.g. str
+                            // subscript at OOB records an IndexError)
+                            // — classify on the recorded raise
+                            // instead, the original's rule
+                            // (`objgetitemiter.zig:excIsStopOrIndex`,
+                            // mirrored in `vm_rt_iter.rs`): a
+                            // `StopIteration` or `IndexError` from
+                            // `__getitem__` IS exhaustion; anything
+                            // else propagates. Without this,
+                            // `list(enumerate('ab'))` raised
+                            // `IndexError` instead of stopping.
+                            let stop = matches!(
+                                ctx2.pending_raise.as_ref(),
+                                Some(p) if p.exc_name == "IndexError"
+                                    || p.exc_name == "StopIteration"
+                            );
+                            if stop {
+                                ctx2.pending_raise.take();
+                                CallOutcome::Stop
+                            } else {
+                                let _ = ctx2.record_typed(e);
+                                CallOutcome::Raise
+                            }
                         }
                     }
                 };

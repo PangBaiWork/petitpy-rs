@@ -337,8 +337,17 @@ pub fn new_iter(ctx: &mut CallCtx, data: IteratorData) -> Value {
 /// stub-tested and C13's VM integration covers the live path.
 pub fn getiter(ctx: &mut CallCtx, value: Value) -> Result<Value, IterError> {
     if let Value::Heap(r) = value {
-        if matches!(ctx.arena.get(r), Obj::Iterator(_)) {
-            return Ok(value);
+        if let Obj::Iterator(it) = ctx.arena.get(r) {
+            // Every iterator is its own iterator — EXCEPT a dict
+            // VIEW, which is an `Obj::Iterator` too (no `extra`,
+            // the kind — 0/1/2, `DictViewKind` in objdict_methods
+            // — in `index`): it must fall through to the type's
+            // getiter slot (`dict_view_getiter` → a fresh view
+            // iterator), or `next(iter(d.keys()))` fails with
+            // "object not an iterator" (E2).
+            if !(it.extra.is_empty() && it.index <= 2) {
+                return Ok(value);
+            }
         }
     }
     let type_ = obj_get_type(ctx.arena, ctx.types, value);

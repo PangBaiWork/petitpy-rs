@@ -132,6 +132,31 @@ pub(crate) fn intercept_builtin_call(
     if fun == state.sum_builtin {
         return Some(crate::runtime::builtin_vm::call_sum_ctx(ctx, state, n_args, n_kw, args));
     }
+    // `str` / `bool` are the TYPE objects themselves (E2): a
+    // 1-arg instance call runs the instance's `__str__` /
+    // `__bool__` through the VM's real call hook (see
+    // `builtin_str`); anything else delegates to the type-call
+    // path inside those fns.
+    if fun == Value::Heap(ctx.types.str_) {
+        return Some(crate::runtime::builtin_str::call_str_ctx(ctx, state, n_args, n_kw, args));
+    }
+    if fun == Value::Heap(ctx.types.bool_) {
+        return Some(crate::runtime::builtin_str::call_bool_ctx(ctx, state, n_args, n_kw, args));
+    }
+    // `repr` / `len` / `print` are plain `FunBuiltin`s (E2):
+    // a 1-arg instance call (any instance arg for `print`)
+    // runs the instance's dunder through the VM's real call
+    // hook (see `builtin_str`); anything else delegates to the
+    // existing ctx-only builtin inside those fns.
+    if fun == state.repr_builtin {
+        return Some(crate::runtime::builtin_str::call_repr_ctx(ctx, state, n_args, n_kw, args));
+    }
+    if fun == state.len_builtin {
+        return Some(crate::runtime::builtin_str::call_len_ctx(ctx, state, n_args, n_kw, args));
+    }
+    if fun == state.print_builtin {
+        return Some(crate::runtime::builtin_str::call_print_ctx(ctx, state, n_args, n_kw, args));
+    }
     // `sys.print_exception` is intercepted the same way (D2):
     // its default target is the VM's `sys_stdout`, which a
     // `FunBuiltin` slot cannot see.

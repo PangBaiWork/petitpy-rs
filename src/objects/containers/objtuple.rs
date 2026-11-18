@@ -74,6 +74,7 @@ use crate::objects::obj::{obj_get_int_maybe, obj_get_type, ObjError};
 use crate::objects::objtype::subclass::is_subclass_fast;
 use crate::objects::obj_ops::{get_index, obj_print_helper};
 use crate::objects::slots::{BinaryOp, GetIterFn, PrintKind, SubscrArg, UnaryOp};
+use crate::objects::slots::CallHook;
 use crate::objects::strings::objstr_a::{fast_slice_indexes, StrError};
 use crate::objects::value::{Obj, SliceData, TypeData};
 use crate::objects::value::{GcRef, Value};
@@ -260,6 +261,7 @@ pub fn tuple_make_new(
     tuple_type: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, TupleError> {
     // The polled sig check: record the error, keep going.
     let sig_err = if n_kw > 0 || args.len() > 1 {
@@ -282,7 +284,7 @@ pub fn tuple_make_new(
     // `collect_iterable` is C9a's `getiter`/`iternext` loop; a
     // failure here OVERWRITES the recorded sig error (the Zig's
     // `mp_getiter` sets `pending_exc` again).
-    let items = collect_iterable(ctx, args[0])?;
+    let items = collect_iterable(ctx, args[0], call)?;
     if let Some(e) = sig_err {
         return Err(e);
     }
@@ -699,5 +701,5 @@ pub fn tuple_make_new_builtin(
     args: &[Value],
 ) -> PyResult<Value> {
     let tuple_type = ctx.types.tuple;
-    tuple_make_new(ctx, tuple_type, args, 0).map_err(|e| ctx.record_typed(e))
+    tuple_make_new(ctx, tuple_type, args, 0, None).map_err(|e| ctx.record_typed(e))
 }

@@ -337,7 +337,7 @@ fn set_getiter_table_order_and_exhaustion() {
     let list = fx.heap_list(vec![Value::SmallInt(1), Value::SmallInt(2), Value::SmallInt(3)]);
     let set_t = fx.types.set;
     let mut ctx = fx.ctx();
-    let s = set_make_new(&mut ctx, set_t, &[list], 0).expect("make_new");
+    let s = set_make_new(&mut ctx, set_t, &[list], 0, None).expect("make_new");
     let it = set_getiter(&mut ctx, s).expect("getiter");
     let mut got = Vec::new();
     loop {

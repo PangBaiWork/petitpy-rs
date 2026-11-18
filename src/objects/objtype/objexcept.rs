@@ -85,6 +85,7 @@
 //!   clause, which the VM rejects earlier via `is_exception_type`).
 
 use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
+use crate::objects::slots::CallHook;
 use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::static_qstr_id;
@@ -199,6 +200,7 @@ pub fn exception_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     exception_make_new(ctx, type_, args, n_kw).map_err(ExcError::to_pyerror)
 }

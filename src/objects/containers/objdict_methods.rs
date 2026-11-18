@@ -14,10 +14,13 @@ use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::containers::map::{
     map_lookup, map_of, map_of_mut, map_set_value, LookupKind, LookupOutcome,
 };
+use crate::objects::iters::iter::FLAG_ITER_IS_ITERNEXT;
 use crate::objects::obj::{obj_id, obj_len_maybe};
 use crate::objects::obj_ops::obj_print_helper;
+use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
-use crate::objects::value::{IteratorData, MapData, Obj, Value};
+use crate::objects::slots::CallHook;
+use crate::objects::value::{GcRef, IteratorData, MapData, Obj, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
 use super::objdict::{
     dict_binary_op, dict_clear, dict_copy, dict_new, dict_ref_of, dict_unary_op,
@@ -62,24 +65,28 @@ impl DictViewKind {
 }
 
 /// Build a dict view (`Obj::Iterator`, kind in `index`, no `extra`).
+/// The header is the `dict_view` ROM type (E2 — it was `None`, so
+/// `type(d.keys())`, `print(d.keys())` and `len(d.keys())` all
+/// failed: no slots at all).
 pub(crate) fn make_view(ctx: &mut CallCtx, dict: Value, kind: DictViewKind) -> Value {
     let it = IteratorData {
         source: dict,
         index: kind as usize,
         extra: Vec::new(),
     };
-    Value::Heap(ctx.alloc(None, Obj::Iterator(it)))
+    Value::Heap(ctx.alloc(Some(ctx.types.dict_view), Obj::Iterator(it)))
 }
 
 /// Build a dict view iterator (`Obj::Iterator`, cursor in `index`,
-/// kind in `extra[0]`).
+/// kind in `extra[0]`). The header is the `dict_view_it` ROM type
+/// (name `iterator`, `FLAG_ITER_IS_ITERNEXT` — E2, was `None`).
 pub(crate) fn make_view_it(ctx: &mut CallCtx, dict: Value, kind: DictViewKind) -> Value {
     let it = IteratorData {
         source: dict,
         index: 0,
         extra: vec![Value::SmallInt(kind as i64)],
     };
-    Value::Heap(ctx.alloc(None, Obj::Iterator(it)))
+    Value::Heap(ctx.alloc(Some(ctx.types.dict_view_it), Obj::Iterator(it)))
 }
 
 /// Read a value as a dict view: `(dict, kind)`. `None` for any other
@@ -249,6 +256,7 @@ pub fn dict_update(
     self_v: Value,
     other: Option<Value>,
     kwargs: &MapData,
+    mut call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, DictError> {
     let r = dict_ref_of(ctx.arena, self_v);
     ensure_not_fixed(ctx.arena, r)?;
@@ -286,9 +294,9 @@ pub fn dict_update(
             // (The Zig stops after 3 elements of a pair; this
             // materialises the pair whole first — same verdict, see
             // the module docs.)
-            let pairs = collect_iterable(ctx, other_v)?;
+            let pairs = collect_iterable(ctx, other_v, call.as_deref_mut())?;
             for pair in pairs {
-                let elems = collect_iterable(ctx, pair)?;
+                let elems = collect_iterable(ctx, pair, call.as_deref_mut())?;
                 if elems.len() != 2 {
                     return Err(DictError::ValueError(UPDATE_SEQ_WRONG_LEN));
                 }
@@ -345,7 +353,7 @@ pub fn dict_fromkeys(
     };
     let dict = dict_new(ctx, hint);
     let dict_ref = dict.as_heap().expect("fresh dict is heap");
-    let keys = collect_iterable(ctx, iterable)?;
+    let keys = collect_iterable(ctx, iterable, None)?;
     for k in keys {
         match map_lookup(ctx, ctx.types, dict_ref, k, LookupKind::Add)? {
             LookupOutcome::Added(i) | LookupOutcome::Found(i) => {
@@ -462,6 +470,57 @@ pub fn dict_view_getiter(ctx: &mut CallCtx, self_v: Value) -> PyResult<Value> {
     Ok(make_view_it(ctx, dict, kind))
 }
 
+/// `mp_type_dict_view` (objdict.zig:921-...): ONE type for all
+/// three kinds (name `dict_view`), slots print / unary_op /
+/// binary_op / getiter. `dict` is the caller-owned locals dict
+/// (empty — views expose no methods).
+pub fn dict_view_type_data(dict: GcRef) -> TypeData {
+    TypeData {
+        name: static_qstr_id(b"dict_view").expect("dict_view is a static qstr"),
+        flags: 0,
+        base: None,
+        mro: Vec::new(),
+        dict,
+        attr: None,
+        make_new: None,
+        bases: None,
+        unary_op: Some(dict_view_unary_op),
+        binary_op: Some(dict_view_binary_op),
+        call: None,
+        getiter: Some(dict_view_getiter),
+        subscr: None,
+        buffer: None,
+        print: Some(dict_view_print),
+        namedtuple_fields: None,
+        protocol: None,
+    }
+}
+
+/// `mp_type_dict_view_it` (objdict.zig:885-...): name `iterator`,
+/// flags `FLAG_ITER_IS_ITERNEXT`, getiter returns self; the next
+/// step is `dict_view_it_next` via `iternext`'s view-it arm.
+pub fn dict_view_it_type_data(dict: GcRef) -> TypeData {
+    TypeData {
+        name: static_qstr_id(b"iterator").expect("iterator is a static qstr"),
+        flags: FLAG_ITER_IS_ITERNEXT,
+        base: None,
+        mro: Vec::new(),
+        dict,
+        attr: None,
+        make_new: None,
+        bases: None,
+        unary_op: None,
+        binary_op: None,
+        call: None,
+        getiter: Some(|_ctx: &mut CallCtx, self_: Value| Ok(self_)),
+        subscr: None,
+        buffer: None,
+        print: None,
+        namedtuple_fields: None,
+        protocol: None,
+    }
+}
+
 
 // ── `BuiltinFn` adapters (the method table) ─────────────────────────
 
@@ -525,7 +584,25 @@ pub fn dict_popitem_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value
 pub fn dict_update_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     check_arity(args, 1, 2).map_err(|e| ctx.record_typed(e))?;
     let empty = MapData::new();
-    dict_update(ctx, first(args), args.get(1).copied(), &empty).map_err(|e| ctx.record_typed(e))
+    dict_update(ctx, first(args), args.get(1).copied(), &empty, None).map_err(|e| ctx.record_typed(e))
+}
+
+/// `dict.update` as a `BuiltinKwFn` (E2): the `BuiltinFn` path
+/// covers the no-kw call; kwargs arrive as `(qstr, value)` pairs
+/// and are applied after the positional argument (the core
+/// `dict_update`'s `kwargs: &MapData` parameter — the VM's C15
+/// path already passes kwargs through `dict_update` directly).
+pub fn dict_update_kw_wrapper(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+) -> PyResult<Value> {
+    check_arity(args, 1, 2).map_err(|e| ctx.record_typed(e))?;
+    let kw_map = MapData::from_pairs(
+        kwargs.iter().map(|(k, v)| (Value::Qstr(*k), *v)).collect(),
+    );
+    dict_update(ctx, first(args), args.get(1).copied(), &kw_map, None)
+        .map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict.items` (fixed 1 arg).
@@ -607,7 +684,7 @@ pub static DICT_METHODS: &[crate::objects::slots::MethodEntry] = &[
         func: dict_update_builtin,
         min: 1,
         max: 2,
-        kw_func: None,
+        kw_func: Some(dict_update_kw_wrapper),
     },
     crate::objects::slots::MethodEntry {
         name: "items",

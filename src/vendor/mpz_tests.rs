@@ -281,3 +281,13 @@ fn bit_length_cases() {
     assert_eq!(bi("4294967296").num_digits(), 2);
     assert_eq!(bi("0").digits(), &[] as &[u32]);
 }
+#[test]
+fn e2_divmod_neg_neg() {
+    use super::mpz::BigInt;
+    let (q, r) = BigInt::from_int(-2).divmod(&BigInt::from_int(-4)).unwrap();
+    assert_eq!(q.as_int_checked(), Some(0));
+    assert_eq!(r.as_int_checked(), Some(-2));
+    let (q, r) = BigInt::from_int(8).divmod(&BigInt::from_int(-3)).unwrap();
+    assert_eq!(q.as_int_checked(), Some(-3));
+    assert_eq!(r.as_int_checked(), Some(-1));
+}

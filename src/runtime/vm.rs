@@ -153,6 +153,18 @@ pub struct VmState {
     pub all_builtin: Value,
     pub any_builtin: Value,
     pub sum_builtin: Value,
+    /// The `repr` builtin (intercepted by GcRef identity in
+    /// `call_function_ctx` — an instance's `__repr__` needs the
+    /// VM's real call hook, see `builtin_str`). Added by E2.
+    pub repr_builtin: Value,
+    /// The `len` builtin (same interception as `repr` — an
+    /// instance's `__len__` needs the VM's real call hook, see
+    /// `builtin_str`). Added by E2.
+    pub len_builtin: Value,
+    /// The `print` builtin (same interception as `repr` — an
+    /// instance arg's `__str__` needs the VM's real call hook,
+    /// see `builtin_str`). Added by E2.
+    pub print_builtin: Value,
     /// The `NotImplemented` singleton value (D1): an
     /// `Obj::Instance` with the shared ellipsis type as header
     /// (the vendor's `mp_type_singleton` carries both it and
@@ -364,6 +376,8 @@ impl Vm {
             empty_bytes: GcRef(0),
             native_init_wrapper: GcRef(0),
             property: GcRef(0),
+            dict_view: GcRef(0),
+            dict_view_it: GcRef(0),
             socket: None,
             deque: None,
             ordereddict: None,
@@ -412,6 +426,9 @@ impl Vm {
                 all_builtin: Value::None,
                 any_builtin: Value::None,
                 sum_builtin: Value::None,
+                repr_builtin: Value::None,
+                len_builtin: Value::None,
+                print_builtin: Value::None,
                 not_implemented: Value::None,
                 pending_sched: None,
                 compiler_linked: true,

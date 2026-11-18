@@ -497,7 +497,7 @@ pub fn build_fileio_types(
     ctx: &mut CallCtx,
     fun_builtin_var: GcRef,
 ) -> (GcRef, GcRef) {
-    let locals = locals_dict_from_entries(ctx, fun_builtin_var, FILEIO_LOCALS, &[]);
+    let locals = locals_dict_from_entries(ctx, fun_builtin_var, None, FILEIO_LOCALS, &[], &[]);
     let fileio = ctx.alloc(None, Obj::Type(fileio_type_data(locals)));
     let textio = ctx.alloc(None, Obj::Type(textio_type_data(locals)));
     ctx.roots.push(Value::Heap(fileio));

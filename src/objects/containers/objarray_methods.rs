@@ -127,7 +127,7 @@ pub fn array_extend_impl(
     arg: Value,
     len: usize,
 ) -> Result<(), ArrayError> {
-    let items = collect_iterable(ctx, arg).map_err(iter_error)?;
+    let items = collect_iterable(ctx, arg, None).map_err(iter_error)?;
     if len == 0 {
         for it in items {
             array_append(ctx, array, it)?;

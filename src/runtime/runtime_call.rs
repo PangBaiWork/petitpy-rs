@@ -41,7 +41,7 @@ pub fn call_function_n_kw(
             Obj::FunBc(_) => fun_bc_call_slot(ctx, fun, n_args, n_kw, args),
             Obj::BoundMeth(_) => bound_meth_call_slot(ctx, fun, n_args, n_kw, args),
             Obj::Closure(_) => closure_call_slot(ctx, fun, n_args, n_kw, args),
-            Obj::Type(_) => type_call(ctx, fun, n_args, n_kw, args),
+            Obj::Type(_) => type_call(ctx, fun, n_args, n_kw, args, None),
             _ => {
                 let t = obj_get_type(ctx.arena, &ctx.types, fun);
                 match t.and_then(|tr| type_call_slot(ctx, tr)) {

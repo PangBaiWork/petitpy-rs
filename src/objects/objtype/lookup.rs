@@ -256,8 +256,27 @@ pub(crate) fn lookup_in(
             let obj_obj = match obj {
                 Some(v) if native && t != ctx.types.object => {
                     // Native base class: the lookup applies to
-                    // the native subobj.
-                    instance_subobj0(ctx.arena, v).or(Some(v))
+                    // the native subobj — but only when subobj[0]
+                    // IS an object of type `t` (a user subclass's
+                    // native payload, e.g. the list inside a
+                    // `class L(list)` — the Zig's subobj[0] IS
+                    // the native object there). A direct
+                    // Rust-modeled native instance (socket:
+                    // subobj = [fd, family, type, proto]) carries
+                    // raw fields, not a native object — its
+                    // methods take the instance itself (the Zig
+                    // has no instance there at all: the socket
+                    // IS the native object). E2: binding socket
+                    // methods to the fd int raised "expected a
+                    // socket" on every call.
+                    match instance_subobj0(ctx.arena, v) {
+                        Some(sub0)
+                            if obj_get_type(ctx.arena, ctx.types, sub0) == Some(t) =>
+                        {
+                            Some(sub0)
+                        }
+                        _ => Some(v),
+                    }
                 }
                 Some(v) => Some(v),
                 None => None,
@@ -267,11 +286,15 @@ pub(crate) fn lookup_in(
         return Some(LookupHit::Member(fun, bound));
     }
     // 3. Native load_attr fallback for attributes not in
-    // locals_dict.
+    // locals_dict. Same guard as step 2 (E2): only when
+    // subobj[0] IS an object of type `t` — a socket's fd int
+    // must not leak int methods onto the socket.
     if obj.is_some() && !is_type && native && t != ctx.types.object {
         if let Some(sub) = obj.and_then(|v| instance_subobj0(ctx.arena, v)) {
-            if let Some((fun, bound)) = seams.load_maybe(ctx, sub, attr) {
-                return Some(LookupHit::Member(fun, bound));
+            if obj_get_type(ctx.arena, ctx.types, sub) == Some(t) {
+                if let Some((fun, bound)) = seams.load_maybe(ctx, sub, attr) {
+                    return Some(LookupHit::Member(fun, bound));
+                }
             }
         }
     }
@@ -585,7 +608,14 @@ pub fn scan_special_accessors_flag(
 
 /// `typeLocalsDictReadonly` (`objtype.zig:232-247`): the type's
 /// locals dict — itself when already fixed, else a copy marked
-/// fixed.
+/// fixed. E2: the type's locals dict is allocated with a `None`
+/// header at ROM bootstrap (the dict type does not exist yet
+/// when the first type dicts are built) — but the Zig's locals
+/// dict IS a dict object (`type(int.__dict__)` is `dict`, it
+/// prints and subscripts). When the dict is first exposed as a
+/// value, give it the dict header in place: the fixed case
+/// keeps its `is` identity (`int.__dict__ is int.__dict__`,
+/// probed), the copy case gets its header on the copy.
 pub fn type_locals_dict_readonly(ctx: &mut CallCtx, type_: GcRef) -> PyResult<Value> {
     let Some(tdata) = type_data(ctx.arena, type_) else {
         return Err(PyError::PyRaise);
@@ -598,6 +628,10 @@ pub fn type_locals_dict_readonly(ctx: &mut CallCtx, type_: GcRef) -> PyResult<Va
         Obj::Dict(d) => d.map.is_fixed,
         _ => return Err(PyError::PyRaise),
     };
+    let dict_type = ctx.types.dict;
+    if ctx.arena.header(r).type_.is_none() {
+        ctx.arena.set_header_type(r, Some(dict_type));
+    }
     if is_fixed {
         return Ok(dict);
     }
@@ -605,6 +639,9 @@ pub fn type_locals_dict_readonly(ctx: &mut CallCtx, type_: GcRef) -> PyResult<Va
     let Value::Heap(cr) = copy else {
         return Err(PyError::PyRaise);
     };
+    if ctx.arena.header(cr).type_.is_none() {
+        ctx.arena.set_header_type(cr, Some(dict_type));
+    }
     if let Obj::Dict(d) = ctx.arena.get_mut(cr) {
         d.map.is_fixed = true;
     }

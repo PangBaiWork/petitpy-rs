@@ -116,6 +116,8 @@ impl Fixture {
             empty_bytes: mk(&mut arena, b"bytes"),
             native_init_wrapper: mk(&mut arena, b"function"),
             property: mk(&mut arena, b"property"),
+            dict_view: GcRef(0),
+            dict_view_it: GcRef(0),
             socket: None,
             deque: None,
             ordereddict: None,

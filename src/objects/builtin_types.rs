@@ -90,6 +90,16 @@ pub struct BuiltinTypes {
     /// `property` (C12: the special-accessor scan tests
     /// `isExactType(value, property)`).
     pub property: GcRef,
+    /// `dict_view` (E2: ONE ROM type for all three dict-view
+    /// kinds — `dict_keys` / `dict_values` / `dict_items` all
+    /// allocate with this header; the kind lives in the
+    /// `IteratorData`. Built at bootstrap so `make_view` can
+    /// read it from `ctx.types`).
+    pub dict_view: GcRef,
+    /// `dict_view_it` (E2: the view-iterator ROM type, name
+    /// `iterator`, `FLAG_ITER_IS_ITERNEXT`; `make_view_it`
+    /// allocates with this header).
+    pub dict_view_it: GcRef,
     /// `socket` (D3: the `socket` module's type object, built by
     /// `build_socket_module` — not by the VM bootstrap, so the
     /// module entry is a plain constructor function per

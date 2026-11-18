@@ -38,6 +38,7 @@
 pub mod argcheck;
 pub mod bc;
 pub mod builtin_fns;
+pub mod builtin_str;
 pub mod builtin_vm;
 pub mod builtinhelp;
 pub mod builtinevex;
@@ -84,6 +85,7 @@ pub mod vm_rt;
 pub mod vm_rt_iter;
 pub mod vm_rt_name;
 pub mod vm_roots;
+pub mod vm_seams;
 pub mod vm_types;
 pub mod warning;
 
@@ -127,3 +129,5 @@ mod runtime_tests_c;
 mod vm_raise_tests;
 #[cfg(test)]
 mod vm_tests_b;
+#[cfg(test)]
+mod vm_tests_e2;

@@ -109,14 +109,43 @@ pub fn store_global_ctx(
 /// `mp_delete_name` / `mp_delete_global` (`runtime.zig:343-346`):
 /// delete from the locals dict / the globals dict; a missing
 /// key is silent (the Zig ignores the delete result).
-pub fn delete_name_ctx(ctx: &mut CallCtx, state: &mut VmState, qst: u32) {
+/// `mp_delete_name` (`runtime.zig:343`): delete from the locals
+/// dict. The vendor's `dict_get_helper` (`REMOVE_IF_FOUND`,
+/// `objdict.c`) RAISES `KeyError(key)` when the name is missing
+/// (the Zig's `mp_delete_name` ignores the return value, but the
+/// raise travels on the error channel) — so a double `del x`
+/// raises (`del_name.py`'s bare except prints "NameError";
+/// `del_global.py` notes the KeyError in its FIXME comment).
+pub fn delete_name_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    qst: u32,
+) -> Result<(), Value> {
     use crate::objects::containers::objdict::dict_delete;
-    let _ = dict_delete(ctx, Value::Heap(state.locals_dict()), Value::Qstr(qst));
+    use crate::runtime::vm_ops::exc_from_pyerror;
+    dict_delete(ctx, Value::Heap(state.locals_dict()), Value::Qstr(qst))
+        .map(|_| ())
+        .map_err(|e| {
+            let sig = ctx.record_typed(e);
+            exc_from_pyerror(ctx, state, sig)
+        })
 }
 
-pub fn delete_global_ctx(ctx: &mut CallCtx, state: &mut VmState, qst: u32) {
+/// `mp_delete_global` (`runtime.zig:346`): delete from the
+/// globals dict; same `KeyError` rule as `delete_name_ctx`.
+pub fn delete_global_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    qst: u32,
+) -> Result<(), Value> {
     use crate::objects::containers::objdict::dict_delete;
-    let _ = dict_delete(ctx, Value::Heap(state.globals), Value::Qstr(qst));
+    use crate::runtime::vm_ops::exc_from_pyerror;
+    dict_delete(ctx, Value::Heap(state.globals), Value::Qstr(qst))
+        .map(|_| ())
+        .map_err(|e| {
+            let sig = ctx.record_typed(e);
+            exc_from_pyerror(ctx, state, sig)
+        })
 }
 
 /// `mp_load_build_class` (`runtime.zig:328`): the override dict's
@@ -167,6 +196,21 @@ pub fn load_method_maybe_ctx(
                     return Ok((Some(state.next_builtin), Some(obj)));
                 }
             }
+        }
+    }
+    // An instance tries its attribute load first, with the
+    // VM's real call hook (E2): the members map, `__dict__`,
+    // the class lookup, a `property` fget, a descriptor
+    // `__get__`, and the `__getattr__` fallback. The value is
+    // already bound when it is a method (`instance_load_attr`
+    // returns `bind_pair`), so the second element is `None`
+    // (no self to push). `Ok(None)` falls through to the
+    // attr-slot dispatch and the type-locals lookup below.
+    if let Value::Heap(_) = obj {
+        match crate::runtime::vm_seams::try_instance_load_attr(ctx, state, obj, attr) {
+            Ok(Some(v)) => return Ok((Some(v), None)),
+            Ok(None) => {}
+            Err(exc) => return Err(exc),
         }
     }
     // The type's attr slot — via the direct fns for now
@@ -385,10 +429,26 @@ pub fn store_attr_ctx(
     let globals = Value::Heap(state.globals);
     let next_obj = state.next_builtin;
     let exc = ExcRefs::from_exception_types(&state.exc);
-    store_attr(ctx, base, attr, value, &exc, next_obj, &mut builtins, &mut seams, globals)
-        .map_err(|e| match e {
-            RtError::PyRaise => drain_seam_raise(ctx, state),
-            other => rt_error_to_value(ctx, state, other),
-        })
+    // The VM's real call hook (E2), scoped so it is dropped
+    // before the error drain below borrows `state` again.
+    let result = {
+        let mut hook = crate::runtime::vm_seams::make_hook(state);
+        store_attr(
+            ctx,
+            base,
+            attr,
+            value,
+            &exc,
+            next_obj,
+            &mut builtins,
+            &mut seams,
+            globals,
+            Some(&mut hook),
+        )
+    };
+    result.map_err(|e| match e {
+        RtError::PyRaise => drain_seam_raise(ctx, state),
+        other => rt_error_to_value(ctx, state, other),
+    })
 }
 

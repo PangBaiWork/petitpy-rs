@@ -38,7 +38,7 @@ fn set_update_one(
     other: Value,
     pending: &mut Option<SetError>,
 ) -> Result<(), SetError> {
-    match collect_iterable(ctx, other) {
+    match collect_iterable(ctx, other, None) {
         Err(e) => {
             *pending = Some(SetError::from(e));
         }
@@ -105,7 +105,7 @@ pub(crate) fn set_diff_impl(
             let r = set_ref_of(ctx.arena, work);
             super::objset::with_set_table(ctx, r, |_, table| table.clear());
         } else {
-            match collect_iterable(ctx, other) {
+            match collect_iterable(ctx, other, None) {
                 Err(e) => {
                     pending = Some(SetError::from(e));
                 }
@@ -150,7 +150,7 @@ pub(crate) fn set_intersect_impl(
     }
     let out = alloc_set(ctx, ctx.types.set, 0);
     let mut pending: Option<SetError> = None;
-    match collect_iterable(ctx, other) {
+    match collect_iterable(ctx, other, None) {
         Err(e) => {
             pending = Some(SetError::from(e));
         }
@@ -193,7 +193,7 @@ pub(crate) fn set_symdiff_update_impl(
     other: Value,
 ) -> Result<Value, SetError> {
     let mut pending: Option<SetError> = None;
-    match collect_iterable(ctx, other) {
+    match collect_iterable(ctx, other, None) {
         Err(e) => {
             pending = Some(SetError::from(e));
         }
@@ -284,7 +284,7 @@ pub(crate) fn set_isdisjoint_impl(
     self_v: Value,
     other: Value,
 ) -> Result<Value, SetError> {
-    let items = match collect_iterable(ctx, other) {
+    let items = match collect_iterable(ctx, other, None) {
         Err(e) => return Err(SetError::from(e)),
         Ok(v) => v,
     };

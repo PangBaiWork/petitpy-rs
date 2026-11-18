@@ -262,7 +262,7 @@ impl Env {
     /// An instance of `type_` (no-arg construction).
     pub(crate) fn instance_of(&mut self, type_: GcRef) -> Value {
         let mut ctx = self.ctx();
-        crate::objects::objtype::instance_create::instance_make_new(&mut ctx, type_, &[], 0)
+        crate::objects::objtype::instance_create::instance_make_new(&mut ctx, type_, &[], 0, None)
             .expect("instance")
     }
 

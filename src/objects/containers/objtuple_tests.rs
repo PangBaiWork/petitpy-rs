@@ -65,21 +65,21 @@ fn tuple_make_new_basics() {
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
     // `tuple()` → empty.
-    let out = tuple_make_new(ctx, t, &[], 0).unwrap();
+    let out = tuple_make_new(ctx, t, &[], 0, None).unwrap();
     assert_eq!(tuple_items(ctx, out).unwrap(), &[] as &[Value]);
     // `tuple([1, 2])` → (1, 2).
-    let out = tuple_make_new(ctx, t, &[l], 0).unwrap();
+    let out = tuple_make_new(ctx, t, &[l], 0, None).unwrap();
     assert_eq!(tuple_items(ctx, out).unwrap(), &ints(&[1, 2]));
     // `tuple("ab")` → ('a', 'b') — heap `Str` chars.
-    let out = tuple_make_new(ctx, t, &[s], 0).unwrap();
+    let out = tuple_make_new(ctx, t, &[s], 0, None).unwrap();
     let got = tuple_items(ctx, out).unwrap().to_vec();
     assert_eq!(got.len(), 2);
     assert!(matches!(got[0], Value::Heap(_)) && matches!(got[1], Value::Heap(_)));
     // `tuple(t) is t` — exact-tuple arg returned as-is.
-    let out = tuple_make_new(ctx, t, &[inner], 0).unwrap();
+    let out = tuple_make_new(ctx, t, &[inner], 0, None).unwrap();
     assert_eq!(out, inner);
     // `tuple({"a": 1})` → ('a',) — dict iterates its keys.
-    let out = tuple_make_new(ctx, t, &[d], 0).unwrap();
+    let out = tuple_make_new(ctx, t, &[d], 0, None).unwrap();
     assert_eq!(tuple_items(ctx, out).unwrap().len(), 1);
 }
 
@@ -95,29 +95,29 @@ fn tuple_make_new_sig_error_ordering() {
     // `tuple(1, 2)` → "object not iterable" (the `getiter`
     // failure overwrites the recorded sig error).
     assert_eq!(
-        tuple_make_new(ctx, t, &[Value::SmallInt(1), Value::SmallInt(2)], 0),
+        tuple_make_new(ctx, t, &[Value::SmallInt(1), Value::SmallInt(2)], 0, None),
         Err(TupleError::NotIterable)
     );
     // `tuple("a", "b")` → "argument num/types mismatch" (the
     // `getiter` succeeds, so the sig error survives).
     assert_eq!(
-        tuple_make_new(ctx, t, &[a, b], 0),
+        tuple_make_new(ctx, t, &[a, b], 0, None),
         Err(TupleError::ArgNumTypesMismatch)
     );
     // `tuple((1, 2), 99)` → "argument num/types mismatch" (the
     // exact-tuple early return leaves the pending error).
     assert_eq!(
-        tuple_make_new(ctx, t, &[inner, Value::SmallInt(99)], 0),
+        tuple_make_new(ctx, t, &[inner, Value::SmallInt(99)], 0, None),
         Err(TupleError::ArgNumTypesMismatch)
     );
     // `tuple(5)` → "object not iterable".
     assert_eq!(
-        tuple_make_new(ctx, t, &[Value::SmallInt(5)], 0),
+        tuple_make_new(ctx, t, &[Value::SmallInt(5)], 0, None),
         Err(TupleError::NotIterable)
     );
     // kwargs with no positional args → arg mismatch.
     assert_eq!(
-        tuple_make_new(ctx, t, &[], 1),
+        tuple_make_new(ctx, t, &[], 1, None),
         Err(TupleError::ArgNumTypesMismatch)
     );
 }

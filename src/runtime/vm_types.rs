@@ -13,7 +13,9 @@ use crate::objects::containers::objarray::{
 };
 use crate::objects::containers::objarray_methods::ARRAY_METHODS;
 use crate::objects::containers::objdict::dict_type_data;
-use crate::objects::containers::objdict_methods::DICT_METHODS;
+use crate::objects::containers::objdict_methods::{
+    dict_view_it_type_data, dict_view_type_data, DICT_METHODS,
+};
 use crate::objects::containers::objattrtuple::attrtuple_type_data;
 use crate::objects::containers::objfileio::build_fileio_types;
 use crate::objects::containers::objlist::list_type_data;
@@ -44,9 +46,14 @@ use crate::objects::primitives::objfloat::float_type_data;
 use crate::objects::primitives::objint::{fun_n_args, int_locals_dict, int_type_data};
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BuiltinFn, BuiltinKwFn, MethodEntry};
-use crate::objects::strings::objstr_b::{BYTES_METHODS, STR_METHODS};
+use crate::objects::strings::objstr_b::{
+    str_splitlines_kw_wrapper, BYTES_METHODS, STR_METHODS,
+};
 use crate::objects::strings::objstr_methods_b::{bytes_type_data, str_type_data};
-use crate::objects::value::{BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj, TypeData, Value};
+use crate::objects::value::{
+    BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj, StaticClassMethodData, TypeData,
+    Value,
+};
 use crate::runtime::vm_builtins::{ellipsis_print, format_kw_wrapper, none_print};
 
 /// The type objects the VM owns beyond `BuiltinTypes` (built once
@@ -129,11 +136,23 @@ fn plain_type(ctx: &mut CallCtx, name: u32) -> GcRef {
 /// identical to the fixed-arity call slots, C10a). `kw_overrides`
 /// replaces the `kw_func` for a named method (the `str.format`
 /// pass-through — see `format_kw_wrapper`).
+/// `MethodEntry` tables into a type's locals dict (C9c's shape,
+/// which carries sigs). `kw_overrides` as above; `cm_overrides`
+/// names the entries that are classmethods in the original (each
+/// with its `(min, max)` sig counting `cls`, e.g.
+/// `dict.fromkeys` (2, 3) — `objdict.zig:741-743`): the
+/// `FunBuiltin` is wrapped in a `StaticClassMethod` object headed
+/// by the `classmethod` type (the `bytes.fromhex` pattern).
+/// `classmethod` is `None` for builders that run without the
+/// `VmTypes` classmethod type (module locals — none of their
+/// tables has a classmethod); then `cm_overrides` must be empty.
 pub(crate) fn locals_dict_from_entries(
     ctx: &mut CallCtx,
     fun_builtin_var: GcRef,
+    classmethod: Option<GcRef>,
     entries: &[MethodEntry],
     kw_overrides: &[(&str, BuiltinKwFn)],
+    cm_overrides: &[(&str, u16)],
 ) -> GcRef {
     let pairs: Vec<(Value, Value)> = entries
         .iter()
@@ -145,16 +164,32 @@ pub(crate) fn locals_dict_from_entries(
                 .find(|(n, _)| *n == e.name)
                 .map(|(_, f)| *f)
                 .or(e.kw_func);
+            let cm_sig = cm_overrides
+                .iter()
+                .find(|(n, _)| *n == e.name)
+                .map(|(_, s)| *s);
             let fun = ctx.alloc(
                 Some(fun_builtin_var),
                 Obj::FunBuiltin(FunBuiltinData {
                     name,
-                    n_args: fun_n_args(e.min, e.max),
+                    n_args: cm_sig.unwrap_or_else(|| fun_n_args(e.min, e.max)),
                     func: e.func,
                     kw_func,
                 }),
             );
-            (Value::Qstr(name), Value::Heap(fun))
+            let value = if cm_sig.is_some() {
+                let classmethod = classmethod
+                    .expect("classmethod override needs the classmethod type");
+                ctx.alloc(
+                    Some(classmethod),
+                    Obj::StaticClassMethod(StaticClassMethodData {
+                        fun: Value::Heap(fun),
+                    }),
+                )
+            } else {
+                fun
+            };
+            (Value::Qstr(name), Value::Heap(value))
         })
         .collect();
     ctx.alloc(
@@ -170,12 +205,20 @@ pub(crate) fn locals_dict_from_entries(
 /// sigs): every method gets the permissive `(1, 255)` sig — the
 /// method body itself enforces arity with a typed error, so the
 /// observable behaviour matches the sig-checked path. `kw_overrides`
-/// as above.
+/// as above. `cm_overrides` names the entries that are classmethods
+/// in the original (each with its `(min, max)` sig counting `cls`,
+/// e.g. `bytes.fromhex` (2, 3) — `objstr.zig:3512-3520`): the
+/// `FunBuiltin` is wrapped in a `StaticClassMethod` object headed
+/// by the `classmethod` type (the `int.from_bytes` pattern,
+/// `objint.zig:431-438`), so the class binds as `args[0]` and the
+/// entry prints `<bound_method>`.
 fn locals_dict_from_pairs(
     ctx: &mut CallCtx,
     fun_builtin_var: GcRef,
+    classmethod: GcRef,
     entries: &[(&str, BuiltinFn)],
     kw_overrides: &[(&str, BuiltinKwFn)],
+    cm_overrides: &[(&str, u16)],
 ) -> GcRef {
     let pairs: Vec<(Value, Value)> = entries
         .iter()
@@ -186,16 +229,30 @@ fn locals_dict_from_pairs(
                 .iter()
                 .find(|(n, _)| *n == *name)
                 .map(|(_, f)| *f);
+            let cm_sig = cm_overrides
+                .iter()
+                .find(|(n, _)| *n == *name)
+                .map(|(_, s)| *s);
             let fun = ctx.alloc(
                 Some(fun_builtin_var),
                 Obj::FunBuiltin(FunBuiltinData {
                     name: id,
-                    n_args: fun_n_args(1, 255),
+                    n_args: cm_sig.unwrap_or_else(|| fun_n_args(1, 255)),
                     func: *func,
                     kw_func,
                 }),
             );
-            (Value::Qstr(id), Value::Heap(fun))
+            let value = if cm_sig.is_some() {
+                ctx.alloc(
+                    Some(classmethod),
+                    Obj::StaticClassMethod(StaticClassMethodData {
+                        fun: Value::Heap(fun),
+                    }),
+                )
+            } else {
+                fun
+            };
+            (Value::Qstr(id), Value::Heap(value))
         })
         .collect();
     ctx.alloc(
@@ -287,8 +344,10 @@ pub(crate) fn build_vm_types(
     let str_dict = locals_dict_from_pairs(
         ctx,
         fun_builtin_var,
+        classmethod,
         STR_METHODS,
-        &[("format", format_kw_wrapper)],
+        &[("format", format_kw_wrapper), ("splitlines", str_splitlines_kw_wrapper)],
+        &[],
     );
     let str_ = ctx.alloc(
         None,
@@ -297,7 +356,14 @@ pub(crate) fn build_vm_types(
             str_dict,
         )),
     );
-    let bytes_dict = locals_dict_from_pairs(ctx, fun_builtin_var, BYTES_METHODS, &[]);
+    let bytes_dict = locals_dict_from_pairs(
+        ctx,
+        fun_builtin_var,
+        classmethod,
+        BYTES_METHODS,
+        &[("splitlines", str_splitlines_kw_wrapper)],
+        &[("fromhex", fun_n_args(2, 3))],
+    );
     let bytes = ctx.alloc(
         None,
         Obj::Type(bytes_type_data(
@@ -307,24 +373,24 @@ pub(crate) fn build_vm_types(
     );
 
     // Containers.
-    let tuple_dict = locals_dict_from_entries(ctx, fun_builtin_var, TUPLE_METHODS, &[]);
+    let tuple_dict = locals_dict_from_entries(ctx, fun_builtin_var, Some(classmethod), TUPLE_METHODS, &[], &[]);
     let tuple = ctx.alloc(None, Obj::Type(tuple_type_data(tuple_dict)));
-    let list_dict = locals_dict_from_entries(ctx, fun_builtin_var, LIST_METHODS, &[]);
+    let list_dict = locals_dict_from_entries(ctx, fun_builtin_var, Some(classmethod), LIST_METHODS, &[], &[]);
     let list = ctx.alloc(None, Obj::Type(list_type_data(list_dict)));
-    let dict_dict = locals_dict_from_entries(ctx, fun_builtin_var, DICT_METHODS, &[]);
+    let dict_dict = locals_dict_from_entries(ctx, fun_builtin_var, Some(classmethod), DICT_METHODS, &[], &[("fromkeys", fun_n_args(2, 3))]);
     let dict = ctx.alloc(None, Obj::Type(dict_type_data(dict_dict)));
-    let set_dict = locals_dict_from_pairs(ctx, fun_builtin_var, SET_METHODS, &[]);
+    let set_dict = locals_dict_from_pairs(ctx, fun_builtin_var, classmethod, SET_METHODS, &[], &[]);
     let set = ctx.alloc(None, Obj::Type(set_type_data(set_dict)));
     let frozenset_dict =
-        locals_dict_from_pairs(ctx, fun_builtin_var, FROZENSET_METHODS, &[]);
+        locals_dict_from_pairs(ctx, fun_builtin_var, classmethod, FROZENSET_METHODS, &[], &[]);
     let frozenset = ctx.alloc(None, Obj::Type(frozenset_type_data(frozenset_dict)));
     let range_dict = empty_dict(ctx);
     let range = ctx.alloc(None, Obj::Type(range_type_data(range_dict)));
-    let slice_dict = locals_dict_from_entries(ctx, fun_builtin_var, SLICE_METHODS, &[]);
+    let slice_dict = locals_dict_from_entries(ctx, fun_builtin_var, Some(classmethod), SLICE_METHODS, &[], &[]);
     let slice = ctx.alloc(None, Obj::Type(slice_type_data(slice_dict)));
-    let array_dict = locals_dict_from_entries(ctx, fun_builtin_var, ARRAY_METHODS, &[]);
+    let array_dict = locals_dict_from_entries(ctx, fun_builtin_var, Some(classmethod), ARRAY_METHODS, &[], &[]);
     let array = ctx.alloc(None, Obj::Type(array_type_data(array_dict)));
-    let bytearray_dict = locals_dict_from_entries(ctx, fun_builtin_var, ARRAY_METHODS, &[]);
+    let bytearray_dict = locals_dict_from_entries(ctx, fun_builtin_var, Some(classmethod), ARRAY_METHODS, &[], &[]);
     let bytearray = ctx.alloc(None, Obj::Type(bytearray_type_data(bytearray_dict)));
     let memoryview_dict = empty_dict(ctx);
     let memoryview = ctx.alloc(None, Obj::Type(memoryview_type_data(memoryview_dict)));
@@ -348,6 +414,15 @@ pub(crate) fn build_vm_types(
     // frozen `heapq` (`heapify` uses `reversed`).
     let reversed_dict = empty_dict(ctx);
     let reversed = ctx.alloc(None, Obj::Type(reversed_type_data(reversed_dict)));
+    // `dict_view` + `dict_view_it` (E2): the ROM types from
+    // `objdict_methods` — one `dict_view` type for all three
+    // kinds, one `iterator`-named iternnext type for the view
+    // iterators. Built here (not lazily) so `make_view` /
+    // `make_view_it` can read them from `ctx.types`.
+    let dict_view_dict = empty_dict(ctx);
+    let dict_view = ctx.alloc(None, Obj::Type(dict_view_type_data(dict_view_dict)));
+    let dict_view_it_dict = empty_dict(ctx);
+    let dict_view_it = ctx.alloc(None, Obj::Type(dict_view_it_type_data(dict_view_it_dict)));
     // `code` (E1): the ROM type from `objcode.c` (BASIC level).
     // The name `"code"` IS a static qstr (in the generated
     // table — `from_strn` finds it there); the type has no slots.
@@ -383,7 +458,7 @@ pub(crate) fn build_vm_types(
     // locals dict; property CREATION is a builtin call, D lane).
     let module_dict = empty_dict(ctx);
     let module = ctx.alloc(None, Obj::Type(module_type_data(module_dict, object)));
-    let property_dict = locals_dict_from_pairs(ctx, fun_builtin_var, PROPERTY_METHODS, &[]);
+    let property_dict = locals_dict_from_pairs(ctx, fun_builtin_var, classmethod, PROPERTY_METHODS, &[], &[]);
     let property = ctx.alloc(
         None,
         Obj::Type(crate::objects::containers::objproperty::property_type_data(property_dict)),
@@ -488,12 +563,44 @@ pub(crate) fn build_vm_types(
         tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
         filter, zip, enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
         property, ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
-        fileio, textio, attrtuple, code,
+        fileio, textio, attrtuple, code, dict_view, dict_view_it,
     ] {
         ctx.arena.set_header_type(t, Some(type_));
     }
     for t in exc.all() {
         ctx.arena.set_header_type(t, Some(type_));
+    }
+
+    // ROM type dicts are FIXED (E2): the Zig builds them from
+    // static tables, so `int.__dict__ is int.__dict__` (probed)
+    // and `int.foo = 1` raises `AttributeError` (probed — the
+    // fixed map makes `type_store_attr` decline). User classes
+    // created at runtime get fresh unfixed dicts (`Foo.__dict__
+    // is Foo.__dict__` is False, probed), so only the ROM types
+    // built here are marked.
+    for t in [
+        fun_builtin_var, object, int, bool_, cell, float, complex, none_type, str_, bytes,
+        tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
+        filter, zip, enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
+        property, ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
+        fileio, textio, attrtuple, code, dict_view, dict_view_it,
+    ] {
+        let dict_ref = match ctx.arena.get(t) {
+            Obj::Type(d) => d.dict,
+            _ => continue,
+        };
+        if let Obj::Dict(d) = ctx.arena.get_mut(dict_ref) {
+            d.map.is_fixed = true;
+        }
+    }
+    for t in exc.all() {
+        let dict_ref = match ctx.arena.get(t) {
+            Obj::Type(d) => d.dict,
+            _ => continue,
+        };
+        if let Obj::Dict(d) = ctx.arena.get_mut(dict_ref) {
+            d.map.is_fixed = true;
+        }
     }
 
     // MRO patch (D1): every builtin type built here carries an
@@ -510,6 +617,7 @@ pub(crate) fn build_vm_types(
         dict, set, frozenset, range, slice, array, bytearray, memoryview, map, filter, zip,
         enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module, property,
         ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper, code,
+        dict_view, dict_view_it,
     ] {
         if let Obj::Type(d) = ctx.arena.get_mut(t) {
             if d.mro.is_empty() {
@@ -552,6 +660,8 @@ pub(crate) fn build_vm_types(
         empty_bytes,
         native_init_wrapper,
         property,
+        dict_view,
+        dict_view_it,
         socket: None,
         deque: None,
         ordereddict: None,

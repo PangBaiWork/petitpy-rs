@@ -28,6 +28,9 @@ use crate::objects::value::{Obj, Value};
 use crate::runtime::vm::VmState;
 use crate::runtime::vm_ops::{exc_from_pyerror, exc_from_typed, type_error};
 use crate::runtime::vm_rt_iter::contains_op_ctx;
+use crate::support::smallint::{
+    small_int_floor_divide as floored_div, small_int_modulo as floored_mod,
+};
 use crate::vendor::mpz::BigInt;
 
 /// `mp_obj_is_true` (`obj.zig:470` + the VM's polled guard):
@@ -35,6 +38,14 @@ use crate::vendor::mpz::BigInt;
 /// false whenever pending is set — the VM raises instead, since
 /// a false-with-pending would silently swallow the raise).
 pub fn is_true_ctx(ctx: &mut CallCtx, state: &mut VmState, v: Value) -> Result<bool, Value> {
+    // An instance tries its `__bool__` / `__len__` dunder
+    // first, with the VM's real call hook (E2); anything else
+    // goes through `obj_is_true` as before.
+    match crate::runtime::vm_seams::try_instance_bool(ctx, state, v) {
+        Ok(Some(b)) => return Ok(b),
+        Ok(None) => {}
+        Err(exc) => return Err(exc),
+    }
     let types = ctx.types;
     match obj_is_true(ctx, types, v) {
         Ok(b) => {
@@ -70,14 +81,12 @@ pub(crate) fn pending_exc_or_type_error(ctx: &mut CallCtx, state: &VmState) -> V
 pub fn unary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op: UnaryOp, arg: Value) -> Result<Value, Value> {
     use crate::objects::value::SMALL_INT_MIN;
     if op == UnaryOp::Not {
-        let types = ctx.types;
-        let b = match obj_is_true(ctx, types, arg) {
+        // `not obj`: an instance's `__bool__` / `__len__` runs
+        // first (E2) — `is_true_ctx` already does this.
+        let b = match is_true_ctx(ctx, state, arg) {
             Ok(b) => b,
-            Err(e) => return Err(exc_from_pyerror(ctx, state, e)),
+            Err(exc) => return Err(exc),
         };
-        if ctx.has_pending_raise() {
-            return Err(pending_exc_or_type_error(ctx, state));
-        }
         return Ok(Value::Bool(!b));
     }
     if let Value::SmallInt(val) = arg {
@@ -119,6 +128,14 @@ pub fn unary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op: UnaryOp, arg: Va
             Err(MapError::TypeError(msg)) => Err(type_error(ctx, state, msg)),
             Err(_) => Err(pending_exc_or_type_error(ctx, state)),
         };
+    }
+    // An instance tries its unary dunder first, with the VM's
+    // real call hook (E2); no such dunder falls through to the
+    // slot path below.
+    match crate::runtime::vm_seams::try_instance_unary_op(ctx, state, op, arg) {
+        Ok(Some(v)) => return Ok(v),
+        Ok(None) => {}
+        Err(exc) => return Err(exc),
     }
     let type_ = obj_get_type(ctx.arena, ctx.types, arg);
     match call_unary(ctx, type_, op, arg) {
@@ -307,11 +324,19 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
     if op == BinaryOp::Is {
         return Ok(Value::Bool(lhs == rhs));
     }
-    // EQUAL / NOT_EQUAL → the equality protocol.
+    // EQUAL / NOT_EQUAL → the equality protocol. The VM passes
+    // its real call hook (E2), so an instance's `__eq__` /
+    // `__ne__` actually runs inside `obj_equal_not_equal`.
     if op == BinaryOp::Equal || op == BinaryOp::NotEqual {
         let types = ctx.types;
-        return obj_equal_not_equal(ctx, types, op, lhs, rhs)
-            .map_err(|e| exc_from_pyerror(ctx, state, e));
+        // The hook is scoped (and dropped) inside this block:
+        // it borrows `state`, and the error drain below needs
+        // `state` too.
+        let result = {
+            let mut hook = crate::runtime::vm_seams::make_hook(state);
+            obj_equal_not_equal(ctx, types, op, lhs, rhs, Some(&mut hook))
+        };
+        return result.map_err(|e| crate::runtime::vm_seams::drain_hook_raise(ctx, state, e));
     }
     // EXCEPTION_MATCH → `exception_match` (tuple form included).
     if op == BinaryOp::ExceptionMatch {
@@ -403,7 +428,21 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
                 if rhs_val == 0 {
                     return Err(binop_zero_div(ctx, state));
                 }
-                result = Some(Value::SmallInt(lhs_val.div_euclid(rhs_val)));
+                // Floored division (Python `//`, Zig
+                // `mp_small_int_floor_divide`) — NOT `div_euclid`:
+                // Euclid's remainder is always non-negative, so
+                // `-2 // -4` would come out `1` (remainder `2`)
+                // instead of `0` (remainder `-2`, the divisor's
+                // sign). `Value::int` is window-aware: the
+                // `-(2**62) // -1 == 2**62` quotient is out of the
+                // small-int window and becomes a heap int.
+                let q = floored_div(lhs_val, rhs_val);
+                result = Some(Value::int(
+                    ctx.arena,
+                    Some(ctx.types.int),
+                    ctx.roots,
+                    q,
+                ));
             }
             BinaryOp::TrueDivide | BinaryOp::InplaceTrueDivide => {
                 if rhs_val == 0 {
@@ -418,7 +457,11 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
                 if rhs_val == 0 {
                     return Err(binop_zero_div(ctx, state));
                 }
-                result = Some(Value::SmallInt(lhs_val.rem_euclid(rhs_val)));
+                // Floored modulo (Zig `@mod`, Python `%`): the
+                // result takes the DIVISOR's sign — NOT
+                // `rem_euclid` (always non-negative, so
+                // `-2 % -4` would come out `2` instead of `-2`).
+                result = Some(Value::SmallInt(floored_mod(lhs_val, rhs_val)));
             }
             BinaryOp::Power | BinaryOp::InplacePower => {
                 if let Some(exc) = float_precheck_int(ctx, state, op, lhs_val, rhs_val as f64) {
@@ -478,8 +521,17 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
                 if rhs_val == 0 {
                     return Err(binop_zero_div(ctx, state));
                 }
-                let q = Value::SmallInt(lhs_val.div_euclid(rhs_val));
-                let r = Value::SmallInt(lhs_val.rem_euclid(rhs_val));
+                // Floored pair (same `div_euclid` trap as the
+                // FloorDivide/Modulo arms above). `q` is
+                // window-aware via `Value::int` (`-(2**62) // -1`
+                // is a heap int `2**62`); `r` always fits.
+                let q = Value::int(
+                    ctx.arena,
+                    Some(ctx.types.int),
+                    ctx.roots,
+                    floored_div(lhs_val, rhs_val),
+                );
+                let r = Value::SmallInt(floored_mod(lhs_val, rhs_val));
                 let tuple_type = ctx.types.tuple;
                 let tuple = crate::objects::containers::objtuple::new_tuple(
                     ctx, tuple_type, &[q, r],
@@ -527,8 +579,15 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
         std::mem::swap(&mut lhs, &mut rhs);
     }
     // Generic loop: lhs slot → inplace→plain → reverse →
-    // CONTAINS → `binopUnsupported`.
+    // CONTAINS → `binopUnsupported`. An instance lhs tries its
+    // dunder first, with the VM's real call hook (E2); no such
+    // dunder falls through to the slot path below.
     loop {
+        match crate::runtime::vm_seams::try_instance_binary_op(ctx, state, op, lhs, rhs) {
+            Ok(Some(v)) => return Ok(v),
+            Ok(None) => {}
+            Err(exc) => return Err(exc),
+        }
         let type_ = obj_get_type(ctx.arena, ctx.types, lhs);
         match call_binary(ctx, type_, op, lhs, rhs) {
             Ok(SlotOutcome::Value(v)) => return Ok(v),

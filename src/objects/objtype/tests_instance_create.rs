@@ -9,7 +9,7 @@ use crate::memory::gc::CallCtx;
 use crate::objects::containers::objtuple::{new_tuple, tuple_binary_op, tuple_items};
 use crate::objects::containers::tests::empty_dict;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::{BinaryOp, PrintKind};
+use crate::objects::slots::{BinaryOp, CallHook, PrintKind};
 use crate::objects::value::{GcRef, Obj, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
 
@@ -29,6 +29,7 @@ pub(crate) fn marker_make_new(
     _type: GcRef,
     _args: &[Value],
     _n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     Ok(Value::SmallInt(77))
 }
@@ -73,7 +74,7 @@ fn static_class_method_make_new_cases() {
     let staticmethod = fx.types.staticmethod;
     let classmethod = fx.types.classmethod;
     let mut ctx = fx.ctx();
-    let got = static_class_method_make_new(&mut ctx, staticmethod, &[fun], 0)
+    let got = static_class_method_make_new(&mut ctx, staticmethod, &[fun], 0, None)
         .expect("staticmethod(f)");
     let Value::Heap(r) = got else { panic!("not heap") };
     match fx.arena.get(r) {
@@ -84,15 +85,15 @@ fn static_class_method_make_new_cases() {
         other => panic!("not a staticmethod: {other:?}"),
     }
     let mut ctx = fx.ctx();
-    let got = static_class_method_make_new(&mut ctx, classmethod, &[fun], 0)
+    let got = static_class_method_make_new(&mut ctx, classmethod, &[fun], 0, None)
         .expect("classmethod(f)");
     let Value::Heap(r) = got else { panic!("not heap") };
     assert_eq!(fx.arena.header(r).type_, Some(fx.types.classmethod));
     // Wrong arities → the sig error.
     let mut ctx = fx.ctx();
-    assert!(static_class_method_make_new(&mut ctx, staticmethod, &[], 0).is_err());
+    assert!(static_class_method_make_new(&mut ctx, staticmethod, &[], 0, None).is_err());
     let mut ctx = fx.ctx();
-    assert!(static_class_method_make_new(&mut ctx, staticmethod, &[fun, fun], 0).is_err());
+    assert!(static_class_method_make_new(&mut ctx, staticmethod, &[fun, fun], 0, None).is_err());
 }
 
 // ── instances ────────────────────────────────────────────────────────
@@ -152,7 +153,7 @@ fn instance_make_new_blank_init_none() {
     let init = builtin(&mut fx, 0, "__init__", ret_none);
     fx.set_local(c, static_qstr_id(b"__init__").expect("__init__ is static"), init);
     let mut ctx = fx.ctx();
-    let inst = instance_make_new(&mut ctx, c, &[], 0).expect("C()");
+    let inst = instance_make_new(&mut ctx, c, &[], 0, None).expect("C()");
     let Value::Heap(ir) = inst else { panic!("not an instance") };
     assert_eq!(fx.arena.header(ir).type_, Some(c));
     assert!(matches!(fx.arena.get(ir), Obj::Instance(d) if d.subobj.is_empty()));
@@ -166,7 +167,7 @@ fn instance_make_new_init_must_return_none() {
     let init = builtin(&mut fx, 0, "__init__", ret_42);
     fx.set_local(c, static_qstr_id(b"__init__").expect("__init__ is static"), init);
     let mut ctx = fx.ctx();
-    assert!(instance_make_new(&mut ctx, c, &[], 0).is_err());
+    assert!(instance_make_new(&mut ctx, c, &[], 0, None).is_err());
 }
 
 #[test]
@@ -181,7 +182,7 @@ fn instance_make_new_new_returns_non_instance() {
     fx.set_local(c, static_qstr_id(b"__init__").expect("__init__ is static"), init);
     let mut ctx = fx.ctx();
     assert_eq!(
-        instance_make_new(&mut ctx, c, &[], 0).expect("N()"),
+        instance_make_new(&mut ctx, c, &[], 0, None).expect("N()"),
         Value::SmallInt(42)
     );
 }
@@ -197,7 +198,7 @@ fn instance_make_new_new_returns_instance_runs_init() {
     let init = builtin(&mut fx, 0, "__init__", ret_42);
     fx.set_local(c, static_qstr_id(b"__init__").expect("__init__ is static"), init);
     let mut ctx = fx.ctx();
-    assert!(instance_make_new(&mut ctx, c, &[], 0).is_err());
+    assert!(instance_make_new(&mut ctx, c, &[], 0, None).is_err());
 }
 
 #[test]
@@ -211,7 +212,7 @@ fn instance_make_new_native_tail() {
         d.mro = vec![cn, marker, fx.types.object];
     }
     let mut ctx = fx.ctx();
-    let inst = instance_make_new(&mut ctx, cn, &[], 0).expect("CN()");
+    let inst = instance_make_new(&mut ctx, cn, &[], 0, None).expect("CN()");
     let Value::Heap(ir) = inst else { panic!("not an instance") };
     assert!(matches!(fx.arena.get(ir), Obj::Instance(d) if d.subobj == vec![Value::SmallInt(77)]));
 }
@@ -253,7 +254,7 @@ fn instance_make_new_init_runs_then_tail() {
     let init = builtin(&mut fx, 0, "__init__", init_recorder);
     fx.set_local(cn, static_qstr_id(b"__init__").expect("__init__ is static"), init);
     let mut ctx = fx.ctx();
-    let inst = instance_make_new(&mut ctx, cn, &[], 0).expect("CN()");
+    let inst = instance_make_new(&mut ctx, cn, &[], 0, None).expect("CN()");
     let Value::Heap(ir) = inst else { panic!("not an instance") };
     assert_eq!(*INIT_CALLS.lock().unwrap(), 1);
     assert!(matches!(fx.arena.get(ir), Obj::Instance(d) if d.subobj == vec![Value::SmallInt(77)]));
@@ -302,7 +303,7 @@ fn type_print_and_super_print() {
     let mut out = String::new();
     let mut ctx = fx.ctx();
     let sup =
-        super_make_new(&mut ctx, super_, &[Value::Heap(int), Value::SmallInt(1)], 0)
+        super_make_new(&mut ctx, super_, &[Value::Heap(int), Value::SmallInt(1)], 0, None)
             .expect("super(int, 1)");
     let mut ctx = fx.ctx();
     super_print(&mut ctx, sup, PrintKind::Str, &mut out);

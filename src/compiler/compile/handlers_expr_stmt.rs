@@ -5,7 +5,6 @@
 //! `handlers.rs` (file-size rule); re-exported from there.
 
 use super::assign::{c_assign, AssignKind};
-use super::wk_idx;
 use super::Compiler;
 use crate::compiler::emit::consts::*;
 use crate::compiler::grammar_data as grammar;
@@ -253,7 +252,14 @@ pub fn compile_expr_stmt(comp: &mut Compiler, pn: Pn) {
         let sc_kind = comp.scopes.scopes[comp.scope_cur.expect("expr_stmt: no scope_cur")].kind;
         if comp.is_repl && sc_kind == ScopeKind::Module {
             // REPL top-level bare expression: evaluate then print.
-            let repl_q = comp.wk(wk_idx::REPL_PRINT);
+            // The echo callee resolves ON DEMAND as
+            // `__repl_print__` (`compReplPrintQstr`,
+            // `compile.zig:2716-2718`) — NOT via the `wk` table:
+            // `WK_NAMES[16]` is the literal `"<repl_print>"`,
+            // which can never resolve, so a REPL `1+1` raised
+            // `NameError` (E1 regression — see
+            // `repl_single_input_resolves_repl_print`).
+            let repl_q = comp.qstr_from_strn(b"__repl_print__");
             comp.compile_load_id(repl_q);
             comp.compile_node(nodes[0]);
             comp.emit.call_function(1, 0, 0, &mut comp.scopes);

@@ -248,6 +248,8 @@ fn varint_encode_decode_vectors() {
         (300, &[0x82, 0x2c]),
         (16383, &[0xff, 0x7f]),
         (16384, &[0x81, 0x80, 0x00]),
+        // tests.zig read_uint vector: 0xFFFFFF -> [0x87, 0xFF, 0xFF, 0x7F].
+        (0xffffff, &[0x87, 0xff, 0xff, 0x7f]),
         (268_435_456, &[0x81, 0x80, 0x80, 0x80, 0x00]), // 2^28
         (
             72_057_594_037_927_936,
@@ -303,6 +305,16 @@ fn prelude_sig_decode_vectors() {
     let mut cur: &[u8] = &[0x03];
     let s = prelude_sig_decode(&mut cur);
     assert_eq!((s.n_state, s.n_pos_args), (1, 3));
+    // tests.zig realistic vector: [0x26] -> S=5, E=1, A=2.
+    let mut cur: &[u8] = &[0x26];
+    let s = prelude_sig_decode(&mut cur);
+    assert_eq!((s.n_state, s.n_exc_stack, s.scope_flags, s.n_pos_args, s.n_kwonly_args, s.n_def_pos_args), (5, 1, 0, 2, 0, 0));
+    assert!(cur.is_empty());
+    // tests.zig continuation vector: [0x98, 0x10] -> n_state 20.
+    let mut cur: &[u8] = &[0x98, 0x10];
+    let s = prelude_sig_decode(&mut cur);
+    assert_eq!((s.n_state, s.n_exc_stack, s.scope_flags, s.n_pos_args, s.n_kwonly_args, s.n_def_pos_args), (20, 0, 0, 0, 0, 0));
+    assert!(cur.is_empty());
     // [0x80, 0x30]: continuation, S |= 0x30 -> S = 48 -> n_state 49.
     let mut cur: &[u8] = &[0x80, 0x30];
     let s = prelude_sig_decode(&mut cur);
@@ -320,6 +332,16 @@ fn prelude_size_decode_vectors() {
     assert_eq!(prelude_size_decode(&mut cur).n_info, 1);
     let mut cur: &[u8] = &[0x01];
     assert_eq!(prelude_size_decode(&mut cur).n_cell, 1);
+    // tests.zig single-byte vector: [0x0B] -> I=5, C=1.
+    let mut cur: &[u8] = &[0x0b];
+    let s = prelude_size_decode(&mut cur);
+    assert_eq!((s.n_info, s.n_cell), (5, 1));
+    assert!(cur.is_empty());
+    // tests.zig continuation vector: [0xC8, 0x02] -> I=100, C=0.
+    let mut cur: &[u8] = &[0xc8, 0x02];
+    let s = prelude_size_decode(&mut cur);
+    assert_eq!((s.n_info, s.n_cell), (100, 0));
+    assert!(cur.is_empty());
     // [0x81, 0x03]: byte 0 gives C bit 0 and I bits 0-5 = 0;
     // byte 1 gives C bit 1 and I bits 6-11 = 1 -> I = 64, C = 3.
     let mut cur: &[u8] = &[0x81, 0x03];

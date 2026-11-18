@@ -218,6 +218,13 @@ impl Vm {
         globals: GcRef,
         locals: GcRef,
     ) -> Result<Value, Value> {
+        // `petitpy-vm`: the compiler is not linked (the Zig's
+        // `npy_zig_eval_exec` stub).
+        if !state.compiler_linked {
+            return Err(crate::runtime::compile_bridge::compiler_not_linked_error(
+                ctx, state,
+            ));
+        }
         let source_str = match std::str::from_utf8(source) {
             Ok(s) => s,
             Err(_) => {
@@ -342,6 +349,14 @@ impl Vm {
         globals: GcRef,
         locals: GcRef,
     ) -> Result<Value, Value> {
+        // `petitpy-vm`: the compiler is not linked (the Zig's
+        // `npy_zig_eval_exec` stub).
+        if !self.state.compiler_linked {
+            let (mut ctx, state) = self.split();
+            return Err(
+                crate::runtime::compile_bridge::compiler_not_linked_error(&mut ctx, state),
+            );
+        }
         let source_str = match std::str::from_utf8(source) {
             Ok(s) => s,
             Err(_) => return Err(self.compile_error_value(CompileError::SyntaxError)),
@@ -421,6 +436,24 @@ impl Vm {
         }
     }
 
+    /// Replace `sys.argv` (the `sys` module's argv list
+    /// object). Added by E1 for the entry point (`wireSysArgv`,
+    /// `main.zig`): `['-c', ARG...]` or `[script, ARG...]`.
+    /// Like `set_sys_path`, syncs the list object in place.
+    pub fn set_sys_argv(&mut self, args: Vec<String>) {
+        let (mut ctx, state) = self.split();
+        let types = ctx.types;
+        let items: Vec<Value> = args
+            .iter()
+            .map(|a| crate::objects::strings::objstr_a::new_str(&mut ctx, types, a.as_bytes()))
+            .collect();
+        if let Some(list_ref) = state.sys_argv_list {
+            if let Obj::List(l) = ctx.arena.get_mut(list_ref) {
+                l.items = items;
+            }
+        }
+    }
+
     /// Replace the frozen-module table (`frozen_modules.zig`).
     /// Added by C15b for the import tests (and D1's registration
     /// of the frozen `petitpy-lib` bundle).
@@ -433,9 +466,17 @@ impl Vm {
 }
 
 impl Vm {
-    /// Load a module from `.mpy` bytes (the `petitpy-vm` entry
-    /// point): read, register, run the module body.
-    pub fn load_module_from_mpy(&mut self, data: &[u8], name: &str) -> Result<Value, VmError> {
+    /// Register a `.mpy` module WITHOUT running it: the
+    /// register + pin + `__main__` + globals half of
+    /// `load_module_from_mpy`. The entry point's
+    /// `run_main_source` uses it to set `__main__.__file__` +
+    /// `sys.path[0]` between registration and the run.
+    /// Returns `(module_value, code_idx, globals_dict)`.
+    pub(crate) fn register_main_module(
+        &mut self,
+        data: &[u8],
+        name: &str,
+    ) -> Result<(Value, usize, GcRef), VmError> {
         let (module_val, code_idx) = self.register_mpy_code(data, name, None, true)?;
         let module_ref = match module_val {
             Value::Heap(r) => r,
@@ -456,7 +497,17 @@ impl Vm {
             self.state.d4.main_module = Some(module_ref);
         }
         self.state.globals = globals;
-        // Run the module body as a 0-arg function call.
+        Ok((module_val, code_idx, globals))
+    }
+
+    /// Run an already-registered module's body as a 0-arg
+    /// function call: the run half of `load_module_from_mpy`.
+    /// Returns the module value, or the raised exception.
+    pub(crate) fn run_registered_module(
+        &mut self,
+        module_val: Value,
+        code_idx: usize,
+    ) -> Result<Value, VmError> {
         let fun = Value::Heap(self.call_module_fun(code_idx, module_val));
         let result = crate::runtime::vm_ops::call_function(self, fun, 0, 0, &[]);
         match result {
@@ -465,5 +516,121 @@ impl Vm {
         }
     }
 
+    /// Load a module from `.mpy` bytes (the `petitpy-vm` entry
+    /// point): read, register, run the module body.
+    pub fn load_module_from_mpy(&mut self, data: &[u8], name: &str) -> Result<Value, VmError> {
+        let (module_val, code_idx, _globals) = self.register_main_module(data, name)?;
+        self.run_registered_module(module_val, code_idx)
+    }
 
+    /// Like `compile_error_value` but with the caller's source
+    /// name in the traceback frame (`run_main_source`'s
+    /// `"<stdin>"` — the eval path's `"<string>"` is wrong
+    /// there; see `raise_from_code`). `pub(crate)` for the
+    /// REPL line path (`entry::embed_exec`).
+    pub(crate) fn compile_error_value_named(
+        &mut self,
+        e: CompileError,
+        source_name: &str,
+    ) -> Value {
+        let file = self
+            .pool
+            .from_strn(source_name.as_bytes())
+            .map(u32::from)
+            .unwrap_or(0);
+        let (mut ctx, state) = self.split();
+        crate::runtime::compile_bridge::raise_from_code(&mut ctx, state, &e, file)
+    }
+
+    /// `wireScriptFileAndPath` (`main.zig`): set
+    /// `__main__.__file__` = the script path in the module's
+    /// dict, and replace `sys.path[0]` with `dirname(script)`.
+    /// Runs after registration, BEFORE the body runs.
+    fn wire_script_file_and_path(&mut self, module_val: Value, script: &str) {
+        {
+            let (mut ctx, _state) = self.split();
+            if let Value::Heap(module_ref) = module_val {
+                if let Obj::Module(m) = ctx.arena.get(module_ref) {
+                    let dict = Value::Heap(m.dict);
+                    let file_id = ctx
+                        .pool
+                        .from_strn(b"__file__")
+                        .map(u32::from)
+                        .unwrap_or(0);
+                    let types = ctx.types;
+                    let file_val = crate::objects::strings::objstr_a::new_str(
+                        &mut ctx,
+                        types,
+                        script.as_bytes(),
+                    );
+                    let _ = crate::objects::containers::objdict::dict_store(
+                        &mut ctx,
+                        dict,
+                        Value::Qstr(file_id),
+                        file_val,
+                    );
+                }
+            }
+        }
+        // `sys.path[0] := dirname(script)` — the placeholder
+        // empty-qstr entry gets overwritten in place (the Zig's
+        // `std.fs.path.dirname` returns "" for a bare filename).
+        let dir = std::path::Path::new(script)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut paths = self.state.sys_path.clone();
+        if !paths.is_empty() {
+            paths[0] = dir;
+        }
+        self.set_sys_path(paths);
+    }
+
+    /// Run source as `__main__` (the entry point's `runSource`,
+    /// `main.zig`): compile with `source_name` (the entry
+    /// point's `"<stdin>"` for scripts and `-c` alike —
+    /// `main.zig`'s `wireScriptFileAndPath` comment:
+    /// "Compile-side source_file stays as <stdin>"), register
+    /// the module as `__main__` WITHOUT recording `__main__`
+    /// as the source name, set `__main__.__file__` +
+    /// `sys.path[0]` BEFORE the body runs when `file` is
+    /// given, then run the body. Returns the module value, or
+    /// the raised exception object.
+    pub fn run_main_source(
+        &mut self,
+        src: &[u8],
+        source_name: &str,
+        file: Option<&str>,
+    ) -> Result<Value, Value> {
+        let src_str = match std::str::from_utf8(src) {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(self.compile_error_value_named(
+                    CompileError::SyntaxError,
+                    source_name,
+                ))
+            }
+        };
+        let mpy = match compile_to_mpy_named(src_str, InputKind::FileInput, source_name) {
+            Ok(m) => m,
+            Err(ce) => return Err(self.compile_error_value_named(ce, source_name)),
+        };
+        let (module_val, code_idx, _globals) = match self.register_main_module(&mpy, "__main__") {
+            Ok(v) => v,
+            Err(e) => {
+                let (mut ctx, state) = self.split();
+                return Err(crate::runtime::compile_bridge::vm_error_to_value(
+                    &mut ctx, state, e,
+                ));
+            }
+        };
+        if let Some(path) = file {
+            self.wire_script_file_and_path(module_val, path);
+        }
+        self.run_registered_module(module_val, code_idx)
+            .map_err(|e| match e {
+                VmError::Raised(exc) => exc,
+                _ => unreachable!("running a registered module only raises"),
+            })
+    }
 }

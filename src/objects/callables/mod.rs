@@ -20,6 +20,7 @@
 
 pub mod objboundmeth;
 pub mod objclosure;
+pub mod objcode;
 pub mod objfun;
 pub mod objgenerator;
 pub mod objgenerator_types;

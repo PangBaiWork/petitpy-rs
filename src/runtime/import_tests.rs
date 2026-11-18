@@ -672,10 +672,19 @@ fn compile_syntax_beats_notimplemented() {
 }
 
 #[test]
-fn compile_valid_raises_notimplemented() {
+fn compile_valid_returns_code() {
+    // E1: `compile()` returns a code object (the C15a
+    // `NotImplementedError` gap is closed): `repr(c)` is
+    // `<code>` (the reference prints `<>` — its stub type
+    // has name qstr 0; see `objcode.rs`), `type(c).__name__`
+    // is `"code"`, and `eval(c)` runs it.
     let mut ix = Ix::new();
-    let (name, _) = ix.raised_msg("compile('1', 'f', 'eval')\n");
-    assert_eq!(name, "NotImplementedError");
+    ix.run_ok("c = compile('1', 'f', 'eval')\nr = repr(c)\nn = type(c).__name__\nv = eval(c)\n");
+    let r = ix.g("r").unwrap();
+    assert_eq!(ix.val_str(r), "<code>");
+    let n = ix.g("n").unwrap();
+    assert_eq!(ix.val_str(n), "code");
+    assert_eq!(ix.gi("v"), 1);
 }
 
 #[test]

@@ -16,13 +16,14 @@
 //! and `args[2]` as locals — each must be a dict or `None`
 //! (else the bare `TypeError`, `raiseTypeErrorNull`); the
 //! source goes through the buffer protocol (`getBufferRaise`);
-//! the code-object fast path (`objIsCode`) is dead in Rust
-//! (there is no `Obj::Code` yet — see `call_compile_ctx`).
-//! The body runs with the caller's globals/locals
-//! (`codeExecute`'s save/restore + its patch of
+//! the code-object fast path (`objIsCode`, `:132-138`) runs
+//! BEFORE the buffer read (`code_execute` below). The body
+//! runs with the caller's globals/locals (`codeExecute`'s
+//! save/restore + its patch of
 //! `module_fun.context.module.globals` to the caller's globals
-//! — the Rust form is `Vm::eval_exec` / `Vm::eval_exec_ctx`,
-//! which replace the eval module's dict).
+//! — the Rust form of the patch is `code_execute`; the
+//! source path's equivalent is `Vm::eval_exec` /
+//! `Vm::eval_exec_ctx`, which replace the eval module's dict).
 //!
 //! Non-buffer source (`eval(123)`, `eval([1])`, …): the Zig's
 //! `getBufferRaise` IGNORES the `mp_get_buffer` failure (`_ =`,
@@ -46,7 +47,7 @@ use crate::objects::containers::binary::buffer_bytes;
 use crate::objects::obj::obj_get_type;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::strings::objstr_a::str_data_pool;
-use crate::objects::value::Value;
+use crate::objects::value::{GcRef, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::raise::{raise_bad_compile_mode, raise_os_error, raise_type_error_null};
 use crate::runtime::vm::Vm;
@@ -137,11 +138,87 @@ fn eval_exec_helper(
         }
         i += 1;
     }
+    // Code-object fast path (`evalExecHelperImpl`,
+    // `builtinevex.zig:132-138`): `objIsCode` is checked
+    // BEFORE the buffer read — a code object runs via
+    // `codeExecute` with the resolved globals/locals, and
+    // the source is never read as bytes. (So `eval(code)` /
+    // `exec(code)` also work with the compiler unlinked.)
+    if crate::objects::callables::objcode::is_code(
+        ctx.arena,
+        state.vm_types.code,
+        args[0],
+    ) {
+        return code_execute(ctx, state, args[0], globals, locals);
+    }
     let source = match source_bytes(ctx, args[0]) {
         Ok(b) => b,
         Err(e) => return Err(exc_from_pyerror(ctx, state, e)),
     };
     Vm::eval_exec_ctx(ctx, state, &source, kind, globals, locals)
+}
+
+/// `codeExecute` (`builtinevex.zig:55-84`): run a code object
+/// under the given globals/locals. The Zig saves the thread
+/// globals/locals, sets them to the passed ones (locals fall
+/// back to globals when the dicts are the SAME object — the
+/// `dict_locals = if (dict_globals == dict_locals) null`
+/// branch), patches the module function's context
+/// (`module_fun`'s module globals = the passed globals, iff
+/// the function is an exact `fun_bc`), calls it with 0 args,
+/// and restores both on return AND on raise (`defer`).
+///
+/// The patch is what makes the module body read the caller's
+/// globals (the `call_function_ctx` globals switch reads the
+/// context module's dict) and what makes nested `def`s
+/// capture them (`func.__globals__` — probed via the corpus
+/// `builtin_compile.py`: `exec(compile("def func():pass…"))`
+/// then `func.__globals__['x']` is the caller's `x`).
+pub(crate) fn code_execute(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    code: Value,
+    globals: GcRef,
+    locals: GcRef,
+) -> Result<Value, Value> {
+    use crate::objects::value::Obj;
+    let fun_ref = match code {
+        Value::Heap(r) => match ctx.arena.get(r) {
+            Obj::Code(c) => c.module_fun,
+            _ => unreachable!("code_execute takes a code object"),
+        },
+        _ => unreachable!("code_execute takes a code object"),
+    };
+    // Patch the module function's context module globals to
+    // the caller's globals (the Zig's `ctx_ptr.module.globals
+    // = globals` patch, `builtinevex.zig:64-72`) — iff the
+    // function is an exact `fun_bc`. The transient module from
+    // `compile()` carries a fresh (or NULL-bound) dict; the
+    // patch re-points it at the caller's globals.
+    let context = match ctx.arena.get(fun_ref) {
+        Obj::FunBc(f) => f.context,
+        _ => None,
+    };
+    if let Some(module_ref) = context {
+        if let Obj::Module(m) = ctx.arena.get_mut(module_ref) {
+            m.dict = globals;
+        }
+    }
+    let old_globals = state.globals;
+    let old_locals = state.locals;
+    state.globals = globals;
+    state.locals = if locals == globals { None } else { Some(locals) };
+    let result = crate::runtime::vm_call::call_function_ctx(
+        ctx,
+        state,
+        Value::Heap(fun_ref),
+        0,
+        0,
+        &[],
+    );
+    state.globals = old_globals;
+    state.locals = old_locals;
+    result
 }
 
 /// The `eval`/`exec` interception (`call_function_ctx`): the
@@ -228,22 +305,13 @@ fn compile_mode_kind(ctx: &CallCtx, value: Value) -> Option<InputKind> {
 /// mode")`, probed — the mode check OVERWRITES a pending
 /// filename error, since the Zig's `pending_exc` is a plain
 /// assignment: `compile("1", 5, 5)` raises the `ValueError`,
-/// probed).
-///
-/// BLOCKED on the missing `Obj::Code`: after validation this
-/// raises `NotImplementedError` instead of returning a code
-/// object. The gap is precise — it needs an `Obj::Code`
-/// variant + the code type in ROM + `codeExecute` over code
-/// objects (owner: C15b / the entry work). A `FunBc`-as-code
-/// interim was considered and REJECTED: it would misrepresent
-/// `type(c)` (`'function'` vs `'code'`) — a silent divergence
-/// the rules forbid. (Note the original itself cannot report
+/// probed). Then `compile_to_code` (E1) returns the code
+/// object. (Note the original itself cannot report
 /// `type(code)`: the code type pointer is null there, so
 /// `type(compile(...))` ABORTS the reference binary rc=134 —
 /// probed. `repr(c)` is `<>`, `hash(c)` works, `eval(c)` /
-/// `exec(c)` work there; all of that stays blocked here on
-/// `Obj::Code`.)
-///
+/// `exec(c)` work there; Rust returns a real code object —
+/// see `objcode.rs` for the print consequences.)
 /// Original-abort divergences (the reference binary aborts
 /// rc=134; Rust raises instead): a non-str/bytes `compile()`
 /// source (`compile(5, "f", "exec")` — the Zig passes the
@@ -280,10 +348,9 @@ fn compile_glue(
             return Err(exc_from_pyerror(ctx, state, e));
         }
     }
-    // Validated — now COMPILE (C15b: the bridge's `compile_to_code`
+    // Validated — now COMPILE (C15a: the bridge's `compile_to_code`
     // compiles first, so a syntax error beats the missing-code
-    // error, as on the original — then raises NotImplementedError
-    // because there is no `Obj::Code` yet).
+    // error, as on the original — E1: it returns the code object).
     let kind = kind.expect("mode checked above");
     let src = str_data_pool(ctx.arena, ctx.pool, args[0]).expect("source checked above");
     let filename_bytes =

@@ -192,6 +192,32 @@ pub fn print_builtin_nokw(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
     print_impl(ctx, args, &[])
 }
 
+/// `__repl_print__` (`modbuiltins.zig:355`, sig (1, 1)): the
+/// REPL's echo — if the argument is not `None`, print its
+/// `repr` followed by `\n` to stdout (`MP_PLAT_PRINT`, the
+/// same fd-1 path `print` uses with no `file` kwarg), and
+/// return `None`. (The `_ = value` assignment in the Zig is
+/// dead under nano — `CAN_OVERRIDE_BUILTINS=0` — do not
+/// implement it.) Bound in `bind_d1_builtins`; the compiler's
+/// REPL branch resolves the name on demand
+/// (`compReplPrintQstr`, `compile.zig:2716-2718`).
+pub fn repl_print_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    use crate::objects::obj_ops::obj_print_helper;
+    let [arg] = args else {
+        return Err(PyError::PyRaise);
+    };
+    if *arg != Value::None {
+        let types = ctx.types;
+        let mut s = String::new();
+        obj_print_helper(ctx, types, *arg, PrintKind::Repr, &mut s);
+        let mut sink = MP_PLAT_PRINT;
+        let mut print = Print::new(&mut sink);
+        let _ = mp_print_str(&mut print, s.as_bytes());
+        let _ = mp_print_str(&mut print, b"\n");
+    }
+    Ok(Value::None)
+}
+
 /// `str.format` as a `BuiltinKwFn` (C13 — C8b's deferred item):
 /// the kwargs pass through to `str_format` instead of `&[]`, so
 /// `"{x}".format(x=1)` works.

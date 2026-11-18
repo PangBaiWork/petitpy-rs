@@ -24,11 +24,14 @@ use crate::modules::moderrno::build_errno_module;
 use crate::modules::modgc::build_gc_module;
 use crate::modules::modgrp::build_grp_module;
 use crate::modules::modjson::build_json_module;
+use crate::modules::modmath::build_math_module;
 use crate::modules::modmicropython::build_micropython_module;
 use crate::modules::modpwd::build_pwd_module;
 use crate::modules::modre::build_re_module;
 use crate::modules::modselect::build_select_module;
 use crate::modules::modsignal::build_signal_module;
+use crate::modules::modsocket::build_socket_module;
+use crate::modules::modstruct::build_struct_module;
 use crate::modules::modsubprocess::build_subprocess_module;
 use crate::modules::modtime::build_time_module;
 use crate::objects::containers::objfileio::build_stdio_objects;
@@ -57,6 +60,53 @@ pub fn build_d2_modules(vm: &mut Vm) {
     vm.pin(Value::Heap(attrtuple));
     vm.pin(sys);
     vm.pin(os);
+}
+
+/// Build the D3 modules, register them, store the `socket`
+/// type in `vm.types`, and pin all three modules in the VM's
+/// roots. (E1 — D3 built the builders but did not register
+/// them; the frozen `json.py` / `subprocess.py` layers needed
+/// only `_json` / `_subprocess`, which D5 registered.)
+///
+/// - `math` and `socket` register as BUILTIN modules
+///   (`MP_REGISTER_MODULE` in the original —
+///   `modmath.zig:13`, `modsocket.zig:49`; probed: `import
+///   umath` / `import usocket` fail on the reference, so the
+///   u-strip does not resolve them).
+/// - `struct` registers as EXTENSIBLE
+///   (`MP_REGISTER_EXTENSIBLE_MODULE`, `modstruct.zig:18`;
+///   probed: `import ustruct` resolves to it).
+/// - The socket builder also returns the socket type, stored
+///   in `vm.types.socket` (after `drop(ctx)` — the D5 `re`
+///   precedent).
+///
+/// The builders return `PyResult` (the D3 shape) but cannot
+/// fail on a fresh dict — the `expect` documents that (the
+/// same shape as the D2 `store` helper).
+pub fn build_d3_modules(vm: &mut Vm) {
+    let (mut ctx, state) = vm.split();
+    let fun_builtin_var = state.vm_types.fun_builtin_var;
+    let module_type = state.vm_types.module;
+    let math = build_math_module(&mut ctx, fun_builtin_var, module_type)
+        .expect("D3 math module build cannot fail");
+    let (socket, socket_type) = build_socket_module(&mut ctx, fun_builtin_var, module_type)
+        .expect("D3 socket module build cannot fail");
+    let struct_mod = build_struct_module(&mut ctx, fun_builtin_var, module_type)
+        .expect("D3 struct module build cannot fail");
+    for (name, module) in [("math", math), ("socket", socket)] {
+        let id = static_qstr_id(name.as_bytes())
+            .unwrap_or_else(|| panic!("D3 module name is not a static qstr: {name}"));
+        state.builtin_modules.push((id, module));
+    }
+    let struct_id = static_qstr_id(b"struct").expect("struct is a static qstr");
+    state.extensible_modules.push((struct_id, struct_mod));
+    drop(ctx);
+    // The socket type ref (the D5 `re` precedent — stored
+    // after `drop(ctx)` since `ctx.types` borrows `vm.types`).
+    vm.types.socket = Some(socket_type);
+    for module in [math, socket, struct_mod] {
+        vm.pin(module);
+    }
 }
 
 /// Build the D4 small modules, register them in
@@ -144,8 +194,8 @@ pub fn build_d4_modules(vm: &mut Vm) {
 ///   them before any filesystem search, and the frozen
 ///   `json.py` / `subprocess.py` layers (which `import _json`
 ///   / `import _subprocess`) resolve through them. The other
-///   three D3 builders (math/socket/struct) are NOT
-///   registered here — that is Phase E entry work.
+///   three D3 builders (math/socket/struct) are registered by
+///   E1's `build_d3_modules` (above).
 /// - `re` registers as EXTENSIBLE under the name `re` ONLY
 ///   (`MP_REGISTER_EXTENSIBLE_MODULE(MP_QSTR_re, ...)`).
 ///   `import ure` resolves to the SAME module object through

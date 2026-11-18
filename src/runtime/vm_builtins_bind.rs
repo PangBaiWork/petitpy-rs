@@ -22,6 +22,7 @@ use crate::runtime::builtinimport::import_builtin_fn;
 use crate::runtime::vm::{Vm, VmState};
 use crate::runtime::vm_builtins::{
     build_class_builtin_fn, next_builtin_fn, print_builtin, print_builtin_nokw,
+    repl_print_builtin,
 };
 use crate::runtime::builtin_fns::{
     abs_builtin, bin_builtin, callable_builtin, chr_builtin, divmod_builtin, format_builtin,
@@ -169,6 +170,11 @@ pub(crate) fn bind_d1_builtins(
     let _ = mk_var(ctx, "ord", 1, 1, ord_builtin, pairs);
     let _ = mk_var(ctx, "repr", 1, 1, repr_builtin, pairs);
     let _ = mk_var(ctx, "input", 0, 1, input_builtin, pairs);
+    // `__repl_print__` (E1): the REPL echo builtin
+    // (`modbuiltins.zig:355`, sig (1, 1)) — a plain
+    // `BuiltinFn`, no interception; the compiler's REPL branch
+    // resolves it on demand.
+    let _ = mk_var(ctx, "__repl_print__", 1, 1, repl_print_builtin, pairs);
     let _ = mk_kw(ctx, "pow", 2, 3, pow_builtin, pow_builtin_kw, pairs);
     let _ = mk_kw(ctx, "round", 1, 2, round_builtin, round_builtin_kw, pairs);
     let open_val = mk_kw(ctx, "open", 1, 255, open_builtin, open_builtin_kw, pairs);

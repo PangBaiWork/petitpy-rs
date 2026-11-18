@@ -179,7 +179,19 @@ pub fn array_append(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<Value
 /// the self element size — the arg bytes are cloned first,
 /// so self-extend needs no re-fetch); otherwise the iter
 /// path via `arrayExtendImpl`.
-pub fn array_extend(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<Value, ArrayError> {
+/// `arrayExtend` (`objarray.zig`): a buffer arg is a bulk
+/// memcpy; anything else goes through `array_extend_impl`
+/// (the `getiter` loop) with the caller's hook — `None` on
+/// the ctx-only paths (the method wrapper, `+=`), `Some`
+/// on the VM intercept path (`call_array_extend_ctx`), so a
+/// generator arg is collected through the VM's real call
+/// hook (E2i; the `str.join` precedent).
+pub fn array_extend(
+    ctx: &mut CallCtx,
+    self_: Value,
+    arg: Value,
+    call: Option<CallHook<'_, '_>>,
+) -> Result<Value, ArrayError> {
     if let Some((bytes, _)) = buffer_bytes(ctx, arg) {
         let Value::Heap(r) = self_ else {
             return Err(ArrayError::PyRaise);
@@ -200,7 +212,7 @@ pub fn array_extend(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<Value
         }
         return Ok(Value::None);
     }
-    array_extend_impl(ctx, self_, arg, 0, None)?;
+    array_extend_impl(ctx, self_, arg, 0, call)?;
     Ok(Value::None)
 }
 
@@ -274,7 +286,7 @@ pub fn array_binary_op(
             if is_view {
                 return Err(PyError::PyRaise);
             }
-            array_extend(ctx, lhs, rhs).map_err(|e| ctx.record_typed(e))?;
+            array_extend(ctx, lhs, rhs, None).map_err(|e| ctx.record_typed(e))?;
             Ok(lhs)
         }
         BinaryOp::Contains => {
@@ -294,7 +306,14 @@ pub fn array_binary_op(
                 return Ok(Value::Bool(found));
             }
             if is_int_or_float(ctx, rhs) {
-                // Bare `NotImplementedError` (no message).
+                // Bare `NotImplementedError` (no message):
+                // the vendor's `raiseNotImplemented()` sets
+                // `pending_exc` AND returns PyRaise, so the
+                // caller raises instead of falling back (the
+                // bare `Err(PyRaise)` used to be swallowed to
+                // `False`/`True` by the generic loop and the
+                // `contains` iteration fallback).
+                ctx.record_raise("NotImplementedError", None);
                 return Err(PyError::PyRaise);
             }
             Ok(Value::Bool(false))
@@ -322,6 +341,14 @@ pub fn array_binary_op(
             {
                 return Ok(Value::Bool(seq_cmp_bytes(op, &lhs_bytes, &rhs_bytes)));
             }
+            // Bare `NotImplementedError` (no message) — the
+            // vendor's `raiseNotImplemented()` records it on
+            // `pending_exc`; the bare `Err(PyRaise)` used to be
+            // swallowed (the generic loop fell back to the
+            // pointer comparison for `==`, to `TypeError` for
+            // `<`, and the `contains` iteration fallback for
+            // `in`).
+            ctx.record_raise("NotImplementedError", None);
             Err(PyError::PyRaise)
         }
         _ => Err(PyError::PyRaise),
@@ -651,7 +678,7 @@ pub fn array_append_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value
 /// `array.extend` / `bytearray.extend` (fun_builtin_2).
 pub fn array_extend_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 2)?;
-    array_extend(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
+    array_extend(ctx, args[0], args[1], None).map_err(|e| ctx.record_typed(e))
 }
 
 /// `array`'s / `bytearray`'s method table (C13, the Zig's

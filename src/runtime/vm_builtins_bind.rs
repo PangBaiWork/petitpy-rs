@@ -16,7 +16,7 @@ use crate::objects::containers::objstringio_types::build_io_module;
 use crate::objects::objtype::subclass::{isinstance_fun_obj, issubclass_fun_obj};
 use crate::objects::primitives::objint::fun_n_args;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::value::{DictData, FunBuiltinData, InstanceData, MapData, Obj, Value};
+use crate::objects::value::{DictData, FunBuiltinData, InstanceData, MapData, ModuleData, Obj, Value};
 use crate::runtime::builtinevex::{compile_builtin_fn, eval_builtin_fn, exec_builtin_fn};
 use crate::runtime::builtinimport::import_builtin_fn;
 use crate::runtime::vm::{Vm, VmState};
@@ -414,6 +414,33 @@ impl Vm {
             }),
         );
         state.builtins = builtins;
+        // Fix the builtins dict (the vendor's ROM table,
+        // `is_fixed = 1` — the sys/os/errno precedent in
+        // modsys.rs/modos.rs/moderrno.rs): a store into the
+        // builtins module must land in the override dict, not
+        // mutate the ROM table (`module_store_attr`'s fixed
+        // branch). Then expose the builtins as an importable
+        // module (E2i: `import builtins` — the module's dict
+        // IS the builtins dict, so `builtins.abs` reads the
+        // original while `abs` resolves through the override
+        // dict, exactly as the reference binary does).
+        if let Obj::Dict(d) = ctx.arena.get_mut(builtins) {
+            d.map.is_fixed = true;
+        }
+        let builtins_id =
+            static_qstr_id(b"builtins").expect("builtins is a static qstr");
+        let builtins_module = ctx.alloc(
+            Some(vmt.module),
+            Obj::Module(ModuleData {
+                name: builtins_id,
+                dict: builtins,
+                delegation: None,
+            }),
+        );
+        let builtins_module_val = Value::Heap(builtins_module);
+        state
+            .builtin_modules
+            .push((builtins_id, builtins_module_val));
         // No module loaded yet: globals default to builtins (a
         // harmless default — `load_module` sets the real globals).
         state.globals = builtins;
@@ -469,6 +496,33 @@ impl Vm {
             }
         }
         state.hash_builtin = d1.hash_builtin;
+        // E2i: the `array.extend` / `bytearray.extend` method
+        // builtins (two different `FunBuiltin` objects — the
+        // array dict and the bytearray dict are built from
+        // separate tables, same as `str.join` / `bytes.join`
+        // above). Looked up by name; a miss leaves the handle
+        // unset and `extend` keeps its old ctx-only behavior
+        // (a generator arg raises "object not iterable").
+        let extend_q = static_qstr_id(b"extend").expect("extend is a static qstr");
+        // The array type lives in `vm_types` (built before
+        // this bind runs); bytearray's dict is built the same
+        // way — look both up through the builtin type refs.
+        for (type_, slot) in [
+            (ctx.types.array, &mut state.array_extend_builtin),
+            (ctx.types.bytearray, &mut state.bytearray_extend_builtin),
+        ] {
+            let dict = match ctx.arena.get(type_) {
+                Obj::Type(d) => d.dict,
+                _ => continue,
+            };
+            if let Ok(v) = crate::objects::containers::objdict::dict_get_value(
+                &mut ctx,
+                Value::Heap(dict),
+                Value::Qstr(extend_q),
+            ) {
+                *slot = v;
+            }
+        }
         state.min_builtin = d1.min_builtin;
         state.max_builtin = d1.max_builtin;
         state.getattr_builtin = d1.getattr_builtin;
@@ -529,6 +583,7 @@ impl Vm {
         pins.push(state.empty_tuple);
         pins.push(state.ellipsis);
         pins.push(Value::Heap(builtins));
+        pins.push(builtins_module_val);
         pins.push(print_val);
         pins.push(next_val);
         pins.push(bc_val);

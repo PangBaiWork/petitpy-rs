@@ -29,11 +29,21 @@ use crate::runtime::vm_raise::exception_from_pending;
 
 /// Build the exception object for a typed error (`TypedRaise`:
 /// the name/arg/message triple the `CallCtx` recording uses).
+/// E2i: an `OutOfMemory` SIGNAL is not a named error — its
+/// `raise_name()` is `""`, so the `by_name` lookup below fell
+/// back to a bare `TypeError` (a slot allocation failure, e.g.
+/// a huge list repeat, surfaced as `TypeError: ` instead of
+/// `MemoryError`). The vendor raises `MemoryError` for every
+/// allocation failure, so the signal maps here, mirroring
+/// `exc_from_pyerror`'s `OutOfMemory` arm (`"out of memory"`).
 pub fn exc_from_typed<E: TypedRaise>(
     ctx: &mut CallCtx,
     state: &VmState,
     e: E,
 ) -> Value {
+    if e.raise_signal() == PyError::OutOfMemory {
+        return new_exception_msg(ctx, state.exc.memory_error, "out of memory");
+    }
     let name = e.raise_name();
     let type_ = state.exc.by_name(name).unwrap_or(state.exc.type_error);
     if let Some(arg) = e.raise_arg() {

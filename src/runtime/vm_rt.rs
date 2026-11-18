@@ -395,6 +395,19 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
             let mut hook = crate::runtime::vm_seams::make_hook(state);
             obj_equal_not_equal(ctx, types, op, lhs, rhs, Some(&mut hook))
         };
+        // E2i: a slot may answer `Ok(False)` while recording a
+        // raise (the vendor's `raiseNotImplemented()` sets
+        // `pending_exc` AND returns a value — the array slot's
+        // comparison else-branch does exactly this for
+        // mismatched layouts, e.g. `array('b') == array('i')`).
+        // The generic loop's `NotImplemented` arm already
+        // propagates a recorded raise; the equality protocol
+        // must do the same, or `==` silently swallows it to
+        // `False` (`is_true_ctx`'s precedent: false whenever
+        // pending is set — the VM raises instead).
+        if result.is_ok() && ctx.has_pending_raise() {
+            return Err(pending_exc_or_type_error(ctx, state));
+        }
         return result.map_err(|e| crate::runtime::vm_seams::drain_hook_raise(ctx, state, e));
     }
     // MODULO on an exact str/bytes lhs (E2e): the `%`-format

@@ -50,16 +50,23 @@ fn print_impl(
 /// (the exception object travels on `state.pending_exc`, the
 /// C14 side-channel idiom). The default render above is the
 /// ctx-only path (infallible, as before).
-pub(crate) fn print_impl_with(
+/// The `print` kwargs, parsed (E2i — shared by
+/// `print_impl_with` and the VM-intercepted
+/// `print(file=<user instance>)` path in `builtin_str.rs`).
+pub(crate) struct PrintKwargs {
+    pub(crate) sep: Option<Value>,
+    pub(crate) end: Option<Value>,
+    pub(crate) file: Option<Value>,
+    pub(crate) flush: Option<Value>,
+}
+
+/// Parse the `print` kwargs (the terse form, probed: an
+/// unknown kw raises `TypeError: argument num/types
+/// mismatch`; a repeated kw likewise).
+pub(crate) fn parse_print_kwargs(
     ctx: &mut CallCtx,
-    args: &[Value],
     kwargs: &[(u32, Value)],
-    render: &mut dyn FnMut(&mut CallCtx, Value, &mut String) -> PyResult<()>,
-) -> PyResult<Value> {
-    use crate::objects::obj::obj_is_true;
-    use crate::runtime::runtime_call::call_method_n_kw;
-    use crate::runtime::runtime_method::load_method;
-    use crate::support::stream::{get_stream_raise, stream_write_adaptor, MP_STREAM_OP_WRITE};
+) -> Result<PrintKwargs, PyError> {
     let terse = |ctx: &mut CallCtx| -> PyError {
         ctx.record_raise("TypeError", Some("argument num/types mismatch"));
         PyError::PyRaise
@@ -97,6 +104,51 @@ pub(crate) fn print_impl_with(
             return Err(terse(ctx));
         }
     }
+    Ok(PrintKwargs {
+        sep,
+        end,
+        file,
+        flush,
+    })
+}
+
+/// `mp_obj_str_get_data` for a `print` `sep`/`end` value: a qstr
+/// immediate, a heap `Str`, or a heap `Bytes` gives its bytes;
+/// anything else raises `TypeError: can't convert to str
+/// implicitly` (probed on the reference binary).
+pub(crate) fn sep_end_bytes(ctx: &mut CallCtx, v: Value) -> PyResult<Vec<u8>> {
+    match v {
+        Value::Qstr(id) => Ok(ctx.pool.qstr_str(id as u16).to_vec()),
+        Value::Heap(r) => match ctx.arena.get(r) {
+            Obj::Str(s) => Ok(s.bytes.clone()),
+            Obj::Bytes(b) => Ok(b.bytes.clone()),
+            _ => {
+                ctx.record_raise("TypeError", Some("can't convert to str implicitly"));
+                Err(PyError::PyRaise)
+            }
+        },
+        _ => {
+            ctx.record_raise("TypeError", Some("can't convert to str implicitly"));
+            Err(PyError::PyRaise)
+        }
+    }
+}
+
+pub(crate) fn print_impl_with(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+    render: &mut dyn FnMut(&mut CallCtx, Value, &mut String) -> PyResult<()>,
+) -> PyResult<Value> {
+    use crate::objects::obj::obj_is_true;
+    use crate::runtime::runtime_call::call_method_n_kw;
+    use crate::runtime::runtime_method::load_method;
+    use crate::support::stream::{get_stream_raise, stream_write_adaptor, MP_STREAM_OP_WRITE};
+    let kw = parse_print_kwargs(ctx, kwargs)?;
+    let sep = kw.sep;
+    let end = kw.end;
+    let file = kw.file;
+    let flush = kw.flush;
     let sep_bytes = match sep {
         Some(v) => sep_end_bytes(ctx, v)?,
         None => b" ".to_vec(),
@@ -167,28 +219,6 @@ fn rt_to_pyerror(ctx: &mut CallCtx, e: crate::runtime::runtime::RtError) -> PyEr
             let msg = e.message();
             ctx.record_raise(name, Some(&msg));
             PyError::PyRaise
-        }
-    }
-}
-
-/// `mp_obj_str_get_data` for a `print` `sep`/`end` value: a qstr
-/// immediate, a heap `Str`, or a heap `Bytes` gives its bytes;
-/// anything else raises `TypeError: can't convert to str
-/// implicitly` (probed on the reference binary).
-fn sep_end_bytes(ctx: &mut CallCtx, v: Value) -> PyResult<Vec<u8>> {
-    match v {
-        Value::Qstr(id) => Ok(ctx.pool.qstr_str(id as u16).to_vec()),
-        Value::Heap(r) => match ctx.arena.get(r) {
-            Obj::Str(s) => Ok(s.bytes.clone()),
-            Obj::Bytes(b) => Ok(b.bytes.clone()),
-            _ => {
-                ctx.record_raise("TypeError", Some("can't convert to str implicitly"));
-                Err(PyError::PyRaise)
-            }
-        },
-        _ => {
-            ctx.record_raise("TypeError", Some("can't convert to str implicitly"));
-            Err(PyError::PyRaise)
         }
     }
 }

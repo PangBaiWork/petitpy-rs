@@ -145,11 +145,40 @@ impl crate::objects::slots::VmHook for StateHook<'_> {
         }
     }
 
+
     /// E2h: take (and clear) the stashed raise — see the
     /// `VmHook::take_pending` contract.
     fn take_pending(&mut self) -> Option<Value> {
         self.state.pending_exc.take()
     }
+
+
+    /// E2i: the getitem-iterator exhaustion check — take the
+    /// stashed exception iff its EXACT type is `StopIteration`
+    /// or `IndexError` (`objgetitemiter.zig:excIsStopOrIndex`).
+    /// A subclass does NOT count (the vendor compares type
+    /// pointers), so this matches on `type_` directly, not on
+    /// `is_exception_instance` (which is subclass-aware).
+    fn take_pending_if_stop_or_index(&mut self, ctx: &mut CallCtx) -> bool {
+        let Some(exc) = self.state.pending_exc.as_ref() else {
+            return false;
+        };
+        let is_stop_or_index = match exc {
+            Value::Heap(r) => match ctx.arena.get(*r) {
+                crate::objects::value::Obj::Exception(d) => {
+                    d.type_ == self.state.exc.stop_iteration
+                        || d.type_ == self.state.exc.index_error
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if is_stop_or_index {
+            self.state.pending_exc.take();
+            true
+        } else {
+            false
+        }    }
 }
 
 /// Build the VM's hook from `state` (borrows `state` for `'s`).

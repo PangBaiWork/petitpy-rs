@@ -276,6 +276,61 @@ pub(crate) fn collect_iterable(
                 };
             let mut getitem_seam =
                 |ctx2: &mut CallCtx, obj: Value, index: i64| -> CallOutcome {
+                    // E2i: a user instance's `__getitem__` is a
+                    // `FunBc` — it cannot run through the stub
+                    // seams `obj_subscr` uses
+                    // (`bound_meth_call_slot` has no runner for
+                    // `FunBc`), so `list(A())` / `for x in A()`
+                    // failed with "object isn't subscriptable".
+                    // With a hook, run `instance_subscr` through
+                    // the hook seams (the `try_instance_subscr`
+                    // shape, but the hook is shared with the
+                    // `call` / `next` seams through the cell).
+                    // A raise from `__getitem__` is classified
+                    // by the vendor's rule
+                    // (`objgetitemiter.zig:excIsStopOrIndex`,
+                    // EXACT `StopIteration` / `IndexError` →
+                    // exhaustion, anything else propagates):
+                    // the slot-recorded raise is visible on
+                    // `ctx.pending_raise`; a `FunBc` raise is
+                    // stashed on the hook — ask the hook to take
+                    // it (`VmHook::take_pending_if_stop_or_index`).
+                    if crate::runtime::vm_seams::is_instance(ctx2.arena, obj) {
+                        let mut guard = hook_cell.borrow_mut();
+                        if let Some(h) = guard.as_deref_mut() {
+                            let r = crate::objects::objtype::seams::with_call_hook_seams(
+                                h,
+                                |seams| {
+                                    crate::objects::objtype::instance::instance_subscr(
+                                        ctx2,
+                                        obj,
+                                        Value::SmallInt(index),
+                                        SubscrArg::Get,
+                                        seams,
+                                    )
+                                },
+                            );
+                            return match r {
+                                Ok(v) => CallOutcome::Value(v),
+                                Err(PyError::OutOfMemory) => CallOutcome::Raise,
+                                Err(PyError::PyRaise) => {
+                                    let stop = matches!(
+                                        ctx2.pending_raise.as_ref(),
+                                        Some(p) if p.exc_name == "IndexError"
+                                            || p.exc_name == "StopIteration"
+                                    );
+                                    if stop {
+                                        ctx2.pending_raise.take();
+                                        CallOutcome::Stop
+                                    } else if h.take_pending_if_stop_or_index(ctx2) {
+                                        CallOutcome::Stop
+                                    } else {
+                                        CallOutcome::Raise
+                                    }
+                                }
+                            };
+                        }
+                    }
                     match obj_subscr(ctx2, ctx2.types, obj, Value::SmallInt(index), SubscrArg::Get)
                     {
                         Ok(v) => CallOutcome::Value(v),

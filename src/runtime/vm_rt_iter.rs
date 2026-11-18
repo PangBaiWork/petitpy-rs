@@ -119,33 +119,99 @@ pub fn iternext_allow_raise_ctx(
             // Copy the `next` builtin out BEFORE the seams
             // below borrow `state` mutably (E0503).
             let next_builtin = state.next_builtin;
-            // The seams: `call` routes user-function calls
-            // through the VM (capturing `state`); `getitem`
-            // uses the subscr slot directly (no state needed).
+            // The seams share ONE hook through a `RefCell`
+            // (E2i — the E2c `collect_iterable` pattern): two
+            // closures over the same `&mut VmState` cannot be
+            // built (E0524). `call` routes user-function calls
+            // through the VM (the hook's `call` is exactly the
+            // old direct `call_function_ctx` + stash-on-
+            // `pending_exc` shape); `getitem` uses the hook for
+            // a user instance's `__getitem__` (a `FunBc` cannot
+            // run through the stub seams `obj_subscr` uses) and
+            // the subscr slot directly otherwise.
+            use std::cell::RefCell;
+            let mut hook = crate::runtime::vm_seams::make_hook(state);
+            let hook_cell: RefCell<Option<&mut dyn crate::objects::slots::VmHook>> =
+                RefCell::new(Some(&mut hook));
             let mut call_seam =
                 |ctx2: &mut CallCtx, fun: Value, args: &[Value]| -> CallOutcome {
-                    match crate::runtime::vm_call::call_function_ctx(
-                        ctx2, state, fun, args.len(), 0, args,
-                    ) {
+                    let mut guard = hook_cell.borrow_mut();
+                    let Some(h) = guard.as_deref_mut() else {
+                        return CallOutcome::Raise;
+                    };
+                    match h.call(ctx2, fun, args.len(), 0, args) {
                         Ok(v) => CallOutcome::Value(v),
-                        Err(exc) => {
-                            // E2b: stash EVERY raise on the side
-                            // channel — a `StopIteration` from the
-                            // mapped function carries its value
-                            // (`yield from` needs it as the
-                            // delegation result, `next()` as the
-                            // exception's args). `iternext_vm_ctx`
-                            // still swallows a `StopIteration` to
-                            // `Ok(None)` (the plain-`mp_iternext`
-                            // form), so `for`/collection iteration
-                            // is unchanged.
-                            state.pending_exc = Some(exc);
-                            CallOutcome::Raise
-                        }
+                        // E2b: stash EVERY raise on the side
+                        // channel — a `StopIteration` from the
+                        // mapped function carries its value
+                        // (`yield from` needs it as the
+                        // delegation result, `next()` as the
+                        // exception's args). `iternext_vm_ctx`
+                        // still swallows a `StopIteration` to
+                        // `Ok(None)` (the plain-`mp_iternext`
+                        // form), so `for`/collection iteration
+                        // is unchanged.
+                        Err(_) => CallOutcome::Raise,
                     }
                 };
             let mut getitem_seam =
                 |ctx2: &mut CallCtx, obj: Value, index: i64| -> CallOutcome {
+                    // E2i: a user instance's `__getitem__` is a
+                    // `FunBc` — it cannot run through the stub
+                    // seams `obj_subscr` uses, so `for x in A()`
+                    // / `next(iter(A()))` failed with "object
+                    // isn't subscriptable". With the hook, run
+                    // `instance_subscr` through the hook seams
+                    // (the `try_instance_subscr` shape, but the
+                    // hook is shared with the `call` seam
+                    // through the cell). A raise from
+                    // `__getitem__` is classified by the
+                    // vendor's rule
+                    // (`objgetitemiter.zig:excIsStopOrIndex`,
+                    // EXACT `StopIteration` / `IndexError` →
+                    // exhaustion, anything else propagates):
+                    // the slot-recorded raise is visible on
+                    // `ctx.pending_raise`; a `FunBc` raise is
+                    // stashed on the hook — ask the hook to take
+                    // it (`VmHook::take_pending_if_stop_or_index`).
+                    if crate::runtime::vm_seams::is_instance(ctx2.arena, obj) {
+                        let mut guard = hook_cell.borrow_mut();
+                        if let Some(h) = guard.as_deref_mut() {
+                            let r = crate::objects::objtype::seams::with_call_hook_seams(
+                                h,
+                                |seams| {
+                                    crate::objects::objtype::instance::instance_subscr(
+                                        ctx2,
+                                        obj,
+                                        Value::SmallInt(index),
+                                        SubscrArg::Get,
+                                        seams,
+                                    )
+                                },
+                            );
+                            return match r {
+                                Ok(v) => CallOutcome::Value(v),
+                                Err(crate::pyerr::PyError::OutOfMemory) => {
+                                    CallOutcome::Raise
+                                }
+                                Err(crate::pyerr::PyError::PyRaise) => {
+                                    let stop = matches!(
+                                        ctx2.pending_raise.as_ref(),
+                                        Some(p) if p.exc_name == "IndexError"
+                                            || p.exc_name == "StopIteration"
+                                    );
+                                    if stop {
+                                        ctx2.pending_raise.take();
+                                        CallOutcome::Stop
+                                    } else if h.take_pending_if_stop_or_index(ctx2) {
+                                        CallOutcome::Stop
+                                    } else {
+                                        CallOutcome::Raise
+                                    }
+                                }
+                            };
+                        }
+                    }
                     let types = ctx2.types;
                     match obj_subscr(ctx2, types, obj, Value::SmallInt(index), SubscrArg::Get) {
                         Ok(v) => CallOutcome::Value(v),
@@ -521,6 +587,40 @@ pub fn import_name_ctx(
     level: Value,
 ) -> Result<Value, Value> {
     let globals = Value::Heap(state.globals);
+    // The `__import__` override (E2i): `builtins.__import__ =
+    // custom` replaces IMPORT_NAME dispatch (runtime.zig
+    // `mp_import_name` checks
+    // `mp_module_builtins_override_dict` first). The
+    // replacement runs through the VM's real call — the
+    // ctx-only `call_function_n_kw` in
+    // `runtime_import::import_name`'s override branch cannot
+    // run a FunBc (`fun_bc_call_slot` is a stub), so the
+    // check lives here and the default path below passes
+    // `override_dict: None`.
+    if let Some(od) = state.builtins_override_dict {
+        let import_q =
+            crate::runtime::runtime::dunder(b"__import__").expect("__import__ is a static qstr");
+        match crate::runtime::runtime_names::dict_lookup_qstr(ctx, od, import_q) {
+            Ok(Some(custom)) => {
+                let args = [
+                    Value::Qstr(qst),
+                    globals,
+                    Value::None,
+                    from_list,
+                    level,
+                ];
+                return crate::runtime::vm_call::call_function_ctx(
+                    ctx, state, custom, 5, 0, &args,
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(crate::runtime::import_search::rt_error_to_value(
+                    ctx, state, e,
+                ));
+            }
+        }
+    }
     let builtins = crate::runtime::runtime::Builtins {
         globals: Value::Heap(state.builtins),
         override_dict: None,
@@ -561,7 +661,7 @@ pub fn import_from_ctx(
     let next_obj = state.next_builtin;
     let builtins = crate::runtime::runtime::Builtins {
         globals: Value::Heap(state.builtins),
-        override_dict: None,
+        override_dict: state.builtins_override_dict,
     };
     let pool = ctx.pool;
     let mut intern = |b: &[u8]| {

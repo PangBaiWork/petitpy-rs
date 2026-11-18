@@ -1,0 +1,281 @@
+E2i fix pass — array / import / misc singles
+Lane: lane/e2i-array-misc (base master 2ae4032)
+Result file: scripts/e2i_result.txt
+
+§1 — Acceptance (measured by the executor in the worktree)
+-----------------------------------------------------------
+- cargo test --release --lib --tests: lib 1609 passed, 0 failed,
+  3 ignored (1597 + 12 new e2i tests); bins 9 passed;
+  tests/entry_cli.rs 45 passed. 0 warnings (forced recompile).
+- No `unsafe` in the diff (grep; doc-comment hits only — none).
+- check_compile_mpy.py: PASS (552/552 byte-identical).
+- check_frozen.py: PASS (23/23).
+- Six gates (runners with DEFAULTS, no --bin; capability --vm
+  defaults to petitpy-vm): full corpus 529/552 (+9 vs E2f's
+  520), integration 183/202 (unchanged), golden 577/585 (+7
+  vs 570), capability 67/67 GREEN, stdlib 6/8 (unchanged),
+  nano 444/541 (+7 vs 437, report-only).
+- Full-corpus fail set-diff vs master's 25: FLIPPED 9 —
+  array_add, array_micropython, getitem,
+  import_instance_method, io_iobase, memoryerror,
+  ordereddict1, stopiteration, subclass_native_buffer
+  (undocumented extra — Fix 1's Instance buffer arm, §3).
+  0 regressions. Remaining fails (16 + 7 known-fails):
+  array1, builtin_hash, builtin_hash_intbig,
+  builtin_override, builtin_str_hex, class_delattr_setattr,
+  class_new, class_store_class, class_super_closure,
+  int_big_rshift, int_bytes_intbig, int_parse, object_new,
+  special_methods, special_methods_intbig,
+  subclass_native_exc_new.
+- Corpus targets: 8/10 fully flipped — array_add,
+  array_micropython, getitem, stopiteration, io_iobase,
+  memoryerror, ordereddict1, import_instance_method.
+  array1: only lines 37-38 remain (X('b') == b'abc' / != — the
+  E2g seams item, §4(a)). builtin_override: only the
+  `__build_class__` line remains (E2g's half, §4(b)); the
+  builtins-module + `__import__` half is byte-identical
+  (probe_bi_half.py, §3 item 8).
+
+§2 — What was fixed (10 corpus targets, one mechanism each)
+------------------------------------------------------------
+1. array1 (partial — the `bytes(X(...))` line; the `==` lines
+   are §4(a)): `buffer_bytes` (binary.rs) gained an
+   `Obj::Instance` arm recursing on `subobj[0]`.
+2. array_micropython: `array_binary_op` (objarray_methods.rs)
+   now records a bare `NotImplementedError` before returning
+   `PyRaise` in the comparison else-branch and the Contains
+   int/float branch; `binary_op_ctx` (vm_rt.rs) converts a
+   recorded pending raise after `obj_equal_not_equal` into
+   the raise instead of swallowing it.
+3. array_add: `array_extend` (objarray_methods.rs) now takes
+   the VM hook — `VmState.array_extend_builtin` /
+   `bytearray_extend_builtin` handles (vm.rs, looked up in
+   vm_builtins_bind.rs) + intercept arm
+   (vm_call_intercept.rs) + `call_array_extend_ctx`
+   (builtin_vm.rs).
+4. getitem + stopiteration (one mechanism): the getitem seams
+   in `objdict_collect.rs` and `vm_rt_iter.rs` run
+   `instance_subscr` through the VM hook for instances; NEW
+   `VmHook::take_pending_if_stop_or_index` (slots.rs, default
+   `false`; `StateHook` override in vm_seams.rs) takes the
+   stashed StopIteration/IndexError (exact type). Plus NEW
+   `getiter_hook` (iters/iter.rs) for enumerate/map/filter/zip
+   construction over a FunBc `__iter__`, and the C11 `iternext`
+   `extra.len() == 2` branch now accepts `Obj::Instance` as
+   the second iterator.
+5. io_iobase: the VM-intercepted print (`call_print_ctx`,
+   builtin_str.rs) renders each piece and writes it through
+   a per-call hook when the file is an instance with a FunBc
+   `write` (`file_needs_hook_write` / `write_file_piece` /
+   `print_to_instance_file`); `parse_print_kwargs` +
+   `sep_end_bytes` factored out of `print_impl_with`
+   (vm_builtins.rs) into shared helpers.
+6. memoryerror: NEW `MAX_LIST_ITEMS = 2_097_152` +
+   `list_growth_overflows` (objlist.rs); the cap is enforced
+   in the list MUL arm, `list_append`, `list_extend` (exact /
+   range / generic branches) and hence the constructor
+   (via `list_extend`); `exc_from_typed` (vm_ops.rs) now
+   maps a slot `OutOfMemory` to `MemoryError("out of memory")`
+   instead of a bare `TypeError`.
+7. ordereddict1: the ordered ADD in `compact_lookup`'s
+   `ordered_lookup` (map.rs) now writes at `entries[used]`
+   (overwriting the popitem tail tombstone) instead of
+   always pushing at `entries.len()`.
+8. builtin_override (this lane's half): NEW
+   `VmState.builtins_override_dict` (vm.rs) persisted across
+   VM calls; the builtins dict is now FIXED (the ROM table)
+   and `import builtins` exposes it as a module
+   (vm_builtins_bind.rs); `store_attr_ctx` writes the
+   override dict back (vm_rt_name.rs); `load_global_ctx`
+   consults it between globals and builtins (same file);
+   `import_name_ctx` pre-checks it and calls the replacement
+   through the VM's real call (vm_rt_iter.rs).
+9. import_instance_method: `process_component`
+   (builtinimport.rs) now also consults the live
+   `sys.modules` dict (by the interned full name) and
+   returns the value as-is, module or not.
+- Regression tests: NEW `src/runtime/vm_tests_e2i.rs`
+  (12 tests, registered in `src/runtime/mod.rs`).
+
+§3 — Root causes, per corpus target (each probed REF vs Rust first)
+------------------------------------------------------------
+1. array1 — `bytes(X('b', [0x61,0x62,0x63]))` failed "object
+   not iterable" (line 36). Vendor rule (objtype.c:925-940
+   `instance_get_buffer`): a user class's buffer slot
+   delegates to `subobj[0]` (SENTINEL = delegate). The safe
+   reader `buffer_bytes` only matched Array/Bytes/Str, never
+   Instance. Fix 1. (The `==` lines are §4(a).) Side effect:
+   subclass_native_buffer also flipped — `my_bytes` (a bytes
+   subclass) addition/construction goes through the same
+   Instance buffer arm.
+2. array_micropython — cross-typecode `==` printed `FAIL`
+   instead of raising, `<` raised `TypeError`, `98 in
+   bytearray(b'abc')` returned True. Vendor rule
+   (objarray.zig:358-434 `arrayBinaryOpImpl`): the comparison
+   else-branch calls `raiseNotImplemented()` (sets
+   `pending_exc`, returns `PyRaise`). Rust returned bare
+   `PyRaise` with nothing recorded, so `==` was swallowed to
+   False by `obj_equal_not_equal`'s pointer fallback, `<`
+   became `binop_unsupported` TypeError, and `in` fell
+   through to the iteration fallback. Fixes 2+3.
+3. array_add — `a1.extend(i for i in (8, 9))` failed "object
+   not iterable" (line 5). `a1 + a2`, `+=`, `extend(array)`,
+   `extend([6,7])`, and the constructor over a generator all
+   worked; only the `extend` METHOD failed — `array_extend`
+   hardcoded its hook to `None` while `array_extend_impl`
+   already took one. Fix 4 (the `str.join` precedent).
+4. getitem — `for i in A():` failed "object isn't
+   subscriptable" (direct `A()[0]` worked). Both getitem
+   seams used ctx-only `obj_subscr`, whose stub seams cannot
+   run a FunBc `__getitem__`; the VM's LOAD_SUBSCR path uses
+   `try_instance_subscr` with the hook. Fix 5a.
+5. stopiteration — `next(iter(B()))` failed "object isn't
+   subscriptable" (line 2); `next(enumerate/map/zip(A()))`
+   raised a bare `TypeError` (lines 3-5, pre-existing,
+   masked until line 2 was fixed). (a) Same getitem-seam
+   gap as (4), with the vendor's `excIsStopOrIndex` rule
+   (exact StopIteration/IndexError → bare StopIteration,
+   args dropped — hence `iter ()`). (b) The ctx-only
+   `getiter` resolved a FunBc `__iter__` through stub seams
+   (unrecorded `PyRaise`) and fell through to a GETITEM
+   iterator (every user type carries a `subscr` slot).
+   Fix 5b (`getiter_hook` + the `iternext` Instance arm).
+6. io_iobase — `print('test', file=MyIO())` raised a bare
+   TypeError (line 0). `print(file=)` goes through the
+   ctx-only stream protocol (`get_stream_raise` +
+   `iobase_write` → `call_method_n_kw` → `fun_bc_call_slot`
+   stub → unrecorded `PyRaise`). The stream fns are ctx-only
+   (`StreamWriteFn`), so the fix is at the VM-intercepted
+   print, which has the VM. Fix 6.
+7. memoryerror — `1000000000 * l` raised a bare `TypeError`
+   (line 0). Two parts: (a) `ObjError::OutOfMemory`'s raise
+   name is `""`, so `exc_from_typed` fell back to a bare
+   `TypeError` for ANY slot OutOfMemory reaching the VM;
+   (b) no explicit cap — a 3M-element repeat is 48 MiB in
+   Rust and would succeed on this 6 GiB VM. REF boundaries
+   probed: `[1] * 2097152` ok, `* 2097153` MemoryError;
+   append fails at the 2,097,153rd; `list(range(2097153))`
+   MemoryError — a list cannot hold more than 2,097,152
+   elements (16 MiB of 8-byte pointers = the vendor's
+   `MAX_ALLOC`). Fix 7.
+8. ordereddict1 — after `del d["b"]`, `d["abc"] = 123`,
+   `d.popitem()`, `d["xyz"] = 321` read back as `None`
+   (values `[20, 2, None]`) and `d["xyz"]` raised
+   `KeyError`. `dict_popitem` tombstones the last live slot
+   (like the vendor's `dictPopitemImpl`), but the ordered
+   ADD always appended at `entries.len()` while returning
+   `Added(used)` — the caller stored the value into the
+   tombstone (index 2) while the key sat at index 3, past
+   the probe loop's `i < used` bound. The vendor's ordered
+   ADD writes at `tbl[used]`. Fix 8.
+9. builtin_override (this lane's half) — `import builtins`
+   raised `ModuleNotFoundError` (line 3). Three gaps, one
+   root: the `Builtins::override_dict` seams existed since
+   C14/D1 (`runtime_names::load_global`,
+   `runtime_import::import_name`,
+   `runtime_method::store_attr` + `module_store_attr`'s
+   fixed-dict branch) but (a) no `builtins` module object
+   existed, (b) the builtins dict was NOT fixed (so the
+   override branch could never fire), and (c) the VM built
+   a fresh `Builtins { override_dict: None }` per call and
+   dropped any installed override dict. Fix 9: module +
+   fixed dict + persisted `VmState.builtins_override_dict`.
+   Second half found by probing: the override's
+   replacement is a FunBc, and the ctx-only
+   `call_function_n_kw` cannot run one (`fun_bc_call_slot`
+   is a stub → bare TypeError on `import a`), so
+   `import_name_ctx` pre-checks the dict and calls the
+   replacement through the VM's real call.
+10. import_instance_method — `import mod` raised
+    `ModuleNotFoundError` (line 0). `process_component`'s
+    cached lookup only consulted the internal
+    `state.modules` registry, never the live `sys.modules`
+    dict the user wrote to. Fix 10 (a Str-keyed entry is
+    found by a Qstr query — `str_equal` bridges them).
+
+§4 — Shortfalls, out-of-scope notes, and handoffs
+-------------------------------------------------
+(a) array1 lines 37-38 (`X('b',[97,98]) == b'ab'` → REF False,
+    Rust True; `!=` → REF True, Rust False) + the wider
+    family probed 2026-11-18: `L([1,2]) == L([1,2])`,
+    `S('ab') == S('ab')`, `D(a=1) == D(a=1)` (list/str/dict
+    subclasses) → REF True, Rust False. Root cause pinned
+    (vendor-grounded): the Rust `VmSeams::binary` closure
+    (seams.rs) is a SLOT-LEVEL call (`call_binary` — the lhs
+    type's `binary_op` slot directly), while the vendor's
+    SENTINEL branch calls the FULL `mp_binary_op`, which for
+    EQUAL routes to `mp_obj_equal_not_equal` (the 2-pass loop
+    with the `FLAG_EQ_CHECKS_OTHER_TYPE` rule: array/str/bytes
+    flags are 0, so both passes skip and the pointer fallback
+    returns False; a user class HAS the flag, so pass 0 calls
+    the instance slot, which delegates to `subobj[0]` and the
+    full protocol returns True for equal contents). The fix
+    belongs in `src/objects/objtype/seams.rs` (route
+    EQUAL/NOT_EQUAL through the full protocol in the `binary`
+    closure) or equivalently `obj_ops.rs`'s invoke /
+    `instance.rs` — ALL forbidden by this brief §4
+    (E2g territory). NOT implemented here, per the brief.
+    Fixes 2+3 DO fix the `<` side for instances
+    (`x < array` / `x < x2` → NotImplementedError).
+(b) builtin_override flips only after E2g merges: the
+    `__build_class__` line (`class A:` with the override
+    installed → `('class', 'A')`) needs `load_build_class_ctx`
+    (vm_rt_name.rs:154) to consult the override dict via
+    `runtime_names::load_build_class` — it currently returns
+    `state.build_class_builtin` unconditionally. The
+    `VmState.builtins_override_dict` field this lane added is
+    exactly what that call site needs (one-line wiring).
+    E2g owns it.
+(c) `list.extend(gen)` fails the same way `array.extend(gen)`
+    did ("object not iterable" — the same hook gap, no
+    `collect_iterable` hook in the list path). NO corpus
+    coverage; out of scope, noted for a later lane.
+(d) `builtins.<newname> = v` (e.g. `builtins.foo = 1`):
+    REF raises `AttributeError("no attribute 'foo'")`; Rust
+    stores it into the override dict. The vendor's Zig
+    `module_attr` store path stores unconditionally, but the
+    reference BINARY raises — the check lives in the C shim
+    side. The fix is an existence check in
+    `module_store_attr` (`src/objects/objtype/objmodule.rs`,
+    forbidden file — E2g territory or main-agent follow-up).
+    `del builtins.abs` → `KeyError 'abs'` matches REF
+    already (delete targets the override dict).
+(e) `import_from`'s submodule fallback with a FunBc
+    `__import__` override installed still goes through the
+    ctx-only `call_function_n_kw` (`runtime_import.rs` —
+    `import_from_ctx` passes the real override dict). It
+    only fires when a from-import attribute misses AND the
+    module is a package; the corpus never hits it. The full
+    fix needs a hook threaded through `import_from` (a
+    larger seam change).
+(f) str/tuple/bytes repeat at exactly 16 MiB ABORTS the
+    reference (rc=134, null-deref panic in `mp_seq_multiply`,
+    sequence.zig:48 — `str * 16777216`, `tuple * 2097152`,
+    `bytes * 16777216` all abort; `str * 2097153` is fine).
+    A reference bug; Rust raises MemoryError or succeeds
+    instead (deliberate divergence, no corpus coverage).
+(g) A GENERATOR yielding ≥1e9 items into `list.extend` /
+    the list constructor could abort (Rust alloc failure)
+    before the post-collect cap check; the vendor raises
+    MemoryError mid-loop. No corpus coverage.
+(h) `type(iter(s))` still fails (bare TypeError) — E2b's
+    known gap, explicitly out of this lane's scope.
+(i) Reference nondeterminism (already known from E2d):
+    multi-element instance set order alternates across REF
+    runs (ASLR-dependent instance hash); Rust is
+    deterministic. Not a defect.
+(j) `x * 2` for an array subclass names the type `'X'` in
+    the TypeError; REF names `'array'`. Message-only
+    divergence, no corpus coverage.
+(k) Boundary note — two files this brief lists under §4 were
+    touched ONLY for non-class-creation mechanics, because
+    the relevant slots live there: `src/objects/objtype/
+    make_new.rs` (8 lines: the map/filter/zip/enumerate
+    `*_make_new_slot` fns forward their `call` hook instead
+    of ignoring it — Fix 5b; no class-creation code touched)
+    and `src/runtime/vm_call_intercept.rs` (10 lines: the
+    array/bytearray-extend intercept arm — Fix 4; the
+    `__build_class__` interception is untouched, E2g's).
+    No `src/objects/instance.rs`, `src/objects/ints/*`,
+    `src/objects/strings/objstr_methods*.rs` or
+    `src/objects/obj_ops.rs` file was touched.

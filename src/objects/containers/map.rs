@@ -789,10 +789,27 @@ fn ordered_lookup(
     {
         let m = map_of_mut(ctx.arena, map_ref);
         m.used += 1;
-        m.entries.push(MapEntry {
-            key: Some(key),
-            value: Value::None,
-        });
+        // The vendor's ordered ADD writes at `tbl[used]` (map.zig),
+        // overwriting the popitem tombstone that sits there — it does
+        // NOT append past it. `dict_popitem` tombstones the last live
+        // slot (like the vendor's `dictPopitemImpl`), so `entries` can
+        // hold tombstones at indices >= `used`; a plain `push` would
+        // land the entry at `entries.len()` while `Added(used_now)`
+        // tells the caller the value goes at `used_now` — the store
+        // then wrote into the tombstone and the lookup (`i < used`)
+        // never reached the new key (ordereddict1: `d["xyz"] = 321`
+        // read back as None / KeyError).
+        if m.entries.len() > used_now {
+            m.entries[used_now] = MapEntry {
+                key: Some(key),
+                value: Value::None,
+            };
+        } else {
+            m.entries.push(MapEntry {
+                key: Some(key),
+                value: Value::None,
+            });
+        }
         if !key.is_qstr() {
             m.all_keys_are_qstrs = false;
         }

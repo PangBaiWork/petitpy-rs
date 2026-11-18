@@ -302,6 +302,24 @@ pub trait VmHook {
     fn take_pending(&mut self) -> Option<Value> {
         None
     }
+
+    /// Take the hook's stashed exception iff it is EXACTLY
+    /// `StopIteration` or `IndexError` (E2i): the
+    /// getitem-iterator exhaustion rule
+    /// (`objgetitemiter.zig:excIsStopOrIndex` — the exception
+    /// TYPE must be one of the two, NOT a subclass). A `call`
+    /// through the hook stashes its raise where the ctx-only
+    /// seams cannot see it (`state.pending_exc`), so the
+    /// getitem seam cannot classify it from
+    /// `ctx.pending_raise` — it asks the hook instead, which
+    /// takes (clears) the exception when it answers `true`.
+    /// Default: no stashed exception is visible (`SeamHook`
+    /// keeps this — its raises are recorded on
+    /// `ctx.pending_raise`, classified by the caller);
+    /// `StateHook` overrides it.
+    fn take_pending_if_stop_or_index(&mut self, ctx: &mut CallCtx) -> bool {
+        let _ = ctx;
+        false    }
 }
 
 /// The VM's user-code hook: `&mut dyn VmHook` — see `VmHook`.

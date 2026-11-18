@@ -388,6 +388,185 @@ pub(crate) fn call_len_ctx(
 /// `state.pending_exc` and drained below); otherwise delegate
 /// to the existing `print_builtin` (bit-identical behaviour
 /// for non-instance args).
+/// Render one `print` argument into `s` (E2i — extracted
+/// from `call_print_ctx`'s render closure so the
+/// `print(file=<user instance>)` path renders identically):
+/// an instance through its `__str__` dunder (a raise stashes
+/// the exception object on `state.pending_exc` and reports
+/// `PyRaise`, the C14 side-channel idiom), a container
+/// through `print_helper_hook`, anything else through the
+/// default `obj_print_helper`.
+fn render_print_arg(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    v: Value,
+    s: &mut String,
+) -> PyResult<()> {
+    if is_instance(ctx.arena, v) {
+        match render_instance(ctx, state, v, PrintKind::Str) {
+            Ok(Some(text)) => {
+                s.push_str(&text);
+                Ok(())
+            }
+            Ok(None) => {
+                obj_print_helper(ctx, ctx.types, v, PrintKind::Str, s);
+                Ok(())
+            }
+            Err(exc) => {
+                state.pending_exc = Some(exc);
+                Err(PyError::PyRaise)
+            }
+        }
+    } else if is_container(ctx, v) {
+        // E2d: a nested instance's `__repr__` runs through the
+        // hook (a raise inside is swallowed by the helper —
+        // slot semantics, see `print_helper_hook`).
+        print_helper_hook(ctx, state, v, PrintKind::Str, s);
+        Ok(())
+    } else {
+        obj_print_helper(ctx, ctx.types, v, PrintKind::Str, s);
+        Ok(())
+    }
+}
+
+/// Does `file`'s `write` method need the VM (E2i)? Only a
+/// `FunBc` / `Closure` does — a native `write` (a `StringIO`,
+/// a `File`) runs through the ctx-only stream protocol, and
+/// a missing `write` keeps the protocol path's
+/// `AttributeError`. The lookup is ctx-only (no call), so it
+/// cannot raise.
+fn file_needs_hook_write(ctx: &mut CallCtx, file: Value) -> bool {
+    if !is_instance(ctx.arena, file) {
+        return false;
+    }
+    let Some(write_q) = static_qstr_id(b"write") else {
+        return false;
+    };
+    match crate::objects::objtype::seams::real_load_maybe(ctx, file, write_q) {
+        Some((fun, _)) => matches!(
+            fun,
+            Value::Heap(r)
+                if matches!(ctx.arena.get(r), Obj::FunBc(_) | Obj::Closure(_))
+        ),
+        None => false,
+    }
+}
+
+/// Call `file`'s `write` method with a bytearray over `piece`
+/// (E2i — one `print` piece; the hook is created per call
+/// because a hook and the render both borrow `state`, so they
+/// cannot be live at once). The return converts the way
+/// `iobase_read_write` does: `None` → `OSError(EAGAIN)`,
+/// int `< 0` → `OSError(-ret)`, anything else →
+/// `TypeError` (`mp_obj_get_int`); the count itself is
+/// discarded (the adaptor's contract).
+fn write_file_piece(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    file: Value,
+    piece: &[u8],
+) -> PyResult<()> {
+    use crate::objects::containers::objarray::new_bytearray;
+    use crate::objects::obj::{obj_get_int, ObjError};
+    use crate::objects::objtype::seams::real_load_maybe;
+    use crate::objects::slots::VmHook;
+    use crate::runtime::raise::raise_os_error;
+    use crate::support::stream::MP_EAGAIN;
+    let Some(write_q) = static_qstr_id(b"write") else {
+        ctx.record_raise("AttributeError", Some("no attribute 'write'"));
+        return Err(PyError::PyRaise);
+    };
+    let Some((fun, bound)) = real_load_maybe(ctx, file, write_q) else {
+        ctx.record_raise("AttributeError", Some("no attribute 'write'"));
+        return Err(PyError::PyRaise);
+    };
+    let ba = new_bytearray(ctx, ctx.types.bytearray, piece);
+    // The bytearray must be rooted across the method call: the
+    // call allocates, a collection could trigger (the GC stress
+    // rule), and `ba` is otherwise reachable only from this
+    // stack slot (D6 — the `iobase_read_write` idiom).
+    ctx.roots.push(Value::Heap(ba));
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
+    let ret_obj = match bound {
+        Some(self_) => hook.call(ctx, fun, 2, 0, &[self_, Value::Heap(ba)]),
+        None => hook.call(ctx, fun, 1, 0, &[Value::Heap(ba)]),
+    }?;
+    if ret_obj == Value::None {
+        return Err(raise_os_error(ctx, MP_EAGAIN));
+    }
+    let ret = obj_get_int(ctx, ctx.types, ret_obj).map_err(|e| match e {
+        ObjError::OutOfMemory => PyError::OutOfMemory,
+        other => ctx.record_typed(other),
+    })?;
+    if ret < 0 {
+        let errno = (-ret) as i32;
+        return Err(raise_os_error(ctx, errno));
+    }
+    Ok(())
+}
+
+/// `print(..., file=<user instance>)` (E2i): the file's
+/// `write` is a `FunBc` — it cannot run through the ctx-only
+/// stream protocol (`iobase_write` → `call_method_n_kw` →
+/// the `fun_bc_call_slot` stub → a bare `TypeError`), so
+/// `print` to a user `io.IOBase` subclass failed
+/// (`io_iobase.py`: REF prints `write 4` / `write 1`). This
+/// path renders each piece exactly like `print_impl_with`
+/// does (arg, sep between args, end last) and writes each
+/// through the VM hook; `flush=True` calls the file's `flush`
+/// method with 0 args through the hook (missing → the
+/// `AttributeError` the ctx-only path raises).
+fn print_to_instance_file(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+    file: Value,
+) -> PyResult<Value> {
+    use crate::objects::obj::obj_is_true;
+    use crate::runtime::vm_builtins::{parse_print_kwargs, sep_end_bytes};
+    let kw = parse_print_kwargs(ctx, kwargs)?;
+    let sep_bytes = match kw.sep {
+        Some(v) => sep_end_bytes(ctx, v)?,
+        None => b" ".to_vec(),
+    };
+    let end_bytes = match kw.end {
+        Some(v) => sep_end_bytes(ctx, v)?,
+        None => b"\n".to_vec(),
+    };
+    let flush = match kw.flush {
+        Some(v) => obj_is_true(ctx, ctx.types, v)?,
+        None => false,
+    };
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            write_file_piece(ctx, state, file, &sep_bytes)?;
+        }
+        let mut s = String::new();
+        render_print_arg(ctx, state, *arg, &mut s)?;
+        write_file_piece(ctx, state, file, s.as_bytes())?;
+    }
+    write_file_piece(ctx, state, file, &end_bytes)?;
+    if flush {
+        use crate::objects::objtype::seams::real_load_maybe;
+        use crate::objects::slots::VmHook;
+        let Some(flush_q) = static_qstr_id(b"flush") else {
+            ctx.record_raise("AttributeError", Some("no attribute 'flush'"));
+            return Err(PyError::PyRaise);
+        };
+        let Some((fun, bound)) = real_load_maybe(ctx, file, flush_q) else {
+            ctx.record_raise("AttributeError", Some("no attribute 'flush'"));
+            return Err(PyError::PyRaise);
+        };
+        let mut hook = crate::runtime::vm_seams::make_hook(state);
+        match bound {
+            Some(self_) => hook.call(ctx, fun, 1, 0, &[self_])?,
+            None => hook.call(ctx, fun, 0, 0, &[])?,
+        };
+    }
+    Ok(Value::None)
+}
+
 pub(crate) fn call_print_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -395,6 +574,27 @@ pub(crate) fn call_print_ctx(
     n_kw: usize,
     args: &[Value],
 ) -> Result<Value, Value> {
+    // The kwargs pairs, built once: the instance-file check
+    // below needs them before the hook-arg branch.
+    let pairs: Vec<(u32, Value)> = (0..n_kw)
+        .map(|i| {
+            let name = args[n_args + 2 * i].as_qstr().unwrap_or(0);
+            (name, args[n_args + 2 * i + 1])
+        })
+        .collect();
+    // E2i: a `file=` that is a user instance whose `write` is
+    // a `FunBc` takes the hook path (`print_to_instance_file`)
+    // — the ctx-only stream protocol cannot run it
+    // (`io_iobase.py`). Any other file (a native stream, a
+    // missing `write`, `file=None`) keeps the paths below.
+    if let Some(file_q) = static_qstr_id(b"file") {
+        if let Some((_, f)) = pairs.iter().find(|(name, _)| *name == file_q) {
+            if file_needs_hook_write(ctx, *f) {
+                return print_to_instance_file(ctx, state, &args[..n_args], &pairs, *f)
+                    .map_err(|e| crate::runtime::vm_seams::drain_hook_raise(ctx, state, e));
+            }
+        }
+    }
     // E2d: the hook path also runs when an arg is a container
     // (it may hold an instance — the render closure recurses
     // it through `print_helper_hook`); plain scalars still
@@ -403,56 +603,17 @@ pub(crate) fn call_print_ctx(
         .iter()
         .any(|a| is_instance(ctx.arena, *a) || is_container(ctx, *a));
     if !has_hook_arg {
-        let pairs: Vec<(u32, Value)> = (0..n_kw)
-            .map(|i| {
-                let name = args[n_args + 2 * i].as_qstr().unwrap_or(0);
-                (name, args[n_args + 2 * i + 1])
-            })
-            .collect();
         return crate::runtime::vm_builtins::print_builtin(ctx, &args[..n_args], &pairs)
             .map_err(|e| crate::runtime::vm_ops::exc_from_pyerror(ctx, state, e));
     }
-    let pairs: Vec<(u32, Value)> = (0..n_kw)
-        .map(|i| {
-            let name = args[n_args + 2 * i].as_qstr().unwrap_or(0);
-            (name, args[n_args + 2 * i + 1])
-        })
-        .collect();
     // The render closure borrows `state` for the dunder calls;
     // it is dropped when `print_impl_with` returns, before the
     // error drain below borrows `state` again.
     let result = {
-        let mut render = |ctx: &mut CallCtx, v: Value, s: &mut String| -> PyResult<()> {
-            if is_instance(ctx.arena, v) {
-                // `state` is captured by the closure; a dunder
-                // raise stashes the exception object and reports
-                // `PyRaise` (the C14 side-channel idiom).
-                match render_instance(ctx, state, v, PrintKind::Str) {
-                    Ok(Some(text)) => {
-                        s.push_str(&text);
-                        Ok(())
-                    }
-                    Ok(None) => {
-                        obj_print_helper(ctx, ctx.types, v, PrintKind::Str, s);
-                        Ok(())
-                    }
-                    Err(exc) => {
-                        state.pending_exc = Some(exc);
-                        Err(PyError::PyRaise)
-                    }
-                }
-            } else if is_container(ctx, v) {
-                // E2d: a nested instance's `__repr__` runs
-                // through the hook (a raise inside is swallowed
-                // by the helper — slot semantics, see
-                // `print_helper_hook`).
-                print_helper_hook(ctx, state, v, PrintKind::Str, s);
-                Ok(())
-            } else {
-                obj_print_helper(ctx, ctx.types, v, PrintKind::Str, s);
-                Ok(())
-            }
-        };
+        let mut render =
+            |ctx: &mut CallCtx, v: Value, s: &mut String| -> PyResult<()> {
+                render_print_arg(ctx, state, v, s)
+            };
         crate::runtime::vm_builtins::print_impl_with(
             ctx,
             &args[..n_args],

@@ -113,6 +113,7 @@ impl Fixture {
             empty_bytes: mk(&mut arena, b"bytes"),
             native_init_wrapper: mk(&mut arena, b"function"),
             property: mk(&mut arena, b"property"),
+            socket: None,
         };
         Fixture {
             arena,

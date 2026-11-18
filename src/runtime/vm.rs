@@ -322,6 +322,7 @@ impl Vm {
             empty_bytes: GcRef(0),
             native_init_wrapper: GcRef(0),
             property: GcRef(0),
+            socket: None,
         };
         let (types, vm_types, exc, empty_tuple, ellipsis) = {
             let mut ctx = CallCtx::new(&mut arena, &mut roots, &dummy, &pool, &mut pending_raise);

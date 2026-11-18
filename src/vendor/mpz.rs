@@ -193,9 +193,18 @@ impl BigInt {
                 // value < 1, truncates to 0
                 self.set_from_int(0);
             } else if adj_exp == 0 {
-                // 1 <= value < 2, so truncates to 1. NOTE: this
-                // resets the sign (mpz_set_from_int), so -1.5 -> +1.
+                // 1 <= |value| < 2, so truncates to 1.
+                // `set_from_int` resets the sign, so restore it:
+                // the reference gives `int(-1.5) == -1` (probed
+                // 2026-11-18), not +1. The vendor C
+                // `mpz_set_from_float` has the same latent shape
+                // (its `mpz_set_from_int(z, 1)` also clears
+                // `z->neg`), but the Zig's
+                // `mp_obj_new_int_from_float` never reaches it for
+                // the observable path — the observed behaviour is
+                // the signed truncation.
                 self.set_from_int(1);
+                self.neg = sgn;
             } else {
                 // 2 <= value
                 let dig_cnt = ((adj_exp + 1 + 31) / 32) as usize;

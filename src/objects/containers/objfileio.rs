@@ -524,7 +524,11 @@ pub fn build_fileio_types(
 
 /// Allocate one `Obj::File` with the given handle, fd and
 /// header type. `buffer` is the `.buffer` sibling for stdio
-/// text objects, `None` otherwise.
+/// text objects, `None` otherwise. `finaliser` sets the GC
+/// finaliser flag (`file_io.zig:510-511` — only `open()` files
+/// are allocated with `m_malloc_with_finaliser`, so a dropped
+/// file is closed by the collector; stdio objects are not
+/// flagged and are rooted forever by the sys module).
 fn new_file_object(
     ctx: &mut CallCtx,
     handle: FileHandle,
@@ -532,17 +536,20 @@ fn new_file_object(
     is_text: bool,
     type_: GcRef,
     buffer: Option<GcRef>,
+    finaliser: bool,
 ) -> Value {
-    Value::Heap(ctx.alloc(
-        Some(type_),
-        Obj::File(FileData {
-            handle,
-            fd,
-            is_text,
-            closed: false,
-            buffer,
-        }),
-    ))
+    let obj = Obj::File(FileData {
+        handle,
+        fd,
+        is_text,
+        closed: false,
+        buffer,
+    });
+    if finaliser {
+        Value::Heap(ctx.alloc_with_finaliser(Some(type_), obj))
+    } else {
+        Value::Heap(ctx.alloc(Some(type_), obj))
+    }
 }
 
 /// Build the six stdio objects (`npy_file_io_init`,
@@ -559,12 +566,12 @@ pub fn build_stdio_objects(
     textio: GcRef,
 ) -> (Value, Value, Value) {
     let mut one = |handle: FileHandle, fd: i32| -> Value {
-        let buffer = new_file_object(ctx, handle.clone(), fd, false, fileio, None);
+        let buffer = new_file_object(ctx, handle.clone(), fd, false, fileio, None, false);
         let buffer_ref = match buffer {
             Value::Heap(r) => r,
             _ => unreachable!("new_file_object allocates a heap object"),
         };
-        new_file_object(ctx, handle, fd, true, textio, Some(buffer_ref))
+        new_file_object(ctx, handle, fd, true, textio, Some(buffer_ref), false)
     };
     let stdin = one(FileHandle::Stdin, 0);
     let stdout = one(FileHandle::Stdout, 1);
@@ -694,6 +701,7 @@ fn open_impl(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         !binary,
         type_,
         None,
+        true,
     ))
 }
 

@@ -66,14 +66,24 @@
 //!   (flag cleared first, exactly as gc.zig does) onto a pending
 //!   list, marks them + their transitive children live for this
 //!   collection so `__del__` still sees an intact object, and the VM
-//!   drains the list with `take_pending_finalisers()`, runs `__del__`
-//!   through its normal call path, then frees each object. Only
-//!   native types use finalisers (files, sockets); user classes'
-//!   `__del__` is never called, as in the original. The flag is
-//!   cleared when the object is listed, so a finaliser runs at most
-//!   once. `pending_exc` save/restore around the call (gc.zig
-//!   `runFinalisers`) is the VM hook's job — the arena holds no
-//!   `pending_exc` (it lives in `VmState`, C13).
+//!   drains the list with `take_pending_finalisers()` — see
+//!   `crate::runtime::finaliser::drain_pending_finalisers`, run by
+//!   `call_gc_collect_ctx` after an explicit `gc.collect()` — runs
+//!   `__del__` through its normal call path, then frees each object.
+//!   Pending objects left over from an earlier collection (e.g. a
+//!   stress collection inside `alloc`) are seeded into the mark
+//!   phase of every later collection until drained, so they are
+//!   never swept without `__del__` running. Only native types use
+//!   finalisers (files, sockets); user classes' `__del__` is never
+//!   called, as in the original. The flag is cleared when the object
+//!   is listed, so a finaliser runs at most once. `pending_exc`
+//!   save/restore around the call (gc.zig `runFinalisers`) is the
+//!   drain's job — the arena holds no `pending_exc` (it lives in
+//!   `VmState`, C13). A collection also drops the trailing run of
+//!   free slots (see `collect_inner`): the Rust `Vec` has no
+//!   "collect on no room" trigger, so without the truncation
+//!   `mem_free()` would count every slot ever allocated and the
+//!   300k-object reclaim case would fail its 8 MiB bound.
 //! * **`collect()` returns the freed-object count**: gc.zig's
 //!   `gc_collect()` returns `void` and Python `gc.collect()` returns
 //!   `0` always (`modgc.zig`: `PY_GC_COLLECT_RETVAL=1`, "the bumping
@@ -350,6 +360,16 @@ impl<'a> CallCtx<'a> {
         // Borrow split: roots are borrowed by alloc, arena by self.
         let roots = &*self.roots;
         self.arena.alloc(type_, obj, roots)
+    }
+
+    /// Allocate an object with the finaliser flag set (see
+    /// `GcArena::alloc_with_finaliser`): `collect()` lists it for
+    /// its `__del__` when it becomes unreachable. Only native
+    /// types use it (files from `open()`, sockets).
+    pub fn alloc_with_finaliser(&mut self, type_: Option<GcRef>, obj: Obj) -> GcRef {
+        // Borrow split: roots are borrowed by alloc, arena by self.
+        let roots = &*self.roots;
+        self.arena.alloc_with_finaliser(type_, obj, roots)
     }
 }
 
@@ -759,6 +779,13 @@ impl GcArena {
             .filter_map(|v| v.as_heap())
             .collect();
         self.mark_closure(&mut marked, &seeds);
+        // Pending finalisers from an earlier collection (not yet
+        // drained — e.g. a stress collection inside `alloc`, whose
+        // caller has no `CallCtx` to run `__del__` with) stay live
+        // until the VM drains them; otherwise this collection
+        // would sweep them without ever running `__del__`.
+        let pending_seeds: Vec<GcRef> = self.pending_finalisers.clone();
+        self.mark_closure(&mut marked, &pending_seeds);
         // Finaliser pass (gc.zig runFinalisers): every unmarked object
         // allocated with a finaliser gets its flag cleared first, is
         // marked live together with its transitive children (so __del__
@@ -789,6 +816,28 @@ impl GcArena {
                 self.free.push(i as u32);
                 freed += 1;
             }
+        }
+        // Shrink the heap back: drop the trailing run of free slots
+        // (and their free-list entries) so `mem_free()` /
+        // `info().free` reflect the live heap, not every slot ever
+        // allocated. gc.zig's pool only grows while full — a
+        // collection reclaims blocks inside it, so `gc_info()`'s
+        // total stays at the pool size (1 MiB after the 300k-object
+        // case). The Rust arena is a `Vec` that grows on every
+        // unreused allocation and has no "collect on no room"
+        // trigger, so after 300k dropped objects the free-slot sum
+        // alone is ~19 MiB and `gc.mem_alloc() + gc.mem_free()`
+        // fails the 8 MiB bound; truncating the dead tail after
+        // the sweep restores the observable contract. Live objects
+        // keep their indices (only trailing free slots go), so no
+        // `GcRef` is invalidated.
+        let mut new_len = self.slots.len();
+        while new_len > 0 && self.slots[new_len - 1].payload.is_none() {
+            new_len -= 1;
+        }
+        if new_len < self.slots.len() {
+            self.free.retain(|&i| (i as usize) < new_len);
+            self.slots.truncate(new_len);
         }
         freed
     }

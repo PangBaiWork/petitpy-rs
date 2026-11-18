@@ -137,6 +137,15 @@ pub(crate) fn intercept_builtin_call(
             ctx, state, n_args, n_kw, args,
         ));
     }
+    // `gc.collect` (F6): intercepted by GcRef identity so the
+    // finaliser drain runs with full VM state (see
+    // `call_gc_collect_ctx`); the plain `gc_collect_builtin`
+    // cannot materialise a `__del__` raise for the protected print.
+    if fun == state.gc_collect_builtin {
+        return Some(crate::runtime::builtin_vm::call_gc_collect_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     // `str.format` (F3): intercepted by GcRef identity so an
     // instance arg runs its `__format__` / `__str__` through the
     // VM's real call hook (see `call_str_format_ctx`); anything

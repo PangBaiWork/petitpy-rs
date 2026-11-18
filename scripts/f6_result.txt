@@ -1,0 +1,215 @@
+Lane F6 result — GC finaliser + heap reclaim (ADR 019)
+=======================================================
+Base: master aa18a95 (full 545/552, integration 193/202,
+golden 585/585, capability 67/67, stdlib 8/8, nano 454/541,
+lib 1680 + 3 ignored). Worktree ~/workspace/petitpy-rs-f6-gc,
+branch lane/f6-gc. NOTE: master moved to d9b7196 (F5b merged)
+while this lane ran; all numbers below are against THIS
+lane's base aa18a95. After rebase the expectation is
+198/202 -> 200/202 (see §4).
+
+§1 Acceptance (all verified by the executor in the worktree)
+-----------------------------------------------------------
+- cargo test --release --lib --tests: 1689 passed, 0 failed,
+  3 ignored (1680 + 9 new: 2 arena + 7 VM). bins: 9.
+  entry_cli: 45. 0 warnings (forced recompile).
+  0 unsafe in the diff. Largest touched file gc.rs 895 lines
+  (< 2500). check_compile_mpy.py PASS, check_frozen.py PASS.
+- Full gate: GREEN (7 known-fails exactly).
+- Integration: 195/202 (193 -> 195). Fail-set diff vs base
+  aa18a95 = ONLY gc_closes_dropped_files_and_sockets and
+  gc_reclaims_garbage removed, 0 regressions. Remaining 7:
+  itertools_cpython_functions, socket_fromfd_wraps_fd,
+  subprocess_streams_env_cwd_text, os_kill_esrch_raises,
+  os_chown_self_noop (all F5b, since merged on master),
+  select_timeout_zero_returns_promptly,
+  select_readable_fd_is_ready (documented divergence).
+- Golden: 585/585 (rust==cpython 576/585). Capability: GREEN.
+  Stdlib: 8/8. Nano: 454/541 (report-only, unchanged).
+- Gate outputs: ~/workspace/f6_verify/ (full.txt,
+  integration.txt, golden.txt, capability.txt, stdlib.txt,
+  nano.txt). Probes: ~/workspace/f6_probe/.
+
+§2 Mechanisms (all vendor hooks, no new Rust types)
+-----------------------------------------------
+Vendor spec (read from the original, gc.zig:32-43 + ADR 019):
+allocations made with GC_ALLOC_FLAG_HAS_FINALISER get their
+`__del__` called after marking, before sweeping, protected
+(an exception is printed, not raised). Only native types use
+it (files, sockets); user classes' `__del__` is never called.
+Blocks allocated by a finaliser are created marked and
+survive the sweep that follows. `gc_collect` (gc.zig:205-212)
+is locked -> no-op, else collect -> mark -> runFinalisers ->
+sweep. `gc_info` (245-270): total = used + free over the
+fixed 1 MiB pool.
+
+1. src/memory/gc.rs: (a) NEW CallCtx::alloc_with_finaliser
+   next to alloc. (b) collect_inner seeds pending-finaliser
+   leftovers from earlier collections into the mark phase
+   BEFORE the finaliser pass, so undrained pending objects
+   survive later collections instead of being swept silently.
+   (c) After the sweep, the trailing run of free slots is
+   truncated (slots.truncate + free-list prune) — live objects
+   keep their indices, no GcRef is invalidated,
+   allocated_bytes untouched (the sweep already decremented
+   it). (d) Doc-header finaliser paragraph updated.
+2. NEW src/runtime/finaliser.rs (105 lines):
+   drain_pending_finalisers(ctx, state) — takes the pending
+   list (no-op if empty); saves ctx.take_pending_raise();
+   ctx.arena.lock() (no collection from inside a finaliser;
+   a re-entrant gc.collect() sees the lock, returns 0, drains
+   an empty list); per object in slot order:
+   load_method_maybe(ctx, obj, __del__, Value::None) ->
+   Ok(Some(dest)) -> call_method_n_kw(ctx, 0, 0, &dest, &[])
+   (native __del__ bodies are close FunBuiltins, always the
+   same call shape the vendor uses: mp_load_method_maybe +
+   mp_call_function_1_protected); on Err(e) the raise is
+   materialised (same convention as builtin_vm.rs) and printed
+   via obj_print_exception into a String, stdout flushed,
+   then written to stderr (the print_traceback shape,
+   embed_exec.rs:54-68); Ok(None) -> skip; Err(_) on lookup ->
+   skip silently + clear (vendor defer-restore semantics).
+   After each object the pending raise is taken, then the
+   object is freed. No `?` between lock/unlock, so the unlock
+   always runs. The saved raise is restored at the end.
+3. src/objects/containers/objfileio.rs: new_file_object gains
+   a `finaliser: bool` param (flagged -> alloc_with_finaliser,
+   else alloc); the open() path passes true; stdio objects
+   pass false (vendor parity: file_io.zig:510-511, only
+   open() uses m_malloc_with_finaliser; sockets were already
+   flagged, modsocket.rs:299).
+4. src/modules/modgc.rs: build_gc_module now returns
+   (module, collect_fn); gc_collect_builtin itself UNCHANGED
+   (still collects, returns 0 — the fallback when called
+   without interception).
+5. src/runtime/vm.rs: NEW VmState.gc_collect_builtin: Value,
+   default Value::None (a FunBuiltin heap value never equals
+   None, so the default is safe pre-registration).
+6. src/runtime/vm_modules.rs: state.gc_collect_builtin =
+   gc_collect right after build_gc_module.
+7. src/runtime/vm_call_intercept.rs: NEW arm after the hash
+   arm — fun == state.gc_collect_builtin ->
+   call_gc_collect_ctx.
+8. src/runtime/builtin_vm.rs: NEW call_gc_collect_ctx —
+   arity (0,0) reproduced by hand via mismatch (interception
+   bypasses the sig check; gc.collect(1) -> TypeError
+   "argument num/types mismatch", probed identical on both);
+   collect, then drain_pending_finalisers, then Ok(SmallInt 0).
+
+Tests (9 new):
+- gc_tests.rs: reclaim_truncates_dead_tail (300k floats,
+  heap < 8 MiB after collect, arena len 1),
+  pending_survives_next_collect_until_drained (collect 1
+  lists, collect 2 keeps alive via seed-marking, drain +
+  free + collect frees).
+- vm_tests_f6.rs (7): file finaliser (200 dropped files,
+  leaked < 10), socket finaliser (same for sockets), user
+  __del__ NOT called, gc.collect() returns 0 + arity error,
+  live file survives collect (write after collect, read
+  back "hello world"), reclaim case verbatim (300k P(i)),
+  raising __del__ printed + swallowed (hand-built type whose
+  __del__ is a raising FunBuiltin; asserts __del__ ran, no
+  pending raise leaks, object freed, VM still usable).
+  The three fd-sensitive tests share one static Mutex
+  (FD_GUARD): cargo test runs threads in parallel and a
+  sibling test's transient fds inflated the /dev/fd counts
+  (one flaky failure observed before the guard; 3x stable
+  runs after).
+
+Two findings that shaped the tests:
+- A FunBuiltin on a user (instance) type is a staticmethod
+  by the vendor's payload rule (convert_member_lookup,
+  lookup.rs:149-154 — probed: a FunBuiltin __init__ on a
+  user type is unbound), so the raising test's __del__ is
+  called with 0 args and declares n_args (0,0). Production
+  native __del__ bodies live on native types and are bound
+  (1 arg); the arity reflects the lookup result, not the
+  production signature.
+- fun_bc_call_slot is a STUB (objfun.rs:426-434): a
+  Python-level __del__ cannot run through the CallCtx-only
+  drain (it would return bare PyRaise and print a spurious
+  bare TypeError). Irrelevant in production: native __del__
+  is always the close FunBuiltin.
+
+§3 Probes (release binary, ~/workspace/f6_probe/)
+------------------------------------------------
+- case1.py (gc_closes... verbatim): Rust True (was False),
+  rc 0; stdout+stderr+rc byte-identical vs reference.
+- case2.py (gc_reclaims... verbatim): Rust True,
+  heap=42784 alloc=42240 free=544 (was 19242784).
+  Byte-compare: line 1 True identical; heap-numbers line
+  differs by design (REF heap=1048576 alloc=1760
+  free=1046816 — different heap accounting, both < 8 MiB;
+  the integration case prints only True).
+- file_only.py, sock_only.py, user_del.py (user __del__
+  NOT called): IDENTICAL to REF (stdout+stderr+rc).
+- keepalive.py (live file survives collect, stays writable,
+  content reads back): IDENTICAL, rc 0.
+- gc.collect(1): identical on both — TypeError "argument
+  num/types mismatch", rc 1.
+- Raising __del__ is UNOBSERVABLE from Python on the
+  reference: socket subclass can't be instantiated (REF
+  TypeError "can't create instance", del_raise.py);
+  socket.socket.__del__ = boom fails identically on both
+  (AttributeError "no attribute '__del__'", del_patch.py);
+  io.FileIO doesn't exist on either (del_sub_file.py).
+  The protected print is therefore covered only by the
+  Rust-level lib test (f6_raising_del...), whose traceback
+  print is visible with --nocapture but not asserted
+  (stderr cannot be captured without unsafe fd redirection).
+
+§4 Left-open / divergences (do NOT fix in this lane)
+----------------------------------------------------
+- BASE STALE: master moved aa18a95 -> d9b7196 (F5b merged)
+  during this lane. Rebase needed before merge; expect a
+  mod.rs conflict (vm_tests_f5b vs vm_tests_f6
+  registration — keep-both, both #[cfg(test)], same pattern
+  as F5a/F3). After rebase the expected integration is
+  198 -> 200/202.
+- Stress-path finaliser deferral: a stress collection
+  inside alloc() populates pending_finalisers but has no
+  CallCtx to run __del__ with; the objects are drained at
+  the next explicit gc.collect() and seed-marked to survive
+  meanwhile. The CLI path never stress-collects anyway:
+  Vm::new never calls gc_init() (pre-existing gap, F1
+  noted; F1 calls it in ppy_new only).
+- F1 print-sink interaction: the drain prints tracebacks
+  to std stderr directly (like print_traceback), NOT
+  through F1's SinkGuard — a host-installed write sink will
+  not receive finaliser tracebacks on the library path.
+- Pre-existing divergences found while probing (OUT of
+  scope, record only): (a) Rust os.close(fd) only closes
+  fds in state.os_fds (populated by os.open); os.close(3)
+  on an open()-created fd raises EBADF on Rust while the
+  reference's real close(2) succeeds (dbg2.py: REF
+  "os.close done" rc 0, Rust OSError [Errno 9] EBADF rc 1).
+  (b) Rust file write is write-through/unbuffered vs REF
+  buffered: writing to /dev/full raises OSError 28 at write
+  on Rust, succeeds on REF (close swallows the flush
+  error) — del_raise_full.py / full_close.py.
+- f.closed attribute does not exist on either binary
+  (keepalive probe first version failed identically with
+  AttributeError "no attribute 'closed'").
+- gc.collect() still returns 0 (vendor parity). No user
+  class __del__ is ever called. No faked mem numbers.
+
+§5 Files changed (9 modified + 2 new, +622/-25)
+------------------------------------------------
+- src/memory/gc.rs (+65/-~): alloc_with_finaliser,
+  seed-marking, trailing-run truncation, doc update.
+- src/memory/gc_tests.rs (+51): 2 arena tests.
+- src/runtime/finaliser.rs (NEW, 105): drain.
+- src/runtime/vm_tests_f6.rs (NEW, 330): 7 VM tests.
+- src/objects/containers/objfileio.rs: new_file_object
+  finaliser param; open() true, stdio false.
+- src/modules/modgc.rs: build_gc_module returns
+  (module, collect_fn).
+- src/runtime/vm.rs: VmState.gc_collect_builtin field.
+- src/runtime/vm_modules.rs: capture + store it.
+- src/runtime/vm_call_intercept.rs: gc.collect arm.
+- src/runtime/builtin_vm.rs: call_gc_collect_ctx.
+- src/runtime/mod.rs: register finaliser + vm_tests_f6.
+- Exclusions honored: no objint*.rs, no src/entry/api.rs,
+  no F5a typing code, no F3 subclass code, no F5b files
+  (vm_dispatch.rs, instance.rs op arms, socket fromfd,
+  subprocess, os kill/chown).

@@ -469,3 +469,54 @@ fn collect_start_end_sweep_all_noop() {
     arena.sweep_all();
     assert_eq!(arena.len(), 1);
 }
+
+#[test]
+fn reclaim_truncates_dead_tail() {
+    // F6: after 300k dropped objects + collect, `mem_alloc() +
+    // mem_free()` must be < 8 MiB (the `gc_reclaims_garbage`
+    // case). Without the trailing-run truncation in
+    // `collect_inner`, the free-slot sum alone is ~19 MiB.
+    let mut arena = GcArena::new();
+    let mut roots = RootSet::new();
+    let live = alloc_float(&mut arena, &roots, 1.0);
+    roots.push(Value::Heap(live));
+    for i in 0..300_000 {
+        let _ = alloc_float(&mut arena, &roots, i as f64);
+    }
+    assert_eq!(arena.collect(&roots), 300_000);
+    let heap = arena.mem_alloc() + arena.mem_free();
+    assert!(heap > 0, "live objects keep the heap non-empty");
+    assert!(
+        heap < 8 * 1024 * 1024,
+        "heap after collect must be < 8 MiB, got {heap}"
+    );
+    assert_eq!(arena.len(), 1, "dead tail truncated to the live prefix");
+}
+
+#[test]
+fn pending_survives_next_collect_until_drained() {
+    // F6: a pending finaliser left over from an earlier
+    // collection (e.g. a stress collection inside `alloc`,
+    // whose caller has no `CallCtx` to run `__del__` with) is
+    // seeded into the mark phase, so the next collection does
+    // NOT sweep it without `__del__` running.
+    let mut arena = GcArena::new();
+    let roots = RootSet::new();
+    let ty = alloc_float(&mut arena, &roots, 0.0);
+    let f = arena.alloc_with_finaliser(Some(ty), Obj::Float(1.0), &roots);
+    // Collect 1 lists it (not freed — the finaliser pass marks it
+    // live instead of sweeping it).
+    assert_eq!(arena.collect(&roots), 0);
+    // Simulate the VM not draining yet: a second collection must
+    // keep the object alive (seed-marked from the pending list),
+    // not sweep it without `__del__` running.
+    assert_eq!(arena.collect(&roots), 0);
+    assert_ne!(arena.nbytes(f), 0, "pending object stays intact");
+    assert_eq!(arena.take_pending_finalisers().len(), 1);
+    // The VM drains, then frees: the next collection frees it.
+    let pending = arena.take_pending_finalisers();
+    assert!(pending.is_empty(), "list already drained above");
+    arena.free(f);
+    assert_eq!(arena.collect(&roots), 1);
+    assert!(arena.take_pending_finalisers().is_empty());
+}

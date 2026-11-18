@@ -7,6 +7,7 @@
 pub mod compiler;
 pub mod frontend;
 pub mod memory;
+pub mod modules;
 pub mod objects;
 pub mod pyerr;
 pub mod qstr_table;

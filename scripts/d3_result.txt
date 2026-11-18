@@ -1,0 +1,340 @@
+Lane D3 result — library modules: json / math / socket / struct / subprocess
+Worktree: ~/workspace/petitpy-rs-d3-lib, branch lane/d3-lib, base master c9fc4e6.
+Acceptance: lib 1298 passed (1249 baseline + 49 new), 0 failed, 5 ignored
+(4 pre-existing + 1 new); bins 9 passed; 0 warnings; no `unsafe`;
+every file < 800 lines; scripts/check_compile_mpy.py PASS (552/552,
+0 rust compile failures, 0 byte mismatches); ~/workspace/petitpy-orig clean.
+One commit: "Lane D3: library modules — json/math/socket/struct/subprocess".
+
+New tests (49 passed + 1 ignored): math 13, struct 5 (+1 ignored),
+json 6, socket 13, subprocess 12.
+
+§1 — What was built (source -> Rust)
+======================================
+
+All modules are pure Rust std, no unsafe, no C FFI. Each follows the
+`build_io_module` builder pattern (C18b): `build_<name>_module(ctx,
+fun_builtin_var, module_type) -> PyResult<Value>` returning the module
+object; registration into `VmState.builtin_modules` is the caller's
+(D1/Phase E entry work — see §4). Test fixture per file: local `Fx`
+with `setup_<module>` + `run_ok` / `raised_msg` / `g*` read-backs.
+
+math — src/modules/modmath.rs (422) + modmath_tests.rs (463)
+  Source: src/modules/modmath.zig (441), table at :376.
+  28 fns + 5 constants (e pi tau inf nan), Zig table order.
+  generic1/generic2 with the vendor domain-error predicate (result
+  nan/inf while input wasn't -> ValueError "math domain error").
+  log2/log10 are NOT libm: log(x) * (1/ln 2) / log(x) * (1/ln 10)
+  (probed: log2(8) = 2.9999999999999996). ceil/floor/trunc return
+  int via C7's int_from_float; frexp via bit decomposition
+  (subnormal scale-up by 2^64); modf with inf/nan guards (Rust
+  fract(inf) is NaN, C gives 0.0); ldexp via <=1023-exponent
+  chunked scaling; gcd as Euclid over BigInt (abs + divmod,
+  gcd() = 0, never negative, bool counts as int).
+  NO factorial / isclose / gamma (probed AttributeError).
+
+json — src/modules/modjson.rs (691) + modjson_tests.rs (295)
+  Source: src/modules/modjson.zig (455). Module name is `_json`
+  (table at :431: __name__ encode decode string). encode sig
+  (4,4); string sig (2,2); decode sig (1,1).
+  Encoder: None/bool/small-int/str/list/tuple/dict + finite float;
+  max_depth 256; non-str keys, subclasses, NaN/inf, bytes, sets,
+  deep nesting -> TypeError "not handled by the native JSON
+  encoder". Escaping: " \b \t \n \f \r, <0x20 -> \u00xx;
+  ensure_ascii >=0x7F -> \uXXXX (astral -> surrogate pair).
+  ensure_ascii is an IDENTITY check against True (1 is not True).
+  Decoder: strict numbers (no leading zero, 1. / 1e rejected);
+  strings with \" \\ \/ \b \f \n \r \t \uXXXX; surrogate codes
+  D800-DFFF rejected (even valid pairs); trailing garbage ->
+  ValueError "not handled by the native JSON decoder". Ints
+  <=18 digits -> small int, >18 digits -> parse_num_integer
+  (BigInt); floats -> parse_num_float(tok, false). Dict order is
+  insertion order (MapData.entries).
+  The Python `json.py` layer (petitpy-lib, 387 lines) is D5's,
+  NOT ported here.
+
+struct — src/modules/modstruct.rs (434) + modstruct_tests.rs (319)
+  Source: src/modules/modstruct.zig (374), table at :333:
+  __name__ calcsize pack pack_into unpack unpack_from (unpack ==
+  unpack_from, the same FunBuiltin object; NO `error` type).
+  getFmtType: '!' -> '>', '@ = < >' kept, else '@' WITHOUT
+  consuming the char. getFmtNum parses the digit run.
+  calcSizeItems: 'x' = size only, 's' = 1 item, else count items
+  with alignment from C9b binary_get_size ('=' yields size 0 ->
+  BadTypecode). Built on C9b's binary.rs (binary_get_size /
+  binary_get_val / binary_set_val / value_word /
+  value_from_word + BinaryError). 'S' get returns empty str in
+  safe Rust (C9b's documented limit); 'O' round-trips via
+  value_word/value_from_word.
+  FLOAT=0 rule (binary.zig): 'e'/'f'/'d' have SIZES but their
+  value branches are dead — unpack('<f'/'<d') returns the INT
+  bit pattern, pack('<f'/'<d'/'<e') takes an int.
+
+socket — src/modules/modsocket.rs (741) + modsocket_tests.rs (515)
+  Source: src/modules/modsocket.zig (431), table at :367.
+  Module globals (11, Zig order): __name__, socket (ctor var
+  2..3), fromfd (var 3..4), AF_UNIX=1 AF_INET=2 AF_INET6=10
+  SOCK_STREAM=1 SOCK_DGRAM=2 SOL_SOCKET=1 SO_REUSEADDR=2
+  SO_PEERCRED=17. Socket type: flags 0x0000, name socket,
+  locals dict 10 entries (bind listen accept recv sendall
+  setblocking getsockopt fileno close __del__), no print slot
+  (default print `<socket>`), no make_new (construction goes
+  through the module's constructor function).
+  Representation: Obj::Instance { members: empty MapData,
+  subobj: [fd, family, type, proto] }, header type the socket
+  TypeData, allocated with alloc_with_finaliser (the Zig's
+  m_malloc_with_finaliser; the GC drain runs __del__ = close).
+  The OS socket lives in a process-global table
+  `SOCKETS: Mutex<HashMap<RawFd, SocketState>>` keyed by fd
+  (a BuiltinFn receives only CallCtx — no VmState handle —
+  and value.rs (886) / gc.rs (830) are both over the cap, so
+  no new Obj variant and no arena field; fds are
+  process-unique). close() removes the entry (fd closes on
+  drop). Operations that can block (accept/recv/sendall)
+  work on a dup of the fd (as_fd + try_clone_to_owned,
+  safe), never on the table's object, so the lock is never
+  held across I/O. `__del__` is the SAME FunBuiltin object
+  as `close` (Rust-level test asserts the shared value).
+  BuiltinTypes gained `socket: Option<GcRef>` (C13b precedent
+  for array/bytearray); build_socket_module returns
+  (module, socket_type) and the caller stores Some(type) in
+  vm.types.socket. 9 BuiltinTypes literal sites updated with
+  `socket: None` (6 test fixtures + vm.rs dummy +
+  vm_types.rs build_vm_types).
+
+subprocess — src/modules/modsubprocess.rs (500) + modsubprocess_tests.rs (418)
+  Source: src/modules/mod_subprocess.zig (373). Module
+  `_subprocess`, sole export `_spawn_and_wait`, sig (8,8):
+  (argv, input, timeout, env, cwd, stdin, stdout, stderr)
+  -> (returncode, stdout bytes|None, stderr bytes|None,
+  timed_out). Implemented with std::process::Command +
+  reader/writer threads (no libc fork/exec, no poll).
+  Modes INHERIT=-4 PIPE=-1 STDOUT=-2 DEVNULL=-3, else fd.
+  Returncode is the exit code, or the negated signal
+  (ExitStatusExt::signal — the Zig's WIFEXITED/WIFSIGNALED
+  bit ops). Spawn failure (missing executable, bad cwd)
+  maps to the (127, b''|None, b''|None, False) tuple for
+  exec/cwd errnos, OSError otherwise (see §2).
+
+Shared helpers / cross-cutting changes
+  - src/lib.rs: `pub mod modules;` (+1 line).
+  - src/objects/builtin_types.rs: `socket: Option<GcRef>` (+8).
+  - src/vendor/mpz.rs + mpz_tests.rs: the set_from_float sign
+    fix (see §3).
+  - src/modules/mod.rs: declares the 5 modules + 5 test files.
+
+§2 — Reference probes (all on ~/workspace/petitpy-orig/zig-out/bin/petitpy)
+=========================================================================
+
+math (2026-11-18)
+  int(-1.5)=-1, int(-1.9)=-1, int(-0.5)=0, math.trunc(-1.9)=-1,
+  math.ceil(-1.5)=-1, math.floor(-1.5)=-2,
+  int(1e30)=1000000000000000019884624838656, int(2**62),
+  int(1e19)=10000000000000000000,
+  int(9.223372036854776e18)=9223372036854775808.
+  ceil(inf) -> OverflowError "can't convert inf to int";
+  ceil(nan) -> ValueError "can't convert NaN to int";
+  floor(-inf) -> OverflowError; trunc(nan) -> ValueError.
+  frexp(inf)=(inf,0); frexp(nan)=(nan,0); frexp(-0.0)=(-0.0,0);
+  frexp(5e-324)=(0.5,-1073); frexp(2.5)=(0.625,2);
+  frexp(-8.0)=(-0.5,4). modf(inf)=(0.0,inf); modf(nan)=(nan,nan);
+  modf(-0.0)=(-0.0,-0.0). ldexp(0.0,100)=0.0;
+  ldexp(1.0,-1074)=5e-324; ldexp(1.0,-1075)=0.0;
+  ldexp(1.5,10000)=inf; ldexp(inf,2)=inf; ldexp(nan,2)=nan.
+  log(2)=0.6931471805599453; sin(0)=0.0; pow(2,10)=1024.0.
+  gcd(0)=0; gcd(-5)=5; gcd(2**100,2**50)=1125899906842624.
+  degrees(1)=57.29577951308232; radians(90)=1.5707963267948966.
+  ldexp(1.5, 2**40) ABORTS the reference rc=134 (Zig @intCast
+  to c_int panics, modmath.zig:262) — Rust saturates the
+  exponent to i32 (documented divergence).
+
+json (2026-11-18)
+  _json.decode(123) -> ValueError "not handled by the native
+  JSON decoder" (non-str reads as empty input).
+  _json.encode(1, 2, ",", True) and _json.string(123, True) ->
+  TypeError "can't convert to str implicitly".
+  _json.encode(1, ",", ",", 1) = 1 (ensure_ascii=1 is not True).
+  _json.encode(b"hi", ",", ":", True) -> TypeError "not handled
+  by the native JSON encoder".
+  _json.encode({"a": 1}, ", ", ": ") -> TypeError "argument
+  num/types mismatch" (sig is (4,4)); with True -> '{"a": 1}'.
+
+struct (2026-11-18)
+  pack('<i', True) = b'\x01\x00\x00\x00'.
+  struct.unpack is struct.unpack_from = True.
+  calcsize('2') -> ValueError "bad typecode".
+  unpack_from('<i', b'\x01\x00\x00\x00\x00', -4) = (0,);
+  unpack_from('<i', b'\x01\x00\x00\x00\x00', -5) = (1,).
+  unpack('<S', b'\x00'*8) ABORTS the reference rc=134
+  (binary.zig:199 dereferences the stored pointer as a C
+  string; null -> panic) — Rust's C9b behaviour (empty str)
+  is a pre-existing documented safe-Rust limit.
+  pack('<s', 123) ABORTS the reference rc=134 (reads an
+  uninitialised buffer) — Rust zero-fills (documented
+  divergence in modstruct.rs docs).
+
+socket (2026-11-18)
+  listen on unbound socket -> OSError [Errno 22] EINVAL.
+  recv on unbound socket -> OSError [Errno 22] EINVAL.
+  recv on a listener -> OSError [Errno 22] EINVAL.
+  bind(123) -> OSError [Errno 22] EINVAL. bind(b"path") works.
+  fileno: 3; type(s) = <class 'socket'>; str(s) = '<socket>'.
+  getsockopt(SOL_SOCKET, SO_PEERCRED, 12) on a listener ->
+  12 bytes b'_t\x00\x00...' (ucred: pid, uid 0, gid 0).
+  getsockopt(SOL_SOCKET, SO_REUSEADDR, 4) -> b'\x00\x00\x00\x00'.
+  sendall(bytearray(b"hi")) -> TypeError "can't convert to
+  str implicitly". fileno after close -> -1; double close ok;
+  recv after close -> OSError [Errno 9] EBADF.
+
+subprocess (2026-11-18)
+  argv as str ABORTS the reference rc=134 ("incorrect
+  alignment" panic, MpObjList.fromObj, mp_mirrors.zig:593).
+  argv as tuple ABORTS the reference rc=134 ("attempt to use
+  null value" panic in cStrArray, mod_subprocess.zig:137).
+  argv=[] -> OSError [Errno 22] EINVAL. argv item non-str ->
+  OSError EINVAL. env as str ABORTS the reference rc=134
+  (same fromObj panic).
+  input=123 HANGS the reference (process never exits — cat
+  never sees EOF; probe killed after 8 minutes).
+  input="abc" (str) -> (0, b'abc', None, False).
+  timeout=None -> TypeError "can't convert to float".
+  env=["FOO"] (no '=') -> (0, b'FOO\n', None, False) — the
+  child sees the BARE entry (Rust passes (entry, ""), so the
+  child sees "FOO=" — documented divergence).
+  cwd=/nonexistent-dir-xyz -> (127, b'', None, False).
+  cwd=/bin/true (a file) -> (127, b'', None, False).
+  bad cmd with stdout+stderr pipes -> (127, b'', b'', False).
+  stdin=STDOUT(-2) with echo -> (0, b'hi\n', None, False).
+
+§3 — Bugs found and fixed
+==========================
+
+REAL BUGS (in the tree, found by D3's tests/probes)
+1. BigInt::set_from_float sign bug (Lane C's, in
+   src/vendor/mpz.rs): the adj_exp == 0 arm called
+   set_from_int(1), resetting `neg`, so from_float(-1.5)
+   was +1 (the code's own comment documented "-1.5 -> +1").
+   Fixed by restoring `self.neg = sgn` after set_from_int(1).
+   The reference gives int(-1.5) == -1 (probed). The old
+   test `set_from_float_negative_one_to_two_quirk` asserted
+   the buggy value ("1"); it now asserts the corrected
+   values with a comment explaining the history, and
+   `set_from_float_cases` already carried the correct
+   -1.5/-1.0 cases.
+2. `fun_n_args` 8-bit packing limit (mine, found via gcd):
+   fun_sig_range decodes (n_args >> 8, n_args & 0xff) — min
+   and max are 8-bit each. fun_n_args(0, 0xffff) decodes to
+   min=255, max=255, so a var builtin registered with max
+   0xffff rejects every call with "argument num/types
+   mismatch". Var builtins must use max 255 (the established
+   convention: vm.rs print uses (0,255)). Fixed in math gcd
+   and used for struct pack/pack_into.
+3. `ldexp` powi underflow (mine): 2f64.powi(-1074) is 0.0
+   (computes 1/2^1074 -> 1/inf), so ldexp(1.0, -1074) was
+   0.0 instead of 5e-324. Rewrote with chunked scaling
+   (steps <=1023, early exit on inf/0.0).
+4. calc_size_items trailing-digit bug (mine):
+   calcsize('2') must raise "bad typecode" (the Zig calls
+   binary_get_size(fmt_type, 0)); initially returned (0,0).
+5. `record_raise` first-wins shadowing (mine, in
+   subprocess): str_arg records TypeError, then the
+   EINVAL remap in str_list_arg/cwd_arg was ignored, so
+   ["..."/bin/true", 123] raised TypeError instead of
+   OSError(22). str_list_arg/cwd_arg now use str_bytes_of
+   directly (no prior record). Confirmed by the stale-run
+   output before the fix.
+
+TEST BUGS (mine, all fixed in the tests, not the code)
+- struct pack '<s' is 1 byte (no count means 1):
+  pack('<s', 'ab') == b'a', not b'ab'; same for unpack.
+- struct unpack_from offset -4 on a 5-byte buffer reads
+  index 1 -> (0,), not (1,); the test now uses -5.
+- json encode call passed only 3 args (missing True) — the
+  TypeError "argument num/types mismatch" was CORRECT
+  behaviour (sig (4,4)), verified on the reference.
+- `ok = ok and ...` chains rewritten to single `assert`
+  statements (see the VM bug below).
+
+A REAL VM BUG FOUND BY D3 (NOT fixed in this lane — C13's)
+- `and` with a False left followed by a call raises
+  TypeError("object not callable") in the Rust VM: the
+  JUMP_IF_FALSE_OR_POP path leaves the stack misaligned
+  when the jump is taken, so the following call pops a
+  wrong callee. Minimal repro (reference prints False
+  cleanly):
+    import struct
+    ok = False
+    ok = ok and struct.pack('<i', 1) == b'\x01\x00\x00\x00'
+  Preserved as #[ignore]d test
+  `modstruct_tests::and_false_shortcircuit_vm_bug` (with a
+  comment); the fixing lane removes the #[ignore]. D3's own
+  tests avoid the pattern (single `assert` statements).
+  Every pack/unpack/json line passes in isolation; the chain
+  failed only once an intermediate link went False — that is
+  how the bug was bisected.
+
+§4 — Not done, divergences, handovers
+======================================
+
+Divergences (all documented in the module docs too)
+- math: ldexp(1.5, 2**40) saturates instead of aborting
+  (reference rc=134, @intCast panic).
+- struct: pack('<s', 123) zero-fills instead of aborting
+  (reference rc=134, uninitialised buffer); 'S' get is
+  empty str (C9b limit, reference rc=134 on null).
+- socket: constructor cannot call socket() in pure std —
+  placeholder /dev/null fd, bind() swaps in the real
+  listener (fd number changes across bind(); a client
+  connecting between bind() and listen() is accepted;
+  listen(backlog) is a validation no-op after bind()).
+  fromfd with a non-negative fd raises NotImplementedError
+  (wrapping a foreign fd needs from_raw_fd / borrow_raw,
+  both unsafe; this lane is pure-std with no unsafe).
+  fromfd(-1) works (behaves like a closed socket).
+  getsockopt raises OSError(ENOPROTOOPT) for every
+  (level, opt) — no stable-std getsockopt (peer_cred is
+  unstable); the reference returns real bytes (12-byte
+  ucred for SO_PEERCRED). Integer args truncate to i32
+  (the Zig's @intCast would abort on overflow).
+  bind("") returns ENOENT (reference binds an
+  abstract-named socket). listen() on a fromfd listener
+  fd is EINVAL (role unknowable without SO_ACCEPTCONN).
+  The socket __del__-via-GC-finaliser path is UNTESTED
+  (needs the gc module, D4's); explicit close() is tested.
+- subprocess: timeout kill is SIGKILL (returncode -9),
+  not the Zig's SIGTERM (-15), and no 1s grace period
+  (no SIGTERM in std). A file-descriptor stream mode is
+  served by re-opening /proc/self/fd/<fd> (works for pipes
+  and freshly-opened files; does not share the original's
+  file offset or append mode; a socket fd fails ENXIO).
+  An env entry without '=' is passed as (entry, "") (the
+  child sees "FOO="; the reference passes "FOO" through).
+  argv as str/tuple and env as str ABORT the reference;
+  this port returns OSError(EINVAL). input=123 HANGS the
+  reference; this port raises TypeError.
+- json: the Python json.py layer is D5's, not ported.
+  subprocess.py (run/check_output/call/CompletedProcess)
+  is D5's, not ported.
+
+Handovers
+- D1 / Phase E entry: register the five builders in
+  VmState.builtin_modules so `import <name>` works:
+  build_math_module, build_json_module,
+  build_struct_module, build_subprocess_module (all return
+  the module Value), and build_socket_module (returns
+  (module, socket_type) — the caller must ALSO store the
+  type in vm.types.socket = Some(type_ref), or the socket
+  constructor raises TypeError "socket type not registered").
+  D1 already merged (master 1300, commit 2140ecf) WITHOUT
+  these registrations (it registered `io` only); the D3
+  worktree base is pre-D1 (c9fc4e6), so this lane will need
+  a rebase onto current master at merge time.
+- The C13 `and`-short-circuit VM bug (see §3) needs a
+  fixing lane; the ignored repro test is in
+  modstruct_tests.rs.
+- Cap debt UNCHANGED by this lane: value.rs 886 + map.rs
+  860 (over cap, pre-existing). New files are all < 800
+  (largest modsocket.rs 741, modjson.rs 691).
+  BuiltinTypes grew one field (`socket: Option<GcRef>`,
+  81 -> 89 lines in builtin_types.rs) with 9 one-line
+  literal updates; no other frozen interface changed.

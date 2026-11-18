@@ -101,6 +101,8 @@ fn set_from_float_cases() {
     assert_eq!(BigInt::from_float(0.5).to_string(), "0");
     assert_eq!(BigInt::from_float(-0.5).to_string(), "0");
     assert_eq!(BigInt::from_float(1.5).to_string(), "1");
+    assert_eq!(BigInt::from_float(-1.5).to_string(), "-1");
+    assert_eq!(BigInt::from_float(-1.0).to_string(), "-1");
     assert_eq!(BigInt::from_float(2.5).to_string(), "2");
     assert_eq!(BigInt::from_float(-2.5).to_string(), "-2");
     assert_eq!(BigInt::from_float(1e30).to_string(), "1000000000000000019884624838656");
@@ -116,11 +118,17 @@ fn set_from_float_cases() {
 
 #[test]
 fn set_from_float_negative_one_to_two_quirk() {
-    // The C's adj_exp == 0 branch calls mpz_set_from_int(z, 1),
-    // which resets the sign: -1.5 -> +1. Ported exactly.
-    assert_eq!(BigInt::from_float(-1.5).to_string(), "1");
-    assert_eq!(BigInt::from_float(-1.0).to_string(), "1");
-    assert_eq!(BigInt::from_float(-1.999).to_string(), "1");
+    // Lane C documented the vendor shape here: the C's
+    // adj_exp == 0 branch calls mpz_set_from_int(z, 1),
+    // which resets the sign (-1.5 -> +1). D3 FIXED it:
+    // the reference's observable behavior is int(-1.5) ==
+    // -1 (probed 2026-11-18 — the Zig's
+    // mp_obj_new_int_from_float truncates toward zero), so
+    // `set_from_float` restores the sign after the
+    // `set_from_int(1)` call. These cases pin the fix.
+    assert_eq!(BigInt::from_float(-1.5).to_string(), "-1");
+    assert_eq!(BigInt::from_float(-1.0).to_string(), "-1");
+    assert_eq!(BigInt::from_float(-1.999).to_string(), "-1");
     assert_eq!(BigInt::from_float(1.999).to_string(), "1");
 }
 

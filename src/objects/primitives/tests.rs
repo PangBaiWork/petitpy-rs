@@ -126,6 +126,7 @@ impl Fixture {
             empty_bytes,
             native_init_wrapper,
             property,
+            socket: None,
         };
         Fixture { arena, roots, types, pool: RuntimeQstr::new(), pending_raise: None }
     }

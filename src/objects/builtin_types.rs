@@ -77,5 +77,13 @@ pub struct BuiltinTypes {
     /// `property` (C12: the special-accessor scan tests
     /// `isExactType(value, property)`).
     pub property: GcRef,
+    /// `socket` (D3: the `socket` module's type object, built by
+    /// `build_socket_module` — not by the VM bootstrap, so the
+    /// module entry is a plain constructor function per
+    /// `modsocket.zig`, and the constructor needs the type
+    /// object to allocate instances with. `None` until a
+    /// socket module is built and registered; the registrar
+    /// stores `Some(type_ref)` after calling the builder).
+    pub socket: Option<GcRef>,
 }
 

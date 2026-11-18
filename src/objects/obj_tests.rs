@@ -142,6 +142,7 @@ impl Fixture {
             classmethod,
             boundmeth,
             property,
+            socket: None,
             empty_tuple,
             empty_bytes,
             native_init_wrapper,

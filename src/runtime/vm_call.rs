@@ -590,6 +590,27 @@ pub(crate) fn call_build_class_ctx(
             }
         };
         if let Some(m) = method {
+            // The Zig calls `dest[0]` (the raw function) with
+            // one arg and ignores `dest[1]` (the bound self):
+            // `mp_call_function_1(dest[0], new_class)`
+            // (`modbuiltins.zig:574-588`). The VM loader
+            // collapses the pair into a `BoundMeth` value
+            // (`type_attr` → `class_lookup` → `bind_pair`), so
+            // unwrap it here — otherwise the bound self is
+            // prepended and the 1-param
+            // `__init_subclass__(cls)` sees two args
+            // ("argument num/types mismatch"). A classmethod
+            // `__init_subclass__` unwraps the same way (its
+            // `convert_member_lookup` pair is `(fun, Some(K))`,
+            // and the Zig calls the raw fun with the new class
+            // as `cls`).
+            let m = match m {
+                Value::Heap(r) => match ctx.arena.get(r) {
+                    Obj::BoundMeth(d) => d.func,
+                    _ => m,
+                },
+                _ => m,
+            };
             if let Err(e) = call_function_ctx(ctx, state, m, 1, 0, &[new_class]) {
                 unroot(ctx, new_class_ref);
                 return Err(e);

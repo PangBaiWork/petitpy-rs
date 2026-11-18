@@ -1,0 +1,208 @@
+# Lane F4 result — class creation (__init_subclass__, MRO) + dict.__missing__
+
+Base: master 9b92299 (E2j merged: full 545/552, integration 186/202,
+golden 585/585, capability 67/67, stdlib 7/8, nano 454/541, lib 1636).
+Worktree: ~/workspace/petitpy-rs-f4-class, branch lane/f4-class.
+Commit: (this lane's commit — see git log on the branch).
+
+## §1. Acceptance numbers
+
+- lib: **1649 passed / 0 failed / 3 ignored** (+13 new tests in NEW
+  `src/runtime/vm_tests_f4.rs`), bins 9, entry_cli 45, 0 warnings
+  (forced recompile: `touch src/lib.rs && cargo build --release`),
+  no unsafe in the diff vs 9b92299, largest touched file
+  `src/objects/objtype/instance.rs` 816 lines (< 2500).
+- check_compile_mpy: PASS. check_frozen: PASS. orig clean.
+- Full corpus: **545/552**, gate GREEN (exactly the 7 known-fails).
+- Integration: **186/202 -> 190/202**. Fail-set diff vs base shows
+  ONLY the 4 targets removed (0 regressions):
+  `init_subclass`, `cpython_platform_import_slice_mro`,
+  `dict_missing_basic`, `dict_missing_counter_pattern` all PASS.
+- Golden: 585/585 (rust==cpython 576/585). Capability: GREEN.
+  Stdlib: 7/8 (only test_enum). Nano: 454/541 (report-only).
+- Gate outputs: ~/workspace/f4_verify/ (full_gate, integration,
+  golden, capability, stdlib, nano .txt).
+
+## §2. The three mechanisms
+
+### (a) `__init_subclass__` — `src/runtime/vm_call.rs:609` (unwrap)
+
+Vendor: `modbuiltins.zig:574-588` (`initSubclass`): iterate the
+bases, `mp_load_method_maybe(base, __init_subclass__)`, call
+`dest[0]` (the RAW function) with one arg — the new class —
+ignoring `dest[1]` (the bound self). First base with the method
+wins; plain function and `@classmethod` forms both receive the
+new class as `cls`.
+Rust bug: `call_build_class_ctx`'s PEP 487 loop called the
+loader's return value with one arg, but `load_method_maybe_ctx`
+collapses the (fun, bound) pair into a `BoundMeth` value
+(`type_attr` → `class_lookup` → `bind_pair`,
+`src/objects/objtype/instance.rs:91`), so `call_function_ctx`
+prepended the base and the 1-param `__init_subclass__(cls)`
+saw two args ("argument num/types mismatch"). Fix: unwrap a
+`BoundMeth` to its raw `func` before the 1-arg call
+(`vm_call.rs:605-616`). The `(method, Some(bound))` return
+shape (type locals-dict path) already carries the raw fun and
+is unchanged.
+Probed divergence (vendor-faithful, NOT CPython):
+`type('T', (B,), {})` does NOT call the hook on the reference
+(the vendor calls it from `__build_class__` only, not from
+`mp_obj_new_type`) — Rust matches (`[]`); pinned by test
+`f4_init_subclass_via_type`.
+
+### (b) MRO inconsistency — `src/objects/objtype/errors.rs:126`
+###     (`TypedRaise`) + `src/objects/objtype/typecreate.rs:193,196`
+###     (`record_typed`)
+
+Vendor: `objtype.zig:990-1038` (`c3Mro`) detects the
+inconsistent case and raises `TypeError` with the message
+formatted at `:1025-1030`: prefix + `" A"` for the first base,
+`", B"` for each later one.
+Rust already detected it: `c3_mro`
+(`src/objects/objtype/lookup_mro.rs:97`) returns
+`Err(ObjTypeError::MroConflict(names))` and `new_type_finish`
+propagates it — but `type_make_new` returned only the bare
+`PyRaise` signal (`e.to_pyerror()`), so no exception object
+was ever built and the VM raised a message-less `TypeError`
+(`class Z(A, B)` silently "succeeded" from the program's
+point of view — the `except` printed an empty line).
+Fix: implement `TypedRaise` for `ObjTypeError`
+(`raise_name` from `exc_type`, `raise_arg` None,
+`raise_message` formats `MroConflict`'s base names via the
+pool exactly as the Zig does; `Raised`/`OutOfMemory` map to
+an empty name so `record_typed` records nothing for them),
+and use `ctx.record_typed(e)` in `type_make_new`'s final
+match. This also records the messages for the other
+type-creation errors (`TypeTakesOneOrThree`,
+`NotAcceptableBase`, `LayoutConflict`, `TooManyBases`, …)
+which lost their messages through the same path. The polled
+sig-error rule is preserved: only the error actually
+returned is recorded (the sig error only when the body
+succeeded).
+Note: `super_make_new` (`typecreate.rs`, second identical
+`to_pyerror` match) still uses the bare signal — same gap
+for `super()` errors, left for a follow-up lane (out of F4
+scope; see §4).
+
+### (c) `dict.__missing__` — `src/objects/objtype/seams.rs:471-515`
+###     (`stub_subscr`) + `src/objects/objtype/instance.rs:437`
+###     (`instance_subscr`)
+
+Vendor: `objdict.zig:270-282` documents the protocol but does
+NOT implement it (the subscr slot receives the inner dict
+storage, not the outer instance — "a proper fix needs runtime
+support"). The Rust `instance_subscr` already HAD the protocol
+(`Err(SubscrError::KeyError) if is_get` → look `__missing__`
+up with slot 0 → call it with the key) but it was dead code:
+`stub_subscr` mapped every slot failure to
+`SubscrError::Raise`, because `call_subscr` collapses every
+`PyRaise` into `NotImplemented` and the dict slot's recorded
+`KeyError` was invisible to it.
+Fix, two halves:
+1. `stub_subscr`: on `NotImplemented` for a Get, take the
+   pending raise to INSPECT it and re-record it verbatim; a
+   `KeyError` becomes `SubscrError::KeyError`. (The take only
+   inspects — `instance_subscr` owns the record's lifecycle.)
+   Non-KeyError raises are restored exactly; Set/Delete
+   misses are untouched (`__missing__` is Get-only).
+2. `instance_subscr`: when a `__missing__` member is found,
+   DISCARD the recorded `KeyError` BEFORE the call — the
+   dispatch loop polls the recorded raise at the top of every
+   iteration (`vm_dispatch.rs:100-108`) and would otherwise
+   fire the stale `KeyError` instead of a raise from
+   `__missing__` itself (found by debugging: the `ValueError`
+   WAS stashed on `pending_exc` and the drain DID return it,
+   but the stale record fired on the next iteration). When no
+   `__missing__` member exists the record is left in place
+   for the drain, so the miss still raises `KeyError`.
+Semantics probed on the reference and matched: the return
+value is NOT stored (`'x' in d` stays False); `.get` never
+calls `__missing__`; a raising `__missing__` propagates; a
+dict subclass without `__missing__` and an exact dict still
+raise `KeyError`; `del` of a missing key raises `KeyError`.
+
+## §3. Probe table (REF vs Rust, byte-compared unless noted)
+
+All probes in ~/workspace/f4_probe/ (REF =
+~/workspace/petitpy-orig/zig-out/bin/petitpy).
+
+- init_subclass.py (the integration case verbatim):
+  REF `['C', 'D', 'k:L']` rc=0; Rust identical.
+- mro.py / mro2.py (`class Z(A, B)` + `type('Z', (A, B), {})`):
+  REF `Cannot create a consistent method resolution order (MRO)
+  for bases A, B`; Rust identical (both forms; before the fix
+  Rust raised with an EMPTY message).
+- missing.py (basic + Counter + raising + plain/subclass-no-
+  missing KeyError): REF `m-x / False / DFLT / 2 5 0 /
+  True False / raised boom-z / plain KeyError x /
+  subclass-no-missing KeyError x` rc=0; Rust identical.
+- missing2.py (`__getitem__` raising + `__missing__` raising):
+  REF `getitem raised ValueError: getitem-boom / missing raised
+  ValueError: boom-z / after` rc=0; Rust identical.
+- missing3.py (`__missing__` prints then raises): REF `missing
+  called with z / missing raised ValueError: boom-z / after`
+  rc=0; Rust identical.
+- edge.py (8 cases): non-callable `__missing__` (= 5) ->
+  TypeError; inherited `__missing__` (`Q()['y']` -> 'p-y');
+  `__init_subclass__` via `type()` -> `[]` (no call, vendor
+  behavior); raising `__init_subclass__` -> RuntimeError
+  'no-sub'; `del d['q']` -> KeyError 'q'; 3-base MRO message;
+  `.get` skips `__missing__`; int-key `__missing__` (7 -> 70).
+  REF vs Rust stdout+stderr byte-identical, rc=0/0.
+- diamond.py (consistent MRO + super() chain, WITH `A.g`):
+  REF `E,D,B,C,A,object / C / ['D', 'B', 'C', 'A']` rc=0;
+  Rust identical. (An earlier draft of this probe omitted
+  `A.g` and BOTH binaries raised `AttributeError: no
+  attribute 'g'` identically — the test program was wrong,
+  not the implementation.)
+
+## §4. Left open
+
+- `super()`-construction errors still lose their messages
+  (`super_make_new` in `typecreate.rs` still returns the bare
+  `to_pyerror()` signal — same shape as the MRO bug fixed
+  here). Now a one-line change (`record_typed`) since
+  `TypedRaise` exists for `ObjTypeError`; not done here
+  because it is outside the F4 brief's 4 cases.
+- `__missing__` on the CTX-ONLY path: `instance_subscr`
+  discards the recorded `KeyError` before calling
+  `__missing__`; on stub seams the call cannot run a `FunBc`
+  (`call_via_type_slot` has no runner), so a ctx-only
+  subscript of a dict-subclass instance WITH `__missing__`
+  and a missing key now yields a bare `TypeError` / "object
+  isn't subscriptable" instead of the `KeyError` it used to
+  give. Only reachable from ctx-only `obj_subscr` callers
+  (notably the `store_attr` seams in
+  `src/runtime/runtime_method.rs:291`); no gate program hits
+  it (all gate paths run through the VM hook seams). A full
+  fix would need the seams to expose whether a raise was
+  stashed on the hook (`VmHook::take_pending`), so the
+  discard could be conditional.
+- `type('T', (B,), {})` does not call `__init_subclass__`
+  (vendor behavior, probed on the reference; CPython differs).
+  Pinned by test, not a bug.
+
+## §5. Files changed (one commit, do NOT merge)
+
+- `src/runtime/vm_call.rs` (+17/-1): `__init_subclass__`
+  `BoundMeth` unwrap.
+- `src/objects/objtype/errors.rs` (+52): `TypedRaise` for
+  `ObjTypeError` (MRO message formatting).
+- `src/objects/objtype/typecreate.rs` (+8/-3): `record_typed`
+  in `type_make_new`.
+- `src/objects/objtype/seams.rs` (+21/-1): `stub_subscr`
+  KeyError detection (inspect + re-record).
+- `src/objects/objtype/instance.rs` (+19/-8): `__missing__`
+  arm discards the recorded `KeyError` before the call.
+  (Subscr code only — the binary/unary op code in this file,
+  F3's territory, is untouched.)
+- `src/runtime/mod.rs` (+2): register `vm_tests_f4`.
+- NEW `src/runtime/vm_tests_f4.rs` (431 lines, 13 tests):
+  plain/classmethod/`type()`/raising `__init_subclass__`,
+  MRO conflict (class + `type()` forms) + consistent diamond,
+  `__missing__` basic/Counter/raising/not-stored, exact-dict
+  miss, `del` miss.
+- Exclusions honored: no `objint*.rs`, no `gc.rs`, no
+  `__build_class__`/builtins-override machinery changes
+  (read only), no MRO-computation change for consistent
+  hierarchies.

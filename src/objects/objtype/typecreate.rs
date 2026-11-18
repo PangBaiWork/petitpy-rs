@@ -180,12 +180,20 @@ pub fn type_make_new(
     } else {
         Err(ObjTypeError::TypeTakesOneOrThree)
     };
+    // F4: record the typed error (not just the bare `PyRaise`
+    // signal) — otherwise the exception object is never built
+    // and the VM can only raise a message-less `TypeError`
+    // (the MRO-conflict case: `class Z(A, B)` raised with an
+    // empty message). `record_typed` is first-wins and records
+    // exactly the error returned here, so the polled sig-error
+    // rule ("a later error overwrites it") is preserved: the
+    // sig error is recorded only when the body succeeded.
     match result {
         Ok(v) => match sig_err {
-            Some(e) => Err(e.to_pyerror()),
+            Some(e) => Err(ctx.record_typed(e)),
             None => Ok(v),
         },
-        Err(e) => Err(e.to_pyerror()),
+        Err(e) => Err(ctx.record_typed(e)),
     }
 }
 

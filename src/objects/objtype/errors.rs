@@ -8,8 +8,11 @@
 //! (MRO) for bases X, Y"`); `message()` returns the static prefix
 //! and the test asserts the names from the payload.
 
+use crate::memory::gc::TypedRaise;
 use crate::objects::obj::ExcType;
+use crate::objects::value::Value;
 use crate::pyerr::PyError;
+use crate::runtime::qstr::RuntimeQstr;
 
 /// A raise signalled by an objtype helper.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -117,6 +120,50 @@ impl ObjTypeError {
             ObjTypeError::OutOfMemory => PyError::OutOfMemory,
             _ => PyError::PyRaise,
         }
+    }
+}
+
+impl TypedRaise for ObjTypeError {
+    /// The exception name (`""` for `OutOfMemory` / `Raised` —
+    /// `record_typed` records nothing for an empty name: an OOM
+    /// has no exception object, and `Raised` means the object
+    /// already travels on the `pending_exc` side channel).
+    fn raise_name(&self) -> &'static str {
+        match self.clone().exc_type() {
+            Some(t) => t.name(),
+            None => "",
+        }
+    }
+
+    fn raise_arg(&self) -> Option<Value> {
+        None
+    }
+
+    /// The TERSE message. `MroConflict` formats the base names
+    /// into the message, exactly as the Zig does
+    /// (`objtype.zig:1025-1030`: the prefix, then `" A"` for the
+    /// first base and `", B"` for each later one).
+    fn raise_message(&self, pool: &RuntimeQstr) -> Option<String> {
+        match self {
+            ObjTypeError::MroConflict(names) => {
+                let mut msg = String::from(
+                    "Cannot create a consistent method resolution order (MRO) for bases",
+                );
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        msg.push(',');
+                    }
+                    msg.push(' ');
+                    msg.push_str(&String::from_utf8_lossy(pool.qstr_str(*n as u16)));
+                }
+                Some(msg)
+            }
+            _ => self.message().map(|m| m.to_string()),
+        }
+    }
+
+    fn raise_signal(&self) -> PyError {
+        self.clone().to_pyerror()
     }
 }
 

@@ -19,7 +19,7 @@ use crate::objects::primitives::ops::{
 };
 use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
 use crate::objects::value::{GcRef, TypeData, Value};
-use crate::pyerr::PyResult;
+use crate::pyerr::{PyError, PyResult};
 
 /// `mp_type_bool` ROM data. `dict` is the bootstrap's empty
 /// placeholder (the original has no `locals_dict`). The op slots are
@@ -74,9 +74,11 @@ pub fn bool_print(
 /// `npy_bool_fn_make_new`, sig (0, 1, false): 0 args → `False`,
 /// else `newBool(mp_obj_is_true(args[0]))`. Same polled arg-check
 /// rule as int: the branch's own error wins, else a wrong count
-/// surfaces as `ArgNumTypesMismatch`. Truth is C0's `Value::is_true`
-/// (payload table — complete for builtins; qstr `""` needs C6's
-/// length fix, which merges first).
+/// surfaces as `ArgNumTypesMismatch`. Truth is `obj_is_true`
+/// (the BOOL slot, then LEN) — NOT the payload-only
+/// `Value::is_true`: a `range(0)` has no falsy payload, its BOOL
+/// slot (`range_unary_op`, `len > 0`) makes it false, and a user
+/// `__bool__` returning `1` is false too (E2's probe).
 pub fn bool_make_new(
     ctx: &mut CallCtx<'_>,
     _types: &BuiltinTypes,
@@ -87,14 +89,17 @@ pub fn bool_make_new(
     let r = match args.len() {
         0 => Ok(Value::Bool(false)),
         _ => {
-            // C0's `is_true` is payload-only and infallible in this
-            // tree; the `Err` arm exists only because `is_true`
-            // returns `PyResult` for C12's `__bool__` / `__len__`
-            // slots (whose data travels on C13's `pending_exc`
-            // channel). Unreachable here.
-            let Ok(truth) = args[0].is_true(ctx.arena) else {
-                return Err(PrimError::OutOfMemory);
-            };
+            // `obj_is_true` records a slot raise on
+            // `pending_raise` itself; `PrimError::PyRaise`
+            // carries only the signal (its name is empty, so
+            // the slot wrapper's `record_typed` leaves the
+            // recorded exception alone).
+            let truth = crate::objects::obj::obj_is_true(ctx, ctx.types, args[0]).map_err(
+                |e| match e {
+                    PyError::OutOfMemory => PrimError::OutOfMemory,
+                    _ => PrimError::PyRaise,
+                },
+            )?;
             Ok(Value::Bool(truth))
         }
     };

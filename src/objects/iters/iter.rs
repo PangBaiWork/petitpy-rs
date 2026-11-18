@@ -284,6 +284,62 @@ pub struct IterSeams<'a> {
     /// `getitem(ctx, obj, index)`: the bound `__getitem__`
     /// call plus the Stop/Index classification.
     pub getitem: &'a mut dyn FnMut(&mut CallCtx, Value, i64) -> CallOutcome,
+    /// `next(ctx, it)` (E2c): advance an arbitrary iterator
+    /// value — `Value(v)` = next item, `Stop` = exhausted,
+    /// `Raise` = a raise (stashed on the side channel, same
+    /// as `call`). `None` = no resume closure: fall through
+    /// to `next_builtin` below. The C14 runtime
+    /// (`runtime_iter.rs`) supplies the generator-aware
+    /// resume (`resume_gen`); the ctx-only paths supply
+    /// neither, so a generator sub-iterator keeps the old
+    /// "object not an iterator" error there.
+    pub next: Option<&'a mut dyn FnMut(&mut CallCtx, Value) -> CallOutcome>,
+    /// The `next` builtin object (E2c): when `next` is `None`
+    /// but this is `Some`, a non-`Iterator` sub-iterator is
+    /// advanced by calling the builtin through the `call`
+    /// seam. The VM (`vm_rt_iter.rs`) supplies
+    /// `state.next_builtin` — the intercept routes it to the
+    /// real resume, so no second `&mut VmState` borrow is
+    /// needed (a `next` closure over `state` would collide
+    /// with the `call` seam's borrow, E0524). A `StopIteration`
+    /// from the builtin surfaces as `Raise` (the call seam
+    /// stashes every raise); the caller translates it back
+    /// to exhaustion (`iternext_vm_ctx` swallows it, the
+    /// raising form propagates it) — the same shape as a
+    /// `StopIteration` from a mapped function.
+    pub next_builtin: Option<Value>,
+}
+
+/// Advance one sub-iterator of a map/filter/zip/enumerate
+/// (E2c): an `Obj::Iterator` goes through the C11 dispatch;
+/// anything else (a generator, a user iterator) goes through
+/// the `next` closure when one is present, else through the
+/// `next` builtin via the `call` seam when one is present;
+/// with neither, the old `TypeError("object not an
+/// iterator")` is preserved.
+pub(crate) fn next_sub(
+    ctx: &mut CallCtx,
+    sub: Value,
+    seams: &mut IterSeams<'_>,
+) -> Result<Option<Value>, IterError> {
+    if matches!(sub, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::Iterator(_))) {
+        return iternext(ctx, sub, seams);
+    }
+    if let Some(next) = seams.next.as_mut() {
+        return match next(ctx, sub) {
+            CallOutcome::Value(v) => Ok(Some(v)),
+            CallOutcome::Stop => Ok(None),
+            CallOutcome::Raise => Err(IterError::PyRaise),
+        };
+    }
+    if let Some(nb) = seams.next_builtin {
+        return match (seams.call)(ctx, nb, &[sub]) {
+            CallOutcome::Value(v) => Ok(Some(v)),
+            CallOutcome::Stop => Ok(None),
+            CallOutcome::Raise => Err(IterError::PyRaise),
+        };
+    }
+    Err(IterError::TypeError(NOT_AN_ITERATOR))
 }
 
 /// The interning seam: `qstr_from_strn` over the caller's pool.
@@ -423,8 +479,15 @@ pub fn iternext(
     if extra.len() == 2 {
         // Range `[stop, step]` vs map-1 / filter / enumerate /
         // zip-1 `[TAG, x]` — resolved by shape (module docs).
+        // E2c: `x` is a sub-iterator — an `Obj::Iterator` OR
+        // an `Obj::Generator` (a map/filter/zip over a
+        // generator stores the generator itself in `extra[1]`;
+        // only recognising `Iterator` made `next(map(f, gen))`
+        // raise "object not an iterator"). A range's `extra[1]`
+        // is a `SmallInt` and enumerate's is its counter, so
+        // neither is affected.
         let second_is_iter = matches!(extra[1], Value::Heap(rr)
-            if matches!(ctx.arena.get(rr), Obj::Iterator(_)));
+            if matches!(ctx.arena.get(rr), Obj::Iterator(_) | Obj::Generator(_)));
         if second_is_iter {
             return match extra[0] {
                 Value::SmallInt(MAP_ITER_TAG) => map_iternext(ctx, it, seams),

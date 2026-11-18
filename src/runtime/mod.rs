@@ -73,6 +73,7 @@ pub mod vm_builtins;
 pub mod vm_builtins_bind;
 pub mod vm_call;
 pub mod vm_call_intercept;
+pub mod vm_call_var_kw;
 pub mod vm_dispatch;
 pub mod vm_dispatch_exec;
 pub mod vm_dispatch_util;
@@ -133,3 +134,5 @@ mod vm_tests_b;
 mod vm_tests_e2;
 #[cfg(test)]
 mod vm_tests_e2b;
+#[cfg(test)]
+mod vm_tests_e2c;

@@ -556,9 +556,10 @@ fn is_callable_needs_call_slot() {
     let t = fx.slotted_type("float", 0, None, None, None, None, None, Some(dummy_call));
     let v = fx.value_of(t, Obj::Float(1.0));
     let f = fx.value_of(fx.types.float, Obj::Float(1.0));
-    assert!(obj_is_callable(&fx.arena, &fx.types, v));
-    assert!(!obj_is_callable(&fx.arena, &fx.types, f));
-    assert!(!obj_is_callable(&fx.arena, &fx.types, Value::SmallInt(1)));
+    let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
+    assert!(obj_is_callable(&mut ctx, v));
+    assert!(!obj_is_callable(&mut ctx, f));
+    assert!(!obj_is_callable(&mut ctx, Value::SmallInt(1)));
 }
 
 #[test]

@@ -257,9 +257,10 @@ pub fn instance_unary_op_slot(
 /// binary op on subobj0; member → call the bound method with 1
 /// arg (rhs); CONTAINS → bool-ify via `obj_is_true`; NULL → NULL.
 /// Only the class dictionary is consulted (see the module docs).
-/// A member that returns `NotImplemented` has no fallback in this
-/// port (no NotImplemented value exists yet — see the module
-/// docs); the member's result is returned as-is.
+/// A member (or native-base op) returning `NotImplemented` means
+/// "try other fallbacks (e.g. `__rop__`) and if nothing works,
+/// raise TypeError" (objtype.zig:1178-1181) — it returns `None`
+/// (not implemented) so the caller falls through (E2c).
 pub fn instance_binary_op(
     ctx: &mut CallCtx,
     op: BinaryOp,
@@ -281,7 +282,11 @@ pub fn instance_binary_op(
             // The runtime op's result is returned directly (the
             // CONTAINS bool-ify below applies only to the member
             // path — objtype.zig:1172-1176).
-            return seams.binary(ctx, op, sub0, rhs);
+            let res = seams.binary(ctx, op, sub0, rhs)?;
+            match res {
+                Some(v) if crate::objects::obj::is_not_implemented(ctx, v) => Ok(None),
+                other => Ok(other),
+            }
         }
         Some(LookupHit::Member(fun, bound)) => {
             let ret = seams.call_pair(ctx, fun, bound, 1, 0, &[rhs])?;
@@ -292,8 +297,8 @@ pub fn instance_binary_op(
 }
 
 /// Finish a binary result: CONTAINS bool-ifies, the rest passes
-/// through. (`NotImplemented` handling is the open item in the
-/// module docs.)
+/// through — except `NotImplemented`, which is "not implemented"
+/// (see `instance_binary_op`).
 fn finish_binary(
     ctx: &mut CallCtx,
     op: BinaryOp,
@@ -302,6 +307,8 @@ fn finish_binary(
     if op == BinaryOp::Contains {
         let b = obj_is_true(ctx, ctx.types, ret)?;
         Ok(Some(Value::Bool(b)))
+    } else if crate::objects::obj::is_not_implemented(ctx, ret) {
+        Ok(None)
     } else {
         Ok(Some(ret))
     }

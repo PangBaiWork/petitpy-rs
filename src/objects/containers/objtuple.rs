@@ -71,7 +71,7 @@ use crate::objects::containers::objdict::DictError;
 use crate::objects::containers::objdict_methods::collect_iterable;
 use crate::objects::containers::sequence::{seq_cmp_objs, seq_count_obj, seq_index_obj};
 use crate::objects::obj::{obj_get_int_maybe, obj_get_type, ObjError};
-use crate::objects::objtype::subclass::is_subclass_fast;
+use crate::objects::objtype::subclass::{cast_to_native_base, is_subclass_fast};
 use crate::objects::obj_ops::{get_index, obj_print_helper};
 use crate::objects::slots::{BinaryOp, GetIterFn, PrintKind, SubscrArg, UnaryOp};
 use crate::objects::slots::CallHook;
@@ -359,7 +359,25 @@ fn tuple_cmp(
     rhs_value: Value,
 ) -> Result<bool, TupleError> {
     if !rhs_has_tuple_getiter(ctx, rhs_value) {
-        return Err(TupleError::PyRaise);
+        // Slow path for user subclasses (objtuple.zig:153-158):
+        // the rhs type's iter slot is not the tuple's (a user
+        // class gets `instance_getiter_slot`), so cast to the
+        // native tuple base instead of failing. A tuple
+        // subclass instance is an `Obj::Instance` whose
+        // subobj[0] IS the underlying tuple —
+        // `cast_to_native_base` returns it (or the value
+        // itself when it already is a tuple); anything else is
+        // still "not implemented".
+        let Some(cast) = cast_to_native_base(
+            ctx.arena,
+            ctx.types,
+            rhs_value,
+            Value::Heap(ctx.types.tuple),
+        ) else {
+            return Err(TupleError::PyRaise);
+        };
+        let rhs: Vec<Value> = tuple_items(ctx, cast).unwrap_or(&[]).to_vec();
+        return Ok(seq_cmp_objs(ctx, op, lhs, &rhs)?);
     }
     // Clone first: `seq_cmp_objs` needs `&mut ctx`.
     let rhs: Vec<Value> = tuple_items(ctx, rhs_value).unwrap_or(&[]).to_vec();

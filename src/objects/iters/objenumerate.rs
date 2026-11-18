@@ -16,7 +16,7 @@
 //! (`mp_obj_get_int` bounds — probed).
 
 use super::iter::{
-    getiter, iternext, new_iter, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
+    getiter, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
     ENUMERATE_ITER_TAG, FLAG_ITER_IS_ITERNEXT, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
@@ -111,7 +111,7 @@ pub fn enumerate_iternext(
         },
         _ => return Err(IterError::TypeError(NOT_AN_ITERATOR)),
     };
-    let Some(next) = iternext(ctx, sub, seams)? else {
+    let Some(next) = next_sub(ctx, sub, seams)? else {
         return Ok(None);
     };
     let cur = obj_get_int(ctx, ctx.types, cur_v).map_err(IterError::from)?;

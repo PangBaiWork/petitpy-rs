@@ -566,6 +566,7 @@ fn range_type_data_shape() {
     assert!(data.subscr.is_some());
     assert!(data.getiter.is_some());
     assert!(data.print.is_some());
+    assert!(data.attr.is_some());
     // Full config: NO binary op (the nano equality-only op is out
     // of scope).
     assert!(data.binary_op.is_none());

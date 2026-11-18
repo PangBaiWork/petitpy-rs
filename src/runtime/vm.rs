@@ -153,6 +153,13 @@ pub struct VmState {
     /// VM's real call hook to collect the iterable first.
     pub str_join_builtin: Value,
     pub bytes_join_builtin: Value,
+    /// The `list.sort` method builtin (E2c): the `FunBuiltin`
+    /// from the list type dict. Intercepted by GcRef identity
+    /// in `call_function_ctx` (see `call_list_sort_ctx` in
+    /// `builtin_vm.rs`) — `list_sort` is ctx-only and returns
+    /// `PyRaise` for a non-`None` key, so `l.sort(key=f)`
+    /// needs the VM's real call hook to run `f`.
+    pub list_sort_builtin: Value,
     pub min_builtin: Value,
     pub max_builtin: Value,
     pub getattr_builtin: Value,
@@ -428,6 +435,7 @@ impl Vm {
                 sorted_builtin: Value::None,
                 str_join_builtin: Value::None,
                 bytes_join_builtin: Value::None,
+                list_sort_builtin: Value::None,
                 min_builtin: Value::None,
                 max_builtin: Value::None,
                 getattr_builtin: Value::None,

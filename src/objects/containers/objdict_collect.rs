@@ -223,10 +223,23 @@ pub(crate) fn collect_iterable(
             // the hook is NOT classified here — the exception
             // object is stashed on `state.pending_exc`, which this
             // ctx-only fn cannot see, so it surfaces as a raise.
-            let mut hook = call.as_deref_mut();
+            //
+            // E2c: ONE hook serves both the `call` seam and the
+            // `next` seam below, so it is shared through a
+            // `RefCell` — two closures over the same `&mut`
+            // hook cannot be built (E0524, the E2b `VmHook`
+            // rationale). The two seams are only ever called
+            // sequentially by C11's `iternext` (pull subs, then
+            // call the function); a re-entrant borrow of the
+            // same cell cannot happen — a nested collection
+            // builds its own hook and cell — so `borrow_mut`
+            // never panics here.
+            use std::cell::RefCell;
+            let hook_cell = RefCell::new(call.as_deref_mut());
             let mut call_seam =
                 |ctx2: &mut CallCtx, fun: Value, args: &[Value]| -> CallOutcome {
-                    if let Some(h) = hook.as_deref_mut() {
+                    let mut guard = hook_cell.borrow_mut();
+                    if let Some(h) = guard.as_deref_mut() {
                         return match h.call(ctx2, fun, args.len(), 0, args) {
                             Ok(v) => CallOutcome::Value(v),
                             Err(PyError::OutOfMemory) => CallOutcome::Raise,
@@ -287,9 +300,38 @@ pub(crate) fn collect_iterable(
                         }
                     }
                 };
+            // The `next` seam (E2c): resume a generator
+            // sub-iterator through the hook's `resume` — the
+            // `iternext` form, so exhaustion is `Ok(None)`
+            // (a `Stop`) and a raise inside the generator is a
+            // `Raise` (never confused with the mapped
+            // function's own `StopIteration`, which the call
+            // seam above correctly surfaces as a raise —
+            // probed on the reference). Without a hook there
+            // is no VM to resume with, so it records the old
+            // "object not an iterator" raise itself and
+            // returns `Raise` — the caller drains the recorded
+            // raise, so the ctx-only error is unchanged.
+            let mut next_fn = |ctx2: &mut CallCtx, sub: Value| -> CallOutcome {
+                let mut guard = hook_cell.borrow_mut();
+                match guard.as_deref_mut() {
+                    Some(h) => match h.resume(ctx2, sub) {
+                        Ok(Some(v)) => CallOutcome::Value(v),
+                        Ok(None) => CallOutcome::Stop,
+                        Err(PyError::OutOfMemory) => CallOutcome::Raise,
+                        Err(PyError::PyRaise) => CallOutcome::Raise,
+                    },
+                    None => {
+                        let _ = ctx2.record_raise("TypeError", Some("object not iterable"));
+                        CallOutcome::Raise
+                    }
+                }
+            };
             let mut seams = IterSeams {
                 call: &mut call_seam,
                 getitem: &mut getitem_seam,
+                next: Some(&mut next_fn),
+                next_builtin: None,
             };
             let mut out = Vec::new();
             loop {

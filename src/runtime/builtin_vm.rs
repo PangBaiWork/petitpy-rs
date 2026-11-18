@@ -286,18 +286,20 @@ pub fn call_sorted_ctx(
     }
 }
 
-/// `sorted` with a real key function: decorate once per item,
-/// stable-sort the pairs with a 3-way comparator over the
-/// dispatch loop's `binary_op_ctx`, raise the FIRST comparison
-/// failure after the sort completes (the C9b rule).
-fn sort_with_key(
+/// `sorted` with a real key function, minus the result list:
+/// decorate once per item, stable-sort the pairs with a 3-way
+/// comparator over the dispatch loop's `binary_op_ctx`, raise
+/// the FIRST comparison failure after the sort completes (the
+/// C9b rule). Returns the sorted items; `sort_with_key` wraps
+/// them in a fresh list, `call_list_sort_ctx` writes them back
+/// into the sorted list in place.
+fn sort_items_with_key(
     ctx: &mut CallCtx,
     state: &mut VmState,
     items: Vec<Value>,
     key_fn: Value,
     reverse: bool,
-) -> Result<Value, Value> {
-    let types = ctx.types;
+) -> Result<Vec<Value>, Value> {
     let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(items.len());
     for item in items {
         let key = call_function_ctx(ctx, state, key_fn, 1, 0, &[item])?;
@@ -354,9 +356,79 @@ fn sort_with_key(
     if let Some(e) = first_err {
         return Err(e);
     }
-    let sorted: Vec<Value> = pairs.into_iter().map(|(_, item)| item).collect();
+    Ok(pairs.into_iter().map(|(_, item)| item).collect())
+}
+
+/// `sorted` with a real key function: decorate once per item,
+/// stable-sort the pairs with a 3-way comparator over the
+/// dispatch loop's `binary_op_ctx`, raise the FIRST comparison
+/// failure after the sort completes (the C9b rule).
+fn sort_with_key(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    items: Vec<Value>,
+    key_fn: Value,
+    reverse: bool,
+) -> Result<Value, Value> {
+    let types = ctx.types;
+    let sorted = sort_items_with_key(ctx, state, items, key_fn, reverse)?;
     let list = new_list(ctx, types.list, &sorted);
     Ok(Value::Heap(list))
+}
+
+/// `list.sort` (E2c): `list_sort` is ctx-only and returns
+/// `PyRaise` for a non-`None` key, so the VM intercepts the
+/// method by GcRef identity (`VmState.list_sort_builtin`) and
+/// runs the key through the real call hook here. A `None` key
+/// delegates to `list_sort_builtin` (the in-place quicksort);
+/// a real key decorates once per item (the `sorted` pattern —
+/// the original calls the key per comparison inside its
+/// quicksort, and ABORTS outright when a key call or a
+/// comparison fails: `sort(key=len)` on ints panics at
+/// mp_mirrors.zig:745; Rust raises instead and leaves the list
+/// unchanged on failure), stable-sorts, and writes the items
+/// back into the original list in place. Returns `None`.
+pub fn call_list_sort_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if n_args != 1 {
+        return Err(mismatch(ctx, state));
+    }
+    let Some(self_v) = args.first().copied() else {
+        return Err(mismatch(ctx, state));
+    };
+    let items: Vec<Value> = match self_v {
+        Value::Heap(r) => match ctx.arena.get(r) {
+            Obj::List(l) => l.items.clone(),
+            _ => return Err(mismatch(ctx, state)),
+        },
+        _ => return Err(mismatch(ctx, state)),
+    };
+    let kws = kw_args(args, n_args, n_kw);
+    let (key, reverse) = parse_sort_args(ctx, &[self_v], &kws).map_err(|e| {
+        let pe = ctx.record_typed(e);
+        exc_from_pyerror(ctx, state, pe)
+    })?;
+    match key {
+        Some(k) if k != Value::None => {
+            let sorted = sort_items_with_key(ctx, state, items, k, reverse)?;
+            if let Value::Heap(r) = self_v {
+                if let Obj::List(l) = ctx.arena.get_mut(r) {
+                    l.items = sorted;
+                }
+            }
+            Ok(Value::None)
+        }
+        _ => {
+            list_sort_builtin(ctx, &[self_v], &kws)
+                .map_err(|e| exc_from_pyerror(ctx, state, e))?;
+            Ok(Value::None)
+        }
+    }
 }
 
 /// `mp_builtin_min` / `mp_builtin_max` (`modbuiltins.zig:763+`):

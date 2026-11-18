@@ -127,7 +127,7 @@ mod tests {
         call: &'a mut dyn FnMut(&mut CallCtx, Value, &[Value]) -> CallOutcome,
         getitem: &'a mut dyn FnMut(&mut CallCtx, Value, i64) -> CallOutcome,
     ) -> IterSeams<'a> {
-        IterSeams { call, getitem }
+        IterSeams { call, getitem, next: None, next_builtin: None }
     }
 
     /// A panicking call closure (getitem tests never call it).

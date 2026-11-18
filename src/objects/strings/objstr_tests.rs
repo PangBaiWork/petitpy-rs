@@ -765,3 +765,35 @@ pub(crate) fn call_bytes(
     let r = f(&mut fx.ctx(), &types, args).unwrap();
     bytes_of(fx, r)
 }
+
+// ── E2c sweep: short direct calls must error, not panic ───────────────
+// The `builtin_method!` wrappers used to guard only `args.is_empty()`,
+// so a direct call with fewer args than the method reads (`str_join`
+// with just `self`) indexed out of bounds and panicked (SIGABRT). The
+// VM's sig check rejects short calls before they reach here; this pins
+// the direct path instead.
+#[test]
+fn e2c_short_direct_calls_error_not_panic() {
+    type W = fn(&mut CallCtx, &[Value]) -> Result<Value, PyError>;
+    let mut fx = Fx::new();
+    let sep = fx.s(b",");
+    let needle = fx.s(b"x");
+    // min 2: one arg (self only) → Err, no panic.
+    let min2: &[W] = &[
+        str_join_builtin,
+        str_find_builtin,
+        str_zfill_builtin,
+        crate::objects::strings::objstr_b::str_center_builtin,
+        crate::objects::strings::objstr_b::str_partition_builtin,
+    ];
+    for f in min2 {
+        assert!(f(&mut fx.ctx(), &[sep]).is_err());
+    }
+    // min 3: two args → Err.
+    assert!(str_replace_builtin(&mut fx.ctx(), &[sep, needle]).is_err());
+    // min 1: one arg (self only) is fine; empty args → Err.
+    assert!(str_lower_builtin(&mut fx.ctx(), &[sep]).is_ok());
+    assert!(str_split_builtin(&mut fx.ctx(), &[sep]).is_ok());
+    assert!(str_join_builtin(&mut fx.ctx(), &[]).is_err());
+    assert!(str_lower_builtin(&mut fx.ctx(), &[]).is_err());
+}

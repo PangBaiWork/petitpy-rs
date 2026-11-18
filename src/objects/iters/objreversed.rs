@@ -212,6 +212,8 @@ mod tests {
         let mut seams = IterSeams {
             call: &mut call,
             getitem: &mut getitem,
+            next: None,
+                next_builtin: None,
         };
         let r = reversed_make_new(ctx, &[seq], 0, &mut seams)?;
         // `iternext` needs no seams (subscript is direct).
@@ -350,6 +352,8 @@ mod tests {
             let mut seams = IterSeams {
                 call: &mut call,
                 getitem: &mut getitem,
+                next: None,
+                next_builtin: None,
             };
             reversed_make_new(&mut ctx, &[obj], 0, &mut seams).unwrap()
         };
@@ -409,6 +413,8 @@ mod tests {
         let mut seams = IterSeams {
             call: &mut call,
             getitem: &mut getitem,
+            next: None,
+                next_builtin: None,
         };
         let out = reversed_make_new(&mut ctx, &[obj], 0, &mut seams).unwrap();
         assert_eq!(out, target);

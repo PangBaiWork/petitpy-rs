@@ -102,6 +102,13 @@ pub enum PrimError {
     BufferProtocol,
     /// `TypeError: argument num/types mismatch`.
     ArgNumTypesMismatch,
+    /// A slot already raised — its data is on `pending_raise`
+    /// (the caller's `record_typed` leaves it alone because
+    /// this variant's name is empty); only the `PyRaise` signal
+    /// travels here. (`bool()`'s truth call: `obj_is_true` may
+    /// raise through a `__bool__`/`__len__` slot whose data is
+    /// already recorded.)
+    PyRaise,
     /// An allocation failed (carries `PyError::OutOfMemory` through).
     OutOfMemory,
 }
@@ -133,7 +140,7 @@ impl PrimError {
             PrimError::DivideByZero | PrimError::ComplexDivideByZero | PrimError::ComplexZeroPower => {
                 Some(ExcType::ZeroDivisionError)
             }
-            PrimError::OutOfMemory => None,
+            PrimError::OutOfMemory | PrimError::PyRaise => None,
         }
     }
 
@@ -163,6 +170,7 @@ impl PrimError {
             PrimError::Pow3ModZero => Some("divide by zero"),
             PrimError::BufferProtocol => Some("object with buffer protocol required"),
             PrimError::ArgNumTypesMismatch => Some("argument num/types mismatch"),
+            PrimError::PyRaise => None,
             PrimError::OutOfMemory => None,
         }
     }

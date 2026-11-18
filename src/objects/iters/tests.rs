@@ -65,6 +65,8 @@ impl PanicSeams {
         IterSeams {
             call: &mut *self.call,
             getitem: &mut *self.getitem,
+            next: None,
+                next_builtin: None,
         }
     }
 }

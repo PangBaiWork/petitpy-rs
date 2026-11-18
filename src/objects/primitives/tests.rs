@@ -8,9 +8,11 @@
 use super::*;
 use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::primitives::ops::static_qstr_id;
+use crate::objects::slots::UnaryOp;
 use crate::objects::value::{
     BytesData, DictData, GcRef, MapData, Obj, StrData, TypeData, Value,
 };
+use crate::pyerr::{PyError, PyResult};
 use crate::runtime::qstr::RuntimeQstr;
 use crate::vendor::mpz::BigInt;
 
@@ -18,6 +20,27 @@ pub(crate) fn static_resolver(id: u32) -> Option<Vec<u8>> {
     crate::compiler::qstr::QSTR_STRINGS
         .get(id as usize)
         .map(|s| s.to_vec())
+}
+
+/// A `UnaryOpFn` for the fixture's `str` / `list` types (E2c):
+/// answers `Len` from the payload; anything else → `PyRaise`
+/// (`call_unary` maps it to `NotImplemented`, the same as having
+/// no slot). The real VM wires the full slots; the fixture builds
+/// types plain, and `bool()` (`obj_is_true`) needs a LEN slot to
+/// see an empty container as false.
+fn fixture_len_slot(ctx: &mut CallCtx, op: UnaryOp, arg: Value) -> PyResult<Value> {
+    if op != UnaryOp::Len {
+        return Err(PyError::PyRaise);
+    }
+    let n = match arg {
+        Value::Heap(r) => match ctx.arena.get(r) {
+            Obj::Str(s) => s.bytes.len() as i64,
+            Obj::List(l) => l.items.len() as i64,
+            _ => return Err(PyError::PyRaise),
+        },
+        _ => return Err(PyError::PyRaise),
+    };
+    Ok(Value::SmallInt(n))
 }
 
 pub(crate) struct Fixture {
@@ -99,6 +122,18 @@ impl Fixture {
         let native_init_wrapper = make_type(&mut arena, &roots, b"function");
         for t in [int, str_, bytes, bool_, none_type, float, complex, tuple, list, set, frozenset, range, dict, array, bytearray, type_, object, super_, staticmethod, classmethod, boundmeth, empty_tuple, empty_bytes, property, native_init_wrapper] {
             roots.push(Value::Heap(t));
+        }
+        // E2c: `bool()` (`obj_is_true`) reads truthiness through
+        // the BOOL slot, then the LEN slot — the fixture builds
+        // types plain (no slots), so an empty heap str/list
+        // read as true. Wire a LEN-only slot on `str`/`list`
+        // (anything else → `PyRaise` → `NotImplemented`, the
+        // same as having no slot) so `bool("")` / `bool([])`
+        // are false here as in the VM.
+        for t in [str_, list] {
+            if let Obj::Type(d) = arena.get_mut(t) {
+                d.unary_op = Some(fixture_len_slot);
+            }
         }
         let types = BuiltinTypes {
             int,

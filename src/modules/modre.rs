@@ -592,7 +592,7 @@ pub fn call_sub_ctx(
     // currently ignored".
     let where_bytes = str_arg(ctx, where_v).map_err(|e| exc(ctx, state, e))?;
     let is_str = subject_is_str(ctx, where_v);
-    let is_callable = obj_is_callable(ctx.arena, ctx.types, replace);
+    let is_callable = obj_is_callable(ctx, replace);
     let end = where_bytes.len();
     let mut result: Option<Vec<u8>> = None;
     let mut begin = 0usize;

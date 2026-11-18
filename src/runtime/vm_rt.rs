@@ -76,6 +76,14 @@ pub(crate) fn pending_exc_or_type_error(ctx: &mut CallCtx, state: &VmState) -> V
     })
 }
 
+/// `isTypeOrNone` (`runtime.zig:544-546`): `None` or an exact
+/// `type` object (header type is `type` — the vendor's
+/// `isExactType(o, &mp_type_type)`).
+fn is_type_or_none(ctx: &CallCtx, o: Value) -> bool {
+    o == Value::None
+        || matches!(o, Value::Heap(r) if ctx.arena.header(r).type_ == Some(ctx.types.type_))
+}
+
 /// `mp_unary_op` (`runtime.zig:352-408`): NOT is `!is_true`;
 /// small ints take the fast path (HASH/POSITIVE/INT_MAYBE are
 /// the identity; NEGATIVE/ABS on `SMALL_INT_MIN` make a heap
@@ -558,20 +566,33 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
         }
         return Err(binop_unsupported(ctx, state, op, lhs, rhs));
     }
-    // Full-only `int | None` typing union — needs the import
-    // system (C15's `typingCall`); fall through to
-    // `binopUnsupported` until then (documented stub).
+    // Full-only `int | None` typing union (`runtime.zig:574-577`,
+    // F5a): `|` with both sides a type or None (and not both
+    // None) routes to `typing._union` — BEFORE the small-int
+    // path and BEFORE `nativeSubclassOp` (the generic loop's
+    // `try_instance_binary_op`). `_union` itself flattens and
+    // dedups; a single member returns the member itself
+    // (`int | int` → `<class 'int'>`).
+    if op == BinaryOp::Or
+        && is_type_or_none(ctx, lhs)
+        && is_type_or_none(ctx, rhs)
+        && (lhs != Value::None || rhs != Value::None)
+    {
+        let union_q =
+            crate::runtime::runtime::dunder(b"_union").expect("_union is a static qstr");
+        return crate::runtime::vm_seams::typing_call_ctx(ctx, state, union_q, lhs, rhs);
+    }
     // `nativeSubclassOp` (F3 — see `native_subclass_op` below):
     // an int/float/str subclass on the right of a native scalar
     // works as its value (reflected method first, else recurse
-    // on the native base). Placed here — after EQUAL/NOT_EQUAL,
-    // before the MODULO intercept — as in the vendor
-    // (`runtime.zig:580`, after IS/EQUAL/EXCEPTION_MATCH and the
-    // typing union, before the small-int fast path). The MODULO
-    // intercept below is Rust's `%`-format hook, which the
-    // vendor reaches later through the str slot — a `'%d' % R(2)`
-    // takes the same result either way (the `%` engine unwraps
-    // the rhs via `nativeBase`).
+    // on the native base). Placed here — after EQUAL/NOT_EQUAL
+    // and the typing union above, before the MODULO intercept —
+    // as in the vendor (`runtime.zig:580`, after
+    // IS/EQUAL/EXCEPTION_MATCH and the typing union, before the
+    // small-int fast path). The MODULO intercept below is Rust's
+    // `%`-format hook, which the vendor reaches later through the
+    // str slot — a `'%d' % R(2)` takes the same result either way
+    // (the `%` engine unwraps the rhs via `nativeBase`).
     if let Some(v) = native_subclass_op(ctx, state, op, lhs, rhs)? {
         return Ok(v);
     }

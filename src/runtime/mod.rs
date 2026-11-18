@@ -155,3 +155,6 @@ mod vm_tests_e2j;
 mod vm_tests_f3;
 #[cfg(test)]
 mod vm_tests_f4;
+
+#[cfg(test)]
+mod vm_tests_f5a;

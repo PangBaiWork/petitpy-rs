@@ -12,11 +12,11 @@
 //! `isSubclassImpl` needs `mp_load_method_maybe`, so `is_subclass`
 //! takes the `VmSeams` — the common paths (type / tuple
 //! classinfo) never touch it. The `BuiltinFn` adapters use the
-//! default seams (`call_via_type_slot` + no `load_maybe`): a union
-//! classinfo without a real `load_maybe` falls through to
-//! `IssubclassArg2`, until C14 wires the real one (documented
-//! limitation, not a divergence — no UnionType object exists in
-//! the tree yet; the `int | None` object is C14/C15's).
+//! REAL `load_maybe` (`real_load_maybe`, F5a): a UnionType's
+//! `__args__` tuple is visible, so `isinstance(1, int | None)`
+//! takes the union branch; a generic alias is still rejected
+//! (its `__origin__` makes `union_args` return `None` — the
+//! reference raises the same arg-2 TypeError).
 
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::callables::objfun::fun_builtin_2_type_data;
@@ -27,7 +27,7 @@ use crate::objects::value::{FunBuiltinData, GcRef, Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 
 use super::errors::ObjTypeError;
-use super::seams::{with_stub_seams, VmSeams};
+use super::seams::{real_load_maybe, with_seams, VmSeams};
 
 /// `mp_obj_is_type` (`obj.zig`, inlined here): the value is a heap
 /// object whose header type is exactly `type_`.
@@ -252,24 +252,35 @@ pub fn is_subclass_of_value(
 /// `mp_builtin_issubclass` (`objtype.zig:555-562`) as a
 /// `BuiltinFn` (fixed arity 2 — the `fun_builtin_2_call` adapter
 /// checks the count first).
+///
+/// F5a: the seams use the REAL `load_maybe` (not the stub's
+/// None), so `union_args` can see a UnionType's `__args__`
+/// tuple — `issubclass(C, int | None)` takes the union branch
+/// (`objtype.zig:524-549`). A generic alias still falls through
+/// to `IssubclassArg2`: its `__origin__` makes `union_args`
+/// return `None`, exactly as on the reference
+/// (`isinstance(1, list[int])` raises the arg-2 TypeError).
 pub fn issubclass_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let [object, classinfo] = args else {
         return Err(PyError::PyRaise);
     };
     if type_ref(ctx.arena, *object).is_none() {
-        return Err(ObjTypeError::IssubclassArg1.to_pyerror());
+        return Err(ctx.record_typed(ObjTypeError::IssubclassArg1));
     }
-    with_stub_seams(|seams| is_subclass(ctx, *object, *classinfo, seams).map_err(|e| e.to_pyerror()))
+    with_seams(real_load_maybe, |seams| {
+        is_subclass(ctx, *object, *classinfo, seams).map_err(|e| ctx.record_typed(e))
+    })
 }
 
 /// `mp_builtin_isinstance` (`objtype.zig:569-575`) as a
-/// `BuiltinFn` (fixed arity 2).
+/// `BuiltinFn` (fixed arity 2). Same real-`load_maybe` seams as
+/// `issubclass_builtin` (F5a) — `isinstance(1, int | None)`.
 pub fn isinstance_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let [object, classinfo] = args else {
         return Err(PyError::PyRaise);
     };
-    with_stub_seams(|seams| {
-        is_subclass_of_value(ctx, *object, *classinfo, seams).map_err(|e| e.to_pyerror())
+    with_seams(real_load_maybe, |seams| {
+        is_subclass_of_value(ctx, *object, *classinfo, seams).map_err(|e| ctx.record_typed(e))
     })
 }
 

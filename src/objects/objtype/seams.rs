@@ -406,6 +406,26 @@ pub fn real_load_maybe(
             }
         }
     }
+    // The instance members map (F5a — the vendor's `mp_load_method_maybe`
+    // calls the type's attr slot BEFORE the locals_dict search, and
+    // for a user instance that slot reads the members map first
+    // (`instance_load_attr` step 1). Members are returned RAW,
+    // unbound (`(value, None)` — an instance-dict function is not
+    // bound, as in MicroPython/CPython). Without this step a
+    // UnionType's `__args__` tuple — an instance member — was
+    // invisible, so `isinstance(1, int | None)` fell through to
+    // `IssubclassArg2`. This also makes the `__reversed__` /
+    // `__len__` / `__iter__` probes see an instance member of the
+    // same name, as the vendor does (it returns the member and the
+    // caller then fails to call it, instead of silently falling
+    // through to the next mechanism).
+    if let Value::Heap(r) = obj {
+        if let Obj::Instance(d) = ctx.arena.get(r) {
+            if let Some(i) = d.members.find_qstr(ctx.pool, attr) {
+                return Some((d.members.entries[i].value, None));
+            }
+        }
+    }
     let t = obj_get_type(ctx.arena, ctx.types, obj)?;
     let hit = with_stub_seams(|seams| class_lookup(ctx, Some(obj), attr, None, false, t, seams))?;
     match hit {

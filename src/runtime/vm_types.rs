@@ -3,6 +3,7 @@
 //! `vm.rs` (file-size cap).
 
 use crate::memory::gc::CallCtx;
+use crate::objects::callables::objcode::code_type_data;
 use crate::objects::callables::objfun::{fun_bc_type_data, fun_builtin_var_type_data};
 use crate::objects::callables::objgenerator_types::{
     gen_instance_locals_dict, gen_instance_type_data, gen_wrap_type_data,
@@ -46,8 +47,44 @@ use crate::objects::slots::{BuiltinFn, BuiltinKwFn, MethodEntry};
 use crate::objects::strings::objstr_b::{BYTES_METHODS, STR_METHODS};
 use crate::objects::strings::objstr_methods_b::{bytes_type_data, str_type_data};
 use crate::objects::value::{BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj, TypeData, Value};
-use crate::runtime::vm::VmTypes;
 use crate::runtime::vm_builtins::{ellipsis_print, format_kw_wrapper, none_print};
+
+/// The type objects the VM owns beyond `BuiltinTypes` (built once
+/// by `build_vm_types`, rooted in `roots.extra` for the VM's
+/// lifetime). Moved here from `vm.rs` by E1 (file-size cap).
+#[derive(Clone, Copy)]
+pub struct VmTypes {
+    pub fun_bc: GcRef,
+    pub gen_wrap: GcRef,
+    pub gen_instance: GcRef,
+    pub closure: GcRef,
+    pub bound_meth: GcRef,
+    pub module: GcRef,
+    pub object: GcRef,
+    pub ellipsis: GcRef,
+    pub slice: GcRef,
+    pub fun_builtin_var: GcRef,
+    pub array: GcRef,
+    pub bytearray: GcRef,
+    pub memoryview: GcRef,
+    /// The cell type (`MAKE_CLOSURE` allocates cells with it).
+    pub cell: GcRef,
+    /// The property type (bound as `property` in builtins).
+    pub property: GcRef,
+    /// The `map` type (bound as `map` in builtins, C13b).
+    pub map: GcRef,
+    /// The `filter` type (bound as `filter` in builtins, C13b).
+    pub filter: GcRef,
+    /// The `zip` type (bound as `zip` in builtins, C13b).
+    pub zip: GcRef,
+    /// The `enumerate` type (bound as `enumerate` in builtins,
+    /// C13b).
+    pub enumerate: GcRef,
+    /// The `reversed` type (bound as `reversed` in builtins, D5).
+    pub reversed: GcRef,
+    /// The `code` type (the type of `compile()` results, E1).
+    pub code: GcRef,
+}
 
 // ── Type construction ──────────────────────────────────────────────────
 
@@ -311,6 +348,15 @@ pub(crate) fn build_vm_types(
     // frozen `heapq` (`heapify` uses `reversed`).
     let reversed_dict = empty_dict(ctx);
     let reversed = ctx.alloc(None, Obj::Type(reversed_type_data(reversed_dict)));
+    // `code` (E1): the ROM type from `objcode.c` (BASIC level).
+    // The name `"code"` IS a static qstr (in the generated
+    // table — `from_strn` finds it there); the type has no slots.
+    let code_name = ctx
+        .pool
+        .from_strn(b"code")
+        .expect("code name interns") as u32;
+    let code_dict = empty_dict(ctx);
+    let code = ctx.alloc(None, Obj::Type(code_type_data(code_dict, code_name)));
 
     // Callables.
     let fun_bc_dict = empty_dict(ctx);
@@ -442,7 +488,7 @@ pub(crate) fn build_vm_types(
         tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
         filter, zip, enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
         property, ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
-        fileio, textio, attrtuple,
+        fileio, textio, attrtuple, code,
     ] {
         ctx.arena.set_header_type(t, Some(type_));
     }
@@ -463,7 +509,7 @@ pub(crate) fn build_vm_types(
         fun_builtin_var, int, bool_, cell, float, complex, none_type, str_, bytes, tuple, list,
         dict, set, frozenset, range, slice, array, bytearray, memoryview, map, filter, zip,
         enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module, property,
-        ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
+        ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper, code,
     ] {
         if let Obj::Type(d) = ctx.arena.get_mut(t) {
             if d.mro.is_empty() {
@@ -534,6 +580,7 @@ pub(crate) fn build_vm_types(
         zip,
         enumerate,
         reversed,
+        code,
     };
     (types, vm_types, exc, empty_tuple, Value::Heap(ellipsis_singleton))
 }

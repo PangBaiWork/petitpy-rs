@@ -5,6 +5,7 @@
 //! `docs/comparison-and-plan.md` for the scope and the phased plan.
 
 pub mod compiler;
+pub mod entry;
 pub mod frontend;
 pub mod memory;
 pub mod modules;

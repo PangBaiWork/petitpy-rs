@@ -26,6 +26,25 @@ use crate::objects::value::Value;
 use crate::runtime::vm::VmState;
 use crate::runtime::vm_ops::exc_from_pyerror;
 
+/// The `petitpy-vm` compiler stub error (`main_vm.zig`):
+/// with the compiler unlinked (`VmState.compiler_linked ==
+/// false`), any compile attempt raises
+/// `NotImplementedError("compiler not linked in petitpy-vm")`
+/// — the exact message of the Zig stub (`main_vm.zig:15-19`
+/// replaces `npy_zig_eval_exec` / `compile_to_code_glue`
+/// with it). Callers check `state.compiler_linked` first
+/// and return this error. Code objects do NOT go through
+/// here: the `objIsCode` fast path in `eval_exec_helper`
+/// runs before any compile, exactly as the Zig checks it
+/// before calling `npy_zig_eval_exec`.
+pub(crate) fn compiler_not_linked_error(ctx: &mut CallCtx, state: &VmState) -> Value {
+    let e = crate::runtime::raise::raise_not_implemented(
+        ctx,
+        Some("compiler not linked in petitpy-vm"),
+    );
+    exc_from_pyerror(ctx, state, e)
+}
+
 /// `MP_ENOMEM` (`zig_compile_bridge.zig:51-52`).
 pub const MP_ENOMEM: i32 = 12;
 
@@ -125,10 +144,10 @@ pub fn compile_and_load(
 
 /// `npy_zig_compile_to_code`'s FULL arm (`zig_compile_bridge.zig:316`,
 /// `compile_to_code_glue.impl`): compile + load, then wrap the
-/// module function as a `code` object — except there is NO
-/// `Obj::Code` in Rust yet (Phase E/C18), so after the load the
-/// function raises `NotImplementedError` (no message, as in
-/// C15a's `compile_glue`).
+/// module function as a `code` object (`newCodeMinimum`,
+/// `builtinevex.zig:17-19`) — E1 (C15a left a
+/// `NotImplementedError` here, blocked on the missing
+/// `Obj::Code`).
 ///
 /// Compiling FIRST matters: a syntax error beats the missing-code
 /// error (the original raises `SyntaxError` for
@@ -137,7 +156,8 @@ pub fn compile_and_load(
 /// instead — now fixed). The loaded module is transient (its
 /// globals are NULL in the Zig — `compile()` binds no module's
 /// globals; the code object is executed later under whatever
-/// globals the caller chooses — so `module_dict` is `None` here).
+/// globals the caller chooses — so `module_dict` is `None` here,
+/// unlike `compile_and_load`'s `Some(globals)`).
 pub fn compile_to_code(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -145,6 +165,11 @@ pub fn compile_to_code(
     kind: InputKind,
     source_name: &str,
 ) -> Result<Value, Value> {
+    // `petitpy-vm`: the compiler is not linked (the Zig's
+    // `compile_to_code_glue` stub).
+    if !state.compiler_linked {
+        return Err(compiler_not_linked_error(ctx, state));
+    }
     let mpy = match compile_source_to_mpy(src, kind, source_name) {
         Ok(m) => m,
         Err(ce) => {
@@ -152,15 +177,21 @@ pub fn compile_to_code(
             return Err(raise_from_code(ctx, state, &ce, file));
         }
     };
-    // Load (validates the .mpy, incl. the header check) and drop
-    // the result — the code object it would wrap does not exist.
-    if let Err(e) = crate::runtime::vm::Vm::register_mpy_code_ctx(
+    // Load (validates the .mpy, incl. the header check) with no
+    // module dict — the Zig binds NULL here — then wrap the
+    // module function as a code object.
+    let (module_val, code_idx) = match crate::runtime::vm::Vm::register_mpy_code_ctx(
         ctx, state, &mpy, source_name, None,
     ) {
-        return Err(vm_error_to_value(ctx, state, e));
-    }
-    let e = crate::runtime::raise::raise_not_implemented(ctx, None);
-    Err(exc_from_pyerror(ctx, state, e))
+        Ok(v) => v,
+        Err(e) => return Err(vm_error_to_value(ctx, state, e)),
+    };
+    let fun = crate::runtime::vm::Vm::call_module_fun_ctx(ctx, state, code_idx, module_val);
+    Ok(crate::objects::callables::objcode::new_code(
+        ctx,
+        state.vm_types.code,
+        fun,
+    ))
 }
 
 /// Map a `VmError` to its exception object (for the bridge fns
@@ -172,7 +203,7 @@ pub fn compile_to_code(
 /// * `OutOfMemory` → `MemoryError("out of memory")` (the existing
 ///   convention — `exc_from_pyerror`'s `OutOfMemory` arm).
 /// * `Raised(v)` → the object itself.
-fn vm_error_to_value(
+pub(crate) fn vm_error_to_value(
     ctx: &mut CallCtx,
     state: &VmState,
     e: crate::runtime::vm::VmError,

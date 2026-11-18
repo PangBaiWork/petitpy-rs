@@ -15,6 +15,27 @@ use crate::vendor::re15::{ByteProg, Sub};
 
 // ── Payload structs (lane-owned; simple initial forms) ─────────────
 
+/// Header of every heap object: its type (a `GcRef` to an `Obj::Type`
+/// slot) plus GC flags. `type_` is `None` only while bootstrapping the
+/// very first type objects (in MicroPython `mp_type_type`'s type is
+/// itself — the same circularity, resolved at startup). Moved here
+/// from `value.rs` by E1 (file-size cap); re-exported there so
+/// `crate::objects::value::ObjHeader` keeps working.
+#[derive(Clone, Copy, Debug)]
+pub struct ObjHeader {
+    pub type_: Option<GcRef>,
+    pub flags: u8,
+}
+
+impl ObjHeader {
+    pub const FLAG_MARK: u8 = 0x01;
+    pub const FLAG_FINALISER: u8 = 0x02;
+
+    pub fn new(type_: Option<GcRef>) -> ObjHeader {
+        ObjHeader { type_, flags: 0 }
+    }
+}
+
 /// Dynamic string bytes (UTF-8 under `STR_UNICODE=1`). C8 owns.
 #[derive(Clone, Debug)]
 pub struct StrData {
@@ -158,6 +179,17 @@ pub struct MatchData {
     pub caps: Vec<Sub>,
     pub num_matches: usize,
     pub subject: Value,
+}
+
+/// Compiled code object (E1 owns; `builtinevex.zig`'s
+/// `MpObjCodeMinimum` = `{base, module_fun}`, 16 bytes).
+/// The payload is the compiled module function (`FunBc`) —
+/// the code object is a thin wrapper around it, exactly as
+/// the Zig's `newCodeMinimum(module_fun)`. The module
+/// function is a child (GC arm in `value.rs`).
+#[derive(Clone, Debug)]
+pub struct CodeData {
+    pub module_fun: GcRef,
 }
 
 /// Range object. C9 owns.

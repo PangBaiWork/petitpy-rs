@@ -317,6 +317,19 @@ mod tests {
         assert_eq!(QSTR_HASHES[123], qstr_compute_hash(b"print"));
         assert_eq!(QSTR_HASHES[165], qstr_compute_hash(b"zip"));
         assert_eq!(QSTR_HASHES[123], rt.qstr_hash(123));
+        // tests.zig pins (vendor py/qstr.c): the os-module qstrs
+        // and the modos ROM string constants. If any drifts,
+        // `os.sep == '/'` / `os.name == "posix"` silently fail.
+        assert_eq!(28537, qstr_compute_hash(b"os"));
+        assert_eq!(44715, qstr_compute_hash(b"urandom"));
+        assert_eq!(8606, qstr_compute_hash(b"st_mode"));
+        assert_eq!(24245, qstr_compute_hash(b"st_ino"));
+        assert_eq!(46474, qstr_compute_hash(b"/"));
+        assert_eq!(46511, qstr_compute_hash(b"\n"));
+        assert_eq!(46475, qstr_compute_hash(b"."));
+        assert_eq!(26309, qstr_compute_hash(b".."));
+        assert_eq!(56408, qstr_compute_hash(b"posix"));
+        assert_eq!(5381, qstr_compute_hash(b""));
     }
 
     // ── Dynamic interning ─────────────────────────────────────────────

@@ -1,0 +1,261 @@
+Lane E1 result — entry + CLI (`petitpy` / `petitpy-vm`)
+=========================================================
+
+Base: master aba64a2 (no rebase needed). One commit: "Lane E1: entry + CLI".
+Brief: scripts/e1_brief.md (NOT committed, stays untracked).
+
+Acceptance
+----------
+- lib: 1479 passed, 0 failed, 7 ignored (1476 + 3 new lib tests)
+- bins: 9 passed (zigpy-compile), 0 in main, 0 in petitpy-vm
+- integration tests/entry_cli.rs: 45 passed, 0 failed
+- Total new tests: 48 (3 lib + 45 integration) — brief asked >= 30
+- 0 warnings; no unsafe in the diff (doc comments excluded)
+- scripts/check_compile_mpy.py: PASS (0 byte mismatches, 552/552)
+- scripts/check_frozen.py: PASS (23/23, 38,141 bytes)
+- Every touched file < 800 lines: value.rs 451, value_data.rs 539,
+  vm.rs 545, vm_types.rs 586, vm_call.rs 690 (unchanged, at cap),
+  map.rs 860 (pre-existing debt, unchanged). entry/* <= 242.
+- Original repo clean (git status empty).
+- Binaries from clean `cargo build --release`:
+  target/release/petitpy-rs 1,824,112 bytes (was 288,488 skeleton)
+  target/release/petitpy-vm  1,811,136 bytes (new)
+
+§1 — Mapping (what was built, and the design decisions)
+--------------------------------------------------------
+(a) `petitpy` CLI — src/main.rs + NEW src/entry/:
+  - `main.zig` (423) -> main.rs dispatch (version/help/emit-mpy/
+    REPL/-c/script, in the Zig's order) + entry/mod.rs (VERSION
+    "0.9.0", io_error_name), entry/base64.rs (std base64, `=` pad),
+    entry/systemexit.rs, entry/embed_exec.rs, entry/embed_run_mpy.rs.
+  - Printed strings match the original byte-for-byte (`petitpy
+    0.9.0`, usage saying `petitpy`) although the binary is petitpy-rs.
+(b) `petitpy-vm` — NEW src/bin/petitpy-vm.rs (`main_vm.zig`, 233;
+    note: it lives at src/main_vm.zig, NOT src/runtime/ as the
+    brief's §(b) header suggested — no functional impact).
+  - `VmState.compiler_linked: bool`, default true; the vm binary
+    sets it false. Checked in `call_eval_exec_ctx` /
+    `call_compile_ctx` (builtinevex.rs), `Vm::eval_exec` +
+    `eval_exec_ctx` (vm_eval.rs), and `exec_source_in_module`
+    (import_search.rs) — the `.py` import compile path. `.mpy`
+    imports are NOT gated. The raise is
+    NotImplementedError("compiler not linked in petitpy-vm").
+  - Missing .mpy -> stderr `error: <Name>`, exit 1; extra args
+    after the .mpy path ignored.
+(c) `__main__` + sys wiring — the run seam is
+    `Vm::run_main_source(src, source_name, file: Option<&str>)`
+    (vm_eval.rs): compile FileInput with the caller's source name
+    (NOT "__main__"), `register_main_module` (split out of
+    `load_module_from_mpy`, which stays a thin wrapper) +
+    `wire_script_file_and_path` (`__main__.__file__` + sys.path[0]
+    = dirname(script), BEFORE the body runs) + `run_registered_module`.
+    `set_sys_argv` added next to `set_sys_path` (syncs the
+    sys_argv_list object in place). `compile_error_value_named`
+    (pub(crate)) lets the traceback frame carry the caller's source
+    name instead of the hardcoded "<string>".
+    Env path (`wire_env_sys_path`, embed_exec.rs): PYTHONPATH
+    colon-split, empty entries skipped -> PETITPY_LIB, else
+    `$HOME/.petitpy/lib` -> `<exe dir>/../share/petitpy/lib` iff
+    that directory exists. Runs for script, -c and REPL alike.
+(d) REPL — `run_repl` (embed_exec.rs): banner to stderr, `>>> `
+    prompt to stderr BEFORE each read (incl. the final EOF read),
+    EOF -> "\n" to stderr, exit 0. Each line SINGLE_INPUT, source
+    name "<stdin>", SAME persistent globals. Raises print the
+    traceback to stderr, loop continues. NO continuation
+    (`mp_repl_continue_with_input` is a stub returning false).
+    Line buffer 4096 / accumulator 16384 are the C16 readline
+    call parameters.
+(e) `__repl_print__` — `repl_print_builtin` (vm_builtins.rs):
+    non-None arg -> print repr(arg) + "\n" to stdout, return None.
+    Bound in `bind_d1_builtins` (NOT `build_builtins`, whose mk_var
+    is defined after the print bind). See §3.1 for the REPL_PRINT
+    compiler fix.
+(f) Obj::Code + `compile()` backend — NEW
+    src/objects/callables/objcode.rs (`code_type_data`,
+    `new_code`, `is_code` via the arena header type):
+    payload `CodeData { module_fun: GcRef }` (value_data.rs);
+    `Obj::Code` variant; `children()` -> [module_fun];
+    `heap_bytes()` -> 16. The `code` type is built in
+    `build_vm_types` like `reversed` (empty dict + code_type_data),
+    in the header-type fix loop and the MRO patch loop; `VmTypes`
+    gained a `code: GcRef` field. `compile_to_code`
+    (compile_bridge.rs) keeps the FunBc from the
+    `register_mpy_code_ctx(..., None)` path and wraps it via
+    `new_code`. `code_execute` (builtinevex.rs): patches the FunBc
+    context module dict to the caller's globals iff exact fun_bc,
+    save/restore globals + locals (`locals == globals` -> None,
+    the Zig's `dict_locals = null` branch), calls with 0 args.
+    `eval`/`exec` check the code fast path BEFORE the buffer read.
+(g) D3 registration — NEW `build_d3_modules` (vm_modules.rs):
+    math + socket -> `builtin_modules`, struct ->
+    `extensible_modules`; `vm.types.socket = Some(socket_type)`
+    after drop(ctx); called in `Vm::new` after `build_d2_modules`.
+    D3's module files untouched.
+(h) Mapping-only:
+  - `mp_type_roms.zig` — ROM singletons already built by
+    `build_vm_types`; no missing type on the entry path.
+  - `vendor_stubs.zig` — 3 live items, all dead-or-covered under
+    full (nano-only help shadow; mp_hal_stdout_tx_strn_cooked =
+    C8c/C16; mp_repl_continue_with_input -> false). Nothing ported.
+  - `lib.zig` — trivial re-export root; Phase F owns it.
+  - `tests.zig` — all 16 blocks have Rust equivalents (see §3.7
+    for the 4 gaps found and pinned). Compiler test CLIs
+    (lexer_test/qstr_test/compile_test, 863 lines) are differential
+    harnesses spawning vendor tools (token_dump / mpy-cross); their
+    capabilities are already covered by the Rust check scripts
+    (check_lexer_corpus.py, check_qstrrt_table.py,
+    check_compile_mpy.py 552/552) + unit tests — NO CLI ported,
+    no gap found.
+  - Cap compliance splits (same commit): `VmTypes` moved from
+    vm.rs to vm_types.rs (re-exported from vm.rs; vm.rs 578 ->
+    545); `ObjHeader` moved from value.rs to value_data.rs
+    (re-exported from value.rs; value.rs 469 -> 451).
+
+§2 — Probes (reference vs Rust binary, all matching)
+---------------------------------------------------
+Commands run against ~/workspace/petitpy-orig/zig-out/bin/petitpy
+(and petitpy-vm) vs target/release/petitpy-rs (and petitpy-vm).
+- `--version` / `-V` -> `petitpy 0.9.0\n` rc 0; `--version extra`
+  -> same (argv[1] only). `--help` / `-h` -> usage on stderr rc 0,
+  byte-identical incl. trailing blank line and em-dash.
+- `--emit-mpy em.py` (print(1+1)) -> base64 byte-identical to the
+  reference (pinned in test emit_mpy_byte_pinned); missing file ->
+  `petitpy: cannot read input` rc 1; bad syntax -> SyntaxError
+  traceback rc 2; no arg -> `usage: petitpy --emit-mpy IN.py` rc 2.
+- `-c 'print(1+1)'` -> `2` rc 0; `-c ... a b` ->
+  `['-c', 'a', 'b']`; bare `-c` ->
+  `petitpy: argument expected for the -c option` rc 2.
+- `sub/s.py a b` -> `__file__` `sub/s.py`, sys.path[0] `sub`,
+  argv `['sub/s.py', 'a', 'b']`.
+- SystemExit codes (all 8 match): bare/0/None -> 0; 3 -> 3;
+  -1 -> 255; 2**70 -> 1; True -> 1; "x" -> 1. No traceback ever.
+- `raise ValueError("boom")` -> rc 1, stdout empty, stderr exactly
+  `Traceback (most recent call last):\n  File "<stdin>", in
+  <module>\nValueError: boom\n` (petitpy flushes stdout first).
+- Compile error `1+` -> rc 1, stderr `...File "<stdin>"\nSyntaxError:
+  invalid syntax\n` (NO `, in <module>` — SyntaxError frame has
+  block null).
+- REPL pipe `x = 5 / x / 1+1 / def f(): / print("hi") / raise
+  ValueError("boom") / 2+2` -> stdout `5\n2\nhi\n4\n`, stderr
+  byte-identical incl. banner, 8 prompts, both tracebacks, final
+  `\n`. Empty input -> banner + `>>> \n`, rc 0.
+- `PYTHONPATH=/foo:/bar` -> `['', '/foo', '/bar',
+  '/home/hatch/.petitpy/lib']`; `PETITPY_LIB=/baz` -> `['', '/baz']`.
+- petitpy-vm: `--version`/`-V` -> `petitpy-vm 0.9.0` rc 0; no args /
+  `--help` -> vm usage on stderr rc 0 (byte-identical); missing
+  .mpy -> stderr first line `error: FileNotFound`, rc 1 (see §3.4);
+  run .mpy -> prints, sys.argv `[]`, sys.path `['']`; uncaught
+  ValueError -> traceback on STDOUT (not stderr), rc 1, with the
+  .mpy's recorded source name `File "<emit-mpy>"`; SystemExit(3)
+  -> rc 3, no output; `eval("1+1")` in .mpy ->
+  `NotImplementedError: compiler not linked in petitpy-vm`
+  traceback on stdout, rc 1; `import math` / `import os` in .mpy
+  work; corrupt .mpy -> stdout `ValueError: incompatible .mpy
+  file\n`, rc 1; extra args after the .mpy path ignored.
+- Code objects (CLI): `compile("1+1","f","eval")` -> type name
+  `code`, repr `<code>`, `eval(c)` == 2, `exec(compile("x = 41",
+  "f", "exec"))` -> None and x == 41; `hash(c)` is an int.
+- D3 (CLI): `import math/socket/struct` resolve;
+  `math.sqrt(4)` == 2.0, `struct.calcsize('i')` == 4,
+  `import ustruct` resolves, `import umath` / `import usocket` ->
+  ModuleNotFoundError.
+
+§3 — Bugs / corrections / findings
+-----------------------------------
+3.1 REPL_PRINT bug CONFIRMED and FIXED (brief §(e) was right).
+    The Rust handler used `comp.wk(wk_idx::REPL_PRINT)`, interning
+    the literal WK_NAMES[16] string `"<repl_print>"` — a name that
+    can never resolve, so a REPL `1+1` would have raised NameError.
+    Fixed: the REPL branch in handlers_expr_stmt.rs now resolves
+    `__repl_print__` on demand via `comp.qstr_from_strn`, exactly
+    like `compReplPrintQstr` (compile.zig:2716-2718). The
+    `"<repl_print>"` WK entry itself stays (mirrors the Zig table).
+    Regression test `repl_single_input_resolves_repl_print`
+    (runtime_glue_tests_b.rs); verified through the built CLI
+    (`1+1` prints `2` in the REPL).
+3.2 repr(c) decision: the Rust code type is the vendor BASIC shape
+    — name `"code"` (a static qstr, generated table line 384),
+    flags 0, NO print slot — so `repr(c)` is `<code>` (via
+    `obj_print_helper`'s no-slot fallback) and `type(c)` is
+    `<class 'code'>`. The reference prints `<>` only because its
+    stub type has name qstr 0. An earlier prediction of `<>` was
+    falsified by the failing test (`repr(c)` came back `"<code>"`).
+    Documented divergence, same root cause as the `type()` abort
+    (§3.3). The brief pins only `type(c)` as the code type; repr
+    was NOT pinned there.
+3.3 `type(compile(...))` divergence (NOT a bug): on the reference
+    it ABORTS rc=134 (`mp_mirrors.zig:745 fromPtr` null cast —
+    `full_stubs.zig` gives `mp_type_code` as 256 zero bytes). Rust
+    implements the vendor shape properly (name `"code"`).
+3.4 petitpy-vm missing file: Rust reproduces only the first line
+    `error: FileNotFound`; the reference then prints a Zig stack
+    trace (std/Io paths + main_vm.zig:220). The trace is
+    Zig-runtime noise, not reproduced by design (pinned in
+    vm_missing_file).
+3.5 `io_error_name` maps errno 2/13/21/20/36/40/22 to
+    FileNotFound/PermissionDenied/IsDir/NotDir/NameTooLong/
+    SymLinkLoop/InvalidArgument; anything else falls back to
+    `e.to_string()` — the fallback is UNPROBED (see §4).
+3.6 Test-helper bug (no production code involved): the e2e file's
+    `b64_decode` mishandled `=` padding (short final chunk shift
+    math), so 4 vm tests failed on first run (vm_run_mpy,
+    vm_import_math, vm_traceback_stdout, vm_extra_args_ignored);
+    the .mpy files whose base64 has no padding passed, which is
+    how the bug was isolated. Fixed in the helper; all 45 pass.
+3.7 tests.zig mapping check found 4 genuine missing pins — all
+    added (all pass):
+    - prelude sig: `[0x26]` -> (5,1,0,2,0,0) and `[0x98,0x10]`
+      -> n_state 20 (bc_tests.rs).
+    - prelude size: `[0x0B]` -> (5,1) and `[0xC8,0x02]` ->
+      (100,0) (bc_tests.rs).
+    - varint: 0xFFFFFF -> `[0x87, 0xFF, 0xFF, 0x7F]` row
+      (bc_tests.rs; the Zig's exact decode input).
+    - djb2 literals (qstr.rs `djb2_matches_vendor_precomputed_
+      hashes`): os=28537, urandom=44715, st_mode=8606,
+      st_ino=24245, "/"=46474, "\n"=46511, "."=46475, ".."=26309,
+      "posix"=56408, ""=5381 (values cross-checked in Python
+      against the djb2 formula first; the pre-existing test only
+      cross-checked __init__/print/zip against the table).
+    - parse_num_base: `("ff", 16, 0, 16)` row
+      (parsenum_tests.rs).
+    Already covered (no action): smallint grid subsumes both Zig
+    tests; unicode_full_ascii_table subsumes both unichar tests;
+    the zero-remap guard (3-byte search -> 1); parse_num_base's
+    other 3 cases; comptime/runtime djb2 agreement is N/A in Rust
+    (single implementation).
+3.8 D3 registration kinds verified against the original + D4's
+    probe: math/socket are BUILTIN (`MP_REGISTER_MODULE`;
+    `import umath`/`import usocket` fail), struct is EXTENSIBLE
+    (`MP_REGISTER_EXTENSIBLE_MODULE`; `import ustruct` resolves).
+    Vendor `extmod/modsocket.c` says EXTENSIBLE, but petitpy's own
+    Zig port replaces it — the probe + `.zig` comment win.
+3.9 Cap compliance: E1 grew vm.rs 567 -> 578 and value.rs 459 ->
+    469, past the brief's caps — fixed with the in-commit splits
+    in §1(h) (final vm.rs 545, value.rs 451; vm_call.rs 690 and
+    map.rs 860 unchanged).
+3.10 `GcRef` lives in `crate::objects::value`, NOT
+    `crate::memory::gc` (compile error caught during step 1).
+    `bind_d1_builtins` vs `build_builtins`: `__repl_print__` must
+    be bound in the former (its `mk_var` is defined after the
+    print bind in the latter — first placement failed to compile).
+
+§4 — Not done
+-------------
+- `io_error_name` fallback (`e.to_string()`) unprobed: only the 7
+  mapped errno names were exercised (FileNotFound, IsDir seen in
+  tests; PermissionDenied/NotDir/NameTooLong/SymLinkLoop/
+  InvalidArgument mapped but not triggered).
+- REPL line-buffer caps (4096 line / 16384 accum) are wired as
+  the readline call parameters; edge behaviour at the cap was not
+  probed.
+- Compiler test CLIs (lexer_test/qstr_test/compile_test) NOT
+  ported as binaries — capabilities covered by the check scripts
+  (§1(h)); no gap found.
+- The `__main__` module is registered in `state.modules` only
+  when loaded via `load_module_from_mpy` as "__main__" (D4's
+  behaviour, unchanged by E1).
+- D5's 4 ignored tests unchanged (7 ignored total, same as D5).
+- No work on Phase E gates, optimization, or Phase F.
+- Binary size is recorded only (brief §1): petitpy-rs 288,488 ->
+  1,824,112 bytes (the skeleton linked no VM); petitpy-vm
+  1,811,136 bytes. No size work done.

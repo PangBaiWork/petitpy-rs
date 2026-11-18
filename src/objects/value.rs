@@ -179,25 +179,6 @@ impl Value {
     }
 }
 
-/// Header of every heap object: its type (a `GcRef` to an `Obj::Type`
-/// slot) plus GC flags. `type_` is `None` only while bootstrapping the
-/// very first type objects (in MicroPython `mp_type_type`'s type is
-/// itself — the same circularity, resolved at startup).
-#[derive(Clone, Copy, Debug)]
-pub struct ObjHeader {
-    pub type_: Option<GcRef>,
-    pub flags: u8,
-}
-
-impl ObjHeader {
-    pub const FLAG_MARK: u8 = 0x01;
-    pub const FLAG_FINALISER: u8 = 0x02;
-
-    pub fn new(type_: Option<GcRef>) -> ObjHeader {
-        ObjHeader { type_, flags: 0 }
-    }
-}
-
 /// A heap object. Variant set frozen (`docs/value-obj-design.md` D4);
 /// payload structs are lane-owned and may evolve.
 #[derive(Clone, Debug)]
@@ -275,6 +256,12 @@ pub enum Obj {
     /// Regex match object (D5 owns; `extmod/modre.c`). The
     /// subject is a child (GC arm in `children()` below).
     Match(MatchData),
+    /// Compiled code object (E1 owns; `builtinevex.zig`'s
+    /// `MpObjCodeMinimum`). The payload is the module
+    /// function the code wraps; it is a child (GC arm in
+    /// `children()` below). `compile()` returns one; `eval` /
+    /// `exec` accept it.
+    Code(CodeData),
 }
 
 impl Obj {
@@ -294,6 +281,8 @@ impl Obj {
             Obj::File(_) => 16,
             Obj::Re(r) => r.prog.bytelen,
             Obj::Match(m) => m.caps.len() * 16,
+            // A code object wraps one module function.
+            Obj::Code(_) => 16,
             Obj::Tuple(t) => t.len() * 8,
             Obj::List(l) => l.items.len() * 8,
             Obj::Dict(d) => d.map.alloc * 16 + d.map.index.len() * 4,
@@ -408,6 +397,8 @@ impl Obj {
             // A match object keeps its subject alive (the
             // subject's bytes back the capture spans).
             Obj::Match(m) => vec![m.subject],
+            // A code object keeps its module function alive.
+            Obj::Code(c) => vec![Value::Heap(c.module_fun)],
             // A FILE's only child is its `.buffer` sibling
             // (the stdio TextIOWrapper's FileIO; `None` for
             // files `open()` created — file_io.zig's
@@ -444,11 +435,12 @@ impl Obj {
 // `value.rs` was 886 lines, over the 800 cap); re-exported here
 // so every `crate::objects::value::TypeData` path keeps working.
 pub use crate::objects::value_data::{
-    ArrayData, AttrTupleData, BoundMethData, BytesData, CellData, ClosureData, DequeData,
-    DictData, ExceptionData, FileData, FileHandle, FunBcData, FunBuiltinData, GenState,
-    GeneratorData, InstanceData, IteratorData, ListData, MapData, MapEntry, MatchData,
-    ModuleData, ModuleDelegation, PropertyData, RangeData, ReData, SetData, SliceData,
-    StaticClassMethodData, StrData, StringIoData, SuperData, TraceFrame, TypeData,
+    ArrayData, AttrTupleData, BoundMethData, BytesData, CellData, ClosureData, CodeData,
+    DequeData, DictData, ExceptionData, FileData, FileHandle, FunBcData, FunBuiltinData,
+    GenState, GeneratorData, InstanceData, IteratorData, ListData, MapData, MapEntry,
+    MatchData, ModuleData, ModuleDelegation, ObjHeader, PropertyData, RangeData, ReData,
+    SetData, SliceData, StaticClassMethodData, StrData, StringIoData, SuperData,
+    TraceFrame, TypeData,
 };
 
 

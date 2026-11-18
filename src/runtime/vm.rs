@@ -70,40 +70,9 @@ use crate::runtime::code_store::CodeStore;
 use crate::runtime::qstr::RuntimeQstr;
 use crate::runtime::vm_types::build_vm_types;
 
-/// The type objects the VM owns beyond `BuiltinTypes` (built once
-/// by `build_vm_types`, rooted in `roots.extra` for the VM's
-/// lifetime).
-#[derive(Clone, Copy)]
-pub struct VmTypes {
-    pub fun_bc: GcRef,
-    pub gen_wrap: GcRef,
-    pub gen_instance: GcRef,
-    pub closure: GcRef,
-    pub bound_meth: GcRef,
-    pub module: GcRef,
-    pub object: GcRef,
-    pub ellipsis: GcRef,
-    pub slice: GcRef,
-    pub fun_builtin_var: GcRef,
-    pub array: GcRef,
-    pub bytearray: GcRef,
-    pub memoryview: GcRef,
-    /// The cell type (`MAKE_CLOSURE` allocates cells with it).
-    pub cell: GcRef,
-    /// The property type (bound as `property` in builtins).
-    pub property: GcRef,
-    /// The `map` type (bound as `map` in builtins, C13b).
-    pub map: GcRef,
-    /// The `filter` type (bound as `filter` in builtins, C13b).
-    pub filter: GcRef,
-    /// The `zip` type (bound as `zip` in builtins, C13b).
-    pub zip: GcRef,
-    /// The `enumerate` type (bound as `enumerate` in builtins,
-    /// C13b).
-    pub enumerate: GcRef,
-    /// The `reversed` type (bound as `reversed` in builtins, D5).
-    pub reversed: GcRef,
-}
+// `VmTypes` lives in `vm_types.rs` (moved by E1, file-size cap);
+// re-exported here so `crate::runtime::vm::VmTypes` keeps working.
+pub use crate::runtime::vm_types::VmTypes;
 
 /// The VM's mutable state (the `Ctx` + `mp_state_ctx` pieces
 /// `execute_frame` needs). `Vm` splits into a `CallCtx` (arena /
@@ -154,8 +123,7 @@ pub struct VmState {
     /// The `exec` builtin (same interception as `eval`).
     pub exec_builtin: Value,
     /// The `compile` builtin (same interception as `eval`;
-    /// raises `NotImplementedError` — there is no `Obj::Code`
-    /// yet, see `builtinevex.rs`).
+    /// returns a code object — `Obj::Code`, E1).
     pub compile_builtin: Value,
     /// The `__import__` builtin (intercepted by GcRef identity
     /// in `call_function_ctx`, like `eval` — its `func` is a
@@ -198,6 +166,14 @@ pub struct VmState {
     /// drained by `pending_exc_check` (the dispatch loop's
     /// per-iteration poll, `vm.zig:110-114` Tier G).
     pub pending_sched: Option<Value>,
+    /// Whether the compiler is linked into this VM
+    /// (`main_vm.zig`: the `petitpy-vm` binary sets the
+    /// compiler-bridge stubs, so `eval` / `exec` / `compile`
+    /// and the import system's `.py` compile path raise
+    /// `NotImplementedError("compiler not linked in
+    /// petitpy-vm")`; the `petitpy` binary leaves it true).
+    /// Added by E1.
+    pub compiler_linked: bool,
     /// `sys.path` (`MP_STATE_VM(sys_mutable[0])`,
     /// `runtime.zig:276-279`): the import search path. Default
     /// `[""]` — `mp_init` creates an empty list and appends the
@@ -438,6 +414,7 @@ impl Vm {
                 sum_builtin: Value::None,
                 not_implemented: Value::None,
                 pending_sched: None,
+                compiler_linked: true,
                 sys_path: vec![String::new()],
                 sys_path_list: None,
                 sys_modules_dict: None,
@@ -469,6 +446,7 @@ impl Vm {
         };
         vm.build_builtins();
         crate::runtime::vm_modules::build_d2_modules(&mut vm);
+        crate::runtime::vm_modules::build_d3_modules(&mut vm);
         crate::runtime::vm_modules::build_d4_modules(&mut vm);
         crate::runtime::vm_modules::build_d5_modules(&mut vm);
         vm

@@ -256,12 +256,92 @@ fn compile_bad_mode_and_filename() {
 }
 
 #[test]
-fn compile_valid_args_is_not_implemented() {
-    // Validated args, but there is no `Obj::Code` yet — the
-    // precise gap (see `compile_glue`).
-    let (name, args) = Vx::new().raised("compile(\"1+2\", \"f\", \"eval\")");
-    assert_eq!(name, "NotImplementedError");
-    assert!(args.is_empty(), "bare NotImplementedError: {args:?}");
+fn compile_valid_args_returns_code() {
+    // E1: validated args return a code object (the C15a
+    // `NotImplementedError` gap is closed) — `eval` of it is 3.
+    let mut vx = Vx::new();
+    vx.run_ok("v = eval(compile(\"1+2\", \"f\", \"eval\"))");
+    assert_eq!(vx.gi("v"), 3);
+}
+
+#[test]
+fn code_execute_with_explicit_dicts() {
+    // `codeExecute` (`builtinevex.zig:55-84`, E1): `exec(c)`
+    // runs under the caller's globals; explicit globals /
+    // locals dicts replace them (locals distinct from globals
+    // — `y` lands in the passed dict, not the module globals);
+    // a `def` inside the executed code captures the caller's
+    // globals (`func.__globals__` — the context patch);
+    // `hash(c)` is an int.
+    let mut vx = Vx::new();
+    vx.run_ok(
+        "c = compile(\"y = x + 1\", \"file\", \"exec\")\n\
+         x = 41\n\
+         exec(c)\n\
+         exec(c, {\"x\": 2})\n\
+         exec(c, {}, {\"x\": 3})\n\
+         exec(compile(\"def func(): pass\", \"file\", \"exec\"))\n\
+         gx = func.__globals__['x']\n\
+         h = type(hash(c)).__name__\n\
+         v = eval(compile(\"x + 1\", \"file\", \"eval\"))\n",
+    );
+    // The module-global `y` is from the first `exec(c)` only
+    // (the later execs store into their own dicts).
+    assert_eq!(vx.gi("y"), 42);
+    assert_eq!(vx.gi("gx"), 41);
+    let h = vx.g("h").unwrap();
+    assert_eq!(vx.val_str(h), "int");
+    assert_eq!(vx.gi("v"), 42);
+}
+
+#[test]
+fn repl_single_input_resolves_repl_print() {
+    // E1 regression: the REPL branch of `expr_stmt` must
+    // resolve `__repl_print__` on demand (`compReplPrintQstr`,
+    // `compile.zig:2716-2718`) — the old code interned the
+    // literal WK name `"<repl_print>"`, which can never
+    // resolve, so a REPL `1+1` raised `NameError`. A
+    // `SingleInput` `1+1` through `Vm::eval_exec` returns
+    // `Ok(None)` only when the echo call resolves (the
+    // printed `2` on stdout is pinned by the CLI REPL e2e
+    // test). The builtin itself returns `None`, and prints
+    // nothing for a `None` argument.
+    let mut vm = Vm::new();
+    let (mut ctx, _state) = vm.split();
+    let globals = empty_dict(&mut ctx.arena, &mut ctx.roots);
+    ctx.roots.extra.push(Value::Heap(globals));
+    drop(ctx);
+    let r = vm
+        .eval_exec(b"1+1", InputKind::SingleInput, globals, globals)
+        .expect("REPL 1+1 resolves __repl_print__");
+    assert_eq!(r, Value::None);
+    let mut vx = Vx::new();
+    vx.run_ok("r = __repl_print__(None)\n");
+    assert_eq!(vx.g("r"), Some(Value::None));
+}
+
+#[test]
+fn d3_modules_registered() {
+    // E1 (g): D3's `math` / `socket` / `struct` builders are
+    // registered — `import math` / `import socket` /
+    // `import struct` resolve; `import ustruct` resolves
+    // through the u-strip (struct is extensible), while
+    // `import umath` / `import usocket` do not (math/socket
+    // are builtin). The socket type is stored in
+    // `vm.types.socket`.
+    let mut vx = Vx::new();
+    vx.run_ok(
+        "import math\nimport socket\nimport struct\nimport ustruct\n\
+         assert math.sqrt(4) == 2.0\nassert struct.calcsize('i') == 4\n",
+    );
+    assert!(
+        vx.vm.types.socket.is_some(),
+        "socket type stored in vm.types.socket"
+    );
+    let (name, _) = vx.raised("import umath");
+    assert_eq!(name, "ModuleNotFoundError");
+    let (name, _) = vx.raised("import usocket");
+    assert_eq!(name, "ModuleNotFoundError");
 }
 
 #[test]
@@ -368,9 +448,10 @@ fn eval_buffer_source_via_ctx_path() {
 
 #[test]
 fn compile_ctx_path_validates() {
-    // `call_compile_ctx` directly: valid args reach the
-    // `Obj::Code` gap (`NotImplementedError`), a bad mode the
-    // `ValueError`, too few args the terse `TypeError`.
+    // `call_compile_ctx` directly: valid args return a code
+    // object (E1 — the C15a `NotImplementedError` gap is
+    // closed), a bad mode the `ValueError`, too few args the
+    // terse `TypeError`.
     let mut vm = Vm::new();
     // Intern the names BEFORE the split (`CallCtx.pool` is a
     // shared ref and cannot intern).
@@ -389,16 +470,17 @@ fn compile_ctx_path_validates() {
     let mode = Value::Qstr(eval_id);
     let r = call_compile_ctx(&mut ctx, state, 3, 0, &[src, fname, mode]);
     match r {
-        Err(exc) => {
-            let t = obj_get_type(&ctx.arena, &ctx.types, exc).expect("exc type");
+        Ok(v) => {
+            // A code object: its type's name is `"code"`.
+            let t = obj_get_type(&ctx.arena, &ctx.types, v).expect("code has a type");
             match ctx.arena.get(t) {
                 Obj::Type(d) => {
                     let name = String::from_utf8_lossy(ctx.pool.qstr_str(d.name as u16));
-                    assert_eq!(name, "NotImplementedError");
+                    assert_eq!(name, "code");
                 }
                 _ => panic!("not a type"),
             }
         }
-        Ok(v) => panic!("expected NotImplementedError, got {v:?}"),
+        Err(exc) => panic!("expected a code object, got a raise: {exc:?}"),
     }
 }

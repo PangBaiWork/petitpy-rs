@@ -69,6 +69,7 @@ fn parse_num_base_explicit_base() {
         (b"0b11", 2, 2, 2),
         (b"0b11", 10, 0, 10),
         (b"0x10", 2, 0, 2),
+        (b"ff", 16, 0, 16), // tests.zig: no prefix at all -> 0 consumed
         (b"010", 8, 0, 8),
         (b"010", 16, 0, 16),
     ];

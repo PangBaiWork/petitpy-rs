@@ -64,6 +64,9 @@ pub fn io_error_name(e: &std::io::Error) -> String {
         Some(26) => "FileBusy",              // ETXTBSY
         Some(27) => "FileTooBig",            // EFBIG
         Some(28) => "NoSpaceLeft",           // ENOSPC
+        Some(30) => "ReadOnlyFileSystem",  // EROFS (in the Zig
+        // switch; unreachable via the CLI's read-only opens, but
+        // the table is the union of the switches, so it belongs)
         Some(36) => "NameTooLong",           // ENAMETOOLONG, PROBED
         Some(40) => "SymLinkLoop",           // ELOOP, PROBED
         Some(75) => "FileTooBig",            // EOVERFLOW
@@ -102,6 +105,7 @@ mod io_error_name_tests {
             (26, "FileBusy"),
             (27, "FileTooBig"),
             (28, "NoSpaceLeft"),
+            (30, "ReadOnlyFileSystem"),
             (36, "NameTooLong"),
             (40, "SymLinkLoop"),
             (75, "FileTooBig"),
@@ -113,7 +117,7 @@ mod io_error_name_tests {
         }
         // The fallback is the Zig name, not the OS message:
         // any errno outside both switches is `Unexpected`.
-        for errno in [3, 4, 9, 30, 110] {
+        for errno in [3, 4, 9, 110] {
             let e = std::io::Error::from_raw_os_error(errno);
             assert_eq!(io_error_name(&e), "Unexpected", "errno {errno}");
         }

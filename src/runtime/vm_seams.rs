@@ -107,6 +107,27 @@ impl crate::objects::slots::VmHook for StateHook<'_> {
             }
         }
     }
+
+    fn binary_op(
+        &mut self,
+        ctx: &mut CallCtx,
+        op: BinaryOp,
+        lhs: Value,
+        rhs: Value,
+    ) -> PyResult<Value> {
+        match crate::runtime::vm_rt::binary_op_ctx(ctx, self.state, op, lhs, rhs) {
+            Ok(v) => Ok(v),
+            Err(exc) => {
+                // First failure wins (the sort's run-to-completion
+                // rule): a later comparison failure must not
+                // overwrite the exception the caller will drain.
+                if self.state.pending_exc.is_none() {
+                    self.state.pending_exc = Some(exc);
+                }
+                Err(PyError::PyRaise)
+            }
+        }
+    }
 }
 
 /// Build the VM's hook from `state` (borrows `state` for `'s`).

@@ -356,18 +356,18 @@ fn list_sort_plain() {
     let empty = lst(&mut fx, vec![]);
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-    list_sort(ctx, l, None, false).unwrap();
+    list_sort(ctx, l, None, false, None).unwrap();
     assert_eq!(items_of(ctx, l), ints(&[1, 2, 3]));
-    list_sort(ctx, l, None, true).unwrap();
+    list_sort(ctx, l, None, true, None).unwrap();
     assert_eq!(items_of(ctx, l), ints(&[3, 2, 1]));
-    list_sort(ctx, dups, None, false).unwrap();
+    list_sort(ctx, dups, None, false, None).unwrap();
     assert_eq!(items_of(ctx, dups), ints(&[1, 1, 2, 3, 3]));
-    list_sort(ctx, big_l, None, false).unwrap();
+    list_sort(ctx, big_l, None, false, None).unwrap();
     let expect: Vec<Value> = (1..=20).map(Value::SmallInt).collect();
     assert_eq!(items_of(ctx, big_l), expect);
     // len <= 1 is a no-op.
-    list_sort(ctx, one, None, false).unwrap();
-    list_sort(ctx, empty, None, true).unwrap();
+    list_sort(ctx, one, None, false, None).unwrap();
+    list_sort(ctx, empty, None, true, None).unwrap();
     assert_eq!(items_of(ctx, one), ints(&[1]));
     assert_eq!(items_of(ctx, empty), &[] as &[Value]);
 }
@@ -383,14 +383,14 @@ fn list_sort_reverse_kw() {
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
     // `reverse=1` → reversed; `reverse=0` → plain.
-    list_sort_builtin(ctx, &[l1], &[KwArg { name: rev_q, value: Value::SmallInt(1) }])
+    list_sort_builtin(ctx, &[l1], &[KwArg { name: rev_q, value: Value::SmallInt(1) }], None)
         .unwrap();
     assert_eq!(items_of(ctx, l1), ints(&[2, 1]));
-    list_sort_builtin(ctx, &[l2], &[KwArg { name: rev_q, value: Value::SmallInt(0) }])
+    list_sort_builtin(ctx, &[l2], &[KwArg { name: rev_q, value: Value::SmallInt(0) }], None)
         .unwrap();
     assert_eq!(items_of(ctx, l2), ints(&[1, 2]));
     // `reverse="yes"` → truthy → reversed (probed).
-    list_sort_builtin(ctx, &[l3], &[KwArg { name: rev_q, value: yes }]).unwrap();
+    list_sort_builtin(ctx, &[l3], &[KwArg { name: rev_q, value: yes }], None).unwrap();
     assert_eq!(items_of(ctx, l3), ints(&[2, 1]));
 }
 
@@ -406,10 +406,10 @@ fn list_sort_mixed_partial() {
     let ctx = &mut ctx;
     // The FIRST failed comparison wins; the sort runs to
     // completion and the list is left partially sorted.
-    let err = list_sort(ctx, l1, None, false).unwrap_err();
+    let err = list_sort(ctx, l1, None, false, None).unwrap_err();
     assert_eq!(
         err,
-        ListError::CompareUnsupported { lhs: b"str", rhs: b"int" }
+        ListError::CompareUnsupported { lhs: "str".to_string(), rhs: "int".to_string() }
     );
     assert_eq!(
         err.message_string().as_deref(),
@@ -420,24 +420,24 @@ fn list_sort_mixed_partial() {
         vec![Value::SmallInt(1), Value::SmallInt(2), a, Value::SmallInt(3)]
     );
     assert_eq!(
-        list_sort(ctx, l2, None, false),
-        Err(ListError::CompareUnsupported { lhs: b"int", rhs: b"str" })
+        list_sort(ctx, l2, None, false, None),
+        Err(ListError::CompareUnsupported { lhs: "int".to_string(), rhs: "str".to_string() })
     );
     assert_eq!(
         items_of(ctx, l2),
         vec![Value::SmallInt(1), a, Value::SmallInt(2), Value::SmallInt(3)]
     );
     assert_eq!(
-        list_sort(ctx, l3, None, false),
-        Err(ListError::CompareUnsupported { lhs: b"int", rhs: b"str" })
+        list_sort(ctx, l3, None, false, None),
+        Err(ListError::CompareUnsupported { lhs: "int".to_string(), rhs: "str".to_string() })
     );
     assert_eq!(
         items_of(ctx, l3),
         vec![a, Value::SmallInt(1), Value::SmallInt(2)]
     );
     assert_eq!(
-        list_sort(ctx, l4, None, false),
-        Err(ListError::CompareUnsupported { lhs: b"int", rhs: b"str" })
+        list_sort(ctx, l4, None, false, None),
+        Err(ListError::CompareUnsupported { lhs: "int".to_string(), rhs: "str".to_string() })
     );
     assert_eq!(
         items_of(ctx, l4),
@@ -458,12 +458,12 @@ fn list_sort_key_deferred_and_bad_args() {
     // key call fails, so a clean error is the intended
     // divergence — see the `list_sort` docs).
     assert_eq!(
-        list_sort(ctx, l, Some(l), false),
+        list_sort(ctx, l, Some(l), false, None),
         Err(ListError::PyRaise)
     );
     // `sort(foo=1)` / `sort(1, 2, 3)` → arg mismatch.
     assert_eq!(
-        list_sort_builtin(ctx, &[l], &[KwArg { name: foo_q, value: Value::SmallInt(1) }])
+        list_sort_builtin(ctx, &[l], &[KwArg { name: foo_q, value: Value::SmallInt(1) }], None)
             .map_err(|_| ListError::ArgNumTypesMismatch),
         Err(ListError::ArgNumTypesMismatch)
     );
@@ -471,13 +471,14 @@ fn list_sort_key_deferred_and_bad_args() {
         list_sort_builtin(
             ctx,
             &[l, Value::SmallInt(1), Value::SmallInt(2)],
-            &[]
+            &[],
+            None
         )
         .map_err(|_| ListError::ArgNumTypesMismatch),
         Err(ListError::ArgNumTypesMismatch)
     );
     // `key=None` sorts normally.
-    list_sort_builtin(ctx, &[l], &[KwArg { name: key_q, value: Value::None }]).unwrap();
+    list_sort_builtin(ctx, &[l], &[KwArg { name: key_q, value: Value::None }], None).unwrap();
     assert_eq!(items_of(ctx, l), ints(&[1, 2]));
 }
 

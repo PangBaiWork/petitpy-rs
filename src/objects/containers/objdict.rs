@@ -399,7 +399,8 @@ pub fn dict_copy(ctx: &mut CallCtx, dict: Value) -> Result<Value, DictError> {
 /// Is `v` an `OrderedDict` VALUE (header type is the `OrderedDict`
 /// type)? The Zig's print/equal check the TYPE (`objBaseType ==
 /// &mp_type_ordereddict`), not the map's `is_ordered` layout flag.
-fn is_ordered_dict_value(ctx: &CallCtx, v: Value) -> bool {
+/// Shared with `builtin_str.rs` (`print_helper_hook`).
+pub(crate) fn is_ordered_dict_value(ctx: &CallCtx, v: Value) -> bool {
     match v {
         Value::Heap(r) => match ctx.arena.header(r).type_ {
             Some(t) => is_ordered_dict_type(ctx.arena, t),

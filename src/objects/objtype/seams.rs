@@ -312,6 +312,16 @@ impl crate::objects::slots::VmHook for SeamHook<'_> {
         ctx.record_raise("TypeError", Some("object not iterable"));
         Err(PyError::PyRaise)
     }
+
+    fn binary_op(
+        &mut self,
+        ctx: &mut CallCtx,
+        op: BinaryOp,
+        lhs: Value,
+        rhs: Value,
+    ) -> PyResult<Value> {
+        crate::objects::obj_ops::obj_binary_op(ctx, ctx.types, op, lhs, rhs)
+    }
 }
 
 /// Run `f` with seams whose `call` is the VM's real call hook

@@ -94,12 +94,16 @@ pub enum ListError {
     NotIterable,
     /// `TypeError("unsupported types for __lt__: 'X', 'Y'")` —
     /// a sort comparison with no slot answer. The operand type
-    /// names are static qstr bytes; use `message_string()` to
-    /// render the message (it is not a static literal).
-    CompareUnsupported {
-        lhs: &'static [u8],
-        rhs: &'static [u8],
-    },
+    /// names are owned `String`s — a user class name is dynamic
+    /// (resolved through the pool by `obj_type_name`), not a
+    /// static literal; use `message_string()` to render it.
+    CompareUnsupported { lhs: String, rhs: String },
+    /// A comparison raised a real exception on the hook path
+    /// (E2d): the exception object is stashed on the VM's
+    /// `pending_exc` by the hook (first failure wins) and the
+    /// VM caller drains it. Empty name on purpose, so
+    /// `record_typed` records nothing for this variant.
+    HookRaised,
     /// A `get_index` failure (non-int index, out-of-range,
     /// overflow) — the `ObjError` carries the type/message.
     Obj(ObjError),
@@ -125,7 +129,7 @@ impl ListError {
             ListError::CompareUnsupported { .. } => "TypeError",
             ListError::Obj(e) => e.exc_type().map(|t| t.name()).unwrap_or(""),
             ListError::OutOfMemory => "MemoryError",
-            ListError::PyRaise => "",
+            ListError::HookRaised | ListError::PyRaise => "",
         }
     }
 
@@ -143,7 +147,7 @@ impl ListError {
             ListError::NotIterable => Some("object not iterable"),
             ListError::CompareUnsupported { .. } => None,
             ListError::Obj(e) => e.message(),
-            ListError::OutOfMemory | ListError::PyRaise => None,
+            ListError::OutOfMemory | ListError::PyRaise | ListError::HookRaised => None,
         }
     }
 
@@ -153,9 +157,7 @@ impl ListError {
     pub fn message_string(&self) -> Option<String> {
         match self {
             ListError::CompareUnsupported { lhs, rhs } => Some(format!(
-                "unsupported types for __lt__: '{}', '{}'",
-                String::from_utf8_lossy(lhs),
-                String::from_utf8_lossy(rhs)
+                "unsupported types for __lt__: '{lhs}', '{rhs}'"
             )),
             _ => None,
         }

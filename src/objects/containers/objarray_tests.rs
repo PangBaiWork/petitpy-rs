@@ -26,6 +26,7 @@
 //! `fx.heap_*` call may follow it in the same scope.
 
 use super::objarray::*;
+use super::objarray_make_new::*;
 use super::objarray_methods::*;
 use super::tests::Fixture;
 use crate::objects::obj::ObjError;
@@ -236,6 +237,8 @@ fn bytearray_make_new_errors() {
     let mut fx = Fixture::new();
     let s_ab = fx.heap_str(b"ab");
     let big70 = fx.heap_bigint(BigInt::from_int(1) << 70u64);
+    // A DYNAMIC qstr literal (what source code produces).
+    let q1234 = fx.pool.from_strn(b"1234").unwrap() as u32;
     let t = fx.bytearray;
     let t_arr = fx.array;
     let mut ctx = fx.ctx();
@@ -244,6 +247,14 @@ fn bytearray_make_new_errors() {
     match bytearray_make_new(ctx, t_arr, t, &[s_ab], &[], None) {
         Err(ArrayError::WrongNumArgs) => {}
         other => panic!("bytearray('ab'): {other:?}"),
+    }
+    // E2e: `bytearray('1234')` as a dynamic qstr — the old
+    // `is_str_value` check was header-type-based and missed
+    // `Value::Qstr`, so it slipped through to
+    // `array_construct` instead of raising.
+    match bytearray_make_new(ctx, t_arr, t, &[Value::Qstr(q1234)], &[], None) {
+        Err(ArrayError::WrongNumArgs) => {}
+        other => panic!("bytearray('1234' qstr): {other:?}"),
     }
     // `bytearray(-1)` — the reference ABORTS (rc=134,
     // `@intCast` panic); Rust raises ValueError("negative

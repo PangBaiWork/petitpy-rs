@@ -8,6 +8,7 @@ pub mod binary;
 pub mod map;
 pub mod map_set;
 pub mod objarray;
+pub mod objarray_make_new;
 pub mod objarray_methods;
 pub mod objattrtuple;
 #[cfg(test)]

@@ -36,7 +36,7 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::slots::CallHook;
-use crate::objects::containers::objarray::{
+use crate::objects::containers::objarray_make_new::{
     array_make_new, bytearray_make_new, memoryview_make_new,
 };
 use crate::objects::containers::objdict::dict_make_new;

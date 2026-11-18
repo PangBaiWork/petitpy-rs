@@ -8,22 +8,22 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::obj::{
-    is_float, obj_get_float, obj_get_int, obj_get_type, BuiltinTypes, ObjError,
+    is_float, obj_get_float, obj_get_int, obj_get_int_maybe, obj_get_type, BuiltinTypes,
+    ObjError,
 };
 use crate::objects::primitives::ops::is_exact_int as obj_is_int;
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::int_from_float;
-use crate::objects::slots::PrintKind;
+use crate::objects::objtype::instance::instance_unary_op;
+use crate::objects::objtype::seams::with_call_hook_seams;
+use crate::objects::slots::{CallHook, PrintKind, UnaryOp};
 use crate::objects::strings::objstr_a::{
-    find_static_qstr, is_bytes_value, is_str_value, new_str_via_qstr, slot_raise,
-    str_data_pool, StrError,
+    is_bytes_value, is_str_value, new_str_via_qstr, str_data_pool, StrError,
 };
 use crate::objects::strings::objstr_b::{dict_get, new_str_type_from_vstr};
-use crate::objects::strings::objstr_methods_c::KwArg;
 use crate::objects::strings::objstr_print::*;
 use crate::objects::strings::vstr::{Vstr, VstrSink};
 use crate::objects::value::{Obj, Value};
-use crate::pyerr::{PyError, PyResult};
 
 // ── `str_to_int` (objstr.zig:2376-2387) ───────────────────────────────
 
@@ -118,6 +118,69 @@ pub fn format_arg_as_int(
     Ok(arg)
 }
 
+/// Run an instance's `__int__` through the hook (E2e).
+/// `Ok(None)` = no `__int__` method (or no hook — the slot
+/// path); `Err(PyRaise)` = the method raised (the exception
+/// object is stashed on the hook's side channel —
+/// `state.pending_exc` — and drains at the VM branch) or
+/// returned a non-int (the vendor's bare `TypeError`, rebuilt
+/// by `exc_from_pyerror` when nothing is stashed — probed).
+fn call_int_maybe_hook(
+    ctx: &mut CallCtx,
+    arg: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Option<Value>, StrError> {
+    let Some(hook) = hook else {
+        return Ok(None);
+    };
+    with_call_hook_seams(hook, |seams| {
+        instance_unary_op(ctx, UnaryOp::IntMaybe, arg, seams)
+    })
+    .map_err(|_| StrError::PyRaise)
+}
+
+/// `%d`/`%i`/`%u`/`%o`/`%x`/`%X` int conversion with an optional
+/// VM hook for `__int__` dispatch (E2e): `int_value` covers
+/// small ints / heap ints / bools; a user-class instance needs
+/// its `__int__` method run through the hook (the slot's
+/// `instance_unary_op_slot` uses stub seams and cannot run
+/// FunBc — so `int(A())` and `"%d" % A()` both raised
+/// "can't convert to int" with no hook). No hook (the slot
+/// path) → `IntConversion`, as today.
+fn modulo_int_value(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    arg: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<IntValue, StrError> {
+    if let Some(iv) = int_value(ctx, types, arg)? {
+        return Ok(iv);
+    }
+    match call_int_maybe_hook(ctx, arg, hook)? {
+        Some(v) => int_value(ctx, types, v)?.ok_or(StrError::Obj(ObjError::IntConversion)),
+        None => Err(StrError::Obj(ObjError::IntConversion)),
+    }
+}
+
+/// `*` width / precision int conversion with the same hook
+/// (E2e — the vendor's width/precision parse calls
+/// `mp_obj_get_int`, which dispatches `__int__`: `"%*d" %
+/// (A(), 42)` prints `   42` on the reference).
+fn modulo_width_int(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    arg: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<i64, StrError> {
+    match obj_get_int_maybe(ctx, types, arg).map_err(StrError::Obj)? {
+        Some(n) => Ok(n),
+        None => match call_int_maybe_hook(ctx, arg, hook)? {
+            Some(v) => obj_get_int(ctx, types, v).map_err(StrError::Obj),
+            None => Err(StrError::Obj(ObjError::IntConversion)),
+        },
+    }
+}
+
 // ── `%`-format ────────────────────────────────────────────────────────
 
 /// `vspPrintHelperIntoTemp` (`objstr.zig`): print `arg` into a
@@ -166,6 +229,7 @@ fn str_modulo_format_impl(
     args: &[Value],
     dict: Option<Value>,
     out: &mut Vstr,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<(), StrError> {
     let n_args = args.len();
     let mut arg_i: i32 = 0;
@@ -234,8 +298,8 @@ fn str_modulo_format_impl(
                 if arg_i as usize >= n_args {
                     return Err(StrError::MoreArgs);
                 }
-                width = obj_get_int(ctx, types, args[arg_i as usize])
-                    .map_err(StrError::Obj)? as i32;
+                width = modulo_width_int(ctx, types, args[arg_i as usize], hook.as_deref_mut())?
+                    as i32;
                 arg_i += 1;
                 p += 1;
             } else {
@@ -251,8 +315,8 @@ fn str_modulo_format_impl(
                     if arg_i as usize >= n_args {
                         return Err(StrError::MoreArgs);
                     }
-                    prec = obj_get_int(ctx, types, args[arg_i as usize])
-                        .map_err(StrError::Obj)? as i32;
+                    prec = modulo_width_int(ctx, types, args[arg_i as usize], hook.as_deref_mut())?
+                        as i32;
                     arg_i += 1;
                     p += 1;
                 } else {
@@ -298,8 +362,7 @@ fn str_modulo_format_impl(
             }
             b'd' | b'i' | b'u' => {
                 let a = format_arg_as_int(ctx, types, arg)?;
-                let iv = int_value(ctx, types, a)?
-                    .ok_or(StrError::Obj(ObjError::IntConversion))?;
+                let iv = modulo_int_value(ctx, types, a, hook.as_deref_mut())?;
                 print_mp_int(out, &iv, 10, b'a', flags, fill, width, prec)?;
             }
             b'o' => {
@@ -307,8 +370,7 @@ fn str_modulo_format_impl(
                 if alt != 0 {
                     f |= PF_SHOW_PREFIX | PF_SHOW_OCTAL_LETTER;
                 }
-                let iv = int_value(ctx, types, arg)?
-                    .ok_or(StrError::Obj(ObjError::IntConversion))?;
+                let iv = modulo_int_value(ctx, types, arg, hook.as_deref_mut())?;
                 print_mp_int(out, &iv, 8, b'a', f, fill, width, prec)?;
             }
             b'r' | b's' => {
@@ -328,8 +390,7 @@ fn str_modulo_format_impl(
             }
             b'X' | b'x' => {
                 let base_char = if conv == b'X' { b'A' } else { b'a' };
-                let iv = int_value(ctx, types, arg)?
-                    .ok_or(StrError::Obj(ObjError::IntConversion))?;
+                let iv = modulo_int_value(ctx, types, arg, hook.as_deref_mut())?;
                 print_mp_int(out, &iv, 16, base_char, flags | alt, fill, width, prec)?;
             }
             b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => {
@@ -350,11 +411,29 @@ fn str_modulo_format_impl(
 /// tuple rhs → its items; dict rhs → `dict = rhs, args = [rhs]`;
 /// anything else → `args = [rhs], dict = None`. The NULL-vs-None
 /// sentinel is critical (the Zig checks `dict == MP_OBJ_NULL`).
+/// The hook-less entry (the slot path — `binary_op_inner`):
+/// `%d` on a user instance raises "can't convert to int" here,
+/// as it did before E2e (the slot's stub seams cannot run a
+/// FunBc `__int__`).
 pub fn str_modulo_format(
     ctx: &mut CallCtx,
     types: &BuiltinTypes,
     pattern: Value,
     rhs: Value,
+) -> Result<Value, StrError> {
+    str_modulo_format_hook(ctx, types, pattern, rhs, None)
+}
+
+/// The hook-carrying `%`-format entry (E2e): the VM's
+/// `binary_op_ctx` passes its hook so the `%d`/`%o`/`%x` arms
+/// dispatch a user instance's `__int__` through it
+/// (`modulo_int_value`).
+pub fn str_modulo_format_hook(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    pattern: Value,
+    rhs: Value,
+    hook: Option<CallHook<'_, '_>>,
 ) -> Result<Value, StrError> {
     let pat_data = str_data_pool(ctx.arena, ctx.pool, pattern)
         .ok_or(StrError::BadImplicitConversion)?;
@@ -368,407 +447,13 @@ pub fn str_modulo_format(
         _ => (vec![rhs], None),
     };
     let mut out = Vstr::new(16);
-    str_modulo_format_impl(ctx, types, &pat_data, is_bytes, &args, dict, &mut out)?;
+    str_modulo_format_impl(ctx, types, &pat_data, is_bytes, &args, dict, &mut out, hook)?;
     let type_ = obj_get_type(ctx.arena, types, pattern).unwrap_or(types.str_);
     Ok(new_str_type_from_vstr(ctx, types, type_, &mut out))
 }
 
-// ── `str.format` ──────────────────────────────────────────────────────
 
-/// Look a keyword up in `kwargs` (`npyStrKwargsLookup`,
-/// `objstr.zig:339-342` — a map lookup by the field name's qstr).
-/// Kwarg names are qstr ids, so the field name must be a static
-/// qstr to match (`find_static_qstr`); a non-static name can never
-/// equal a static qstr id's bytes — it is a miss, `KeyError`.
-fn kwargs_lookup(kwargs: &[KwArg], field_name: &[u8]) -> Option<Value> {
-    let id = find_static_qstr(field_name)?;
-    kwargs.iter().find(|k| k.name == id).map(|k| k.value)
-}
-
-/// A byte of the format spec, or 0 past the end (the Zig's
-/// NUL-terminated spec buffer — `vspNulTerminated`).
-fn spec_at(spec: &[u8], i: usize) -> u8 {
-    spec.get(i).copied().unwrap_or(0)
-}
-
-/// `formatHelperInto` (`objstr.zig:2709-3039`): the `{}`-format
-/// walker. `args[0]` is the format string itself; `arg_i` is
-/// shared with nested specs (a nested `{...}` inside a format spec
-/// consumes args). `kwargs` is the keyword map (empty until
-/// C10/C13 pass real kwargs through).
-fn format_helper_into(
-    ctx: &mut CallCtx,
-    types: &BuiltinTypes,
-    s: &[u8],
-    arg_i: &mut i32,
-    args: &[Value],
-    kwargs: &[KwArg],
-    out: &mut Vstr,
-) -> Result<(), StrError> {
-    let mut p = 0usize;
-    let top = s.len();
-    while p < top {
-        // Handle `}` — `}}` → literal `}`, otherwise raise.
-        if s[p] == b'}' {
-            p += 1;
-            if p < top && s[p] == b'}' {
-                out.add_byte(b'}')?;
-                p += 1;
-                continue;
-            }
-            return Err(StrError::BadFormatStr);
-        }
-        if s[p] != b'{' {
-            out.add_byte(s[p])?;
-            p += 1;
-            continue;
-        }
-        p += 1;
-        if p < top && s[p] == b'{' {
-            out.add_byte(b'{')?;
-            p += 1;
-            continue;
-        }
-        // Parse: [field_name] ["!" conv] [":" format_spec] "}".
-        let mut field_name: Option<(usize, usize)> = None;
-        let mut conversion: u8 = 0;
-        let mut format_spec: Option<(usize, usize)> = None;
-        if p < top && s[p] != b'}' && s[p] != b'!' && s[p] != b':' {
-            let start = p;
-            while p < top && s[p] != b'}' && s[p] != b'!' && s[p] != b':' {
-                p += 1;
-            }
-            field_name = Some((start, p));
-        }
-        if p < top && s[p] == b'!' {
-            p += 1;
-            if p < top && (s[p] == b'r' || s[p] == b's') {
-                conversion = s[p];
-                p += 1;
-            } else {
-                return Err(StrError::BadFormatStr);
-            }
-        }
-        if p < top && s[p] == b':' {
-            p += 1;
-            if p < top && s[p] != b'}' {
-                let spec_start = p;
-                let mut nest: i32 = 1;
-                while p < top {
-                    if s[p] == b'{' {
-                        nest += 1;
-                    } else if s[p] == b'}' {
-                        nest -= 1;
-                        if nest == 0 {
-                            break;
-                        }
-                    }
-                    p += 1;
-                }
-                format_spec = Some((spec_start, p));
-            }
-        }
-        if p >= top {
-            return Err(StrError::BadFormatStr);
-        }
-        if s[p] != b'}' {
-            return Err(StrError::BadFormatStr);
-        }
-        // Resolve the argument.
-        let mut arg: Value;
-        if let Some((fstart, fend)) = field_name {
-            let fname = &s[fstart..fend];
-            if !fname.is_empty() && fname[0].is_ascii_digit() {
-                // Manual index: mixing manual after auto raises.
-                if *arg_i > 0 {
-                    return Err(StrError::BadFormatStr);
-                }
-                let mut index: i32 = 0;
-                let q = str_to_int(fname, 0, &mut index);
-                if index as usize >= args.len() - 1 {
-                    return Err(StrError::TupleIndexOutOfRange);
-                }
-                arg = args[index as usize + 1];
-                *arg_i = -1;
-                if q < fname.len() {
-                    // `.` / `[` remainder (or any other junk).
-                    return Err(StrError::AttrsNotSupported);
-                }
-            } else {
-                // Keyword: scan to `.` / `[`, look up the name.
-                let mut lookup_end = 0usize;
-                while lookup_end < fname.len()
-                    && fname[lookup_end] != b'.'
-                    && fname[lookup_end] != b'['
-                {
-                    lookup_end += 1;
-                }
-                let field_q = new_str_via_qstr(ctx, types, &fname[..lookup_end]);
-                let Some(v) = kwargs_lookup(kwargs, &fname[..lookup_end]) else {
-                    return Err(StrError::KeyError(field_q));
-                };
-                arg = v;
-                if lookup_end < fname.len() {
-                    return Err(StrError::AttrsNotSupported);
-                }
-            }
-        } else {
-            // Automatic numbering: mixing auto after manual raises.
-            if *arg_i < 0 {
-                return Err(StrError::BadFormatStr);
-            }
-            if *arg_i as usize >= args.len() - 1 {
-                return Err(StrError::TupleIndexOutOfRange);
-            }
-            arg = args[*arg_i as usize + 1];
-            *arg_i += 1;
-        }
-        // Default conversion: `'s'` only when there is NO spec AND
-        // no explicit conversion.
-        if format_spec.is_none() && conversion == 0 {
-            conversion = b's';
-        }
-        if conversion != 0 {
-            let kind = if conversion == b's' {
-                PrintKind::Str
-            } else {
-                PrintKind::Repr
-            };
-            let mut tmp = Vstr::new(16);
-            {
-                let mut sink = VstrSink(&mut tmp);
-                obj_print_helper(ctx, types, arg, kind, &mut sink);
-            }
-            arg = new_str_type_from_vstr(ctx, types, types.str_, &mut tmp);
-        }
-        let mut fill: u8 = 0;
-        let mut alignc: u8 = 0;
-        let mut width: i32 = -1;
-        let mut precision: i32 = -1;
-        let mut conv_type: u8 = 0;
-        let mut flags: u32 = 0;
-        if let Some((spec_start, spec_end)) = format_spec {
-            // Recurse into the spec (it may itself contain `{...}`
-            // fields, sharing `arg_i`).
-            let mut inner = Vstr::new(16);
-            format_helper_into(
-                ctx,
-                types,
-                &s[spec_start..spec_end],
-                arg_i,
-                args,
-                kwargs,
-                &mut inner,
-            )?;
-            let spec = inner.as_bytes().to_vec();
-            // `__format__` / `nativeBase` (full builds): no user
-            // classes or methods exist in Rust yet (C12/C13/C14) —
-            // identity, documented.
-            let mut sp = 0usize;
-            // [[fill]align]
-            if is_alignment(spec_at(&spec, sp)) {
-                alignc = spec_at(&spec, sp);
-                sp += 1;
-            } else if spec_at(&spec, sp) != 0 && is_alignment(spec_at(&spec, sp + 1)) {
-                fill = spec_at(&spec, sp);
-                alignc = spec_at(&spec, sp + 1);
-                sp += 2;
-            }
-            // [sign]
-            if spec_at(&spec, sp) == b'+'
-                || spec_at(&spec, sp) == b'-'
-                || spec_at(&spec, sp) == b' '
-            {
-                if spec_at(&spec, sp) == b'+' {
-                    flags |= PF_SHOW_SIGN;
-                } else if spec_at(&spec, sp) == b' ' {
-                    flags |= PF_SPACE_SIGN;
-                }
-                sp += 1;
-            }
-            // [#]
-            if spec_at(&spec, sp) == b'#' {
-                flags |= PF_SHOW_PREFIX;
-                sp += 1;
-            }
-            // [0] — NOT consumed here; `str_to_int` eats it as part
-            // of the width.
-            if spec_at(&spec, sp) == b'0' {
-                if alignc == 0 && arg_looks_numeric(ctx.arena, types, arg) {
-                    alignc = b'=';
-                }
-                if fill == 0 {
-                    fill = b'0';
-                }
-            }
-            // [width]
-            sp = str_to_int(&spec, sp, &mut width);
-            // [,_]
-            if spec_at(&spec, sp) == b',' || spec_at(&spec, sp) == b'_' {
-                flags |= (spec_at(&spec, sp) as u32) << PF_SEP_POS;
-                sp += 1;
-            }
-            // [.precision]
-            if spec_at(&spec, sp) == b'.' {
-                sp += 1;
-                sp = str_to_int(&spec, sp, &mut precision);
-            }
-            // [type]
-            if is_type(spec_at(&spec, sp)) {
-                conv_type = spec_at(&spec, sp);
-                sp += 1;
-            }
-            if spec_at(&spec, sp) != 0 {
-                return Err(StrError::BadFormatStr);
-            }
-        }
-        if alignc == 0 {
-            alignc = if arg_looks_numeric(ctx.arena, types, arg) {
-                b'>'
-            } else {
-                b'<'
-            };
-        }
-        if fill == 0 {
-            fill = b' ';
-        }
-        if flags & (PF_SHOW_SIGN | PF_SPACE_SIGN) != 0 {
-            if conv_type == b's' || conv_type == b'c' {
-                return Err(StrError::BadFormatStr);
-            }
-        }
-        match alignc {
-            b'<' => flags |= PF_LEFT_ADJUST,
-            b'=' => flags |= PF_PAD_AFTER_SIGN,
-            b'^' => flags |= PF_CENTER_ADJUST,
-            _ => {}
-        }
-        // Integer branch (bool counts — `arg_looks_integer`).
-        if arg_looks_integer(ctx.arena, types, arg) {
-            match conv_type {
-                b'b' => {
-                    let iv = int_value(ctx, types, arg)?
-                        .ok_or(StrError::Obj(ObjError::IntConversion))?;
-                    print_mp_int(out, &iv, 2, b'a', flags, fill, width, 0)?;
-                    p += 1;
-                    continue;
-                }
-                b'c' => {
-                    let n = obj_get_int(ctx, types, arg).map_err(StrError::Obj)?;
-                    let ch = (n as i32) as u8;
-                    print_strn(out, &[ch], flags, fill, width)?;
-                    p += 1;
-                    continue;
-                }
-                0 | b'n' | b'd' => {
-                    let iv = int_value(ctx, types, arg)?
-                        .ok_or(StrError::Obj(ObjError::IntConversion))?;
-                    print_mp_int(out, &iv, 10, b'a', flags, fill, width, 0)?;
-                    p += 1;
-                    continue;
-                }
-                b'o' => {
-                    let mut f = flags;
-                    if f & PF_SHOW_PREFIX != 0 {
-                        f |= PF_SHOW_OCTAL_LETTER;
-                    }
-                    let iv = int_value(ctx, types, arg)?
-                        .ok_or(StrError::Obj(ObjError::IntConversion))?;
-                    print_mp_int(out, &iv, 8, b'a', f, fill, width, 0)?;
-                    p += 1;
-                    continue;
-                }
-                b'X' | b'x' => {
-                    let base_char = if conv_type == b'X' { b'A' } else { b'a' };
-                    let iv = int_value(ctx, types, arg)?
-                        .ok_or(StrError::Obj(ObjError::IntConversion))?;
-                    print_mp_int(out, &iv, 16, base_char, flags, fill, width, 0)?;
-                    p += 1;
-                    continue;
-                }
-                b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'%' => {
-                    // Fall through to the numeric branch.
-                }
-                _ => return Err(StrError::BadFormatStr),
-            }
-        }
-        // Numeric branch (int or float).
-        if arg_looks_numeric(ctx.arena, types, arg) {
-            let mut ct = conv_type;
-            if ct == 0 {
-                ct = b'g';
-            }
-            if ct == b'n' {
-                ct = b'g';
-            }
-            match ct {
-                b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => {
-                    let f = obj_get_float(ctx, types, arg).map_err(StrError::Obj)?;
-                    print_float(out, f, ct, flags, fill, width, precision)?;
-                    p += 1;
-                    continue;
-                }
-                b'%' => {
-                    let f = obj_get_float(ctx, types, arg).map_err(StrError::Obj)?;
-                    let pct_flags = flags | PF_ADD_PERCENT;
-                    print_float_pct(out, f, pct_flags, fill, width, precision)?;
-                    p += 1;
-                    continue;
-                }
-                _ => return Err(StrError::BadFormatStr),
-            }
-        } else {
-            if alignc == b'=' {
-                return Err(StrError::BadFormatStr);
-            }
-            match conv_type {
-                0 | b's' => {
-                    let data = str_data_pool(ctx.arena, ctx.pool, arg)
-                        .ok_or(StrError::BadImplicitConversion)?;
-                    let mut slen = data.len() as i32;
-                    let mut prec = precision;
-                    if prec < 0 {
-                        prec = slen;
-                    }
-                    if slen > prec {
-                        slen = prec;
-                    }
-                    print_strn(out, &data[..slen as usize], flags, fill, width)?;
-                }
-                _ => return Err(StrError::BadFormatStr),
-            }
-        }
-        p += 1;
-    }
-    Ok(())
-}
-
-/// `mpObjStrFormatImpl` (`objstr.zig:3040-3049`): `str.format(...)`.
-/// `args[0]` is the format string; `kwargs` is the keyword map
-/// (empty until C10/C13 pass real kwargs through). The result takes
-/// the format string's type (bytes in, bytes out).
-pub fn str_format(
-    ctx: &mut CallCtx,
-    types: &BuiltinTypes,
-    args: &[Value],
-    kwargs: &[KwArg],
-) -> Result<Value, StrError> {
-    let self_ = args[0];
-    let data = str_data_pool(ctx.arena, ctx.pool, self_)
-        .ok_or(StrError::BadImplicitConversion)?;
-    let mut arg_i: i32 = 0;
-    let mut out = Vstr::new(16);
-    format_helper_into(ctx, types, &data, &mut arg_i, args, kwargs, &mut out)?;
-    let type_ = obj_get_type(ctx.arena, types, self_).unwrap_or(types.str_);
-    Ok(new_str_type_from_vstr(ctx, types, type_, &mut out))
-}
-
-/// `str.format` slot wrapper (kwargs are empty until C10/C13 pass
-/// them through — the core `str_format` takes them explicitly).
-pub fn str_format_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    if args.is_empty() {
-        return Err(PyError::PyRaise);
-    }
-    let types = ctx.types;
-    str_format(ctx, types, args, &[]).map_err(|e| slot_raise(ctx, e))
-}
+// The `{}`-format engine lives in `objstr_format_brace.rs`
+// (E2e split — this file was 868 lines, over the 800 cap);
+// re-exported so existing call sites keep working.
+pub use crate::objects::strings::objstr_format_brace::{str_format, str_format_builtin};

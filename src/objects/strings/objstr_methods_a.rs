@@ -328,10 +328,26 @@ pub fn str_join(
     let items = iter_items(ctx, types, args[1], None)?;
     let mut out: Vec<u8> = Vec::new();
     let mut first = true;
+    // E2e (item 4): bytes ↔ bytearray normalise on both arms
+    // (vendor `strJoinImpl`, `objstr.zig:1432-1446`) — a
+    // bytearray item joins into a bytes result
+    // (`b'-'.join([bytearray(b'a'), b'b'])`), and a bytearray
+    // separator works. The result type stays `self_type`
+    // (a bytearray separator yields a bytearray — the
+    // `new_str_of_type` bytearray arm).
+    let norm_self_t = if self_type == Some(types.bytearray) {
+        Some(types.bytes)
+    } else {
+        self_type
+    };
     for item in &items {
         // `joinItem` is `nativeBase` on full — identity until
         // instances exist (C12).
-        if obj_get_type(ctx.arena, types, *item) != self_type {
+        let mut item_t = obj_get_type(ctx.arena, types, *item);
+        if item_t == Some(types.bytearray) {
+            item_t = Some(types.bytes);
+        }
+        if item_t != norm_self_t {
             return Err(StrError::JoinType);
         }
         if !first {

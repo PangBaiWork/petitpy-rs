@@ -1,0 +1,356 @@
+Lane E2e result — bytes/bytearray buffer ops + str.format
+==========================================================
+
+Branch: lane/e2e-bytes-format, base master b7f0b7e (E2c merge).
+Worktree: ~/workspace/petitpy-rs-e2e-bytes-format. Executor did NOT
+merge. E2d merged to master (67b7149) while this lane ran — the
+lane needs a rebase at merge time; see §5.
+
+§1 — Runners, comparison rules, file cap
+-----------------------------------------
+- Runners (all under scripts/, take --bin, default
+  target/release/petitpy-rs): run_full_gate.py,
+  run_integration.py, run_golden.py, run_capability.py
+  (--vm, NOT --bin — it takes --zigpy/--vm only),
+  run_stdlib.py, run_nano.py. NOTE: --bin must be an ABSOLUTE
+  path — the runners resolve a relative path against the
+  ORIG repo, so a relative --bin makes every case fail
+  ("interpreter not found", golden 0/585). This lane's
+  first gate run hit exactly that; all numbers below are
+  from absolute-path re-runs.
+- Baselines reproduced, not assumed: a scratch worktree at
+  b7f0b7e was built and gated (full 488/552, integration
+  174/202, golden 545/585 — E2c's numbers exactly), and
+  the fail-name lists were set-diffed (comm) against this
+  lane's lists. "Newly passing" / "0 regressions" below
+  are that diff, not a count subtraction.
+- Golden uses the REFERENCE petitpy binary as oracle
+  (vendor MicroPython absent in this VM); capability stubs
+  compile_pyfront to return False (uv NOT installed) and
+  --vm must be petitpy-vm.
+- FILE CAP: per PangBai 2026-11-18 the per-file line cap is
+  now 2500 lines (raised from 800). Already-done splits
+  stay as they are — no need to undo anything. For the
+  rest of this lane, no further splitting was needed: the
+  largest files touched are objstr_b.rs (794, untouched)
+  and objstr_format.rs (459 after its split). map.rs (860)
+  and gc.rs (830) are now under the cap with no split
+  needed.
+
+§2 — Measured numbers (all reproduced by the executor)
+------------------------------------------------------
+- Full corpus: 507/552 (+19, 0 regressions).
+  Newly passing (19): array_intbig, bytearray1,
+  bytearray_byte_operations, bytearray_center,
+  bytearray_construct, bytearray_count, bytearray_decode,
+  bytearray_partition, bytes, bytes_add_array,
+  bytes_add_bytearray, bytes_add_endian,
+  bytes_compare_array, bytes_compare_bytearray,
+  bytes_construct_array, bytes_construct_bytearray,
+  bytes_construct_endian, string_format,
+  string_format_modulo. (17 are the named targets;
+  array_intbig and bytearray1 are extras from the same
+  mechanisms — bytes(array('i', ...)) via the buffer_data
+  fix, bytearray1 via the bytearray method wiring.)
+  Remaining fails (38 regressions + 7 known-fails):
+  array1, array_add, array_micropython, builtin_hash,
+  builtin_hash_intbig, builtin_override, builtin_reversed,
+  builtin_str_hex, class_delattr_setattr, class_descriptor,
+  class_new, class_setname_hazard,
+  class_setname_hazard_rand, class_store_class,
+  class_super_closure, deque1, deque2, getitem,
+  import_instance_method, int_big_rshift, int_bytes_intbig,
+  int_parse, io_iobase, iter0, iter1, iter2, list_sort,
+  memoryerror, object_new, ordereddict1, slice_attrs,
+  special_methods, special_methods_intbig, stopiteration,
+  subclass_native_buffer, subclass_native_exc_new,
+  subclass_native_init, subclass_native_iter.
+- Integration: 177/202 (+3, 0 regressions). Newly
+  passing: bytes_interop, str_join_bytes_bytearray,
+  uuid4_shape (uuid4 calls os.urandom + int.from_bytes;
+  unblocked by the iter_items Iterator arm / buffer fix —
+  not a named target, a real +1). Remaining 25 fails:
+  builtin_keyword_args, class_repr,
+  collections_abc_import, cpython_platform_import_slice_mro,
+  deque_cpython_idiom, dict_missing_basic,
+  dict_missing_counter_pattern, enum_members,
+  gc_closes_dropped_files_and_sockets,
+  gc_reclaims_garbage, index_error_store_leaves_container_intact,
+  init_subclass, itertools_chain,
+  itertools_cpython_functions, json_cpython_behaviour,
+  native_subclass_operands, object_setattr_method_available,
+  os_chown_self_noop, os_kill_esrch_raises,
+  runtime_annotations, select_readable_fd_is_ready,
+  select_timeout_zero_returns_promptly,
+  socket_fromfd_wraps_fd, subprocess_check_raises_on_nonzero,
+  subprocess_streams_env_cwd_text.
+- Golden: 561/585 (+16, 0 regressions),
+  rust==cpython 554/585 (was 538). Newly passing (16):
+  bytearray1, bytearray_center, bytearray_construct,
+  bytearray_count, bytearray_decode, bytearray_partition,
+  bytes, bytes_add_array, bytes_add_bytearray,
+  bytes_add_endian, bytes_compare_array,
+  bytes_compare_bytearray, bytes_construct_array,
+  bytes_construct_bytearray, bytes_construct_endian,
+  string_format.
+- Capability: 67/67 — GATE GREEN (unchanged).
+- test-stdlib: 6/8 (same as E2c). FAIL: test_abc,
+  test_enum (both cluster (n), out of scope).
+- Nano (invariant check only): 432/541 (+16,
+  report-only).
+- lib: 1573 passed, 0 failed, 4 ignored (1562 + 11 new
+  e2e tests); bins 9; entry_cli 45; 0 warnings (forced
+  recompile); no unsafe (grep over the touched files
+  finds none).
+- check_compile_mpy.py PASS (552/552 byte-identical);
+  check_frozen.py PASS (23/23, 38,141 bytes).
+- Binaries: petitpy-rs 1,867,760 B, petitpy-vm
+  1,854,816 B.
+- Orig repo left clean (tests/__pycache__ /
+  tools/__pycache__ created by the runners, removed).
+
+§3 — Fixes (each probed against the reference binary)
+-----------------------------------------------------
+Fix A — bytes/array/bytearray buffer operands (item 1).
+Root cause: binary_op_inner (objstr_methods_c.rs) already
+tried buffer_data(ctx, types, rhs) for a bytes lhs with a
+different-type rhs — but buffer_data (objstr_a.rs) failed
+for array/bytearray because get_buffer returns Ok(true)
+with a raw pointer that can only be read with unsafe
+("Unreachable today: str/bytes are the only buffer
+providers"). The safe reader already existed:
+buffer_bytes (containers/binary.rs:572) handles Obj::Array
+(incl. view chains via source), Obj::Bytes, Obj::Str,
+Qstr — returns (Vec<u8>, typecode). Fix: in buffer_data,
+after str_data_pool returns None, try buffer_bytes and
+return its bytes. This fixes Add/Contains/comparisons via
+the str slot AND bytes(array)/bytes(bytearray) via
+bytes_make_new (which calls buffer_data).
+Vendor rules (read from source): mpObjStrBinaryOpImpl
+(objstr.zig:842-932) reads ANY buffer rhs via
+npyStrGetBufferRead (ext_mp_get_buffer -> C mp_get_buffer,
+vendor/micropython_embed/py/obj.c:617); Add/Contains/all
+comparisons use raw bytes. arrayBinaryOpImpl
+(objstr.zig:358-434, vendor objarray.c:282-291, 369-376):
+comparisons use typecode_for_comparison (BYTEARRAY -> 'B';
+uppercase -> lowercase + unsigned flag); raw-byte compare
+iff codes equal AND code != 'f'/'d' AND (op == EQUAL OR
+is_unsigned); else bare NotImplementedError; non-buffer rhs
+-> OBJ_FALSE for every comparison op. The Rust
+array_binary_op already mirrors this.
+== is SAFE from this fix: bytes_type_data has flags: 0
+(no EQ_CHECKS_OTHER_TYPE), so obj_equal_not_equal never
+calls the str slot for cross-type ==; the array/bytearray
+slot or pointer comparison decides. All == cases probed
+agree already (array vs bytes False, bytearray/memoryview
+vs bytes True).
+Reference truth table probed (all match after the fix):
+bytearray+bytes -> bytearray, array('b')+bytes -> array,
+bytes+array('b'/'h'/'i'/'l'/'q'/'H') -> bytes with
+native-endian raw bytes; array('b'/'B') == bytes -> False;
+bytearray == bytes -> True; memoryview == bytes -> True;
+array('b') < bytes -> True; array('h'/'i') < bytes ->
+NotImplementedError on ref (bare, aborts — Rust matches
+via the array slot); b".." < array('h') -> raw-byte
+compare; b"ab" + memoryview(b"cd") -> b'abcd'.
+
+Fix B — bytearray str methods (item 2) + bytes.join (item 4)
++ bytes(iter(...)) + bytearray('str').
+Root cause: bytearray had NO str methods wired — the
+bytearray dict was built from ARRAY_METHODS only (append/
+extend) in vm_types.rs. Vendor bytearray locals = the full
+shared table minus trailing encode
+(objstr.zig:3520-3614 array_bytearray_str_bytes_locals_table):
+append, extend, hex, fromhex, decode, find, rfind, index,
+rindex, join, split, splitlines, rsplit, startswith,
+endswith, strip, lstrip, rstrip, format, replace, count,
+partition, rpartition, center, ljust, rjust, lower, upper,
+capitalize, title, zfill, isspace, isalpha, isdigit,
+isupper, islower (str: body+encode only; bytes: hex+decode
++body; array: append+extend only; memoryview: hex only).
+Changes:
+(a) NEW arena-only array_raw_bytes (binary.rs) mirroring
+buffer_bytes' Array arm incl. view chains.
+(b) str_data_pool (objstr_a.rs) gained an Obj::Array arm
+for bytearray typecode (1) ONLY — int arrays and
+memoryviews still return None.
+(c) new_str_of_type gained a bytearray arm allocating a
+REAL Obj::Array (typecode 1, free 0, len n, data bytes,
+source None) — the vendor's mp_obj_new_str_type_from_vstr
+bytearray branch (objstr.zig:3245-3247), NOT a Bytes
+payload with a bytearray header (which would break
+array_print/append/mutation).
+(d) str_check_arg_type now normalizes bytes<->bytearray on
+both sides (vendor objstr.zig:664-680) — fixes the stale
+C9 comment claiming no bytearray type existed in Rust.
+(e) vm_types.rs bytearray dict = ARRAY_METHODS (append,
+extend, tight arities kept) + BYTES_METHODS converted to
+MethodEntry { min: 1, max: 255 } (same lax sig as the bytes
+dict), with fromhex classmethod (2,3) and splitlines kw
+wrapper — the vendor's shared table (verified to include
+isalnum before trailing encode).
+(f) bytearray_make_new str check now also matches
+Value::Qstr(_) — is_str_value is header-type-based and
+misses dynamic-qstr literals, so bytearray('1234') had
+slipped through to array_construct (Rust accepted it;
+ref raises TypeError "wrong number of arguments").
+(g) str_join (objstr_methods_a.rs) normalizes
+bytearray->bytes on BOTH arms (vendor strJoinImpl,
+objstr.zig:1432-1446) — result type stays self_type.
+Item 4: b'-'.join([bytearray(b'a'), b'b']) -> b'a-b';
+bytearray(b",").join([b"a", b"b"]) -> bytearray(b'a,b').
+(h) iter_items (objstr_a.rs) gained an Obj::Iterator arm
+delegating to collect_iterable — bytes(iter([128, 255]))
+now works via C11's iternext Protocol arm.
+(i) partitioner_impl (objstr_b.rs): result[1] is now
+new_str_of_type(self_type, sep) when obj_get_type(arg) !=
+self_type, else arg as-is (vendor partitionerImpl,
+objstr.zig:2172-2176 BYTEARRAY comment) — bytearray
+partition's middle element is a bytearray, not bytes.
+Ref probes: bytearray.fromhex("ff") -> bytearray(b'\xff');
+bytearray(b"a\nb").splitlines() -> [bytearray(b'a'),
+bytearray(b'b')]; bytearray(b"{}").format(1) ->
+bytearray(b'1'); hex/decode/isalnum work.
+
+Fix C — str.format kwargs + %-format __int__ (item 3).
+(1) kwargs_lookup (objstr_format.rs): the failure was NOT
+the nested-spec recursion — the three positional nested
+lines ("{:{}}", "{:{}{}{}}", "{0:{1}{2}}") already PASSED.
+The failure is kwargs: "{foo}".format(foo="bar") raised
+KeyError: foo. Cause: kwargs_lookup required the field
+name to be a STATIC qstr (find_static_qstr), but kwarg
+names from source (foo, text, align, width) are DYNAMIC
+qstrs. Fix: compare kwarg-name BYTES through the pool
+(pool.qstr_str(k.name as u16) == field_name) instead of
+requiring a static id; the vendor interns the field name
+(qstr_from_strn CREATES it) and compares ids — Rust
+compares bytes, the same equality without interning.
+(2) %-format __int__ dispatch: int(A()) ALSO fails on Rust
+(TypeError "can't convert to int") — __int__ dispatch is
+broken generally (E2 cluster (p) special_methods), not
+just in %d. NEW modulo_int_value + call_int_maybe_hook
+(objstr_format.rs): fast path int_value (small/heap ints,
+bools); else run instance_unary_op(IntMaybe) through the
+hook (the slot's instance_unary_op_slot uses stub seams
+and cannot run FunBc). NEW public str_modulo_format_hook;
+existing str_modulo_format delegates with None. NEW
+MODULO branch in binary_op_ctx (vm_rt.rs, after the Equal
+branch, before the generic loop): only when
+obj_get_type(lhs) == str_ or bytes (exact — subclass
+instances and instances with __mod__ keep the generic
+loop; a str lhs with an instance rhs having __rmod__ is
+unaffected because the str slot runs first in both paths);
+creates the hook via make_hook(state), maps errors via
+slot_raise then drain_hook_raise. %d/%i/%u AND %o/%x/%X
+arms use modulo_int_value; %c does NOT (probed: %c does
+not dispatch __int__ on the ref — TypeError "integer
+needed" on BOTH). * width/precision use modulo_width_int
+(probed: "%*d" % (A(), 42) and "%.*f" % (A(), 3.14159)
+dispatch __int__ on the ref).
+Probed edges (all match): __int__ raising ValueError
+("boom") propagates; __int__ returning "x" raises BARE
+TypeError (msg '', args () — finish_unary's BareTypeError
++ exc_from_pyerror rebuilding with no message when
+nothing is stashed); "%o"/"%x"/"%5d" % A() -> 173/7b/
+"  123". "{:d}".format(A()) raises ValueError "bad format
+string" on the ref — str.format {:d} does NOT dispatch
+__int__ (not a target, not changed).
+Note: the first %*d test written for this lane reused a
+class whose __int__ returns 123 as the WIDTH (width 123
+and precision 123 are correct behaviour); the test now
+uses a separate class returning 5.
+
+Splits (brief requirement; both stay under the new cap).
+- objarray.rs 793 -> 604: the three make-new constructors
+(array_make_new, bytearray_make_new, memoryview_make_new)
+moved verbatim to NEW objarray_make_new.rs (207 lines);
+mod.rs + make_new.rs imports retargeted.
+- objstr_format.rs 868 -> 459: the whole brace engine
+(lines 458-868: kwargs_lookup, spec_at,
+format_helper_into, str_format, str_format_builtin)
+moved verbatim to NEW objstr_format_brace.rs (440 lines);
+shared helpers (str_to_int, is_alignment, is_type,
+arg_looks_integer, arg_looks_numeric) stay in
+objstr_format.rs and are imported there; str_format /
+str_format_builtin are re-exported from objstr_format.rs
+so the 5 existing call sites (objstr_b.rs method tables,
+builtin_fns.rs, vm_builtins.rs, objstr_tests.rs) are
+unchanged. objstr_b.rs (794) NOT touched.
+
+Tests (11 new).
+- objstr_tests_d.rs (3 ctx tests): e2e_format_kwargs_dynamic_names,
+e2e_bytes_buffer_operands, e2e_bytearray_str_methods.
+- objarray_tests.rs: bytearray('1234') dynamic-qstr case
+added to bytearray_make_new_errors.
+- NEW src/runtime/vm_tests_e2e.rs (7 VM tests):
+e2e_modulo_int_dispatch, e2e_modulo_int_bad_return,
+e2e_modulo_int_raises, e2e_format_kwargs,
+e2e_bytes_array_ops, e2e_bytearray_methods,
+e2e_bytes_join_bytearray, e2e_bytearray_str_arg.
+
+§4 — Shortfalls, with per-case root causes
+--------------------------------------------
+(a) int(A()) still raises "can't convert to int" — the
+GENERAL __int__ dispatch (E2 cluster (p) special_methods)
+is a larger mechanism (the int() builtin /
+obj_get_int_maybe path, used by int(), float()?, index(),
+etc.); only the %-format path is fixed here. A lane
+fixing int(A()) must thread a hook through
+obj_get_int_maybe's callers or the int builtin — out of
+this lane's scope (its brief is bytes/format).
+(b) REFERENCE BUG — float arrays (documented divergence,
+not fixed): the reference binary is fundamentally broken
+for float arrays — print(array.array("f", [1.0])), len(a),
+a[0], list(a), a + a, a == a, bytes(a), bytearray(a) ALL
+raise TypeError "can't convert to int", and
+bytes(array.array("f", [])) PANICS the reference (Zig
+panic "cast causes pointer to be null" at objstr.zig:1901,
+mp_obj_new_bytes(@ptrCast(bufinfo.buf),...) on a null
+items pointer). Cause: bytesMakeNewImpl
+(objstr.zig:1871-1937) — ext_mp_get_buffer fails for float
+arrays so it falls to the iter path where mp_obj_get_int
+(1.0) raises; the array-construction path calls
+mp_obj_get_int on float items. Corpus never tests float
+arrays in bytes positions (uses 'b'/'h'/'i'). Decision:
+buffer_bytes serves ALL Array typecodes (raw bytes,
+vendor-C/CPython semantics); Rust returns the raw bytes /
+b'' instead. Same divergence class as C8a's.
+(c) list_sort.py still fails on this lane's base
+(b7f0b7e) — E2d's scope (user-class __lt__ sort +
+container repr). E2d MERGED to master (67b7149) while
+this lane ran, so it should now pass on master — NOT
+re-verified on this lane's base; the merger's rebase +
+gate run will confirm.
+(d) Remaining E2 §4 clusters unchanged: (g) __set_name__
+(E2f), (h) __reversed__/slice+range attrs (E2f), (j)
+frozen deque (E2f), (n) descriptor / native-subclass
+dispatch remainder, (p) misc (int_parse,
+int_big_rshift, int_bytes_intbig, getitem,
+import_instance_method, io_iobase, memoryerror,
+ordereddict1, special_methods/__int__/__index__
+dispatch, iter0/1/2), integration builtin-method kwargs
+(E2f).
+(e) test-stdlib test_abc, test_enum still fail (cluster
+(n)).
+(f) Integration remaining 25 fails are the known set
+listed in §2 (no new mechanism among them is in this
+lane's scope).
+
+§5 — Integration notes for the merger
+--------------------------------------
+- E2d merged to master (67b7149) while this lane ran; this
+lane is based on b7f0b7e and needs a rebase. Overlap
+files (expect conflicts): src/runtime/mod.rs (both lanes
+added a test module) and src/runtime/vm_rt.rs (E2e's
+MODULO branch; E2d's hook threading in binary_op_ctx).
+No overlap in E2d's core files — obj_ops.rs,
+objlist_methods.rs, objlist.rs and the tuple/dict print
+paths are untouched by this lane.
+- E2f still runs from the same base; its files do not
+overlap E2e's. Note for E2f: str_format now lives in
+objstr_format_brace.rs but is re-exported from
+objstr_format.rs, so objstr_format::str_format still
+resolves.
+- The scratch baseline worktree (petitpy-rs-e2c-base) was
+removed after the set-diff; the E2e worktree and branch
+remain for the merger.

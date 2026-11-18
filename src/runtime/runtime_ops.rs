@@ -304,7 +304,7 @@ fn is_inplace(op: BinaryOp) -> bool {
     )
 }
 
-fn is_plain_arith(op: BinaryOp) -> bool {
+pub(crate) fn is_plain_arith(op: BinaryOp) -> bool {
     matches!(
         op,
         BinaryOp::Or
@@ -324,7 +324,7 @@ fn is_plain_arith(op: BinaryOp) -> bool {
 }
 
 /// `__op__` → `__rop__` (`op += REVERSE_OR - OR`).
-fn to_reverse(op: BinaryOp) -> BinaryOp {
+pub(crate) fn to_reverse(op: BinaryOp) -> BinaryOp {
     match op {
         BinaryOp::Or => BinaryOp::ReverseOr,
         BinaryOp::Xor => BinaryOp::ReverseXor,

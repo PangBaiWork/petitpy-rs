@@ -44,7 +44,7 @@ use crate::objects::strings::objstr_b::{BYTES_METHODS, STR_METHODS};
 use crate::objects::strings::objstr_methods_b::{bytes_type_data, str_type_data};
 use crate::objects::value::{BytesData, DictData, FunBuiltinData, GcRef, MapData, Obj, TypeData, Value};
 use crate::runtime::vm::VmTypes;
-use crate::runtime::vm_builtins::{ellipsis_print, format_kw_wrapper};
+use crate::runtime::vm_builtins::{ellipsis_print, format_kw_wrapper, none_print};
 
 // ── Type construction ──────────────────────────────────────────────────
 
@@ -234,6 +234,13 @@ pub(crate) fn build_vm_types(
         ctx,
         static_qstr_id(b"NoneType").expect("NoneType is a static qstr"),
     );
+    // D1: the vendor `objnone.c` type carries `none_print`
+    // (`mp_type_roms.zig:191-201`); `plain_type` leaves the
+    // print slot empty, which made `repr(None)` print
+    // `"<NoneType>"`.
+    if let Obj::Type(d) = ctx.arena.get_mut(none_type) {
+        d.print = Some(none_print);
+    }
 
     // Strings (the `format` entry takes the kwargs pass-through —
     // C8b's deferred item, see `format_kw_wrapper`).
@@ -414,6 +421,33 @@ pub(crate) fn build_vm_types(
     }
     for t in exc.all() {
         ctx.arena.set_header_type(t, Some(type_));
+    }
+
+    // MRO patch (D1): every builtin type built here carries an
+    // empty `mro` in its `*_type_data` literal, so
+    // `is_subclass_fast` fell through to `mro.contains(object)`
+    // and `isinstance(1, object)` came out `False`. The Zig's
+    // `mroOf` appends `object` for a parentless type — the ROM
+    // registry (`rom.rs`) already patches its types to `[t,
+    // object]`; patch the VM-built ones the same way (leaving
+    // non-empty MROs — the exception types — alone; `object`
+    // itself gets `[object]`).
+    for t in [
+        fun_builtin_var, int, bool_, cell, float, complex, none_type, str_, bytes, tuple, list,
+        dict, set, frozenset, range, slice, array, bytearray, memoryview, map, filter, zip,
+        enumerate, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module, property,
+        ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
+    ] {
+        if let Obj::Type(d) = ctx.arena.get_mut(t) {
+            if d.mro.is_empty() {
+                d.mro = vec![t, object];
+            }
+        }
+    }
+    if let Obj::Type(d) = ctx.arena.get_mut(object) {
+        if d.mro.is_empty() {
+            d.mro = vec![object];
+        }
     }
 
     let types = BuiltinTypes {

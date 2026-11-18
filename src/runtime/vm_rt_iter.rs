@@ -61,7 +61,7 @@ pub fn getiter_vm_ctx(
 /// Drain a raise left by an iterator seam: `state.pending_exc`
 /// first (the `call` seam's stash), then the recorded
 /// `pending_raise`, else a bare TypeError.
-fn drain_seam_raise(ctx: &mut CallCtx, state: &mut VmState) -> Value {
+pub(crate) fn drain_seam_raise(ctx: &mut CallCtx, state: &mut VmState) -> Value {
     if let Some(exc) = state.pending_exc.take() {
         return exc;
     }
@@ -130,8 +130,29 @@ pub fn iternext_allow_raise_ctx(
                         Ok(v) => CallOutcome::Value(v),
                         Err(ObjError::IndexOutOfRange) => CallOutcome::Stop,
                         Err(e) => {
-                            let _ = ctx2.record_typed(e);
-                            CallOutcome::Raise
+                            // The slot collapses its error into a
+                            // recorded raise (`call_subscr` turns a
+                            // slot `PyRaise` into `NotImplemented`,
+                            // so `obj_subscr` never returns
+                            // `IndexOutOfRange` here) — classify
+                            // on the recorded raise instead, the
+                            // original's rule
+                            // (`objgetitemiter.zig:excIsStopOrIndex`):
+                            // a `StopIteration` or `IndexError`
+                            // from `__getitem__` IS exhaustion;
+                            // anything else propagates.
+                            let stop = matches!(
+                                ctx2.pending_raise.as_ref(),
+                                Some(p) if p.exc_name == "IndexError"
+                                    || p.exc_name == "StopIteration"
+                            );
+                            if stop {
+                                ctx2.pending_raise.take();
+                                CallOutcome::Stop
+                            } else {
+                                let _ = ctx2.record_typed(e);
+                                CallOutcome::Raise
+                            }
                         }
                     }
                 };
@@ -650,7 +671,7 @@ pub fn load_attr(vm: &mut Vm, base: Value, attr: u32) -> Result<Value, Value> {
 
 pub fn store_attr(vm: &mut Vm, base: Value, attr: u32, value: Value) -> Result<(), Value> {
     let (mut ctx, mut state) = vm.split();
-    store_attr_ctx(&mut ctx, &mut state, base, attr, value)
+    store_attr_ctx(&mut ctx, &mut state, base, attr, Some(value))
 }
 
 pub fn getiter_vm(vm: &mut Vm, value: Value) -> Result<Value, Value> {

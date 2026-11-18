@@ -37,6 +37,8 @@
 
 pub mod argcheck;
 pub mod bc;
+pub mod builtin_fns;
+pub mod builtin_vm;
 pub mod builtinhelp;
 pub mod builtinevex;
 pub mod builtinimport;
@@ -62,6 +64,7 @@ pub mod runtime_utils;
 pub mod scheduler;
 pub mod vm;
 pub mod vm_builtins;
+pub mod vm_builtins_bind;
 pub mod vm_call;
 pub mod vm_dispatch;
 pub mod vm_dispatch_exec;
@@ -80,6 +83,12 @@ pub mod warning;
 mod argcheck_tests;
 #[cfg(test)]
 mod bc_tests;
+#[cfg(test)]
+mod builtin_fns_tests;
+#[cfg(test)]
+mod builtin_vm_tests;
+#[cfg(test)]
+mod builtin_vm_tests_b;
 #[cfg(test)]
 mod builtinhelp_tests;
 #[cfg(test)]

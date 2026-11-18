@@ -315,24 +315,35 @@ pub fn load_attr_ctx(
     }
 }
 
-/// `mp_store_attr` (`runtime.zig:1255-1275`): the attr slot
-/// (C12a's — no `attr` field yet, so every store falls through
-/// to the `AttributeError("no attribute '%q'")` raise).
-/// Documented C14 gap: instance attribute stores need C12a's
-/// `Instance` members map + the attr slot.
+/// `mp_store_attr` (`runtime.zig:1255-1275`): the real C14
+/// `runtime_method::store_attr` — the attr slot (C12a's), the
+/// `Instance` members map, descriptors. `value == None` deletes
+/// (the `delattr` path); the old stub always raised
+/// `AttributeError` (the C13b ignored test
+/// `makenew_class_member_store` waited on this).
 pub fn store_attr_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
     base: Value,
     attr: u32,
-    _value: Value,
+    value: Option<Value>,
 ) -> Result<(), Value> {
-    let _ = base;
-    let name = String::from_utf8_lossy(ctx.pool.qstr_str(attr as u16)).into_owned();
-    Err(crate::objects::objtype::objexcept::new_exception_msg(
-        ctx,
-        state.exc.attribute_error,
-        &format!("no attribute '{name}'"),
-    ))
+    use crate::runtime::import_search::rt_error_to_value;
+    use crate::runtime::runtime::{Builtins, ExcRefs, RtError, RuntimeSeams};
+    use crate::runtime::runtime_method::store_attr;
+    use crate::runtime::vm_rt_iter::drain_seam_raise;
+    let mut seams = RuntimeSeams::stub();
+    let mut builtins = Builtins {
+        globals: Value::Heap(state.builtins),
+        override_dict: None,
+    };
+    let globals = Value::Heap(state.globals);
+    let next_obj = state.next_builtin;
+    let exc = ExcRefs::from_exception_types(&state.exc);
+    store_attr(ctx, base, attr, value, &exc, next_obj, &mut builtins, &mut seams, globals)
+        .map_err(|e| match e {
+            RtError::PyRaise => drain_seam_raise(ctx, state),
+            other => rt_error_to_value(ctx, state, other),
+        })
 }
 

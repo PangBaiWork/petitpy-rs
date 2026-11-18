@@ -382,14 +382,21 @@ pub fn bytes_subscr(
 /// slot (full only — bytes has NO unary_op slot; `len(bytes)` is
 /// served by C6's byte fast path). `BOOL` is the BYTE length != 0,
 /// `LEN` is the UTF-8 code-point count; anything else is NULL.
+/// The bytes resolve through the pool (`str_data_pool`): a
+/// string literal loads as a dynamically-interned `Qstr`, and
+/// the static-only `str_data` resolves only ids < 613 — so
+/// `len('abc')` / `bool('')` on a literal raised
+/// `TypeError("object has no len")` until D1 (the `str` slot
+/// gap C13's `str_data_pool` note left open).
 pub fn str_unary_op(ctx: &mut CallCtx, op: UnaryOp, arg: Value) -> PyResult<Value> {
-    let data = match str_data(ctx.arena, arg) {
-        Some(d) => d,
-        None => return Err(PyError::PyRaise),
+    let Some(data) = crate::objects::strings::objstr_a::str_data_pool(
+        ctx.arena, ctx.pool, arg,
+    ) else {
+        return Err(PyError::PyRaise);
     };
     match op {
         UnaryOp::Bool => Ok(Value::Bool(!data.is_empty())),
-        UnaryOp::Len => Ok(Value::SmallInt(utf8_charlen(data) as i64)),
+        UnaryOp::Len => Ok(Value::SmallInt(utf8_charlen(&data) as i64)),
         _ => Err(PyError::PyRaise),
     }
 }

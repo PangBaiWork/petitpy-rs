@@ -453,14 +453,13 @@ fn makenew_class_attr_on_class() {
     assert_eq!(fx.gi("a"), 1);
 }
 
+/// `C.x = 7` (instance attribute store through the STORE_ATTR
+/// opcode) — un-ignored by D1: `store_attr_ctx` is now the real
+/// C14 `runtime_method::store_attr` (the `Instance` members map
+/// + the attr slot), not the stub that always raised
+/// `AttributeError`.
 #[test]
-#[ignore]
 fn makenew_class_member_store() {
-    // Ignored until C14 lands `mp_store_attr`: `store_attr_ctx`
-    // (`vm_rt_name.rs`) is a stub that always raises
-    // `AttributeError("no attribute '%q'")` (documented C14 gap:
-    // instance stores need the `Instance` members map + the
-    // `attr` slot). Kept so the block is not lost.
     let mut fx = Fx::new();
     fx.run_ok("class C: pass\nc = C()\nc.x = 7\na = c.x\n");
     assert_eq!(fx.gi("a"), 7);

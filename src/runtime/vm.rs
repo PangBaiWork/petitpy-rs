@@ -45,18 +45,12 @@
 //!   `ctx.outcome = .raised` + `ctx.pending_exc`.
 //! * **`reenter` (tier-up) is kept as an arm** but never taken on
 //!   native (`reenter_for_tier_up` is wasm-only in the Zig).
-//! * **The `attr` slot does not exist yet** (C12a owns it): where
-//!   the VM needs an attribute lookup it uses the C10a direct
-//!   fns (`fun_bc_attr` / `bound_meth_attr` / `closure_attr`) and
-//!   the type locals-dict lookup — see `load_method` in
-//!   `vm_ops.rs` (C14 subsumes it once `attr` lands).
-//! * **Imports are stubs** (C15): `IMPORT_NAME` / `IMPORT_FROM` /
-//!   `IMPORT_STAR` raise `ImportError` (see `vm_ops.rs`).
-//! * **Float/complex ops are stubs** (C18 owns the float/complex
-//!   type slots): a float operand reaches the float type's
-//!   `binary_op` slot, which is absent, so `binary_op` falls
-//!   through to `binopUnsupported` (TypeError). Documented in
-//!   `vm_ops.rs`.
+//!
+//! The `attr` slot (C12a), the import system (C15b) and the
+//! float/complex slots (C18a) have all landed since the earlier
+//! doc bullets were written; their details live in
+//! `runtime_method.rs`, `builtinimport.rs` / `import_search.rs`
+//! and `objfloat.rs` / `objcomplex.rs` respectively.
 //!
 //! The runner seam (`src/runtime/runner.rs`, unified by C13):
 //! `execute_frame` IS the `VmRunner` body — `gen_resume` /
@@ -176,6 +170,32 @@ pub struct VmState {
     /// `call_function_ctx`, like `eval` — its `func` is a
     /// stub, see `builtinhelp.rs`). Added by C18b.
     pub help_builtin: Value,
+    /// The D1 VM-intercepted builtins (same interception as
+    /// `eval` — their `func`s are the shared stub, see
+    /// `builtin_fns::intercepted_stub_fn` and `builtin_vm.rs`):
+    /// `globals`, `locals`, `dir`, `sorted`, `min`, `max`,
+    /// `getattr`, `setattr`, `hasattr`, `delattr`, `iter`,
+    /// `all`, `any`, `sum`.
+    pub globals_builtin: Value,
+    pub locals_builtin: Value,
+    pub dir_builtin: Value,
+    pub sorted_builtin: Value,
+    pub min_builtin: Value,
+    pub max_builtin: Value,
+    pub getattr_builtin: Value,
+    pub setattr_builtin: Value,
+    pub hasattr_builtin: Value,
+    pub delattr_builtin: Value,
+    pub iter_builtin: Value,
+    pub all_builtin: Value,
+    pub any_builtin: Value,
+    pub sum_builtin: Value,
+    /// The `NotImplemented` singleton value (D1): an
+    /// `Obj::Instance` with the shared ellipsis type as header
+    /// (the vendor's `mp_type_singleton` carries both it and
+    /// `Ellipsis`, `objsingleton.c:47-53`); `ellipsis_print`
+    /// spells it `NotImplemented`.
+    pub not_implemented: Value,
     /// The scheduler pending-exception slot
     /// (`MP_STATE_THREAD(mp_pending_exception)`,
     /// `scheduler.zig:33`): `None` = `MP_OBJ_NULL` = nothing
@@ -330,6 +350,21 @@ impl Vm {
                 compile_builtin: Value::None,
                 import_builtin: Value::None,
                 help_builtin: Value::None,
+                globals_builtin: Value::None,
+                locals_builtin: Value::None,
+                dir_builtin: Value::None,
+                sorted_builtin: Value::None,
+                min_builtin: Value::None,
+                max_builtin: Value::None,
+                getattr_builtin: Value::None,
+                setattr_builtin: Value::None,
+                hasattr_builtin: Value::None,
+                delattr_builtin: Value::None,
+                iter_builtin: Value::None,
+                all_builtin: Value::None,
+                any_builtin: Value::None,
+                sum_builtin: Value::None,
+                not_implemented: Value::None,
                 pending_sched: None,
                 sys_path: vec![String::new()],
                 frozen_modules: crate::runtime::frozen_modules::FrozenTable::new(),
@@ -422,6 +457,9 @@ impl Vm {
         bind("zip", Value::Heap(vmt.zip), &mut pairs);
         bind("enumerate", Value::Heap(vmt.enumerate), &mut pairs);
         bind("Ellipsis", state.ellipsis, &mut pairs);
+        bind("super", Value::Heap(t.super_), &mut pairs);
+        bind("staticmethod", Value::Heap(t.staticmethod), &mut pairs);
+        bind("classmethod", Value::Heap(t.classmethod), &mut pairs);
         for (name, r) in [
             ("BaseException", state.exc.base_exception),
             ("SystemExit", state.exc.system_exit),
@@ -543,6 +581,11 @@ impl Vm {
             crate::runtime::builtinhelp::help_builtin_fn,
             &mut pairs,
         );
+        // The D1 binds (`vm_builtins_bind.rs`): plain builtins,
+        // VM-intercepted builtins, `NotImplemented`,
+        // `isinstance` / `issubclass`, `__name__`, the `io`
+        // module registration.
+        let d1 = crate::runtime::vm_builtins_bind::bind_d1_builtins(&mut ctx, state, &mut pairs);
 
         let builtins = ctx.alloc(
             None,
@@ -561,6 +604,21 @@ impl Vm {
         state.compile_builtin = compile_val;
         state.import_builtin = import_val;
         state.help_builtin = help_val;
+        state.globals_builtin = d1.globals_builtin;
+        state.locals_builtin = d1.locals_builtin;
+        state.dir_builtin = d1.dir_builtin;
+        state.sorted_builtin = d1.sorted_builtin;
+        state.min_builtin = d1.min_builtin;
+        state.max_builtin = d1.max_builtin;
+        state.getattr_builtin = d1.getattr_builtin;
+        state.setattr_builtin = d1.setattr_builtin;
+        state.hasattr_builtin = d1.hasattr_builtin;
+        state.delattr_builtin = d1.delattr_builtin;
+        state.iter_builtin = d1.iter_builtin;
+        state.all_builtin = d1.all_builtin;
+        state.any_builtin = d1.any_builtin;
+        state.sum_builtin = d1.sum_builtin;
+        state.not_implemented = d1.not_implemented;
         // Pin everything live: the types, the singletons, the
         // builtins dict and the builtin values.
         let mut pins: Vec<Value> = Vec::new();
@@ -614,6 +672,22 @@ impl Vm {
         pins.push(exec_val);
         pins.push(compile_val);
         pins.push(import_val);
+        pins.push(d1.globals_builtin);
+        pins.push(d1.locals_builtin);
+        pins.push(d1.dir_builtin);
+        pins.push(d1.sorted_builtin);
+        pins.push(d1.min_builtin);
+        pins.push(d1.max_builtin);
+        pins.push(d1.getattr_builtin);
+        pins.push(d1.setattr_builtin);
+        pins.push(d1.hasattr_builtin);
+        pins.push(d1.delattr_builtin);
+        pins.push(d1.iter_builtin);
+        pins.push(d1.all_builtin);
+        pins.push(d1.any_builtin);
+        pins.push(d1.sum_builtin);
+        pins.push(d1.not_implemented);
+        pins.push(d1.io_module);
         drop(ctx);
         for v in pins {
             self.pin(v);

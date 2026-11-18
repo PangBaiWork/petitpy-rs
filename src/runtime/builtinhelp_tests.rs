@@ -228,6 +228,10 @@ fn help_modules_empty() {
     let (mut ctx, state) = fx.vm.split();
     state.builtin_modules.clear();
     state.extensible_modules.clear();
+    // NOTE (D5): `help("modules")` also lists the frozen
+    // bundle (the original's `mp_help_add_from_names` iterates
+    // the same list), so the frozen table is reset too.
+    state.frozen_modules = crate::runtime::frozen_modules::FrozenTable::new();
     let mut out = String::new();
     print_modules(&mut ctx, &state, &mut out);
     assert_eq!(out, "");

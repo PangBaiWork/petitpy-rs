@@ -26,6 +26,7 @@ use crate::objects::containers::objproperty::PROPERTY_METHODS;
 use crate::objects::iters::objenumerate::enumerate_type_data;
 use crate::objects::iters::objfilter::filter_type_data;
 use crate::objects::iters::objmap::map_type_data;
+use crate::objects::iters::objreversed::reversed_type_data;
 use crate::objects::iters::objzip::zip_type_data;
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::objtype::objexcept_types::{build_exception_types, ExceptionTypes};
@@ -303,6 +304,13 @@ pub(crate) fn build_vm_types(
     let zip = ctx.alloc(None, Obj::Type(zip_type_data(zip_dict)));
     let enumerate_dict = empty_dict(ctx);
     let enumerate = ctx.alloc(None, Obj::Type(enumerate_type_data(enumerate_dict)));
+    // `reversed` (D5): the ROM type from `objreversed` (flags
+    // `0x0080`, make_new + iter slots, no locals dict); bound as
+    // a builtin in `Vm::build_builtins`. The original registers
+    // it in `modbuiltins.zig:1082` — D1 missed it, which broke
+    // frozen `heapq` (`heapify` uses `reversed`).
+    let reversed_dict = empty_dict(ctx);
+    let reversed = ctx.alloc(None, Obj::Type(reversed_type_data(reversed_dict)));
 
     // Callables.
     let fun_bc_dict = empty_dict(ctx);
@@ -432,7 +440,7 @@ pub(crate) fn build_vm_types(
     for t in [
         fun_builtin_var, object, int, bool_, cell, float, complex, none_type, str_, bytes,
         tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
-        filter, zip, enumerate, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
+        filter, zip, enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
         property, ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
         fileio, textio, attrtuple,
     ] {
@@ -454,7 +462,7 @@ pub(crate) fn build_vm_types(
     for t in [
         fun_builtin_var, int, bool_, cell, float, complex, none_type, str_, bytes, tuple, list,
         dict, set, frozenset, range, slice, array, bytearray, memoryview, map, filter, zip,
-        enumerate, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module, property,
+        enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module, property,
         ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
     ] {
         if let Obj::Type(d) = ctx.arena.get_mut(t) {
@@ -502,6 +510,8 @@ pub(crate) fn build_vm_types(
         deque: None,
         ordereddict: None,
         namedtuple_fn: None,
+        re_type: None,
+        match_type: None,
     };
     let vm_types = VmTypes {
         fun_bc,
@@ -523,6 +533,7 @@ pub(crate) fn build_vm_types(
         filter,
         zip,
         enumerate,
+        reversed,
     };
     (types, vm_types, exc, empty_tuple, Value::Heap(ellipsis_singleton))
 }

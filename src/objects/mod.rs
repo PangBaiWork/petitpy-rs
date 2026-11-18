@@ -18,3 +18,5 @@ pub mod value_data;
 mod obj_ops_tests;
 #[cfg(test)]
 mod obj_tests;
+#[cfg(test)]
+mod value_tests;

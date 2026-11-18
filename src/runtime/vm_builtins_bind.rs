@@ -263,6 +263,7 @@ impl Vm {
         bind("filter", Value::Heap(vmt.filter), &mut pairs);
         bind("zip", Value::Heap(vmt.zip), &mut pairs);
         bind("enumerate", Value::Heap(vmt.enumerate), &mut pairs);
+        bind("reversed", Value::Heap(vmt.reversed), &mut pairs);
         bind("Ellipsis", state.ellipsis, &mut pairs);
         bind("super", Value::Heap(t.super_), &mut pairs);
         bind("staticmethod", Value::Heap(t.staticmethod), &mut pairs);

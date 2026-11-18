@@ -45,6 +45,7 @@ pub mod builtinimport;
 pub mod code_store;
 pub mod compile_bridge;
 pub mod d4state;
+pub mod frozen_bundle;
 pub mod frozen_modules;
 pub mod import_search;
 pub mod modos;

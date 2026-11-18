@@ -572,9 +572,16 @@ fn d4_micropython_heap() {
 
 #[test]
 fn d4_collections_deque() {
+    // NOTE (D5): `import collections` now loads the FROZEN
+    // petitpy-lib package (list-backed Python `deque`), so the
+    // NATIVE deque is reached via `ucollections` — on the
+    // reference `ucollections.deque is collections.deque` is
+    // False. The frozen deque's `__init__` is a Python function,
+    // which hits the pre-existing FunBc `__init__` stub-seam
+    // gap (see d5_result.txt §4).
     let mut fx = Fx::new();
     fx.run_ok(
-        "from collections import deque\n\
+        "from ucollections import deque\n\
          d = deque([1, 2, 3], 10)\n\
          a = len(d)\n\
          d.append(4)\n\
@@ -591,9 +598,13 @@ fn d4_collections_deque() {
 
 #[test]
 fn d4_collections_deque_one_arg_fails() {
+    // NOTE (D5): the native deque still requires exactly 2
+    // args; the FROZEN `collections.deque` (list-backed Python
+    // class) accepts 1 — so this pins the native module via
+    // `ucollections`, as on the reference.
     let mut fx = Fx::new();
     assert_eq!(
-        fx.raised_msg("from collections import deque\ndeque([1, 2, 3])\n"),
+        fx.raised_msg("from ucollections import deque\ndeque([1, 2, 3])\n"),
         (
             "TypeError".to_string(),
             "argument num/types mismatch".to_string()
@@ -634,6 +645,13 @@ fn d4_collections_ordereddict() {
 
 #[test]
 fn d4_collections_uimport_identity() {
+    // NOTE (D5): with the frozen bundle loaded, `import
+    // collections` is the FROZEN package, so `deque` is the
+    // list-backed Python class — NOT the native deque
+    // (probed on the reference: `ucollections.deque is
+    // collections.deque` is False). `namedtuple` and
+    // `OrderedDict` are re-exported from the native module
+    // by the frozen package, so they stay identical.
     let mut fx = Fx::new();
     fx.run_ok(
         "import collections\n\
@@ -642,7 +660,7 @@ fn d4_collections_uimport_identity() {
          b = ucollections.namedtuple is collections.namedtuple\n\
          c = ucollections.OrderedDict is collections.OrderedDict\n",
     );
-    assert!(fx.g_bool("a"));
+    assert!(!fx.g_bool("a"));
     assert!(fx.g_bool("b"));
     assert!(fx.g_bool("c"));
 }

@@ -444,7 +444,10 @@ fn setup_code_state_helper(
         if sig.scope_flags & MP_SCOPE_FLAG_VARARGS == 0 {
             return Err(SetupError::ArgCountMismatch);
         }
-        let tuple = ctx.alloc(None, Obj::Tuple(pos_args[sig.n_pos_args..].to_vec()));
+        let tuple = ctx.alloc(
+            Some(ctx.types.tuple),
+            Obj::Tuple(pos_args[sig.n_pos_args..].to_vec()),
+        );
         state[vpk_slot(vpk_idx)] = Some(Value::Heap(tuple));
         vpk_idx -= 1;
         n_args = sig.n_pos_args;
@@ -482,7 +485,7 @@ fn setup_code_state_helper(
         let mut kwargs_dict: Option<GcRef> = None;
         if sig.scope_flags & MP_SCOPE_FLAG_VARKEYWORDS != 0 {
             let d = ctx.alloc(
-                None,
+                Some(ctx.types.dict),
                 Obj::Dict(DictData {
                     map: MapData::new(),
                 }),
@@ -618,7 +621,7 @@ fn setup_code_state_helper(
         }
         if sig.scope_flags & MP_SCOPE_FLAG_VARKEYWORDS != 0 {
             let d = ctx.alloc(
-                None,
+                Some(ctx.types.dict),
                 Obj::Dict(DictData {
                     map: MapData::new(),
                 }),

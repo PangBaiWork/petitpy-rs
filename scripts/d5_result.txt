@@ -1,0 +1,364 @@
+Lane D5: frozen bundle + modre binding — result
+================================================
+Worktree ~/workspace/petitpy-rs-d5-frozen, branch lane/d5-frozen,
+base master af3417f (D4 merged). One commit (see git log).
+Acceptance (verified in-tree by the executor; main agent to re-verify):
+  lib 1476 passed (1428 + 48 new), 0 failed, 7 ignored
+    (3 pre-existing + 4 D5, see §4); bins 9 passed; 0 warnings;
+  check_compile_mpy.py PASS (byte mismatches: 0);
+  check_frozen.py PASS (regen 23/23, checked-in vs original
+    build-frozen/*.mpy 23/23 identical, 38,141 bytes total);
+  no unsafe in src (only doc comments mention the word);
+  every file <800 lines (modre_tests.rs split at 585 + 417);
+  value.rs 459 / map.rs 860 (pre-existing debt, untouched) /
+    vm.rs 567 / vm_call.rs 690; original repo clean.
+
+§1 — mapping table (original → Rust)
+---------------------------------------
+tools/freeze_modules.py (MODULES list, 23 entries — see §3)
+  → scripts/freeze_modules.py (compiles the 23 modules with the
+    Rust `compile_mpy` example, source name `{modname}.py`, into
+    frozen/*.mpy + frozen/frozen-index.txt)
+  → scripts/check_frozen.py (regen-vs-checked-in + checked-in-vs-
+    original build-frozen/*.mpy)
+  → build.rs (emits OUT_DIR/frozen_table.rs:
+    FROZEN_ENTRIES: &[(&str, &[u8])] via include_bytes!, MODULES
+    order, cargo:rerun-if-changed per file; EMPTY table if any
+    file is missing — mirrors the Zig's comptime-if arm)
+  → src/runtime/frozen_bundle.rs (include!s the generated table)
+  → Vm::new fills state.frozen_modules via
+    frozen_bundle::frozen_table() (~38KB copy per Vm::new).
+  The .mpy files are CHECKED IN (unlike the original, which does
+  not track build-frozen/): Rust has no `make freeze` step, and
+  the bytes are deterministic outputs of checked-in compiler +
+  checked-in sources. Source names verified via strings:
+  json.py, collections.py, collections.abc.py, js.py, _thread.py,
+  types.py, re.py, subprocess.py, importlib.metadata.py.
+
+vendor/micropython/extmod/modre.c (MP_REGISTER_EXTENSIBLE_MODULE
+  MP_QSTR_re; config port/mpconfigport.h:113-116: MICROPY_PY_RE=1,
+  MATCH_GROUPS=1, MATCH_SPAN_START_END=1, RE_SUB=1;
+  MICROPY_PY_RE_DEBUG NOT defined; ERROR_REPORTING defaults to
+  TERSE at ROM_LEVEL=MINIMUM, so every compile failure is
+  ValueError "error in regex")
+  → src/modules/modre.rs (655 lines) + modre_types.rs (108:
+    print slots + type builders) + modre_match.rs (144: match
+    methods). Split because the first draft was 879 lines.
+  → Obj::Re(ReData { prog: ByteProg }) (leaf) +
+    Obj::Match(MatchData { caps: Vec<Sub>, num_matches: usize,
+    subject: Value }) in value.rs/value_data.rs; children() arm
+    for Match returns [subject]; heap_bytes arms: Re → prog.bytelen,
+    Match → caps.len()*16.
+  → BuiltinTypes gains re_type/match_type: Option<GcRef> (socket
+    precedent); registrar stores them after drop(ctx).
+  → modre.rs: local check_arity/exc (D4 precedent); str_arg
+    (modsocket shape — TypeError "can't convert to str
+    implicitly"); subject_is_str/piece (mp_obj_new_str_of_type —
+    results follow the SUBJECT's type); is_re (exact-type via
+    obj_get_type vs ctx.types.re_type); re_prog/match_parts
+    (cloned, no arena borrow held); alloc_match; re_print
+    (`<re 0x{slot:x}>`, arena slot — deliberate divergence, the
+    original prints the ASLR-random raw pointer) / match_print
+    (`<match num=N>`, exact); re_type_data/match_type_data
+    (flags 0, print + locals only, no make_new, mro [self,
+    object] after alloc — D4 collections precedent);
+    build_re_module → PyResult<(Value, GcRef, GcRef, Value)>
+    (module, re_t, match_t, sub_fn). The three shared FunBuiltins
+    (match/search/sub) are built once with mk_fun and stored in
+    BOTH the module dict and the `re` locals dict
+    (MapData::from_pairs). Module dict: compile (1–2), match
+    (2–4), search (2–4), sub (3–5 stub); NO split, NO DEBUG at
+    module level; dict fixed via fix_dict (D4 pattern).
+  → compile_pattern uses re15::compilecode alone (covers
+    sizecode's pass too — same compile_into); sizecode → None and
+    compilecode → Err both raise ValueError "error in regex";
+    the flags arg is IGNORED entirely (RE_DEBUG off — the C only
+    reads it under #if MICROPY_PY_RE_DEBUG).
+  → re_exec implements the was_compiled branch with the C's
+    pos/endpos clamping (startpos.clamp(0, len),
+    endpos.clamp(startpos, len)); uncompiled patterns IGNORE
+    pos/endpos. re_split implements the C loop verbatim
+    (maxsplit default 0 = unlimited via the `maxsplit > 0` guard;
+    empty-match break; prog.sub > 0 → NotImplementedError
+    "splitting with sub-captures" after the first piece; tail
+    piece always appended).
+  → call_sub_ctx implements re_sub_helper verbatim (count
+    default 0 = unlimited; unanchored search; stop on no-match
+    OR empty match; no substitution → return the subject ITSELF;
+    callable replace via call_function_ctx with the match object
+    rooted in ctx.roots.extra across the call — D1 sorted
+    precedent; expand_repl handles \g<N>/\N/\\/other-\x exactly
+    as modre.c:340-372, with u32 wrapping arithmetic for the
+    group number as the C's unsigned int, and IndexError(arg)
+    with the number as arg).
+  → match methods implement modre.c:72-176 verbatim (group
+    bounds check n < 0 || n >= num_matches → IndexError(no_in)
+    with the ORIGINAL arg; groups() empty → empty-tuple
+    singleton; match_span_pair shared span/start/end body with
+    utf8_ptr_to_index char conversion for str subjects only).
+
+  `sub` needs VM interception (D1/D4 GcRef-identity precedent
+  in src/runtime/vm_call_intercept.rs): only `sub` calls user
+  code. The module-level `sub` and method-level `sub` are the
+  SAME FunBuiltin object (modre.c registers `re_sub_obj` in both
+  tables), so ONE intercept covers both. VmState gains the plain
+  field `re_sub_builtin: Value` (init Value::None in Vm::new);
+  the module dict holds a bare-raise stub FunBuiltin (D4
+  opt_level_stub_fn precedent); call_sub_ctx(ctx, state, n_args,
+  n_kw, args) in modre.rs does the real work.
+
+  Registration: build_d5_modules(vm) in
+  src/runtime/vm_modules.rs builds _json + _subprocess via D3's
+  builders → builtin_modules (both are MP_REGISTER_MODULE); re →
+  extensible_modules under the name `re` ONLY — `import ure`
+  resolves via the existing D4 u-strip (ure → extensible `re`),
+  NOT via a second registration (registering both `re` and `ure`
+  would wrongly list `ure` as a separate module; the observable
+  behavior is identical for imports, and `ure.__name__` is 're'
+  either way). Pins all three modules; stores re/match types in
+  vm.types. D3's math/socket/struct builders are NOT registered
+  (Phase E entry work, per brief).
+
+src/objects/strings/objstr_methods_a.rs — str_data → str_data_pool
+  (see §3, master bug 2): join, get_substring_data, str_finder
+  (find/rfind/index/count), str_startendswith (startswith/
+  endswith), str_replace, str_split, str_rsplit, str_uni_strip
+  (strip/lstrip/rstrip) — all 14 arena-only sites in the file.
+
+src/runtime/bc.rs — setup_code_state header fix (see §3, master
+  bug 1): the `*args` tuple and the `**kw` dict (both branches)
+  are now allocated with the tuple/dict type headers.
+
+modbuiltins.zig:1082 `reversed` (D1 gap — see §3): the `reversed`
+  ROM type from objreversed.rs (reversed_type_data, flags
+  0x0080, make_new + getiter, no locals dict, no print slot —
+  the VM's default print renders `<reversed>`, as the
+  reference does) + reversed_make_new_slot in
+  objtype/make_new.rs (stub IterSeams — see §3) + VmTypes.reversed
+  + build in vm_types.rs (header-type + MRO patch lists) + bind
+  in vm_builtins_bind.rs build_builtins.
+
+Cap splits (required by the lane's own growth):
+  value.rs tests module (71 lines) → src/objects/value_tests.rs
+  (value.rs 531 → 459); OsFdBuiltins struct vm.rs →
+  src/runtime/modos_fd.rs (vm.rs 583 → 567); modre_tests.rs
+  863 → modre_tests.rs 585 + src/modules/modre_frozen_tests.rs
+  417 (harness copy + frozen/ignored/varargs/reversed tests).
+
+4 D4 tests updated (premises changed by frozen loading — all
+  reference behavior, probed): d4_collections_deque and
+  d4_collections_deque_one_arg_fails now use `from ucollections
+  import deque` (frozen collections.deque is the list-backed
+  Python class); d4_collections_uimport_identity now asserts
+  ucollections.deque is collections.deque is False (b/c still
+  True — namedtuple/OrderedDict re-exported from native);
+  help_modules_empty also resets state.frozen_modules =
+  FrozenTable::new() (print_modules lists frozen names too).
+
+§2 — probes (reference binary ~/workspace/petitpy-orig/zig-out/bin/petitpy)
+-----------------------------------------------------------------------
+Native `ure` (all probed 2026-11-18):
+- Table: DEBUG? False, split? False (module level), sub/match/
+  search/compile? True; ure.__name__ == 're'.
+- Prints: ure.compile("a") → `<re 7001d35ffae0>` (raw pointer,
+  ASLR-random, 12 hex digits); match → `<match num=3>` for 2
+  groups (num_matches = sub+1). Type names: `re`, `match`.
+- Match semantics: group(0/1/2) → value/None for non-
+  participating group; groups() → ('a', None) / () when no caps;
+  span() → (0,1), span(2) → (-1,-1); start()/end(); group(5) →
+  IndexError args (5,), str "5".
+- `match` is ANCHORED at position 0: compile("a").match("banana")
+  is None; match("ba", 1) matches.
+- Compiled-pattern pos/endpos: match("ba", 1) → match;
+  match("ba", 1, 2) → match; match("ba", 1, 1) → None;
+  search("ba", 1) → match; neg pos → None (clamped to 0);
+  pos 99 → None (clamped to len); endpos<start → endpos=
+  startpos → None. Uncompiled patterns IGNORE pos/endpos
+  (ure.match("a", "ba", 1) → None).
+- sub: sub("a","X","banana") → 'bXnXnX'; count=1 → 'bXnana';
+  count=0 → unlimited; flags arg ignored; \g<2>\1 works;
+  callable replace works; bytes subject → bytes result;
+  no-match returns the SAME object; missing group in repl →
+  IndexError 2; \\ repl → \. sub("(a)(n)", "\\g<2>\\1",
+  "banana") → 'bnanaa'.
+- split (pattern method only): compile("a").split("banana") →
+  ['b','n','n','']; maxsplit=1 → ['b','nana']; sub-captures →
+  NotImplementedError "splitting with sub-captures"; nomatch
+  (compile("x").split("abc")) → ['abc']; empty-match split →
+  ['abc']; compile("a").split("ba") → ['b', ''];
+  compile("a").split("abc") → ['', 'bc'] (the "a" matches at 0).
+- Unicode spans are CHAR indices: search("é") on "aéb" →
+  span (1, 2), group "é".
+- compile("a", 2) flags accepted+ignored; compile("") works;
+  empty match group(0) == "".
+- SEGFAULTS on the reference (rc=134, documented divergences —
+  Rust raises TypeError instead): ure.compile(123),
+  ure.compile(None), ure.compile(bytearray(b"a")) (NULL deref
+  in _compilecode, compilecode.c:53 via re1_5_sizecode);
+  ure.sub("a", 5, "banana") (mp_obj_str_get_str NULL deref,
+  modre.c:357).
+- TypeErrors on the reference: ure.search("a", 123),
+  ure.compile("a").match(None) → "can't convert to str
+  implicitly"; ure.compile("a").search("ba", "x"),
+  group("x"), sub("a","X","banana","x"), match("ba", 1.5),
+  split("banana", "x") → "can't convert to int".
+- Method identity is FALSE on the reference (bound methods, not
+  shared objects): ure.match is ure.compile("a").match → False;
+  ure.sub is ure.compile("a").sub → False;
+  ure.compile("a").match is ure.compile("a").match → False.
+  (Do NOT test FunBuiltin identity through attribute access.)
+- Bad compile "[" / "a(" → ValueError "error in regex".
+- import js → ImportError "js: no host bridge available.
+  petitpy must be built with -Dfeature-js=true and run inside
+  a browser/host that registers the js_* wasm imports. See
+  docs/src/adrs/006-js-interop.md." (works in Rust iff
+  ModuleNotFoundError ⊂ ImportError — objexcept_types.rs:51).
+- sys.modules: after `import ure` → [] (builtin/extensible
+  modules are NEVER inserted — D2); after `import re` →
+  ['re'], re is sys.modules['re'] True; after `import ure`
+  too → still ['re'], ure is re False; after `import
+  collections` → ['collections', 're']; after `from
+  collections.abc import Callable` → adds 'collections.abc';
+  after `import json` → adds 'json'. Frozen modules DO register.
+- Frozen modules all import + work on the reference:
+  json.loads('{"k": 1}') → {'k': 1}; json.dumps({"k": 1}) →
+  '{"k": 1}'; json.dumps([1, "a"]) → '[1, "a"]'; heapq
+  (heapify([3,1,2]) → [2,3], heappop → 1); bisect (2); random;
+  functools (reduce → 6); itertools; string
+  (ascii_lowercase[:3] → 'abc'); typing; uuid (uuid4() is not
+  None); enum; ipaddress (ip_network("10.0.0.0/8",
+  strict=False)); importlib; datetime; shutil; pathlib;
+  _thread (<module '_thread'>); types (types.SimpleNamespace
+  is None on the reference — do NOT assert it is a class).
+- from collections.abc import Mapping: isinstance({}, Mapping)
+  → True; isinstance([], Mapping) → True (the frozen abc's
+  Mapping subclasshook is loose); isinstance("x", Mapping) →
+  True.
+- reversed on the reference: print(reversed([1,2,3])) →
+  `<reversed>`; print(map(str, [1])) → `<map>`;
+  list(reversed([1,2,3])) → [3,2,1];
+  list(reversed('abc')) → ['c','b','a'];
+  type(reversed([1])) → <class 'reversed'>.
+- itertools.chain, collections.Counter, collections.defaultdict,
+  frozen deque, _CompiledPattern are all Python classes with
+  __init__ (checked in petitpy-lib sources) — all hit the FunBc
+  __init__ gap in Rust (see §4).
+
+§3 — bugs found / brief corrections
+-----------------------------------
+BRIEF CORRECTIONS (found during grounding, all verified):
+1. tools/freeze_modules.py MODULES has 23 entries, NOT 24
+   (json, types, _thread, js, heapq, bisect, functools,
+   collections, collections.abc, random, itertools, string, re,
+   subprocess, typing, uuid, shutil, pathlib, datetime,
+   importlib, importlib.metadata, enum, ipaddress).
+   build-frozen/ has 23 .mpy files, total 38,141 bytes;
+   `git ls-files build-frozen/` is EMPTY (build artifact, not
+   tracked in the original).
+2. No `DEBUG` constant on native `ure` and NO module-level
+   `split` (only in the compiled-pattern type's locals dict).
+   The frozen `re` shim DOES define DEBUG = 0 (shim-only).
+3. Brief's "subprocess imports os/time" claim was wrong —
+   subprocess.py imports `_subprocess` ONLY.
+
+MASTER BUG 1 — `*args` tuple and `**kw` dict allocated with
+header type None (src/runtime/bc.rs, setup_code_state, C5/C13):
+  The `**kw` dict was allocated with `ctx.alloc(None, ...)` at
+  two sites (the n_kw/DEFKWARGS branch and the no-kwargs
+  branch), and the `*args` tuple the same way. `obj_get_type`
+  returns None for them, so every type-dispatched operation
+  broke: len(kw) → "object has no len", `not kw` → False for
+  the EMPTY dict, len(args) → "object has no len", args[0] →
+  "object isn't subscriptable", and `**kw` unpacking fell into
+  the slow path (vm_call.rs:594-598) that loads `.keys()` on
+  the dict → AttributeError "no attribute 'keys'".
+  Diagnosis path (kept in the result for the record): json.loads
+  failed with AttributeError 'keys' for EVERY input although
+  _json.decode worked directly and a replica of the loads body
+  passed; a debug backtrace hook in new_exception_msg showed
+  load_method_ctx ← call_method_var_kw_ctx ← dispatch inside
+  loads; a second hook showed the object was a Dict (the kw
+  dict, GcRef(566)) with obj_get_type == None; temp tests then
+  proved `not kw` is False and len(kw) fails for the empty
+  kwargs dict. The frozen json.loads/dumps were the first
+  callers to hit it (`if not kw:` + `_Decoder(s, **kw)` /
+  `(cls or JSONEncoder)(**kw).encode(obj)`).
+  FIX (3 one-line changes in bc.rs): allocate with
+  Some(ctx.types.tuple) / Some(ctx.types.dict). Pinned by 5
+  regression tests (d5_varargs_tuple_len/subscr,
+  d5_varkw_not_empty/len/unpack).
+
+MASTER BUG 2 — str methods read dynamic-qstr literals through
+the arena-only `str_data` (src/objects/strings/objstr_methods_a.rs,
+the C13-class dynamic-qstr gap, ~50 sites tree-wide):
+  `str_data` resolves a Qstr via the STATIC table only; a
+  dynamic qstr returns None → StrError::BadImplicitConversion
+  → TypeError "can't convert to str implicitly". D5 hit it in:
+  (a) str_join — `"|".join(...)` failed because the separator
+      "|" is a dynamic qstr (2 sites: separator + items);
+  (b) str_startswith — enum.py's `name.startswith("_")` failed
+      (subject `name` from dict keys + prefix "_" are dynamic).
+  FIX: all 14 arena-only sites in objstr_methods_a.rs now use
+  str_data_pool (join, get_substring_data, str_finder,
+  str_startendswith, str_replace, str_split, str_rsplit,
+  str_uni_strip) — same fix shape as D1's len('abc') and C13b's
+  str_equal. Remaining sites in methods_b.rs (6: caseconv/
+  capitalize/zfill) and methods_c.rs (1) are NOT fixed — see §4.
+
+D1 GAP — `reversed` builtin missing: the original registers it
+  in modbuiltins.zig:1082, but the Rust builtins table lacked
+  it (C11 built the iterator machinery but no type object or
+  binding). Frozen heapq.heapify uses `reversed`, so
+  `import heapq` raised NameError. FIXED in D5 (see §1):
+  reversed_type_data + reversed_make_new_slot + VmTypes.reversed
+  + build_builtins bind. The slot's IterSeams are stubs (a
+  MakeNewFn has no VmState access): a user class whose
+  `__reversed__` is a Python method raises a bare TypeError
+  instead of being called — the C13b class of gap. No builtin
+  sequence defines `__reversed__` in its type dict (verified
+  against the original sources), so builtin sequences are
+  unaffected. Pinned by 3 tests (d5_reversed_list/str/print).
+
+TEST-PREMISE CORRECTIONS (mine, not code bugs):
+- d5_re_compile_match: `match` is anchored — compile("a") on
+  "banana" is None on the reference; test now uses pattern "b".
+- d5_frozen_collections_abc: isinstance([], Mapping) is True
+  on the reference (loose subclasshook); test asserts True.
+- d5_re_split: the nomatch case is compile("x").split("abc")
+  → ['abc']; compile("a").split("abc") → ['', 'bc'].
+
+§4 — not done
+------------
+- FunBc `__init__` stub-seam gap (C13b class, owner: Phase E
+  VM-seam runner work — MakeNewFn/type_call need VM call
+  access). Blocks: `import typing` (instantiates
+  _Subscriptable("Any") at import), `import datetime`
+  (timezone.utc = timezone(...) at import),
+  ipaddress.ip_network(...) (instantiates Python IPv4Network),
+  re.compile("a", re.IGNORECASE).match("A") (frozen re shim's
+  _CompiledPattern.__init__), frozen deque([1,2,3]) +
+  append/popleft. 4 tests #[ignore]d for it:
+  d5_frozen_re_compile_ignored, d5_frozen_deque_ignored,
+  d5_frozen_ipaddress_ignored, d5_frozen_typing_datetime_ignored.
+  (uuid.uuid4() CALLS also fail — "object not iterable", a
+  separate os.urandom/int.from_bytes path issue, not covered
+  by a test; `import uuid` + hasattr(uuid4) pass.)
+- str_data dynamic-qstr gap REMAINS in objstr_methods_b.rs (6
+  sites: str_caseconv lower/upper/title, str_capitalize,
+  str_zfill) and objstr_methods_c.rs (1 site) plus ~30 other
+  tree-wide sites (str slots, %/format paths). Only the 14
+  sites in objstr_methods_a.rs were fixed (see §3).
+- `re` print uses the arena slot index (`<re 0x{slot:x}>`) —
+  deliberate divergence: the original prints the ASLR-random
+  raw pointer, which no test can pin.
+- Reference SEGFAULTS on non-str patterns/subjects/replace
+  (compile(123/None/bytearray), sub("a", 5, ...)) — Rust raises
+  TypeError "can't convert to str implicitly" instead
+  (documented divergence, C8b/C9b class).
+- D3's math/socket/struct module builders are NOT registered
+  (Phase E entry work, per brief — only _json/_subprocess were
+  registered here).
+- map.rs 860 / gc.rs 830 remain over the 800-line cap
+  (pre-existing debt, untouched by D5).
+- Type-object attribute lookup gap (2 pre-existing ignored
+  tests: C13b's C.x, C18b's int.from_bytes e2e) — untouched.

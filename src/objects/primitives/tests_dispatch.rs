@@ -117,6 +117,8 @@ impl SlotFixture {
             deque: None,
             ordereddict: None,
             namedtuple_fn: None,
+            re_type: None,
+            match_type: None,
         };
         SlotFixture { arena, roots, types, pool: RuntimeQstr::new(), pending_raise: None }
     }

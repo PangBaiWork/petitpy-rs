@@ -114,5 +114,14 @@ pub struct BuiltinTypes {
     /// `build_collections_module` — the `ucollections`
     /// factory as well; `None` until registered).
     pub namedtuple_fn: Option<GcRef>,
+    /// `re` (D5: the compiled-pattern type object, built by
+    /// `build_re_module` — the native `re`/`ure` type; `None`
+    /// until the re module is built and registered; the
+    /// registrar stores `Some(type_ref)` after calling the
+    /// builder — the `socket` precedent).
+    pub re_type: Option<GcRef>,
+    /// `match` (D5: the match-object type object, built by
+    /// `build_re_module` alongside `re_type`; same shape).
+    pub match_type: Option<GcRef>,
 }
 

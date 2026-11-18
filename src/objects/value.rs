@@ -269,6 +269,12 @@ pub enum Obj {
     /// `FileData` holds no `Value` children, so `children()`
     /// needs no arm for it (leaf, like `StringIo`).
     File(FileData),
+    /// Compiled regex object (D5 owns; `extmod/modre.c`).
+    /// Leaf payload — no `Value` children.
+    Re(ReData),
+    /// Regex match object (D5 owns; `extmod/modre.c`). The
+    /// subject is a child (GC arm in `children()` below).
+    Match(MatchData),
 }
 
 impl Obj {
@@ -286,6 +292,8 @@ impl Obj {
             // (the kernel buffer is outside the arena); the
             // header + handle slot is the honest estimate.
             Obj::File(_) => 16,
+            Obj::Re(r) => r.prog.bytelen,
+            Obj::Match(m) => m.caps.len() * 16,
             Obj::Tuple(t) => t.len() * 8,
             Obj::List(l) => l.items.len() * 8,
             Obj::Dict(d) => d.map.alloc * 16 + d.map.index.len() * 4,
@@ -397,6 +405,9 @@ impl Obj {
             }
             Obj::Deque(d) => d.items.clone(),
             Obj::AttrTuple(a) => a.items.clone(),
+            // A match object keeps its subject alive (the
+            // subject's bytes back the capture spans).
+            Obj::Match(m) => vec![m.subject],
             // A FILE's only child is its `.buffer` sibling
             // (the stdio TextIOWrapper's FileIO; `None` for
             // files `open()` created — file_io.zig's
@@ -435,9 +446,9 @@ impl Obj {
 pub use crate::objects::value_data::{
     ArrayData, AttrTupleData, BoundMethData, BytesData, CellData, ClosureData, DequeData,
     DictData, ExceptionData, FileData, FileHandle, FunBcData, FunBuiltinData, GenState,
-    GeneratorData, InstanceData, IteratorData, ListData, MapData, MapEntry, ModuleData,
-    ModuleDelegation, PropertyData, RangeData, SetData, SliceData, StaticClassMethodData,
-    StrData, StringIoData, SuperData, TraceFrame, TypeData,
+    GeneratorData, InstanceData, IteratorData, ListData, MapData, MapEntry, MatchData,
+    ModuleData, ModuleDelegation, PropertyData, RangeData, ReData, SetData, SliceData,
+    StaticClassMethodData, StrData, StringIoData, SuperData, TraceFrame, TypeData,
 };
 
 
@@ -446,75 +457,3 @@ pub use crate::objects::value_data::{
 #[allow(dead_code)]
 fn _assert_pyresult(_: PyResult<Value>) {}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::memory::gc::{GcArena, RootSet};
-
-    #[test]
-    fn small_int_window_boundaries() {
-        // Mirrors mp_mirrors.zig:548-551.
-        assert_eq!(SMALL_INT_MAX, (1i64 << 62) - 1);
-        assert_eq!(SMALL_INT_MIN, -(1i64 << 62));
-        assert!(small_int_fits(0));
-        assert!(small_int_fits(SMALL_INT_MAX));
-        assert!(small_int_fits(SMALL_INT_MIN));
-        assert!(!small_int_fits(SMALL_INT_MAX + 1));
-        assert!(!small_int_fits(SMALL_INT_MIN - 1));
-        assert_eq!(Value::small_int(5), Some(Value::SmallInt(5)));
-        assert_eq!(Value::small_int(1i64 << 62), None);
-    }
-
-    #[test]
-    fn immediates_identity() {
-        // Mirrors the OBJ_* constants (mp_mirrors.zig:492-497).
-        assert_eq!(Value::none(), Value::None);
-        assert_eq!(Value::new_bool(true), Value::Bool(true));
-        assert_ne!(Value::new_bool(true), Value::new_bool(false));
-        assert_ne!(Value::none(), Value::new_bool(false));
-        assert_eq!(Value::qstr(42), Value::Qstr(42));
-        assert!(Value::Qstr(7).is_qstr());
-        assert!(Value::SmallInt(-3).is_small_int());
-        assert!(Value::None.is_none());
-        assert!(!Value::SmallInt(0).is_none());
-    }
-
-    #[test]
-    fn int_out_of_window_goes_to_heap() {
-        let mut arena = GcArena::new();
-        let roots = RootSet::new();
-        let big = 1i64 << 62;
-        let v = Value::int(&mut arena, None, &roots, big);
-        assert!(v.is_heap());
-        match arena.get(v.as_heap().unwrap()) {
-            // 2^62 fits in i64 (just outside the 62-bit small-int window).
-            Obj::Int(z) => assert_eq!(z.as_int_checked(), Some(1i64 << 62)),
-            other => panic!("expected Int, got {:?}", other),
-        }
-        let small = Value::int(&mut arena, None, &roots, 7);
-        assert_eq!(small, Value::SmallInt(7));
-    }
-
-    #[test]
-    fn truth_table_primitives() {
-        let arena = GcArena::new();
-        assert!(!Value::None.is_true(&arena).unwrap());
-        assert!(!Value::Bool(false).is_true(&arena).unwrap());
-        assert!(Value::Bool(true).is_true(&arena).unwrap());
-        assert!(!Value::SmallInt(0).is_true(&arena).unwrap());
-        assert!(Value::SmallInt(-1).is_true(&arena).unwrap());
-        // Qstr(0) is MP_QSTRnull and Qstr(1) is MP_QSTR_ — the
-        // generated table holds "" at both ids (LENGTHS[0] ==
-        // LENGTHS[1] == 0), so both are falsy, like bool("") on the
-        // reference binary; a non-empty static qstr is truthy.
-        // (C6 corrects the old assertion, which was written against
-        // the pre-fix arm that returned true for every qstr.)
-        assert!(!Value::Qstr(0).is_true(&arena).unwrap());
-        assert!(!Value::Qstr(1).is_true(&arena).unwrap());
-        let int_id = crate::qstr_table::QSTR_STRINGS
-            .iter()
-            .position(|s| *s == b"int")
-            .unwrap() as u32;
-        assert!(Value::Qstr(int_id).is_true(&arena).unwrap());
-    }
-}

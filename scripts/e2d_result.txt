@@ -1,0 +1,267 @@
+Lane E2d — fix pass: VM hook through comparison + container repr
+================================================================
+Brief: scripts/e2d_brief.md (scope ONLY E2c §4 (a)/(b)/(c)).
+Base: master b7f0b7e. Worktree: ~/workspace/petitpy-rs-e2d-compare-repr,
+branch lane/e2d-compare-repr.
+
+## §1 — What was built
+
+E2c §4 (a) — user-class `__lt__` sorting. `VmHook` gains a third
+method, `binary_op(ctx, op, lhs, rhs)` (src/objects/slots.rs):
+the VM's full binary-op loop, so a FunBc `__lt__` actually
+executes and the reflected fallback + `binop_unsupported` apply
+exactly as at the top level. `StateHook` (vm_seams.rs) calls
+`binary_op_ctx` and stashes the exception object on
+`state.pending_exc` ONLY if empty — first failure wins, the
+sort's run-to-completion rule. `SeamHook` (objtype/seams.rs)
+delegates to the ctx-only `obj_binary_op`. The hook threads
+through `list_sort` → `quicksort_range` → `sort_less`
+(objlist_methods.rs), reborrowed with `as_deref_mut()` at each
+level; `ListError` gains `HookRaised` (exc_name `""`, so
+`record_typed` records nothing — the VM caller drains
+`pending_exc` instead) and `CompareUnsupported`'s fields become
+owned `String`s (a user class name is dynamic, resolved through
+the pool). Both VM sort paths (`sorted`, `list.sort` — now in
+src/runtime/builtin_sort.rs, see below) build the hook in a
+scoped block, pin the list in `ctx.roots.extra` during the sort,
+and drain `pending_exc` first on failure. `sort_less` records
+the first failure only; a raising comparison surfaces the REAL
+exception (ValueError "boom", list left partially sorted — the
+quicksort swaps the pivot into place before the caller raises:
+a 2-element list ends `[B2, B1]` on BOTH binaries, probed).
+`__lt__` returning NotImplemented raises TypeError with the
+class name on both sides — there is NO reflected fallback for
+comparisons (the vendor has no REVERSE_LESS/MORE: the
+`REVERSE_*` enum covers only OR..POWER; verified in
+src/runtime/runtime.zig:700-800 + py/runtime0.h).
+
+E2c §4 (b) — container repr dispatching user `__repr__`.
+`print_helper_hook` (builtin_str.rs) mirrors `instance_print`
++ the four container prints: an instance renders through its
+dunder (`__str__` for Str kind, `__repr__` for Repr — nested
+instances always Repr, since container elements are always
+PRINT_REPR in the Zig); list/tuple/dict/set recurse elements
+with Repr (dict keys AND values; `OrderedDict({...})` for
+ordered dicts; single-tuple comma; `set()`/`frozenset()` for
+empty sets); anything else delegates to `obj_print_helper`.
+SLOT SEMANTICS: a dunder raise inside a container is SWALLOWED
+and the default rendering is used — the reference ABORTS here
+(rc=134, null-pointer panic at mp_mirrors.zig:745), so Rust
+keeping the fallback is a documented divergence (same class as
+the other abort-vs-fallback cases). Only the top-level
+`str`/`repr`/`print` of an instance propagates a raise
+(existing behaviour, unchanged). Wired into `call_str_ctx` /
+`call_repr_ctx` (container branch before the type-call
+delegation) and `call_print_ctx`'s render closure (the gate now
+also fires when an arg is a container). No GC pinning is needed
+here: call args are rooted by the frame-roots snapshot
+(`sync_frame_roots` — nested frames append after the outer
+roots), unlike `sort_items_with_key`'s fresh decorated pairs.
+A namedtuple is an `Obj::Tuple` headed by its class — the
+container check requires an EXACT tuple, so `repr(E())` and
+`repr([E()])` stay `TupEmpty()` via the class's own print slot.
+
+E2c §4 (c) — reflected fallback at internal callers.
+`obj_equal_not_equal` (obj_ops.rs): when the VM passes its hook
+and both operands are exact lists or exact tuples, compare
+element-wise through the hook (recursive EQUAL dispatch,
+bool-ified like `obj_equal`); length mismatch decides
+immediately. The ctx-only path (`call` is None) keeps the
+generic loop exactly as before; tuple-vs-list and subclasses
+fall through. `binary_op_ctx` (vm_rt.rs): after the
+IN→CONTAINS swap and before the generic loop, same-kind
+list/tuple ordering (Less/More/LessEqual/MoreEqual) runs
+`container_compare`, a line-for-line mirror of `seq_cmp_objs`
+(swap Less→More, element equality via the EQUAL dispatch,
+ordering result counted only when exactly `Bool(true)`,
+length tie-breaks). `obj_binary_op` / `obj_unary_op`
+themselves need NO signature change; `seq_cmp_objs` stays as
+the ctx-only fallback. Consequence pinned by test: ordering
+needs BOTH `__lt__` and `__gt__` — an `__lt__`-only class's
+`(A(1),) < (A(2),)` raises `TypeError ... for __gt__` (the
+swapped op), on both binaries.
+
+Type-name fix (feeds all three items): new `obj_type_name`
+(obj_ops.rs) resolves heap type names through the pool, so a
+user class reads `'A'` instead of `''`. Used by
+`binop_unsupported` (vm_rt.rs) and sort_less's
+`CompareUnsupported`. `max([A(3), A(1)])` now raises
+`... for __gt__: 'A', 'A'` on both binaries (was `''`, `''`).
+
+Split (file-size rule): `builtin_vm.rs` hit 802 lines, so the
+sort family (`call_sorted_ctx`, `sort_items_with_key`,
+`sort_with_key`, `call_list_sort_ctx` — 238 lines) moved
+verbatim to NEW src/runtime/builtin_sort.rs (273 lines);
+builtin_vm.rs is now 563. `kw_args` / `mismatch` are
+`pub(crate)` in builtin_vm.rs; the interception chain
+(vm_call_intercept.rs) now calls `builtin_sort::…`.
+`is_ordered_dict_value` is `pub(crate)` in objdict.rs (used by
+`print_helper_hook`).
+
+Tests: NEW src/runtime/vm_tests_e2d.rs (9 tests, Fx harness):
+sort user `__lt__` (list.sort + sorted + reverse + key+lt),
+sort raising ValueError (partial sort + real exception),
+sort `__lt__` → NotImplemented (TypeError with `'B'` names),
+container ordering + equality (incl. the `__gt__` swap pin),
+container repr (nested, dict key/value, set, tuple, str/repr),
+namedtuple-in-list, raising-`__repr__` fallback shape,
+max() TypeError names.
+
+## §2 — Gates (all re-run in the worktree, release build)
+
+- Full corpus: **489/552** (E2c 488) — **+1, 0 regressions**.
+  63 fails = 56 regressions + 7 known-fails exactly.
+  Newly passing (1): list_sort. (Set-diffed against E2c §4(f)'s
+  57; the master-b7f0b7e baselines below were reproduced by a
+  fresh scratch-worktree build for the other three gates.)
+- Integration: **175/202** (E2c 174) — **+1, 0 regressions**.
+  Newly passing (1): class_repr (`print([P(i) for i in
+  range(3)])` → `[P(0), P(1), P(2)]` — the item-2 case).
+- Golden: **546/585** (E2c 545) — **+1, 0 new failures**.
+  Newly passing (1): list_sort.py. rust==cpython 539/585
+  (was 538).
+- Capability: **67/67 — GATE GREEN** (unchanged; 1 CPYTHON
+  DIFF async_def, not gated).
+- test-stdlib: **6/8** (unchanged). Still failing: test_abc,
+  test_enum (both (n)-territory, out of scope).
+- Nano (invariant check only): **417/541** (E2c 416) — **+1,
+  report-only**. Newly passing (1): list_sort.
+- lib: **1571 passed, 0 failed, 4 ignored** (1562 + 9 e2d);
+  bins 9; entry_cli 45; **0 warnings** (forced recompile);
+  no unsafe in the diff. check_compile_mpy PASS (552/552
+  byte-identical); check_frozen PASS (23/23, 38,141 bytes).
+  Binaries: petitpy-rs 1,876,192 B, petitpy-vm 1,863,296 B.
+  All files < 800 lines (largest: vm_rt.rs 711, objlist.rs
+  691, objlist_methods.rs 687, objdict.rs 667; map.rs 860 +
+  gc.rs 830 still over cap, pre-existing, untouched).
+
+## §3 — Verification (main-agent spot checks, all vs the reference)
+
+- 10 probe groups, all byte-identical (stdout+stderr+rc)
+  except p6 (the documented abort-vs-fallback divergence):
+  p1 sort `__lt__`/`__repr__`, p2 container repr, p3
+  NotImplemented sort, p4 raising comparison, p5 nested
+  containers + set + dict, p6 raising `__repr__` in a list
+  (ref ABORTS rc=134 with the mp_mirrors.zig:745 panic
+  trace; Rust prints `[<R object at 23f>]` and continues),
+  p7 (same class as p6), p8 tuple/list ordering + max names,
+  p9 sort(key=) + user `__lt__`, p10 tuple/list equality
+  (incl. nested `[[A(1)]] == [[A(1)]]`).
+- Extra probes: `<=`/`>=` on tuples/lists (identical);
+  `[E()]` → `[TupEmpty()]` (identical); set order
+  `{A(1), A(2)}` + `frozenset({A1, A2})` identical, but the
+  3-element set `{A(1), A(2), A(3)}` differs — see §4.
+- Defects caught in-lane (all fixed before the final run):
+  (1) `print_helper_hook` first took ANY `Obj::Tuple` as a
+  container — broke `e2_namedtuple_empty_repr`
+  (`repr(E())` became `"()"`); fixed with the exact-tuple
+  requirement. (2) Three borrow errors: `sort_less` moved
+  the hook before reading `hook.is_some()` (read the flag
+  first); `quicksort_range`'s hook param needed `mut` for
+  `as_deref_mut()`; the `drop(hook)` after `collect_iterable`
+  extended the borrow past the `map_err` closure — the hook
+  now lives in a block that ends after the collect.
+  (3) `container_compare` first used `exc_from_typed` on a
+  `PyError` — wrong converter (`TypedRaise` bound);
+  `exc_from_pyerror` is the PyError converter.
+  (4) `set_items` is privately imported by objset.rs — import
+  it from `map_set` directly.
+  (5) Two test scripts had a stray leading space before
+  `except` (SyntaxError); one asserted `'[B1, B2]'` after a
+  failed sort where both binaries leave `'[B2, B1]'`.
+- No new `#[ignore]`d tests; the frozen-deque ignored test
+  is untouched (E2f's scope).
+
+## §4 — Remaining shortfall (E2c §4(f) minus list_sort)
+
+Full corpus, 56 regressions (verbatim, sorted):
+array1 array_add array_intbig array_micropython builtin_hash builtin_hash_intbig builtin_override
+builtin_reversed builtin_str_hex bytearray1 bytearray_byte_operations bytearray_center
+bytearray_construct bytearray_count bytearray_decode bytearray_partition bytes bytes_add_array
+bytes_add_bytearray bytes_add_endian bytes_compare_array bytes_compare_bytearray
+bytes_construct_array bytes_construct_bytearray bytes_construct_endian class_delattr_setattr
+class_descriptor class_new class_setname_hazard class_setname_hazard_rand class_store_class
+class_super_closure deque1 deque2 getitem import_instance_method int_big_rshift int_bytes_intbig
+int_parse io_iobase iter0 iter1 iter2 memoryerror object_new ordereddict1 slice_attrs
+special_methods special_methods_intbig stopiteration string_format string_format_modulo
+subclass_native_buffer subclass_native_exc_new subclass_native_init subclass_native_iter
+
+Integration, 27 fails (verbatim, sorted):
+builtin_keyword_args bytes_interop collections_abc_import cpython_platform_import_slice_mro
+deque_cpython_idiom dict_missing_basic dict_missing_counter_pattern enum_members
+gc_closes_dropped_files_and_sockets gc_reclaims_garbage index_error_store_leaves_container_intact
+init_subclass itertools_chain itertools_cpython_functions json_cpython_behaviour
+native_subclass_operands object_setattr_method_available os_chown_self_noop os_kill_esrch_raises
+runtime_annotations select_readable_fd_is_ready select_timeout_zero_returns_promptly
+socket_fromfd_wraps_fd str_join_bytes_bytearray subprocess_check_raises_on_nonzero
+subprocess_streams_env_cwd_text uuid4_shape
+
+Golden, 39 fails (verbatim, sorted):
+array_add array_micropython builtin_hash builtin_reversed bytearray1 bytearray_center
+bytearray_construct bytearray_count bytearray_decode bytearray_partition bytes bytes_add_array
+bytes_add_bytearray bytes_add_endian bytes_compare_array bytes_compare_bytearray
+bytes_construct_array bytes_construct_bytearray bytes_construct_endian class_delattr_setattr
+class_new class_store_class class_super_closure deque1 deque2 getitem import_instance_method
+int_parse iter0 iter1 iter2 memoryerror object_new special_methods_micropython stopiteration
+string_format subclass_native_buffer subclass_native_init subclass_native_iter
+
+Nano (report-only), 124 fails (verbatim, sorted — the E2c 125
+minus list_sort):
+array1 array_add array_intbig array_micropython async_await2 async_for2 async_with2 attrtuple1
+builtin_abs_intbig builtin_bin_intbig builtin_compile builtin_divmod_intbig builtin_hash
+builtin_hash_intbig builtin_help builtin_hex_intbig builtin_oct_intbig builtin_override builtin_pow3
+builtin_pow3_intbig builtin_range_binop builtin_reversed builtin_round_int builtin_round_intbig
+builtin_str_hex bytearray_byte_operations bytearray_center bytearray_construct bytearray_count
+bytearray_decode bytearray_intbig bytearray_partition bytearray_slice_assign bytes bytes_add_array
+bytes_add_bytearray bytes_add_endian bytes_compare3 bytes_compare_array bytes_compare_bytearray
+bytes_construct_array bytes_construct_bytearray bytes_construct_endian bytes_construct_intbig
+class_bases class_delattr_setattr class_dict class_new class_notimpl class_ordereddict
+class_store_class class_super_closure deque1 deque2 deque_micropython deque_slice dict_union
+floordivide_intbig generator_pend_throw getitem import_instance_method int_64_basics int_big1
+int_big_add int_big_and int_big_and2 int_big_and3 int_big_cmp int_big_div int_big_error
+int_big_lshift int_big_mod int_big_mul int_big_or int_big_or2 int_big_or3 int_big_pow int_big_rshift
+int_big_to_small int_big_to_small_int29 int_big_unary int_big_xor int_big_xor2 int_big_xor3
+int_big_zeroone int_bytes_int64 int_bytes_intbig int_constfolding_intbig int_divmod_intbig
+int_intbig int_parse io_bytesio_cow io_bytesio_ext io_bytesio_ext2 io_iobase io_stringio1
+io_stringio_base io_stringio_with io_write_ext iter0 iter1 iter2 memoryerror memoryview_slice_assign
+object_dict object_new op_error_intbig ordereddict_eq parser slice_intbig special_methods
+special_methods2 special_methods_intbig stopiteration string_format string_format_intbig
+struct1_intbig subclass_native_buffer subclass_native_exc_new subclass_native_init
+subclass_native_iter sys_path sys_stdio sys_stdio_buffer
+
+Notes for the next lanes (out of E2d scope):
+(a) `special_methods` / `special_methods_intbig` still fail —
+  the golden diff for special_methods_micropython.py shows
+  the reference printing `42`, `__int__ called`, `TypeError`
+  where Rust raises `TypeError: can't convert to int` — the
+  (p) `__int__`/`__index__` dispatch gap (int(x) on a user
+  instance), not the container-comparison hook (the tuple/list
+  ordering path itself is fixed — see §3 p8/p10).
+(b) `class_descriptor`, `class_setname_hazard[_rand]`,
+  `class_new`, `class_super_closure`, `object_new`,
+  `subclass_native_*` — the (g)/(n) descriptor / native-
+  subclass clusters; `subclass_native_exc_new`'s repr
+  difference and `subclass_native_init`'s `__init__`
+  arg-mismatch are still open.
+(c) `string_format` / `string_format_modulo` — the (m)
+  nested-format-spec gap (E2e's scope).
+(d) `slice_attrs`, `builtin_reversed`, `iter0/1/2`,
+  `getitem` — the (h) `__reversed__` / slice+range attrs
+  cluster (E2f's scope); `deque1/2` + frozen deque — the
+  (j) cluster (E2f's scope); `builtin_keyword_args` +
+  `str_join_bytes_bytearray` — the (d)/(e) clusters
+  (E2e/E2f scope).
+(e) PRE-EXISTING set-order divergence (found by probe, not
+  caused by this lane): `{A(1), A(2), A(3)}` prints
+  `{A1, A3, A2}` on Rust vs `{A3, A1, A2}` on the reference
+  (2-element sets match). Both sides call the identical
+  `set_items(&s.table)` over the same table — the hash-table
+  layout itself differs for 3 elements. Out of scope; the
+  regression test only pins 1- and 2-element set reprs.
+(f) Defining `__eq__` without `__hash__` makes instances
+  unhashable on BOTH binaries (`frozenset([A(1)])` →
+  `TypeError: unsupported type for operator`) — pre-existing,
+  not a regression.
+(g) `stopiteration.py` (golden) still differs — the
+  `get_stop_iter_arg` / subscriptable path, not the
+  container-comparison hook.

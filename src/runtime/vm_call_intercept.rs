@@ -100,7 +100,7 @@ pub(crate) fn intercept_builtin_call(
         return Some(crate::runtime::builtin_vm::call_dir_ctx(ctx, state, n_args, n_kw, args));
     }
     if fun == state.sorted_builtin {
-        return Some(crate::runtime::builtin_vm::call_sorted_ctx(ctx, state, n_args, n_kw, args));
+        return Some(crate::runtime::builtin_sort::call_sorted_ctx(ctx, state, n_args, n_kw, args));
     }
     // `str.join` / `bytes.join` (E2b): the method builtins are
     // intercepted by GcRef identity so a generator / genexpr
@@ -114,7 +114,7 @@ pub(crate) fn intercept_builtin_call(
     // `call_list_sort_ctx`); a `None` key delegates to the
     // ctx-only `list_sort_builtin`.
     if fun == state.list_sort_builtin {
-        return Some(crate::runtime::builtin_vm::call_list_sort_ctx(
+        return Some(crate::runtime::builtin_sort::call_list_sort_ctx(
             ctx, state, n_args, n_kw, args,
         ));
     }

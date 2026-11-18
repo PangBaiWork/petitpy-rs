@@ -262,6 +262,22 @@ pub trait VmHook {
     ) -> PyResult<Value>;
     /// Resume `gen` one step (the `iternext` form).
     fn resume(&mut self, ctx: &mut CallCtx, gen: Value) -> Result<Option<Value>, PyError>;
+    /// Run the VM's full binary-op loop (`binary_op_ctx`) on
+    /// `lhs op rhs` (E2d): the instance dunder runs through the
+    /// real call hook, the reflected fallback and
+    /// `binop_unsupported` apply exactly as at the top level.
+    /// Like `call`, a raise stashes the exception object on
+    /// the VM's `pending_exc` and reports `PyRaise` — and, like
+    /// the sort's first-failure rule, an already-stashed
+    /// exception is NOT overwritten, so the first comparison
+    /// failure is the one the caller drains.
+    fn binary_op(
+        &mut self,
+        ctx: &mut CallCtx,
+        op: BinaryOp,
+        lhs: Value,
+        rhs: Value,
+    ) -> PyResult<Value>;
 }
 
 /// The VM's user-code hook: `&mut dyn VmHook` — see `VmHook`.

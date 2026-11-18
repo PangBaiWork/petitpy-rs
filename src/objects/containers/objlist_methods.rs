@@ -24,7 +24,7 @@ use crate::objects::containers::objdict_methods::collect_iterable;
 use crate::objects::containers::objlist::{is_exact_list, list_items_vec, list_len, ListError};
 use crate::objects::containers::sequence::{seq_count_obj, seq_index_obj};
 use crate::objects::obj::obj_is_true;
-use crate::objects::obj_ops::{get_index, obj_binary_op, obj_get_type_str};
+use crate::objects::obj_ops::{get_index, obj_binary_op, obj_type_name};
 use crate::objects::slots::BinaryOp;
 use crate::objects::slots::CallHook;
 use crate::objects::strings::objstr_methods_c::KwArg;
@@ -246,25 +246,62 @@ pub fn list_reverse(ctx: &mut CallCtx, self_: Value) -> Result<Value, ListError>
 /// failure. `list_sort` returns the recorded error after
 /// the sort finishes, with the list left partially sorted
 /// (probed: `[3, "a", 1, 2]` → `[1, 2, 'a', 3]`).
+///
+/// E2d: `hook` is the VM's `VmHook` (Some on the VM's
+/// `list.sort` / `sorted` paths, None on ctx-only paths).
+/// With a hook the comparison runs the VM's full binary-op
+/// loop (`VmHook::binary_op`), so a FunBc `__lt__` actually
+/// executes; a raise stashes the exception object on the
+/// VM's `pending_exc` (first failure wins — the hook does
+/// not overwrite an already-stashed exception) and is
+/// recorded here as `HookRaised` for the VM caller to drain.
+/// Without a hook the ctx-only `obj_binary_op` runs, and a
+/// `PyRaise` with no recorded raise synthesizes
+/// `CompareUnsupported` as before (the type names are now
+/// pool-resolved, so a user class reads `'A'`, not `''`).
 fn sort_less(
     ctx: &mut CallCtx,
     a: Value,
     b: Value,
     reverse: bool,
     pending: &mut Option<ListError>,
+    hook: Option<CallHook<'_, '_>>,
 ) -> bool {
     let types = ctx.types;
     let target = Value::Bool(!reverse);
-    match obj_binary_op(ctx, types, BinaryOp::Less, a, b) {
+    // Read the hook's presence BEFORE the match: the
+    // `binary_op` call moves the `&mut dyn VmHook` out of
+    // the `Option`, so `hook` cannot be borrowed after it.
+    let has_hook = hook.is_some();
+    let compared = match hook {
+        Some(h) => h.binary_op(ctx, BinaryOp::Less, a, b),
+        None => obj_binary_op(ctx, types, BinaryOp::Less, a, b),
+    };
+    match compared {
         Ok(v) => v == target,
         Err(e) => {
             if pending.is_none() {
                 *pending = Some(match e {
                     PyError::OutOfMemory => ListError::OutOfMemory,
-                    PyError::PyRaise => ListError::CompareUnsupported {
-                        lhs: obj_get_type_str(ctx.arena, a),
-                        rhs: obj_get_type_str(ctx.arena, b),
-                    },
+                    PyError::PyRaise => {
+                        // On the hook path the exception object
+                        // is stashed on the VM's `pending_exc`
+                        // (first failure wins) and the VM caller
+                        // drains it — the sort reports
+                        // `HookRaised`, not a synthesized
+                        // TypeError. On the ctx-only path there
+                        // is no object channel, so the sort
+                        // reports the comparison as unsupported
+                        // (the C6/C7r data-drop convention).
+                        if has_hook {
+                            ListError::HookRaised
+                        } else {
+                            ListError::CompareUnsupported {
+                                lhs: obj_type_name(ctx, a),
+                                rhs: obj_type_name(ctx, b),
+                            }
+                        }
+                    }
                 });
             }
             false
@@ -308,6 +345,7 @@ fn quicksort_range(
     mut tail: isize,
     reverse: bool,
     pending: &mut Option<ListError>,
+    mut hook: Option<CallHook<'_, '_>>,
 ) {
     while tail - head > 1 {
         let mut h = head;
@@ -316,13 +354,31 @@ fn quicksort_range(
         loop {
             loop {
                 h += 1;
-                if !(h < t && sort_less(ctx, list_get_at(ctx, r, h), v, reverse, pending)) {
+                if !(h < t
+                    && sort_less(
+                        ctx,
+                        list_get_at(ctx, r, h),
+                        v,
+                        reverse,
+                        pending,
+                        hook.as_deref_mut(),
+                    ))
+                {
                     break;
                 }
             }
             loop {
                 t -= 1;
-                if !(h < t && sort_less(ctx, v, list_get_at(ctx, r, t), reverse, pending)) {
+                if !(h < t
+                    && sort_less(
+                        ctx,
+                        v,
+                        list_get_at(ctx, r, t),
+                        reverse,
+                        pending,
+                        hook.as_deref_mut(),
+                    ))
+                {
                     break;
                 }
             }
@@ -333,10 +389,10 @@ fn quicksort_range(
         }
         list_swap_at(ctx, r, h, tail);
         if t - head < tail - h {
-            quicksort_range(ctx, r, head, t, reverse, pending);
+            quicksort_range(ctx, r, head, t, reverse, pending, hook.as_deref_mut());
             head = h;
         } else {
-            quicksort_range(ctx, r, h, tail, reverse, pending);
+            quicksort_range(ctx, r, h, tail, reverse, pending, hook.as_deref_mut());
             tail = t;
         }
     }
@@ -363,6 +419,7 @@ pub fn list_sort(
     self_: Value,
     key: Option<Value>,
     reverse: bool,
+    hook: Option<CallHook<'_, '_>>,
 ) -> Result<Value, ListError> {
     if let Some(k) = key {
         if k != Value::None {
@@ -378,7 +435,7 @@ pub fn list_sort(
     };
     let mut pending: Option<ListError> = None;
     if n > 1 {
-        quicksort_range(ctx, r, -1, n - 1, reverse, &mut pending);
+        quicksort_range(ctx, r, -1, n - 1, reverse, &mut pending, hook);
     }
     if let Some(e) = pending {
         return Err(e);
@@ -427,16 +484,19 @@ pub fn parse_sort_args(
 
 /// `list.sort` as the method-table entry: `args[0]` is
 /// `self`, the rest is parsed by `parse_sort_args`.
+/// `hook` is the VM's `VmHook` (Some on the VM's sort
+/// paths, None on ctx-only paths and the method table).
 pub fn list_sort_builtin(
     ctx: &mut CallCtx,
     args: &[Value],
     kwargs: &[KwArg],
+    hook: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     if args.is_empty() {
         return Err(PyError::PyRaise);
     }
     let (key, reverse) = parse_sort_args(ctx, args, kwargs).map_err(|e| ctx.record_typed(e))?;
-    list_sort(ctx, args[0], key, reverse).map_err(|e| ctx.record_typed(e))
+    list_sort(ctx, args[0], key, reverse, hook).map_err(|e| ctx.record_typed(e))
 }
 
 fn arity(args: &[Value], n: usize) -> Result<(), PyError> {
@@ -529,7 +589,7 @@ pub fn list_sort_kw(
             value: *value,
         })
         .collect();
-    list_sort_builtin(ctx, args, &kws)
+    list_sort_builtin(ctx, args, &kws, None)
 }
 
 /// `list.sort` as a plain `BuiltinFn` (the no-kw path):
@@ -537,7 +597,7 @@ pub fn list_sort_kw(
 /// is present, so this is only the documented no-kw form — it
 /// sorts with no key/reverse.
 pub fn list_sort_builtin_nokw(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    list_sort_builtin(ctx, args, &[])
+    list_sort_builtin(ctx, args, &[], None)
 }
 
 /// `list`'s method table (C13, the Zig's `mp_obj_list_methods`

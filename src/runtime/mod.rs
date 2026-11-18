@@ -39,6 +39,7 @@ pub mod argcheck;
 pub mod bc;
 pub mod builtin_fns;
 pub mod builtin_str;
+pub mod builtin_sort;
 pub mod builtin_vm;
 pub mod builtinhelp;
 pub mod builtinevex;
@@ -136,3 +137,5 @@ mod vm_tests_e2;
 mod vm_tests_e2b;
 #[cfg(test)]
 mod vm_tests_e2c;
+#[cfg(test)]
+mod vm_tests_e2d;

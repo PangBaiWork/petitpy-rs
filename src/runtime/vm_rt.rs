@@ -19,8 +19,10 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::map::hash_of;
+use crate::objects::containers::objlist::{is_exact_list, list_items_vec};
+use crate::objects::containers::objtuple::{is_exact_tuple, tuple_items};
 use crate::objects::obj::{call_binary, call_unary, obj_get_type, obj_is_true, SlotOutcome};
-use crate::objects::obj_ops::{obj_equal_not_equal, obj_get_type_str};
+use crate::objects::obj_ops::{obj_equal_not_equal, obj_type_name};
 use crate::objects::objtype::objexcept::{exception_match, is_exception_type};
 use crate::objects::primitives::ops::new_int_from_bigint;
 use crate::objects::slots::{BinaryOp, UnaryOp};
@@ -234,8 +236,8 @@ fn binop_unsupported(
 ) -> Value {
     let op = unreverse_op(op);
     let dunder = binary_op_dunder(op).unwrap_or("");
-    let lname = String::from_utf8_lossy(obj_get_type_str(ctx.arena, lhs)).into_owned();
-    let rname = String::from_utf8_lossy(obj_get_type_str(ctx.arena, rhs)).into_owned();
+    let lname = obj_type_name(ctx, lhs);
+    let rname = obj_type_name(ctx, rhs);
     let msg = format!("unsupported types for {dunder}: '{lname}', '{rname}'");
     crate::objects::objtype::objexcept::new_exception_msg(ctx, state.exc.type_error, &msg)
 }
@@ -315,6 +317,59 @@ fn float_precheck_int(
 /// iteration → `binopUnsupported`). `int op float` /
 /// `int op complex` fall through to the generic loop (C18a) —
 /// the int slot delegates them to the float/complex ops.
+/// `mp_seq_cmp_objs` (`sequence.zig:104-137`) over the VM's
+/// dispatch loop (E2d): the ordering half of the container
+/// comparison, for same-kind exact lists / exact tuples.
+/// Element equality runs the EQUAL dispatch (so a nested
+/// container or a user `__eq__` goes through the hook);
+/// ordering runs `binary_op_ctx` on the elements and counts
+/// only an exact `Bool(true)` result, exactly like
+/// `seq_cmp_objs`. Only Less/More/LessEqual/MoreEqual reach
+/// here (Equal/NotEqual are handled by
+/// `obj_equal_not_equal`'s container branch before the
+/// generic loop).
+fn container_compare(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    op: BinaryOp,
+    lhs: &[Value],
+    rhs: &[Value],
+) -> Result<Value, Value> {
+    debug_assert!(matches!(
+        op,
+        BinaryOp::Less | BinaryOp::More | BinaryOp::LessEqual | BinaryOp::MoreEqual
+    ));
+    let types = ctx.types;
+    let (mut lhs, mut rhs, mut op) = (lhs, rhs, op);
+    // Less/LessEqual swap the operands and become
+    // More/MoreEqual — the element loop then asks
+    // `lhs[i] op rhs[i]` on the swapped sides.
+    if op == BinaryOp::Less || op == BinaryOp::LessEqual {
+        std::mem::swap(&mut lhs, &mut rhs);
+        op = if op == BinaryOp::Less {
+            BinaryOp::More
+        } else {
+            BinaryOp::MoreEqual
+        };
+    }
+    let len = lhs.len().min(rhs.len());
+    for i in 0..len {
+        let eq = binary_op_ctx(ctx, state, BinaryOp::Equal, lhs[i], rhs[i])?;
+        if obj_is_true(ctx, types, eq).map_err(|e| exc_from_pyerror(ctx, state, e))? {
+            continue;
+        }
+        let ord = binary_op_ctx(ctx, state, op, lhs[i], rhs[i])?;
+        return Ok(Value::Bool(ord == Value::Bool(true)));
+    }
+    if lhs.len() != rhs.len() {
+        return Ok(Value::Bool(lhs.len() > rhs.len()));
+    }
+    if op == BinaryOp::More {
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(true))
+}
+
 pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lhs_in: Value, rhs_in: Value) -> Result<Value, Value> {
     use crate::objects::value::{SMALL_INT_MAX, SMALL_INT_MIN};
     let mut op = op_in;
@@ -577,6 +632,38 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
     if op == BinaryOp::In {
         op = BinaryOp::Contains;
         std::mem::swap(&mut lhs, &mut rhs);
+    }
+    // E2d — same-kind container ordering with the VM hook:
+    // the ctx-only `seq_cmp_objs` cannot run a FunBc `__lt__`
+    // (stub seams), so the VM intercepts list/tuple ordering
+    // here and compares element-wise through `binary_op_ctx`
+    // itself. Only exact lists / exact tuples of the SAME
+    // kind; anything else falls through to the generic loop
+    // (slots, then `binopUnsupported`) exactly as before.
+    if matches!(
+        op,
+        BinaryOp::Less | BinaryOp::More | BinaryOp::LessEqual | BinaryOp::MoreEqual
+    ) {
+        let pair: Option<(Vec<Value>, Vec<Value>)> =
+            if is_exact_list(ctx, ctx.types.list, lhs)
+                && is_exact_list(ctx, ctx.types.list, rhs)
+            {
+                Some((list_items_vec(ctx, lhs), list_items_vec(ctx, rhs)))
+            } else if is_exact_tuple(ctx, ctx.types.tuple, lhs)
+                && is_exact_tuple(ctx, ctx.types.tuple, rhs)
+            {
+                let l = tuple_items(ctx, lhs).map(|s| s.to_vec());
+                let r = tuple_items(ctx, rhs).map(|s| s.to_vec());
+                match (l, r) {
+                    (Some(l), Some(r)) => Some((l, r)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        if let Some((l_items, r_items)) = pair {
+            return container_compare(ctx, state, op, &l_items, &r_items);
+        }
     }
     // Generic loop: lhs slot → inplace→plain → reverse →
     // CONTAINS → `binopUnsupported`. An instance lhs tries its

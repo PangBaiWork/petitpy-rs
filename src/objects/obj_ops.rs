@@ -15,6 +15,8 @@ use crate::objects::obj::{
     SlotOutcome, BUFFER_RAISE_IF_UNSUPPORTED, BUFFER_RW, FLAG_EQ_CHECKS_OTHER_TYPE,
     FLAG_EQ_HAS_NEQ_TEST, FLAG_EQ_NOT_REFLEXIVE, FLAG_INSTANCE_TYPE,
 };
+use crate::objects::containers::objlist::{is_exact_list, list_items_vec};
+use crate::objects::containers::objtuple::{is_exact_tuple, tuple_items};
 use crate::objects::objtype::instance::instance_binary_op;
 use crate::objects::objtype::seams::with_call_hook_seams;
 use crate::objects::slots::{BinaryOp, BufferInfo, CallHook, PrintKind, SubscrArg, UnaryOp};
@@ -145,6 +147,53 @@ pub fn obj_equal_not_equal(
         }
     }
 
+    // E2d — same-kind container equality with a hook: when the
+    // VM passes its real call hook and both operands are exact
+    // lists or exact tuples, compare element-wise through the
+    // hook (a FunBc `__eq__` actually executes). The ctx-only
+    // path (`call` is None) keeps the generic loop below, which
+    // routes through the type slots and `seq_cmp_objs` exactly
+    // as before. Tuple-vs-list and subclasses fall through.
+    // Length mismatch decides immediately (`seq_cmp_objs`'s
+    // Equal arm); element equality is the recursive EQUAL
+    // dispatch, bool-ified like `obj_equal`.
+    if call.is_some() {
+        let pair: Option<(Vec<Value>, Vec<Value>)> =
+            if is_exact_list(ctx, types.list, o1) && is_exact_list(ctx, types.list, o2) {
+                Some((list_items_vec(ctx, o1), list_items_vec(ctx, o2)))
+            } else if is_exact_tuple(ctx, types.tuple, o1)
+                && is_exact_tuple(ctx, types.tuple, o2)
+            {
+                let l = tuple_items(ctx, o1).map(|s| s.to_vec());
+                let r = tuple_items(ctx, o2).map(|s| s.to_vec());
+                match (l, r) {
+                    (Some(l), Some(r)) => Some((l, r)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        if let Some((l_items, r_items)) = pair {
+            if l_items.len() != r_items.len() {
+                return Ok(local_false);
+            }
+            for (a, b) in l_items.into_iter().zip(r_items.into_iter()) {
+                let eq = obj_equal_not_equal(
+                    ctx,
+                    types,
+                    BinaryOp::Equal,
+                    a,
+                    b,
+                    call.as_deref_mut(),
+                )?;
+                if !obj_is_true(ctx, types, eq)? {
+                    return Ok(local_false);
+                }
+            }
+            return Ok(local_true);
+        }
+    }
+
     // Generic 2-pass loop (`obj.zig:349-367`): try o1's type, then
     // swap and try o2's type. A slot "not implemented" (`NULL` in
     // the original) falls through; a slot OutOfMemory propagates.
@@ -255,6 +304,31 @@ pub fn obj_get_type_str(arena: &GcArena, value: Value) -> &'static [u8] {
                 _ => b"",
             },
             None => b"",
+        },
+    }
+}
+
+/// A value's type name for error messages. `obj_get_type_str`
+/// resolves static qstrs only, so a user class renders empty
+/// there — but the Zig's `binopUnsupported` (`runtime.zig`)
+/// reads the type's name qstr through the pool, and the
+/// reference prints `'B'` for a user class. This is the
+/// pool-aware form; use it wherever an error message names a
+/// type (the sort's `CompareUnsupported`, `binop_unsupported`).
+pub fn obj_type_name(ctx: &CallCtx, value: Value) -> String {
+    match value {
+        Value::SmallInt(_) => "int".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::None => "NoneType".to_string(),
+        Value::Qstr(_) => "str".to_string(),
+        Value::Heap(r) => match ctx.arena.header(r).type_ {
+            Some(t) => match ctx.arena.get(t) {
+                Obj::Type(d) => {
+                    String::from_utf8_lossy(ctx.pool.qstr_str(d.name as u16)).into_owned()
+                }
+                _ => String::new(),
+            },
+            None => String::new(),
         },
     }
 }

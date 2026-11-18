@@ -224,14 +224,41 @@ pub type BinaryOpFn = for<'a> fn(&mut CallCtx<'a>, BinaryOp, Value, Value) -> Py
 /// nothing breaks. Same process as C6's op-parameter amendment.
 pub type CallFn =
     for<'a> fn(&mut CallCtx<'a>, Value, usize, usize, &[Value]) -> PyResult<Value>;
+/// The VM's function-call hook (E2): `&mut dyn FnMut(&mut
+/// CallCtx, Value, n_args, n_kw, &[Value]) -> PyResult<Value>`
+/// — call `fun` as a function, through the VM when the caller
+/// has one (a `FunBc` callee actually executes). `None` =
+/// the ctx-only path: the stub seams' `call_via_type_slot`
+/// (a `FunBc` callee raises `PyRaise`, the pre-E2 behaviour).
+/// The VM builds it from `call_function_ctx` + the
+/// `state.pending_exc` side channel (the C14 factory contract:
+/// `PyError` cannot carry an object — the hook stashes the
+/// exception object there and returns `PyRaise`; the caller
+/// drains it with `drain_seam_raise`). The hook is passed DOWN
+/// as a parameter, never stored in `CallCtx` (a closure over
+/// `&mut VmState` cannot outlive the call that built it).
+/// Two lifetimes: `'r` is the reference borrow (shortened on
+/// every reborrow, so a caller can pass the hook down several
+/// times), `'h` is the closure's own lifetime.
+pub type CallHook<'r, 'h> = &'r mut (
+    dyn FnMut(&mut CallCtx, Value, usize, usize, &[Value]) -> PyResult<Value> + 'h
+);
+
 /// `fn(&mut CallCtx, Value, n_args, n_kw, &[Value]) -> PyResult<Value>` —
 /// make_new slot (`mp_make_new_fun`, vendor `py/obj.h`): construct an
 /// instance of `type` from `args` (positionals followed by `2 * n_kw`
 /// `(name, value)` keyword pairs — the `CallFn` layout). C12 adds it;
 /// builtin constructors are wired by their owning lanes via thin
 /// adapters (their native signatures vary — see each `*_make_new`).
-pub type MakeNewFn =
-    for<'a> fn(&mut CallCtx<'a>, GcRef, &[Value], usize) -> PyResult<Value>;
+/// E2 adds the trailing `call` hook (`Some` on the VM's type-call
+/// path, `None` on ctx-only paths — see `CallHook`).
+pub type MakeNewFn = for<'a, 'r, 'h> fn(
+    &mut CallCtx<'a>,
+    GcRef,
+    &[Value],
+    usize,
+    Option<CallHook<'r, 'h>>,
+) -> PyResult<Value>;
 /// `fn(&mut CallCtx, Value) -> PyResult<Value>` — getiter slot.
 pub type GetIterFn = for<'a> fn(&mut CallCtx<'a>, Value) -> PyResult<Value>;
 /// Built-in function body (fixed-arity and var-no-kw builtins).

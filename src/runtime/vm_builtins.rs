@@ -36,8 +36,27 @@ fn print_impl(
     args: &[Value],
     kwargs: &[(u32, Value)],
 ) -> PyResult<Value> {
-    use crate::objects::obj::obj_is_true;
     use crate::objects::obj_ops::obj_print_helper;
+    print_impl_with(ctx, args, kwargs, &mut |ctx: &mut CallCtx, v: Value, s: &mut String| {
+        obj_print_helper(ctx, ctx.types, v, PrintKind::Str, s);
+        Ok(())
+    })
+}
+
+/// `print_impl` with a caller-supplied arg renderer (E2): the
+/// VM-intercepted `print` (`builtin_str::call_print_ctx`)
+/// renders instance args through their `__str__` dunder, which
+/// can raise — the render reports it as `PyError::PyRaise`
+/// (the exception object travels on `state.pending_exc`, the
+/// C14 side-channel idiom). The default render above is the
+/// ctx-only path (infallible, as before).
+pub(crate) fn print_impl_with(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+    render: &mut dyn FnMut(&mut CallCtx, Value, &mut String) -> PyResult<()>,
+) -> PyResult<Value> {
+    use crate::objects::obj::obj_is_true;
     use crate::runtime::runtime_call::call_method_n_kw;
     use crate::runtime::runtime_method::load_method;
     use crate::support::stream::{get_stream_raise, stream_write_adaptor, MP_STREAM_OP_WRITE};
@@ -90,7 +109,6 @@ fn print_impl(
         Some(v) => obj_is_true(ctx, ctx.types, v)?,
         None => false,
     };
-    let types = ctx.types;
     match file {
         Some(f) => {
             get_stream_raise(ctx, f, MP_STREAM_OP_WRITE)?;
@@ -99,7 +117,7 @@ fn print_impl(
                     stream_write_adaptor(ctx, f, &sep_bytes)?;
                 }
                 let mut s = String::new();
-                obj_print_helper(ctx, types, *arg, PrintKind::Str, &mut s);
+                render(ctx, *arg, &mut s)?;
                 stream_write_adaptor(ctx, f, s.as_bytes())?;
             }
             stream_write_adaptor(ctx, f, &end_bytes)?;
@@ -121,7 +139,7 @@ fn print_impl(
                     let _ = mp_print_str(&mut print, &sep_bytes);
                 }
                 let mut s = String::new();
-                obj_print_helper(ctx, types, *arg, PrintKind::Str, &mut s);
+                render(ctx, *arg, &mut s)?;
                 let _ = mp_print_str(&mut print, s.as_bytes());
             }
             let _ = mp_print_str(&mut print, &end_bytes);

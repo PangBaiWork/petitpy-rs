@@ -83,6 +83,7 @@ use crate::objects::obj::{BuiltinTypes, ObjError};
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
+use crate::objects::slots::CallHook;
 use crate::objects::value::{GcRef, IteratorData, Obj, SetData, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::objects::containers::objset_methods::{
@@ -440,6 +441,7 @@ pub fn set_make_new(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, SetError> {
     let Some(n_pos) = args.len().checked_sub(n_kw * 2) else {
         return Err(SetError::TypeError(ARG_NUM_TYPES_MISMATCH));
@@ -461,7 +463,7 @@ pub fn set_make_new(
     }
     // Any n_args != 0 takes the iterable path with args[0].
     let set_v = alloc_set(ctx, type_, 0);
-    match collect_iterable(ctx, args[0]) {
+    match collect_iterable(ctx, args[0], call) {
         Err(e) => {
             // `mp_getiter` has no pre-flight: its error overwrites
             // whatever pending was set (verified: `set(1,2)` →
@@ -496,7 +498,7 @@ pub(crate) fn to_set(ctx: &mut CallCtx, value: Value) -> Result<Value, SetError>
         Ok(value)
     } else {
         let type_ = ctx.types.set;
-        set_make_new(ctx, type_, &[value], 0)
+        set_make_new(ctx, type_, &[value], 0, None)
     }
 }
 

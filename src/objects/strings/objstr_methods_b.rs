@@ -51,8 +51,7 @@ fn str_caseconv(
     self_value: Value,
     f: fn(u32) -> u32,
 ) -> Result<Value, StrError> {
-    let data = str_data(ctx.arena, self_value).ok_or(StrError::BadImplicitConversion)?;
-    let data = data.to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, self_value).ok_or(StrError::BadImplicitConversion)?;
     let out: Vec<u8> = data.iter().map(|b| f(*b as u32) as u8).collect();
     let self_type = obj_get_type(ctx.arena, types, self_value);
     let is_str = is_str_value(ctx.arena, self_value);
@@ -89,8 +88,7 @@ pub fn str_title(
     types: &BuiltinTypes,
     args: &[Value],
 ) -> Result<Value, StrError> {
-    let data = str_data(ctx.arena, args[0]).ok_or(StrError::BadImplicitConversion)?;
-    let data = data.to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, args[0]).ok_or(StrError::BadImplicitConversion)?;
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     let mut prev_is_alpha = false;
     for &c in &data {
@@ -121,8 +119,7 @@ pub fn str_capitalize(
     types: &BuiltinTypes,
     args: &[Value],
 ) -> Result<Value, StrError> {
-    let data = str_data(ctx.arena, args[0]).ok_or(StrError::BadImplicitConversion)?;
-    let data = data.to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, args[0]).ok_or(StrError::BadImplicitConversion)?;
     let out: Vec<u8> = data
         .iter()
         .enumerate()
@@ -156,8 +153,7 @@ pub fn str_zfill(
     args: &[Value],
 ) -> Result<Value, StrError> {
     let width = obj_get_int(ctx, types, args[1])?;
-    let data = str_data(ctx.arena, args[0]).ok_or(StrError::BadImplicitConversion)?;
-    let data = data.to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, args[0]).ok_or(StrError::BadImplicitConversion)?;
     if width <= data.len() as i64 {
         return Ok(args[0]);
     }
@@ -215,8 +211,8 @@ macro_rules! str_predicate {
         ) -> Result<Value, StrError> {
             let _ = types;
             let data =
-                str_data(ctx.arena, args[0]).ok_or(StrError::BadImplicitConversion)?;
-            Ok(Value::Bool(str_uni_istype(data, $f, $case)))
+                str_data_pool(ctx.arena, ctx.pool, args[0]).ok_or(StrError::BadImplicitConversion)?;
+            Ok(Value::Bool(str_uni_istype(&data, $f, $case)))
         }
     };
 }
@@ -261,7 +257,7 @@ pub fn bytes_hex(
     let mut has_sep = false;
     if args.len() > 1 {
         out_len += data.len() - 1;
-        let sep_data = str_data(ctx.arena, args[1]).ok_or(StrError::BadImplicitConversion)?;
+        let sep_data = str_data_pool(ctx.arena, ctx.pool, args[1]).ok_or(StrError::BadImplicitConversion)?;
         sep_byte = sep_data.first().copied().unwrap_or(0);
         has_sep = true;
     }

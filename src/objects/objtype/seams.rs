@@ -215,19 +215,19 @@ pub fn type_call_slot(ctx: &CallCtx, type_: GcRef) -> Option<crate::objects::slo
     }
 }
 
-/// Run `f` with seams built from a custom `load_maybe` and a
-/// custom `subscr` closure, with the builtin-live stubs for the
-/// other three entries (see `with_stub_seams` for the fidelity
-/// limits). `with_seams` / `with_subscr_seams` /
-/// `with_stub_seams` are the three call shapes over this builder.
+/// Run `f` with seams built from a custom `call`, a custom
+/// `load_maybe` and a custom `subscr` closure, with the
+/// builtin-live stubs for the other two entries (see
+/// `with_stub_seams` for the fidelity limits). `with_seams` /
+/// `with_subscr_seams` / `with_stub_seams` pass the builtin-live
+/// `call_via_type_slot` here; `with_call_hook_seams` (E2)
+/// passes the VM's real call hook instead.
 pub fn with_custom_seams<R>(
+    mut call: impl FnMut(&mut CallCtx, Value, usize, usize, &[Value]) -> PyResult<Value>,
     mut load: impl FnMut(&mut CallCtx, Value, u32) -> Option<(Value, Option<Value>)>,
     mut subscr: impl FnMut(&mut CallCtx, Value, Value, SubscrArg) -> Result<Value, SubscrError>,
     f: impl FnOnce(&mut VmSeams) -> R,
 ) -> R {
-    let mut call = |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
-        call_via_type_slot(ctx, fun, n, k, a)
-    };
     let mut unary = |ctx: &mut CallCtx, op: UnaryOp, v: Value| {
         let t = obj_get_type(ctx.arena, ctx.types, v);
         match call_unary(ctx, t, op, v) {
@@ -262,7 +262,31 @@ pub fn with_seams<R>(
     load: impl FnMut(&mut CallCtx, Value, u32) -> Option<(Value, Option<Value>)>,
     f: impl FnOnce(&mut VmSeams) -> R,
 ) -> R {
-    with_custom_seams(load, stub_subscr, f)
+    with_custom_seams(
+        |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
+            call_via_type_slot(ctx, fun, n, k, a)
+        },
+        load,
+        stub_subscr,
+        f,
+    )
+}
+
+/// Run `f` with seams whose `call` is the VM's real call hook
+/// (E2 — a `FunBc` callee actually executes) and the other four
+/// entries are the builtin-live stubs. `instance_make_new` uses
+/// this on the VM's type-call path; the ctx-only path keeps
+/// `with_stub_seams` (`call_via_type_slot`, `FunBc` raises).
+pub fn with_call_hook_seams<R>(
+    call: impl FnMut(&mut CallCtx, Value, usize, usize, &[Value]) -> PyResult<Value>,
+    f: impl FnOnce(&mut VmSeams) -> R,
+) -> R {
+    with_custom_seams(
+        call,
+        |_ctx: &mut CallCtx, _obj: Value, _attr: u32| None,
+        stub_subscr,
+        f,
+    )
 }
 
 /// Run `f` with seams built from a custom `subscr` closure and
@@ -274,7 +298,14 @@ pub fn with_subscr_seams<R>(
     subscr: impl FnMut(&mut CallCtx, Value, Value, SubscrArg) -> Result<Value, SubscrError>,
     f: impl FnOnce(&mut VmSeams) -> R,
 ) -> R {
-    with_custom_seams(|_ctx: &mut CallCtx, _obj: Value, _attr: u32| None, subscr, f)
+    with_custom_seams(
+        |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
+            call_via_type_slot(ctx, fun, n, k, a)
+        },
+        |_ctx: &mut CallCtx, _obj: Value, _attr: u32| None,
+        subscr,
+        f,
+    )
 }
 
 /// Run `f` with the stub seams: `call` is the builtin-live

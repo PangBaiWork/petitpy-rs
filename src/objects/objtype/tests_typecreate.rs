@@ -328,11 +328,11 @@ fn type_make_new_one_arg() {
     let int = fx.types.int;
     let type_ = fx.types.type_;
     let mut ctx = fx.ctx();
-    let got = type_make_new(&mut ctx, type_, &[Value::SmallInt(1)], 0).expect("type(1)");
+    let got = type_make_new(&mut ctx, type_, &[Value::SmallInt(1)], 0, None).expect("type(1)");
     assert_eq!(got, Value::Heap(int));
     // `type` of a type value is the `type` type itself.
     let mut ctx = fx.ctx();
-    let got = type_make_new(&mut ctx, type_, &[Value::Heap(int)], 0).expect("type(int)");
+    let got = type_make_new(&mut ctx, type_, &[Value::Heap(int)], 0, None).expect("type(int)");
     assert_eq!(got, Value::Heap(type_));
 }
 
@@ -345,7 +345,7 @@ fn type_make_new_three_args() {
     let name = Value::Qstr(fx.q(b"T"));
     let type_ = fx.types.type_;
     let mut ctx = fx.ctx();
-    let got = type_make_new(&mut ctx, type_, &[name, bases, locals], 0).expect("type(T)");
+    let got = type_make_new(&mut ctx, type_, &[name, bases, locals], 0, None).expect("type(T)");
     let Value::Heap(tr) = got else { panic!("not a heap type") };
     let t_q = fx.q(b"T");
     assert_eq!(type_data(&fx.arena, tr).expect("type data").name, t_q);
@@ -363,9 +363,9 @@ fn type_make_new_errors() {
     // the specific variant is pinned at the `mp_obj_new_type`
     // level; the `MakeNewFn` only carries `PyError`).
     let mut ctx = fx.ctx();
-    assert!(type_make_new(&mut ctx, type_, &[name, bases], 0).is_err());
+    assert!(type_make_new(&mut ctx, type_, &[name, bases], 0, None).is_err());
     // A non-str name → "can't convert to str implicitly".
-    assert!(type_make_new(&mut ctx, type_, &[Value::SmallInt(1), bases, locals], 0).is_err());
+    assert!(type_make_new(&mut ctx, type_, &[Value::SmallInt(1), bases, locals], 0, None).is_err());
     // Three positionals plus a kwarg → the sig error.
     let x_q = fx.q(b"x");
     let mut ctx = fx.ctx();
@@ -374,6 +374,7 @@ fn type_make_new_errors() {
         type_,
         &[name, bases, locals, Value::Qstr(x_q), Value::SmallInt(1)],
         1,
+        None,
     )
     .is_err());
 }
@@ -386,7 +387,7 @@ fn type_call_no_make_new() {
     // used to play this role; C13b wired its adapter.)
     let float = fx.types.float;
     let mut ctx = fx.ctx();
-    assert!(type_call(&mut ctx, Value::Heap(float), 0, 0, &[]).is_err());
+    assert!(type_call(&mut ctx, Value::Heap(float), 0, 0, &[], None).is_err());
 }
 
 #[test]
@@ -397,7 +398,7 @@ fn type_call_with_make_new() {
     let bases = bases_tuple(&mut fx, &[Value::Heap(object)]);
     let t = new_type(&mut fx, b"D", bases, locals).expect("new type");
     let mut ctx = fx.ctx();
-    let inst = type_call(&mut ctx, t, 0, 0, &[]).expect("type() call");
+    let inst = type_call(&mut ctx, t, 0, 0, &[], None).expect("type() call");
     let Value::Heap(ir) = inst else { panic!("not an instance") };
     assert!(matches!(fx.arena.get(ir), Obj::Instance(_)));
     assert_eq!(fx.arena.header(ir).type_, Some(match t {
@@ -414,7 +415,7 @@ fn super_make_new_ok() {
     let super_ = fx.types.super_;
     let int = fx.types.int;
     let mut ctx = fx.ctx();
-    let got = super_make_new(&mut ctx, super_, &[Value::Heap(int), Value::SmallInt(1)], 0)
+    let got = super_make_new(&mut ctx, super_, &[Value::Heap(int), Value::SmallInt(1)], 0, None)
         .expect("super(int, 1)");
     let Value::Heap(r) = got else { panic!("not a super") };
     match fx.arena.get(r) {
@@ -438,12 +439,13 @@ fn super_make_new_errors() {
         super_,
         &[Value::SmallInt(1), Value::SmallInt(2)],
         0,
+        None,
     )
     .is_err());
     // `super(int)` → bare TypeError (the missing arg is `None`,
     // `is_subclass(NoneType, int)` is false).
     let mut ctx = fx.ctx();
-    assert!(super_make_new(&mut ctx, super_, &[Value::Heap(int)], 0).is_err());
+    assert!(super_make_new(&mut ctx, super_, &[Value::Heap(int)], 0, None).is_err());
     // Three args → the sig error on success.
     let mut ctx = fx.ctx();
     assert!(super_make_new(
@@ -451,6 +453,7 @@ fn super_make_new_errors() {
         super_,
         &[Value::Heap(int), Value::SmallInt(1), Value::SmallInt(2)],
         0,
+        None,
     )
     .is_err());
 }
@@ -474,7 +477,7 @@ fn super_attr_mro_branch() {
     let super_ = fx.types.super_;
     let sup = {
         let mut ctx = fx.ctx();
-        super_make_new(&mut ctx, super_, &[Value::Heap(b), inst], 0).expect("super(B, b)")
+        super_make_new(&mut ctx, super_, &[Value::Heap(b), inst], 0, None).expect("super(B, b)")
     };
     let m_q = fx.q(b"m");
     let mut ctx = fx.ctx();
@@ -505,7 +508,7 @@ fn super_attr_parent_branch() {
     let super_ = fx.types.super_;
     let sup = {
         let mut ctx = fx.ctx();
-        super_make_new(&mut ctx, super_, &[Value::Heap(b), inst], 0).expect("super(B, b)")
+        super_make_new(&mut ctx, super_, &[Value::Heap(b), inst], 0, None).expect("super(B, b)")
     };
     let m_q = fx.q(b"m");
     let mut ctx = fx.ctx();
@@ -539,7 +542,7 @@ fn super_attr_init_native_slot() {
     let super_ = fx.types.super_;
     let sup = {
         let mut ctx = fx.ctx();
-        super_make_new(&mut ctx, super_, &[Value::Heap(d), inst], 0).expect("super(D, d)")
+        super_make_new(&mut ctx, super_, &[Value::Heap(d), inst], 0, None).expect("super(D, d)")
     };
     let init_q = static_qstr_id(b"__init__").expect("__init__ is a static qstr");
     let mut ctx = fx.ctx();
@@ -562,7 +565,7 @@ fn super_attr_missing_is_none() {
     let super_ = fx.types.super_;
     let sup = {
         let mut ctx = fx.ctx();
-        super_make_new(&mut ctx, super_, &[Value::Heap(c), inst], 0).expect("super(C, c)")
+        super_make_new(&mut ctx, super_, &[Value::Heap(c), inst], 0, None).expect("super(C, c)")
     };
     let nope_q = fx.q(b"nope");
     let mut ctx = fx.ctx();
@@ -610,7 +613,7 @@ fn super_attr_builtin_member_unbound() {
     let super_ = fx.types.super_;
     let sup = {
         let mut ctx = fx.ctx();
-        super_make_new(&mut ctx, super_, &[Value::Heap(b), inst], 0).expect("super(B, b)")
+        super_make_new(&mut ctx, super_, &[Value::Heap(b), inst], 0, None).expect("super(B, b)")
     };
     let mut ctx = fx.ctx();
     let got = super_attr(&mut ctx, sup, m_q).expect("super attr");

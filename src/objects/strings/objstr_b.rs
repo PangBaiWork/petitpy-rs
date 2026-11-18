@@ -74,11 +74,12 @@ pub fn str_splitlines(
     args: &[Value],
 ) -> Result<Value, StrError> {
     let self_ = args[0];
-    // Copy the bytes up front: `str_data` borrows `ctx.arena`, and
-    // the loop below allocates through `ctx` (C8a's `to_vec`
-    // pattern — a borrow of the arena cannot outlive a `ctx`
-    // mutation).
-    let data = str_data(ctx.arena, self_).unwrap_or(&[]).to_vec();
+    // Pool-aware (E2 — the D5 bug-2 class): arena-only `str_data`
+    // returns `None` for dynamic-qstr literals (every string
+    // literal in a module), so the bytes were read as empty.
+    // Copy the bytes up front: the loop below allocates through
+    // `ctx` (C8a's owned-copy pattern).
+    let data = str_data_pool(ctx.arena, ctx.pool, self_).unwrap_or_default();
     let self_type = obj_get_type(ctx.arena, types, self_).unwrap_or(types.str_);
     let keepends = splitlines_keepends(ctx, types, args)?;
     let mut items: Vec<Value> = Vec::new();
@@ -135,12 +136,10 @@ pub fn partitioner_impl(
     str_check_arg_type(ctx.arena, types, Some(self_type), arg)?;
     let is_str = is_str_value(ctx.arena, self_);
     // Owned copies (see the `to_vec` note in `str_splitlines`).
-    let data = str_data(ctx.arena, self_)
-        .ok_or(StrError::BadImplicitConversion)?
-        .to_vec();
-    let sep = str_data(ctx.arena, arg)
-        .ok_or(StrError::BadImplicitConversion)?
-        .to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, self_)
+        .ok_or(StrError::BadImplicitConversion)?;
+    let sep = str_data_pool(ctx.arena, ctx.pool, arg)
+        .ok_or(StrError::BadImplicitConversion)?;
     if sep.is_empty() {
         return Err(StrError::EmptySeparator);
     }
@@ -202,15 +201,14 @@ pub fn str_count(
 ) -> Result<Value, StrError> {
     let self_ = args[0];
     // Owned copies (see the `to_vec` note in `str_splitlines`).
-    let data = str_data(ctx.arena, self_).unwrap_or(&[]).to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, self_).unwrap_or_default();
     let is_bytes = is_bytes_value(ctx.arena, self_);
     let sub = match args.get(1) {
         Some(v) => *v,
         None => return Err(StrError::WrongArgs),
     };
-    let sub_data = str_data(ctx.arena, sub)
-        .ok_or(StrError::BadImplicitConversion)?
-        .to_vec();
+    let sub_data =
+        str_data_pool(ctx.arena, ctx.pool, sub).ok_or(StrError::BadImplicitConversion)?;
     let start = match args.get(2) {
         Some(v) if *v != Value::None => str_index_to_ptr(ctx, types, &data, is_bytes, *v, true)?,
         _ => 0,
@@ -292,7 +290,7 @@ pub fn str_center(
 ) -> Result<Value, StrError> {
     let self_ = args[0];
     // Owned copy (see the `to_vec` note in `str_splitlines`).
-    let data = str_data(ctx.arena, self_).unwrap_or(&[]).to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, self_).unwrap_or_default();
     let type_ = obj_get_type(ctx.arena, types, self_).unwrap_or(types.str_);
     let width = obj_get_int(ctx, types, args[1]).map_err(StrError::Obj)?;
     if width < 0 {
@@ -324,7 +322,7 @@ fn pad_fillchar(ctx: &mut CallCtx, arg: Option<&Value>) -> Result<u8, StrError> 
     match arg {
         None => Ok(b' '),
         Some(v) => {
-            let d = str_data(ctx.arena, *v).ok_or(StrError::BadImplicitConversion)?;
+            let d = str_data_pool(ctx.arena, ctx.pool, *v).ok_or(StrError::BadImplicitConversion)?;
             if d.len() != 1 {
                 return Err(StrError::FillcharMustBeOne);
             }
@@ -341,7 +339,7 @@ pub fn str_ljust(
 ) -> Result<Value, StrError> {
     let self_ = args[0];
     // Owned copy (see the `to_vec` note in `str_splitlines`).
-    let data = str_data(ctx.arena, self_).unwrap_or(&[]).to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, self_).unwrap_or_default();
     let type_ = obj_get_type(ctx.arena, types, self_).unwrap_or(types.str_);
     let width = obj_get_int(ctx, types, args[1]).map_err(StrError::Obj)?;
     if width < 0 {
@@ -359,7 +357,7 @@ pub fn str_rjust(
 ) -> Result<Value, StrError> {
     let self_ = args[0];
     // Owned copy (see the `to_vec` note in `str_splitlines`).
-    let data = str_data(ctx.arena, self_).unwrap_or(&[]).to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, self_).unwrap_or_default();
     let type_ = obj_get_type(ctx.arena, types, self_).unwrap_or(types.str_);
     let width = obj_get_int(ctx, types, args[1]).map_err(StrError::Obj)?;
     if width < 0 {
@@ -534,7 +532,7 @@ pub fn get_data<'a>(arena: &'a GcArena, v: Value) -> Option<&'a [u8]> {
 /// `mp_obj_str_intern` (`objstr.zig:3179-3183`): `qstr_from_strn`
 /// on the content (dynamic interning; static id when possible).
 pub fn intern(ctx: &mut CallCtx, types: &BuiltinTypes, v: Value) -> Value {
-    let data = str_data(ctx.arena, v).unwrap_or(&[]).to_vec();
+    let data = str_data_pool(ctx.arena, ctx.pool, v).unwrap_or_default();
     new_str_via_qstr(ctx, types, &data)
 }
 
@@ -542,12 +540,9 @@ pub fn intern(ctx: &mut CallCtx, types: &BuiltinTypes, v: Value) -> Value {
 /// when the value is not a str (returned here as `Qstr(0)`,
 /// `MP_QSTRnull`).
 pub fn intern_checked(ctx: &mut CallCtx, types: &BuiltinTypes, v: Value) -> Value {
-    match str_data(ctx.arena, v) {
+    match str_data_pool(ctx.arena, ctx.pool, v) {
         None => Value::Qstr(0),
-        Some(data) => {
-            let data = data.to_vec();
-            new_str_via_qstr(ctx, types, &data)
-        }
+        Some(data) => new_str_via_qstr(ctx, types, &data),
     }
 }
 
@@ -685,6 +680,27 @@ pub fn str_splitlines_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Val
     }
     let types = ctx.types;
     str_splitlines(ctx, types, args).map_err(|e| slot_raise(ctx, e))
+}
+
+/// `str.splitlines` as a `BuiltinKwFn` (E2): the `keepends`
+/// kwarg passes through (`npyStrSplitlinesParseKeepends`,
+/// objstr.zig:375-392 — a positional arg wins over the kwarg,
+/// unknown kwargs are ignored, default `False`).
+pub fn str_splitlines_kw_wrapper(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let keepends_id =
+        static_qstr_id(b"keepends").expect("keepends is a static qstr");
+    let mut merged: Vec<Value> = args.to_vec();
+    if args.len() < 2 {
+        if let Some((_, v)) = kwargs.iter().find(|(k, _)| *k == keepends_id) {
+            merged.push(*v);
+        }
+    }
+    str_splitlines(ctx, types, &merged).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `str.partition` slot wrapper.

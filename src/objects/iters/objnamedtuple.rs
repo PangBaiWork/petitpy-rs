@@ -38,7 +38,7 @@ use super::iter::{
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::containers::objattrtuple::attrtuple_print_helper;
 use crate::objects::containers::objtuple::{
-    new_tuple, tuple_binary_op, tuple_getiter, tuple_subscr, tuple_unary_op,
+    tuple_binary_op, tuple_getiter, tuple_subscr, tuple_unary_op,
 };
 use crate::objects::obj::ObjError;
 use crate::objects::slots::PrintKind;
@@ -228,7 +228,12 @@ pub fn namedtuple_make_new(
         items[idx] = Some(val);
     }
     let items: Vec<Value> = items.into_iter().map(|v| v.expect("count check fills every slot")).collect();
-    Ok(Value::Heap(new_tuple(ctx, class, &items)))
+    // The Zig ALWAYS allocates a fresh tuple with the class as
+    // its header (`namedtupleMakeNewImpl`, objnamedtuple.zig) —
+    // even for 0 fields. `new_tuple` would return the shared
+    // `()` singleton (header type `tuple`), so `TupEmpty()`
+    // printed `()` instead of `TupEmpty()`.
+    Ok(Value::Heap(ctx.alloc(Some(class), Obj::Tuple(items))))
 }
 
 /// `namedtuple_attr` (`objnamedtuple.zig:102-122`), LOAD only

@@ -46,6 +46,7 @@
 //!   failure signal), documented, not silently renamed.
 
 use crate::memory::gc::CallCtx;
+use crate::objects::slots::CallHook;
 use crate::objects::containers::objdict::{
     dict_delete, dict_get_value, dict_store, is_ordered_dict_type, DictError,
 };
@@ -146,6 +147,7 @@ pub fn type_make_new(
     _type: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let n_pos = args.len().saturating_sub(2 * n_kw);
     let sig_err = arg_check_num_sig(n_pos, n_kw, 1, 3, false);
@@ -176,23 +178,41 @@ pub fn type_make_new(
     }
 }
 
+/// `type_call` as a `CallFn` slot (the `type` type's own `call`
+/// slot, used by `call_via_type_slot`): the ctx-only path, no
+/// hook — a class called through the stub seams keeps the
+/// pre-E2 behaviour (a `FunBc` `__init__` raises `PyRaise`).
+pub fn type_call_slot_fn(
+    ctx: &mut CallCtx,
+    self_in: Value,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> PyResult<Value> {
+    type_call(ctx, self_in, n_args, n_kw, args, None)
+}
+
 /// `typeCallImpl` (`objtype.zig:1508-1515`): the `type` type's
 /// `call` slot. A type without a `make_new` slot cannot be called
 /// (`CantCreateInstance`); otherwise the call forwards to the
 /// type's own `make_new` slot with the flat `(args, n_kw)` layout.
+/// `call` is the VM's function-call hook (E2 — see `CallHook`):
+/// `Some` on the VM's type-call path (so a Python `__init__` /
+/// `__new__` actually executes), `None` on ctx-only paths.
 pub fn type_call(
     ctx: &mut CallCtx,
     self_in: Value,
     _n_args: usize,
     n_kw: usize,
     args: &[Value],
+    call: Option<crate::objects::slots::CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let Value::Heap(t) = self_in else {
         return Err(ObjTypeError::BareTypeError.to_pyerror());
     };
     let make_new = type_data(ctx.arena, t).and_then(|d| d.make_new);
     match make_new {
-        Some(f) => f(ctx, t, args, n_kw),
+        Some(f) => f(ctx, t, args, n_kw, call),
         // (C13b: record the message — the VM builds the
         // exception from `pending_raise`; a bare `to_pyerror`
         // would surface a message-less `TypeError`. No callee
@@ -217,6 +237,7 @@ pub fn super_make_new(
     _type: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let n_pos = args.len().saturating_sub(2 * n_kw);
     let sig_err = arg_check_num_sig(n_pos, n_kw, 2, 2, false);

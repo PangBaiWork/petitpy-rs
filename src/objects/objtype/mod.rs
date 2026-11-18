@@ -12,6 +12,7 @@ pub mod instance;
 pub mod instance_create;
 pub mod instance_print;
 pub mod lookup;
+pub mod lookup_mro;
 pub mod make_new;
 pub mod objexcept;
 pub mod objexcept_types;

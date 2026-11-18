@@ -26,6 +26,7 @@ use crate::objects::containers::sequence::{seq_count_obj, seq_index_obj};
 use crate::objects::obj::obj_is_true;
 use crate::objects::obj_ops::{get_index, obj_binary_op, obj_get_type_str};
 use crate::objects::slots::BinaryOp;
+use crate::objects::slots::CallHook;
 use crate::objects::strings::objstr_methods_c::KwArg;
 use crate::objects::value::{GcRef, Obj, Value};
 use crate::pyerr::{PyError, PyResult};
@@ -67,7 +68,12 @@ pub fn list_append(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<Value,
 /// argument bulk-copies (realloc to `len + arg.len + 4` in
 /// the Zig — `Vec` manages capacity here); anything else
 /// goes through the `getiter`/`iternext` loop.
-pub fn list_extend(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<Value, ListError> {
+pub fn list_extend(
+    ctx: &mut CallCtx,
+    self_: Value,
+    arg: Value,
+    call: Option<CallHook<'_, '_>>,
+) -> Result<Value, ListError> {
     let types = ctx.types;
     if is_exact_list(ctx, types.list, arg) {
         // Clone first: `self.extend(self)` must see the old
@@ -81,7 +87,7 @@ pub fn list_extend(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<Value,
             l.items.extend_from_slice(&arg_items);
         }
     } else {
-        let items = collect_iterable(ctx, arg)?;
+        let items = collect_iterable(ctx, arg, call)?;
         let Value::Heap(r) = self_ else {
             return Err(ListError::PyRaise);
         };
@@ -449,7 +455,7 @@ pub fn list_append_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value>
 /// `list.extend` (fun_builtin_2: self, iterable).
 pub fn list_extend_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     arity(args, 2)?;
-    list_extend(ctx, args[0], args[1]).map_err(|e| ctx.record_typed(e))
+    list_extend(ctx, args[0], args[1], None).map_err(|e| ctx.record_typed(e))
 }
 
 /// `list.clear` (fun_builtin_1: self).

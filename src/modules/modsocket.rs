@@ -687,7 +687,7 @@ pub fn build_socket_module(
         _ => return Err(PyError::PyRaise),
     };
     let dict_v = Value::Heap(dict);
-    let locals = locals_dict_from_entries(ctx, fun_builtin_var, SOCKET_LOCALS, &[]);
+    let locals = locals_dict_from_entries(ctx, fun_builtin_var, None, SOCKET_LOCALS, &[], &[]);
     // `__del__` is the same object as `close`
     // (`modsocket.zig:318`): look the built value up and
     // store it under the second name.

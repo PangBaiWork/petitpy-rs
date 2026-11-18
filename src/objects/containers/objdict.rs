@@ -90,6 +90,7 @@ use crate::objects::obj::ObjError;
 use crate::objects::obj_ops::{obj_equal, obj_print_helper};
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BinaryOp, PrintKind, SubscrArg, UnaryOp};
+use crate::objects::slots::CallHook;
 use crate::objects::value::{DictData, GcRef, MapData, Obj, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
 
@@ -302,6 +303,7 @@ pub fn dict_make_new(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, DictError> {
     let Some(n_pos) = args.len().checked_sub(n_kw * 2) else {
         return Err(DictError::TypeError(ARG_NUM_TYPES_MISMATCH));
@@ -322,7 +324,7 @@ pub fn dict_make_new(
                 .map(|c| (c[0], c[1]))
                 .collect::<Vec<(Value, Value)>>(),
         );
-        dict_update(ctx, dict, other, &kwargs)?;
+        dict_update(ctx, dict, other, &kwargs, call)?;
     }
     Ok(dict)
 }
@@ -520,7 +522,7 @@ pub fn dict_binary_op(
             // `d | e` is `d.copy()` + `d.update(e)` (the Zig calls
             // `npy_dt_method_update` with an empty kwargs map).
             let empty = MapData::new();
-            dict_update(ctx, target, Some(rhs), &empty).map_err(|e| ctx.record_typed(e))?;
+            dict_update(ctx, target, Some(rhs), &empty, None).map_err(|e| ctx.record_typed(e))?;
             Ok(target)
         }
         BinaryOp::Contains => {

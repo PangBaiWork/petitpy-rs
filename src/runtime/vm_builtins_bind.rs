@@ -48,6 +48,8 @@ pub(crate) struct D1Bindings {
     pub all_builtin: Value,
     pub any_builtin: Value,
     pub sum_builtin: Value,
+    pub repr_builtin: Value,
+    pub len_builtin: Value,
     pub io_module: Value,
 }
 
@@ -165,10 +167,10 @@ pub(crate) fn bind_d1_builtins(
     let _ = mk_var(ctx, "hash", 1, 1, hash_builtin, pairs);
     let _ = mk_var(ctx, "hex", 1, 1, hex_builtin, pairs);
     let _ = mk_var(ctx, "id", 1, 1, id_builtin, pairs);
-    let _ = mk_var(ctx, "len", 1, 1, len_builtin, pairs);
+    let len_val = mk_var(ctx, "len", 1, 1, len_builtin, pairs);
     let _ = mk_var(ctx, "oct", 1, 1, oct_builtin, pairs);
     let _ = mk_var(ctx, "ord", 1, 1, ord_builtin, pairs);
-    let _ = mk_var(ctx, "repr", 1, 1, repr_builtin, pairs);
+    let repr_val = mk_var(ctx, "repr", 1, 1, repr_builtin, pairs);
     let _ = mk_var(ctx, "input", 0, 1, input_builtin, pairs);
     // `__repl_print__` (E1): the REPL echo builtin
     // (`modbuiltins.zig:355`, sig (1, 1)) — a plain
@@ -223,6 +225,8 @@ pub(crate) fn bind_d1_builtins(
         all_builtin: all_val,
         any_builtin: any_val,
         sum_builtin: sum_val,
+        repr_builtin: repr_val,
+        len_builtin: len_val,
         io_module,
     }
 }
@@ -432,6 +436,9 @@ impl Vm {
         state.all_builtin = d1.all_builtin;
         state.any_builtin = d1.any_builtin;
         state.sum_builtin = d1.sum_builtin;
+        state.repr_builtin = d1.repr_builtin;
+        state.len_builtin = d1.len_builtin;
+        state.print_builtin = print_val;
         state.not_implemented = d1.not_implemented;
         // Pin everything live: the types, the singletons, the
         // builtins dict and the builtin values.

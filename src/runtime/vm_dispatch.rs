@@ -302,14 +302,27 @@ pub(crate) fn dispatch_loop(
             MP_BC_LOAD_SUBSCR => {
                 let index = spop(frame).unwrap_or(Value::None);
                 let base = spop(frame).unwrap_or(Value::None);
-                match list_slot(ctx, base, index) {
-                    Some(v) => spush(frame, v),
-                    None => match obj_subscr(ctx, ctx.types, base, index, SubscrArg::Get) {
-                        Ok(v) => spush(frame, v),
-                        Err(e) => {
-                            return DispatchOutcome::Raised(exc_from_obj_error(ctx, state, e))
-                        }
+                // An instance tries its `__getitem__` first,
+                // with the VM's real call hook (E2); no such
+                // dunder falls through to the slot path below.
+                match crate::runtime::vm_seams::try_instance_subscr(
+                    ctx,
+                    state,
+                    base,
+                    index,
+                    SubscrArg::Get,
+                ) {
+                    Ok(Some(v)) => spush(frame, v),
+                    Ok(None) => match list_slot(ctx, base, index) {
+                        Some(v) => spush(frame, v),
+                        None => match obj_subscr(ctx, ctx.types, base, index, SubscrArg::Get) {
+                            Ok(v) => spush(frame, v),
+                            Err(e) => {
+                                return DispatchOutcome::Raised(exc_from_obj_error(ctx, state, e))
+                            }
+                        },
                     },
+                    Err(exc) => return DispatchOutcome::Raised(exc),
                 }
             }
             // ── stores ──
@@ -376,19 +389,54 @@ pub(crate) fn dispatch_loop(
                 let value = spop(frame);
                 match value {
                     None => {
-                        if let Err(e) =
-                            obj_subscr(ctx, ctx.types, base, index, SubscrArg::Delete)
-                        {
-                            return DispatchOutcome::Raised(exc_from_obj_error(ctx, state, e));
+                        // `del x[i]`: an instance tries its
+                        // `__delitem__` first (E2).
+                        match crate::runtime::vm_seams::try_instance_subscr(
+                            ctx,
+                            state,
+                            base,
+                            index,
+                            SubscrArg::Delete,
+                        ) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                if let Err(e) =
+                                    obj_subscr(ctx, ctx.types, base, index, SubscrArg::Delete)
+                                {
+                                    return DispatchOutcome::Raised(exc_from_obj_error(ctx, state, e));
+                                }
+                            }
+                            Err(exc) => return DispatchOutcome::Raised(exc),
                         }
                     }
                     Some(v) => {
                         if let Some(slot) = list_slot_mut(ctx, base, index) {
                             *slot = v;
-                        } else if let Err(e) =
-                            obj_subscr(ctx, ctx.types, base, index, SubscrArg::Set(v))
-                        {
-                            return DispatchOutcome::Raised(exc_from_obj_error(ctx, state, e));
+                        } else {
+                            // An instance tries its `__setitem__`
+                            // first (E2); no such dunder falls
+                            // through to the slot path.
+                            match crate::runtime::vm_seams::try_instance_subscr(
+                                ctx,
+                                state,
+                                base,
+                                index,
+                                SubscrArg::Set(v),
+                            ) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    if let Err(e) = obj_subscr(
+                                        ctx,
+                                        ctx.types,
+                                        base,
+                                        index,
+                                        SubscrArg::Set(v),
+                                    ) {
+                                        return DispatchOutcome::Raised(exc_from_obj_error(ctx, state, e));
+                                    }
+                                }
+                                Err(exc) => return DispatchOutcome::Raised(exc),
+                            }
                         }
                     }
                 }
@@ -396,29 +444,60 @@ pub(crate) fn dispatch_loop(
             // ── deletes ──
             MP_BC_DELETE_FAST => {
                 let u = decode_uint(state, code_idx, &mut ip);
-                // Clear the slot to NULL (unbound); the Zig
-                // writes `MP_OBJ_NULL` into the slot.
+                // The Zig (`vm.zig:675`): an already-NULL slot
+                // raises `NameError("local variable referenced
+                // before assignment")`; else clear the slot to
+                // NULL (unbound).
                 if let Some(idx) = frame.n_state.checked_sub(1 + u) {
-                    if let Some(slot) = frame.state.get_mut(idx) {
-                        *slot = None;
+                    match frame.state.get(idx) {
+                        Some(None) => {
+                            return DispatchOutcome::Raised(
+                                crate::objects::objtype::objexcept::new_exception_msg(
+                                    ctx,
+                                    state.exc.name_error,
+                                    "local variable referenced before assignment",
+                                ),
+                            );
+                        }
+                        Some(Some(_)) => {
+                            if let Some(slot) = frame.state.get_mut(idx) {
+                                *slot = None;
+                            }
+                        }
+                        None => {}
                     }
                 }
             }
             MP_BC_DELETE_DEREF => {
                 let u = decode_uint(state, code_idx, &mut ip);
+                // The Zig (`vm.zig:681`): an already-empty cell
+                // raises the same NameError; else clear it.
                 if let Some(Value::Heap(r)) = fast_local(frame, u) {
                     if let Obj::Cell(c) = ctx.arena.get_mut(r) {
+                        if c.value.is_none() {
+                            return DispatchOutcome::Raised(
+                                crate::objects::objtype::objexcept::new_exception_msg(
+                                    ctx,
+                                    state.exc.name_error,
+                                    "local variable referenced before assignment",
+                                ),
+                            );
+                        }
                         c.value = None;
                     }
                 }
             }
             MP_BC_DELETE_NAME => {
                 let q = decode_qstr(state, code_idx, &mut ip);
-                delete_name_ctx(ctx, state, q);
+                if let Err(e) = delete_name_ctx(ctx, state, q) {
+                    return DispatchOutcome::Raised(e);
+                }
             }
             MP_BC_DELETE_GLOBAL => {
                 let q = decode_qstr(state, code_idx, &mut ip);
-                delete_global_ctx(ctx, state, q);
+                if let Err(e) = delete_global_ctx(ctx, state, q) {
+                    return DispatchOutcome::Raised(e);
+                }
             }
             // ── stack ops ──
             MP_BC_DUP_TOP => {

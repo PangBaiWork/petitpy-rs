@@ -644,12 +644,12 @@ pub fn store_global(vm: &mut Vm, qst: u32, value: Value) -> Result<(), Value> {
     store_global_ctx(&mut ctx, &mut state, qst, value)
 }
 
-pub fn delete_name(vm: &mut Vm, qst: u32) {
+pub fn delete_name(vm: &mut Vm, qst: u32) -> Result<(), Value> {
     let (mut ctx, mut state) = vm.split();
     delete_name_ctx(&mut ctx, &mut state, qst)
 }
 
-pub fn delete_global(vm: &mut Vm, qst: u32) {
+pub fn delete_global(vm: &mut Vm, qst: u32) -> Result<(), Value> {
     let (mut ctx, mut state) = vm.split();
     delete_global_ctx(&mut ctx, &mut state, qst)
 }

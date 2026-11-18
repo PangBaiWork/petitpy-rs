@@ -208,6 +208,7 @@ pub fn store_attr(
     builtins: &mut Builtins,
     seams: &mut RuntimeSeams,
     globals: Value,
+    mut call: Option<crate::objects::slots::CallHook<'_, '_>>,
 ) -> Result<(), RtError> {
     // Payload tag first: the `VmSeams` closures below borrow
     // `ctx` mutably, so the arena read must end before them.
@@ -250,7 +251,15 @@ pub fn store_attr(
                               n_kw: usize,
                               args: &[Value]|
              -> Result<Value, PyError> {
-                call_function_n_kw(ctx, fun, n_args, n_kw, args).map_err(|e| e.to_pyerror())
+                // The VM's real call hook (E2) when one is
+                // passed, so a `FunBc` `__setattr__` / property
+                // setter actually runs; the stub
+                // `call_function_n_kw` on ctx-only paths.
+                match call.as_deref_mut() {
+                    Some(hook) => hook(ctx, fun, n_args, n_kw, args),
+                    None => call_function_n_kw(ctx, fun, n_args, n_kw, args)
+                        .map_err(|e| e.to_pyerror()),
+                }
             };
             let mut load_c =
                 |ctx: &mut CallCtx, obj: Value, attr: u32| -> Option<(Value, Option<Value>)> {

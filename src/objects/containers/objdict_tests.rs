@@ -42,7 +42,7 @@ fn dict_make_new_empty_and_kwargs() {
     let d = {
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        dict_make_new(ctx, ctx.types.dict, &[], 0).unwrap()
+        dict_make_new(ctx, ctx.types.dict, &[], 0, None).unwrap()
     };
     assert_eq!(fx.pairs(d), Vec::<(Value, Value)>::new());
     // `dict(a=1, b=2)` — kwargs as interleaved (key, value) pairs.
@@ -50,7 +50,7 @@ fn dict_make_new_empty_and_kwargs() {
     let d = {
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        dict_make_new(ctx, ctx.types.dict, &[k1, i(1), k2, i(2)], 2).unwrap()
+        dict_make_new(ctx, ctx.types.dict, &[k1, i(1), k2, i(2)], 2, None).unwrap()
     };
     assert_eq!(fx.pairs(d), vec![(k1, i(1)), (k2, i(2))]);
 }
@@ -67,7 +67,7 @@ fn dict_make_new_from_pairs_and_dict() {
     let d = {
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        dict_make_new(ctx, ctx.types.dict, &[pairs], 0).unwrap()
+        dict_make_new(ctx, ctx.types.dict, &[pairs], 0, None).unwrap()
     };
     assert_eq!(fx.pairs(d).len(), 2);
     assert_eq!(fx.pairs(d)[0].0, i(1));
@@ -75,14 +75,14 @@ fn dict_make_new_from_pairs_and_dict() {
     let d2 = {
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        dict_make_new(ctx, ctx.types.dict, &[d], 0).unwrap()
+        dict_make_new(ctx, ctx.types.dict, &[d], 0, None).unwrap()
     };
     assert_eq!(fx.pairs(d2), fx.pairs(d));
     // `dict({}, {})` → `TypeError("argument num/types mismatch")`.
     let empty = fx.dict();
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-    match dict_make_new(ctx, ctx.types.dict, &[empty, empty], 0) {
+    match dict_make_new(ctx, ctx.types.dict, &[empty, empty], 0, None) {
         Err(DictError::TypeError(msg)) => assert_eq!(msg, "argument num/types mismatch"),
         other => panic!("dict(d, d): {other:?}"),
     }
@@ -97,7 +97,7 @@ fn dict_make_new_bad_pair_length() {
     let pairs = fx.heap_list(vec![t1, t2]);
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-    match dict_make_new(ctx, ctx.types.dict, &[pairs], 0) {
+    match dict_make_new(ctx, ctx.types.dict, &[pairs], 0, None) {
         Err(DictError::ValueError(msg)) => {
             assert_eq!(msg, "dict update sequence has wrong length")
         }
@@ -109,7 +109,7 @@ fn dict_make_new_bad_pair_length() {
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
     assert!(matches!(
-        dict_make_new(ctx, ctx.types.dict, &[s], 0),
+        dict_make_new(ctx, ctx.types.dict, &[s], 0, None),
         Err(DictError::ValueError(_))
     ));
 }
@@ -126,7 +126,7 @@ fn dict_make_new_ordered_dict_flag() {
     let d = {
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        dict_make_new(ctx, od_type, &[pairs], 0).unwrap()
+        dict_make_new(ctx, od_type, &[pairs], 0, None).unwrap()
     };
     assert_eq!(print_of(&mut fx, d), "OrderedDict({1: 2})");
 }
@@ -307,7 +307,7 @@ fn dict_update_sources() {
         let empty = MapData::new();
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        dict_update(ctx, d, Some(src), &empty).unwrap();
+        dict_update(ctx, d, Some(src), &empty, None).unwrap();
     }
     assert_eq!(fx.pairs(d).len(), 2);
     // Pairs source (list of tuples) — overwrites + appends.
@@ -318,7 +318,7 @@ fn dict_update_sources() {
         let empty = MapData::new();
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        dict_update(ctx, d, Some(pairs), &empty).unwrap();
+        dict_update(ctx, d, Some(pairs), &empty, None).unwrap();
     }
     assert_eq!(fx.pairs(d).len(), 3);
     assert_eq!(fx.pairs(d)[1].1, i(22));
@@ -328,7 +328,7 @@ fn dict_update_sources() {
     {
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        dict_update(ctx, d, None, &kw).unwrap();
+        dict_update(ctx, d, None, &kw, None).unwrap();
     }
     assert_eq!(fx.pairs(d).len(), 4);
     // Self-update is a no-op.
@@ -336,7 +336,7 @@ fn dict_update_sources() {
         let empty = MapData::new();
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        dict_update(ctx, d, Some(d), &empty).unwrap();
+        dict_update(ctx, d, Some(d), &empty, None).unwrap();
     }
     assert_eq!(fx.pairs(d).len(), 4);
     // Bad pair → ValueError.
@@ -346,7 +346,7 @@ fn dict_update_sources() {
         let empty = MapData::new();
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        match dict_update(ctx, d, Some(bad), &empty) {
+        match dict_update(ctx, d, Some(bad), &empty, None) {
             Err(DictError::ValueError(msg)) => {
                 assert_eq!(msg, "dict update sequence has wrong length")
             }
@@ -358,7 +358,7 @@ fn dict_update_sources() {
         let empty = MapData::new();
         let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-        match dict_update(ctx, d, Some(i(5)), &empty) {
+        match dict_update(ctx, d, Some(i(5)), &empty, None) {
             Err(DictError::TypeError(msg)) => assert_eq!(msg, "object not iterable"),
             other => panic!("non-iterable update: {other:?}"),
         }
@@ -687,7 +687,7 @@ fn dict_fixed_map_rejects_writes() {
     // Even an empty update raises: the Zig's `dictUpdateImpl`
     // calls `ensureNotFixed` before anything else (objdict.zig:448).
     let empty = MapData::new();
-    match dict_update(ctx, fixed, None, &empty) {
+    match dict_update(ctx, fixed, None, &empty, None) {
         Err(DictError::TypeError(msg)) => assert_eq!(msg, ""),
         other => panic!("fixed update: {other:?}"),
     }

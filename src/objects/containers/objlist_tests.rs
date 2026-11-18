@@ -81,20 +81,20 @@ fn list_make_new_basics() {
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
     // `list()` → empty.
-    let out = list_make_new(ctx, t, &[], 0).unwrap();
+    let out = list_make_new(ctx, t, &[], 0, None).unwrap();
     assert_eq!(items_of(ctx, out), &[] as &[Value]);
     // `list([1, 2])` → [1, 2] (a FRESH list — no exact-list
     // fast path, unlike tuple).
-    let out = list_make_new(ctx, t, &[l], 0).unwrap();
+    let out = list_make_new(ctx, t, &[l], 0, None).unwrap();
     assert_eq!(items_of(ctx, out), ints(&[1, 2]));
     assert_ne!(out, l);
     // `list("ab")` → ['a', 'b'] — heap `Str` chars.
-    let out = list_make_new(ctx, t, &[s], 0).unwrap();
+    let out = list_make_new(ctx, t, &[s], 0, None).unwrap();
     let got = items_of(ctx, out);
     assert_eq!(got.len(), 2);
     assert!(matches!(got[0], Value::Heap(_)) && matches!(got[1], Value::Heap(_)));
     // `list({"a": 1})` → ['a'] — dict iterates its keys.
-    let out = list_make_new(ctx, t, &[d], 0).unwrap();
+    let out = list_make_new(ctx, t, &[d], 0, None).unwrap();
     assert_eq!(items_of(ctx, out), vec![a_key]);
 }
 
@@ -110,28 +110,28 @@ fn list_make_new_sig_error_ordering() {
     // `list(1, 2)` → "object not iterable" (the `getiter`
     // failure overwrites the recorded sig error).
     assert_eq!(
-        list_make_new(ctx, t, &[Value::SmallInt(1), Value::SmallInt(2)], 0),
+        list_make_new(ctx, t, &[Value::SmallInt(1), Value::SmallInt(2)], 0, None),
         Err(ListError::NotIterable)
     );
     // `list([1], 99)` → "argument num/types mismatch" (the
     // extend succeeds, so the sig error survives).
     assert_eq!(
-        list_make_new(ctx, t, &[l, Value::SmallInt(99)], 0),
+        list_make_new(ctx, t, &[l, Value::SmallInt(99)], 0, None),
         Err(ListError::ArgNumTypesMismatch)
     );
     // `list("a", "b")` → "argument num/types mismatch".
     assert_eq!(
-        list_make_new(ctx, t, &[a, b], 0),
+        list_make_new(ctx, t, &[a, b], 0, None),
         Err(ListError::ArgNumTypesMismatch)
     );
     // `list(5)` → "object not iterable".
     assert_eq!(
-        list_make_new(ctx, t, &[Value::SmallInt(5)], 0),
+        list_make_new(ctx, t, &[Value::SmallInt(5)], 0, None),
         Err(ListError::NotIterable)
     );
     // kwargs with no positional args → arg mismatch.
     assert_eq!(
-        list_make_new(ctx, t, &[], 1),
+        list_make_new(ctx, t, &[], 1, None),
         Err(ListError::ArgNumTypesMismatch)
     );
 }
@@ -171,26 +171,26 @@ fn list_extend_paths() {
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
     // Exact-list bulk copy.
-    list_extend(ctx, l, other).unwrap();
+    list_extend(ctx, l, other, None).unwrap();
     assert_eq!(items_of(ctx, l), ints(&[1, 2, 3, 4]));
     // Self-extend doubles (the snapshot is cloned first).
-    list_extend(ctx, l, l).unwrap();
+    list_extend(ctx, l, l, None).unwrap();
     assert_eq!(
         items_of(ctx, l),
         ints(&[1, 2, 3, 4, 1, 2, 3, 4])
     );
     // Extend from a str appends its chars.
-    let l2 = list_make_new(ctx, ctx.types.list, &[], 0).unwrap();
-    list_extend(ctx, l2, s).unwrap();
+    let l2 = list_make_new(ctx, ctx.types.list, &[], 0, None).unwrap();
+    list_extend(ctx, l2, s, None).unwrap();
     let got = items_of(ctx, l2);
     assert_eq!(got.len(), 2);
     // Extend from a dict appends its keys.
-    let l3 = list_make_new(ctx, ctx.types.list, &[], 0).unwrap();
-    list_extend(ctx, l3, d).unwrap();
+    let l3 = list_make_new(ctx, ctx.types.list, &[], 0, None).unwrap();
+    list_extend(ctx, l3, d, None).unwrap();
     assert_eq!(items_of(ctx, l3), vec![a_key]);
     // Non-iterable → NotIterable.
     assert_eq!(
-        list_extend(ctx, l, Value::SmallInt(5)),
+        list_extend(ctx, l, Value::SmallInt(5), None),
         Err(ListError::NotIterable)
     );
 }

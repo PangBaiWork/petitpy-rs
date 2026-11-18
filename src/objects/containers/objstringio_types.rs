@@ -240,7 +240,7 @@ pub fn build_io_module(
     };
     // One shared locals dict for both stream types (the C
     // uses the same `stringio_locals_dict` for both).
-    let locals = locals_dict_from_entries(ctx, fun_builtin_var, STRINGIO_LOCALS, &[]);
+    let locals = locals_dict_from_entries(ctx, fun_builtin_var, None, STRINGIO_LOCALS, &[], &[]);
     let stringio = ctx.alloc(
         Some(ctx.types.type_),
         Obj::Type(stringio_type_data(locals)),

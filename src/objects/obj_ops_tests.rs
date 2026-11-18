@@ -30,15 +30,15 @@ fn equal_reflexive_and_small_ints() {
     let mut fx = Fixture::new();
     let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(
-        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, Value::SmallInt(5), Value::SmallInt(5)).unwrap(),
+        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, Value::SmallInt(5), Value::SmallInt(5), None).unwrap(),
         Value::Bool(true)
     );
     assert_eq!(
-        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, Value::SmallInt(5), Value::SmallInt(6)).unwrap(),
+        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, Value::SmallInt(5), Value::SmallInt(6), None).unwrap(),
         Value::Bool(false)
     );
     assert_eq!(
-        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::NotEqual, Value::SmallInt(5), Value::SmallInt(6)).unwrap(),
+        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::NotEqual, Value::SmallInt(5), Value::SmallInt(6), None).unwrap(),
         Value::Bool(true)
     );
     assert!(obj_equal(&mut ctx, &fx.types, Value::SmallInt(5), Value::SmallInt(5)).unwrap());
@@ -94,11 +94,11 @@ fn equal_via_slot_and_neq_first() {
     let v2 = fx.value_of(t, Obj::Float(2.0));
     let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(
-        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, v1, v2).unwrap(),
+        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, v1, v2, None).unwrap(),
         Value::Bool(true)
     );
     assert_eq!(
-        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::NotEqual, v1, v2).unwrap(),
+        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::NotEqual, v1, v2, None).unwrap(),
         Value::Bool(false)
     );
 }
@@ -122,7 +122,7 @@ fn equal_not_equal_without_neq_test_inverts_equal() {
     let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     // Equal says true → NOT_EQUAL is false.
     assert_eq!(
-        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::NotEqual, v1, v2).unwrap(),
+        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::NotEqual, v1, v2, None).unwrap(),
         Value::Bool(false)
     );
 }
@@ -156,11 +156,11 @@ fn equal_reflexive_flag_goes_to_slot() {
     let w = fx.value_of(t2, Obj::Float(1.0));
     let mut ctx = ctx(&mut fx.arena, &mut fx.roots, &fx.types, &fx.pool, &mut fx.pending_raise);
     assert_eq!(
-        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, v, v).unwrap(),
+        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, v, v, None).unwrap(),
         Value::Bool(false)
     );
     assert_eq!(
-        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, w, w).unwrap(),
+        obj_equal_not_equal(&mut ctx, &fx.types, BinaryOp::Equal, w, w, None).unwrap(),
         Value::Bool(true)
     );
 }

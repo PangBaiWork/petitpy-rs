@@ -170,7 +170,18 @@ pub fn make_function_ctx(
     let mut cursor: &[u8] = &code.fun_data;
     let sig = prelude_sig_decode(&mut cursor);
     let _size = prelude_size_decode(&mut cursor);
-    let name = crate::runtime::bc::decode_uint(&mut cursor);
+    // The name varint is a TABLE INDEX, not a qstr id
+    // (`mp_obj_fun_get_name`, objfun.zig): it indexes the child
+    // code's qstr table. Using it raw as the id made
+    // `Fun.__name__` resolve to a 1-byte string (`'\n'` — the
+    // static qstr at that small id) instead of `'Fun'`.
+    let name_idx = crate::runtime::bc::decode_uint(&mut cursor);
+    let name = state
+        .code_store
+        .qstr_table(code_idx)
+        .get(name_idx)
+        .copied()
+        .unwrap_or(0) as u32;
     let is_gen = sig.scope_flags & MP_SCOPE_FLAG_GENERATOR != 0;
     let type_ = if is_gen {
         state.vm_types.gen_wrap

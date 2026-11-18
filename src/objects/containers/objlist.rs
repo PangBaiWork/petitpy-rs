@@ -60,6 +60,7 @@ use crate::objects::containers::sequence::{seq_cmp_objs, seq_extract_slice};
 use crate::objects::obj::{obj_get_int_maybe, ObjError};
 use crate::objects::obj_ops::{get_index, obj_print_helper};
 use crate::objects::slots::{BinaryOp, PrintKind, SubscrArg, UnaryOp};
+use crate::objects::slots::CallHook;
 use crate::objects::strings::objstr_a::{fast_slice_indexes, StrError};
 use crate::objects::value::{GcRef, ListData, Obj, SliceData, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
@@ -269,6 +270,7 @@ pub fn list_make_new(
     list_type: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, ListError> {
     // The polled sig check: record the error, keep going.
     let sig_err = if n_kw > 0 || args.len() > 1 {
@@ -285,7 +287,7 @@ pub fn list_make_new(
     }
     // `list_extend` runs the `getiter`/`iternext` loop; a
     // failure here OVERWRITES the recorded sig error.
-    list_extend(ctx, list, args[0])?;
+    list_extend(ctx, list, args[0], call)?;
     if let Some(e) = sig_err {
         return Err(e);
     }
@@ -333,7 +335,7 @@ pub fn list_binary_op(
             Ok(Value::Heap(new_list(ctx, list_type, &out)))
         }
         BinaryOp::InplaceAdd => {
-            list_extend(ctx, lhs, rhs).map_err(|e| ctx.record_typed(e))?;
+            list_extend(ctx, lhs, rhs, None).map_err(|e| ctx.record_typed(e))?;
             Ok(lhs)
         }
         BinaryOp::Multiply => {
@@ -683,5 +685,5 @@ pub fn list_store(
 /// is C12's.
 pub fn list_make_new_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let list_type = ctx.types.list;
-    list_make_new(ctx, list_type, args, 0).map_err(|e| ctx.record_typed(e))
+    list_make_new(ctx, list_type, args, 0, None).map_err(|e| ctx.record_typed(e))
 }

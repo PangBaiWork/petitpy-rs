@@ -225,6 +225,7 @@ fn store_attr_instance_type_module() {
             &mut builtins,
             &mut seams,
             globals,
+            None,
         )
         .unwrap();
         assert_eq!(load_attr(&mut ctx, inst, a_q, next_obj).unwrap(), Value::SmallInt(4));
@@ -244,6 +245,7 @@ fn store_attr_instance_type_module() {
             &mut builtins,
             &mut seams,
             globals,
+            None,
         )
         .unwrap_err();
         assert_eq!(err.exc_name(), "AttributeError");
@@ -264,6 +266,7 @@ fn store_attr_instance_type_module() {
             &mut builtins,
             &mut seams,
             globals,
+            None,
         )
         .unwrap();
         assert_eq!(load_attr(&mut ctx, klass_v, a_q, next_obj).unwrap(), Value::SmallInt(8));
@@ -290,6 +293,7 @@ fn store_attr_instance_type_module() {
             &mut builtins,
             &mut seams,
             globals,
+            None,
         )
         .unwrap();
         assert_eq!(load_attr(&mut ctx, m, a_q, next_obj).unwrap(), Value::SmallInt(3));
@@ -303,6 +307,7 @@ fn store_attr_instance_type_module() {
             &mut builtins,
             &mut seams,
             globals,
+            None,
         )
         .unwrap_err();
         match err {
@@ -342,6 +347,7 @@ fn store_attr_instance_type_module() {
             &mut builtins,
             &mut seams,
             globals,
+            None,
         )
         .unwrap_err();
         assert_eq!(err.exc_name(), "AttributeError");

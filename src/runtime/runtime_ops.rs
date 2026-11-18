@@ -579,7 +579,7 @@ pub fn binary_op(
         return Ok(Value::Bool(lhs == rhs));
     }
     if op == BinaryOp::Equal || op == BinaryOp::NotEqual {
-        return crate::objects::obj_ops::obj_equal_not_equal(ctx, &types, op, lhs, rhs)
+        return crate::objects::obj_ops::obj_equal_not_equal(ctx, &types, op, lhs, rhs, None)
             .map_err(RtError::from);
     }
     if op == BinaryOp::ExceptionMatch {

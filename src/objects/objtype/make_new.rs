@@ -35,6 +35,7 @@
 //!   like the Zig's `npy_set_make_new`, `objset.zig:133-151`).
 
 use crate::memory::gc::CallCtx;
+use crate::objects::slots::CallHook;
 use crate::objects::containers::objarray::{
     array_make_new, bytearray_make_new, memoryview_make_new,
 };
@@ -105,8 +106,9 @@ pub fn list_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    list_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
+    list_make_new(ctx, type_, args, n_kw, call).map_err(|e| ctx.record_typed(e))
 }
 
 /// `tuple` (`objtuple.rs:258`): direct, error mapping only.
@@ -115,8 +117,9 @@ pub fn tuple_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    tuple_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
+    tuple_make_new(ctx, type_, args, n_kw, call).map_err(|e| ctx.record_typed(e))
 }
 
 /// `dict` (`objdict.rs:298`): direct, error mapping only.
@@ -125,8 +128,9 @@ pub fn dict_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    dict_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
+    dict_make_new(ctx, type_, args, n_kw, call).map_err(|e| ctx.record_typed(e))
 }
 
 /// `set` — and `frozenset` with the same adapter
@@ -136,8 +140,9 @@ pub fn set_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    set_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
+    set_make_new(ctx, type_, args, n_kw, call).map_err(|e| ctx.record_typed(e))
 }
 
 /// `range` (`objrange.rs:191`): direct, error mapping only.
@@ -146,6 +151,7 @@ pub fn range_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     range_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
 }
@@ -156,6 +162,7 @@ pub fn slice_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     slice_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
 }
@@ -166,8 +173,9 @@ pub fn deque_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
-    deque_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
+    deque_make_new(ctx, type_, args, n_kw, call).map_err(|e| ctx.record_typed(e))
 }
 
 /// `property` (`objproperty.rs:143`): direct, error
@@ -177,6 +185,7 @@ pub fn property_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     property_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
 }
@@ -188,6 +197,7 @@ pub fn memoryview_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     memoryview_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
 }
@@ -201,6 +211,7 @@ pub fn map_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let v = map_make_new(ctx, args, n_kw).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {
@@ -215,6 +226,7 @@ pub fn filter_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let v = filter_make_new(ctx, args, n_kw).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {
@@ -238,6 +250,7 @@ pub fn reversed_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     use crate::objects::iters::iter::{CallOutcome, IterSeams};
     let mut call =
@@ -261,6 +274,7 @@ pub fn zip_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let v = zip_make_new(ctx, args, n_kw).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {
@@ -275,6 +289,7 @@ pub fn enumerate_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let v = enumerate_make_new(ctx, args, n_kw).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {
@@ -290,6 +305,7 @@ pub fn int_make_new_slot(
     _type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let types = ctx.types;
     let pool = ctx.pool;
@@ -314,6 +330,7 @@ pub fn float_make_new_slot(
     _type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let types = ctx.types;
     let pool = ctx.pool;
@@ -337,6 +354,7 @@ pub fn complex_make_new_slot(
     _type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let types = ctx.types;
     let pool = ctx.pool;
@@ -360,6 +378,7 @@ pub fn bool_make_new_slot(
     _type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let types = ctx.types;
     bool_make_new(ctx, types, args, n_kw).map_err(|e| ctx.record_typed(e))
@@ -372,6 +391,7 @@ pub fn str_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let types = ctx.types;
     let (pos, kwargs) = split_kwargs(ctx, args, n_kw)?;
@@ -387,6 +407,7 @@ pub fn bytes_make_new_slot(
     _type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let types = ctx.types;
     let (pos, kwargs) = split_kwargs(ctx, args, n_kw)?;
@@ -400,6 +421,7 @@ pub fn array_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let bytearray_type = ctx.types.bytearray;
     array_make_new(ctx, type_, bytearray_type, args, n_kw)
@@ -414,6 +436,7 @@ pub fn bytearray_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let array_type = ctx.types.array;
     let (pos, kwargs) = split_kwargs(ctx, args, n_kw)?;
@@ -430,6 +453,7 @@ pub fn stringio_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     stringio_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
 }
@@ -442,6 +466,7 @@ pub fn iobase_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     iobase_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
 }
@@ -460,6 +485,7 @@ pub fn namedtuple_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
+    _call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let pool = ctx.pool;
     let mut intern = |b: &[u8]| pool.from_strn(b).map(u32::from);

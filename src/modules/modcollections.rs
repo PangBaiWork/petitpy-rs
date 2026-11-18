@@ -106,7 +106,7 @@ pub fn build_collections_module(
     // pattern), mro `[self, object]` (the D1 patch — the
     // Zig's `mroOf` appends `object` for a parentless type).
     let deque_id = static_qstr_id(b"deque").expect("deque is a static qstr");
-    let deque_locals = locals_dict_from_entries(ctx, fun_builtin_var, DEQUE_METHODS, &[]);
+    let deque_locals = locals_dict_from_entries(ctx, fun_builtin_var, None, DEQUE_METHODS, &[], &[]);
     let deque_type = ctx.alloc(Some(ctx.types.type_), Obj::Type(deque_type_data(deque_locals, deque_id)));
     let object = ctx.types.object;
     if let Obj::Type(d) = ctx.arena.get_mut(deque_type) {

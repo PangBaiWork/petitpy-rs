@@ -173,6 +173,23 @@ impl Value {
                 Obj::List(l) => Ok(!l.items.is_empty()),
                 Obj::Dict(d) => Ok(d.map.used != 0),
                 Obj::Set(s) => Ok(s.table.used != 0),
+                // A dict view (`Obj::Iterator` with no `extra`
+                // and the kind — 0/1/2, `DictViewKind` in
+                // objdict_methods — in `index`): truth is the
+                // dict's, like `dict_view_unary_op`'s LEN/BOOL
+                // delegation. Other iterators (map/filter/…,
+                // view iterators) stay truthy.
+                Obj::Iterator(it)
+                    if it.extra.is_empty() && it.index <= 2 =>
+                {
+                    match it.source {
+                        Value::Heap(dr) => match arena.get(dr) {
+                            Obj::Dict(d) => Ok(d.map.used != 0),
+                            _ => Ok(true),
+                        },
+                        _ => Ok(true),
+                    }
+                }
                 _ => Ok(true),
             },
         }

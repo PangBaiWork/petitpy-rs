@@ -36,12 +36,15 @@ use crate::objects::containers::objlist::new_list;
 use crate::objects::containers::objlist_methods::{list_sort_builtin, parse_sort_args};
 use crate::objects::strings::objstr_methods_c::KwArg;
 use crate::objects::iters::iter::value_to_qstr;
+use crate::objects::objtype::objexcept::is_exception_instance;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::BinaryOp;
 use crate::objects::value::{Obj, Value};
+use crate::pyerr::PyError;
 use crate::runtime::import_search::rt_error_to_value;
 use crate::runtime::runtime::RtError;
 use crate::runtime::runtime_method::{load_attr, load_method_protected, MethodDest};
+use crate::runtime::vm_seams::{is_instance, try_instance_load_attr};
 use crate::runtime::vm::VmState;
 use crate::runtime::vm_call::call_function_ctx;
 use crate::runtime::vm_ops::{exc_from_pyerror, type_error, value_error};
@@ -206,7 +209,25 @@ pub fn call_sorted_ctx(
         ));
     }
     let types = ctx.types;
-    let items = collect_iterable(ctx, args[0]).map_err(|e| {
+    // E2: the input iterable is materialised through the VM's
+    // real call hook (the same pattern as `call_type_ctx` in
+    // vm_call.rs), so `sorted(map(f, xs))` runs `f`. A raise from
+    // `f` is stashed on `state.pending_exc` by the hook and
+    // drained first below; anything else goes through the
+    // recorded `pending_raise` as before.
+    let mut hook = |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
+        match call_function_ctx(ctx, state, fun, n, k, a) {
+            Ok(v) => Ok(v),
+            Err(exc) => {
+                state.pending_exc = Some(exc);
+                Err(PyError::PyRaise)
+            }
+        }
+    };
+    let items = collect_iterable(ctx, args[0], Some(&mut hook)).map_err(|e| {
+        if let Some(exc) = state.pending_exc.take() {
+            return exc;
+        }
         let pe = ctx.record_typed(e);
         exc_from_pyerror(ctx, state, pe)
     })?;
@@ -421,6 +442,27 @@ pub fn call_getattr_ctx(
     }
     let attr = attr_qstr(ctx, state, args[1])?;
     let next_obj = state.next_builtin;
+    // Instances try the VM attribute path first (E2 — the
+    // ctx-only `load_method_maybe` below has no `__getattr__`
+    // fallback and no property-fget call, so `getattr(b, "a")`
+    // on a `__getattr__` class raised instead of returning
+    // `'a'`). A hit returns already-bound. An AttributeError
+    // raise means "missing" for the 3-arg form (the default);
+    // any other raise propagates.
+    if is_instance(ctx.arena, args[0]) {
+        match try_instance_load_attr(ctx, state, args[0], attr) {
+            Ok(Some(v)) => return Ok(v),
+            Ok(None) => {}
+            Err(exc) => {
+                if n_args == 3
+                    && is_exception_instance(ctx.arena, exc, state.exc.attribute_error)
+                {
+                    return Ok(args[2]);
+                }
+                return Err(exc);
+            }
+        }
+    }
     if n_args == 2 {
         load_attr(ctx, args[0], attr, next_obj).map_err(|e| rt_to_value(ctx, state, e))
     } else {
@@ -467,6 +509,22 @@ pub fn call_hasattr_ctx(
     }
     let attr = attr_qstr(ctx, state, args[1])?;
     let next_obj = state.next_builtin;
+    // Instances try the VM attribute path first (E2 — same
+    // `__getattr__` gap as `getattr` above). A hit is `True`;
+    // an AttributeError raise is `False`; any other raise
+    // propagates (the `hasattr(c, "raise")` case).
+    if is_instance(ctx.arena, args[0]) {
+        match try_instance_load_attr(ctx, state, args[0], attr) {
+            Ok(Some(_)) => return Ok(Value::Bool(true)),
+            Ok(None) => {}
+            Err(exc) => {
+                if is_exception_instance(ctx.arena, exc, state.exc.attribute_error) {
+                    return Ok(Value::Bool(false));
+                }
+                return Err(exc);
+            }
+        }
+    }
     match load_method_protected(ctx, args[0], attr, false, next_obj) {
         Ok(dest) => Ok(Value::Bool(dest.is_some())),
         Err(e) => Err(rt_to_value(ctx, state, e)),

@@ -564,7 +564,19 @@ pub fn instance_load_attr(
     if is_property(ctx, fun) {
         let (getter, _, _) = property_proxy(ctx.arena, fun);
         if getter == Value::None {
-            return Ok(None);
+            // Unreadable attribute (objtype.zig:1320): fail
+            // outright — NULL without the SENTINEL, so the caller
+            // raises `AttributeError("no attribute 'prop'")`
+            // instead of falling through to the class dict and
+            // returning the property object itself (E2: `d.prop`
+            // with `prop = property()` silently returned).
+            let name =
+                String::from_utf8_lossy(ctx.pool.qstr_str(attr as u16)).into_owned();
+            ctx.record_raise(
+                "AttributeError",
+                Some(&format!("no attribute '{name}'")),
+            );
+            return Err(PyError::PyRaise);
         }
         let ret = seams.call(ctx, getter, 1, 0, &[self_in])?;
         return Ok(Some(ret));

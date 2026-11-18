@@ -609,3 +609,13 @@ fn op_enum_ordinals_match_vendor() {
     assert_eq!(BinaryOp::from_u8(34), Some(BinaryOp::Power));
     assert_eq!(BinaryOp::from_u8(52), None);
 }
+
+#[test]
+fn e2_heap_floordiv_neg_neg() {
+    let mut fx = Fixture::new();
+    let heap_neg2 = fx.heap_int(BigInt::from_int(-2));
+    let v = binary_val(&mut fx, BinaryOp::FloorDivide, heap_neg2, Value::SmallInt(-4));
+    assert_eq!(as_i64(v, &fx.arena), Some(0));
+    let v = binary_val(&mut fx, BinaryOp::Modulo, heap_neg2, Value::SmallInt(-4));
+    assert_eq!(as_i64(v, &fx.arena), Some(-2));
+}

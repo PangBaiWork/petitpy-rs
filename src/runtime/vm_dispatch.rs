@@ -339,10 +339,16 @@ pub(crate) fn dispatch_loop(
                 }
             }
             MP_BC_STORE_ATTR => {
+                // (`vm.zig:657-662`): `mp_store_attr(sp[0], q,
+                // (sp - 1)[0])` — `sp[0]` is the TOP of the
+                // stack, so the stack is `[value, base]` with
+                // the BASE on top (the compiler pushes the value
+                // first, as for `STORE_SUBSCR`'s `[value, base,
+                // index]` — C13's note). Pop the base first.
                 let q = decode_qstr(state, code_idx, &mut ip);
-                let v = spop(frame).unwrap_or(Value::None);
                 let base = spop(frame).unwrap_or(Value::None);
-                if let Err(e) = store_attr_ctx(ctx, state, base, q, v) {
+                let v = spop(frame).unwrap_or(Value::None);
+                if let Err(e) = store_attr_ctx(ctx, state, base, q, Some(v)) {
                     return DispatchOutcome::Raised(e);
                 }
             }

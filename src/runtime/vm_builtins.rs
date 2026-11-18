@@ -138,14 +138,42 @@ pub fn format_kw_wrapper(
 }
 
 /// The ellipsis print slot: `repr(...)` / `print(...)` is
-/// `Ellipsis` (probed on the reference binary).
+/// `Ellipsis` (probed on the reference binary). The ellipsis
+/// type is shared by the `Ellipsis` singleton and the
+/// `NotImplemented` singleton (D1 — the vendor's
+/// `mp_type_singleton` carries both, `objsingleton.c:47-53`),
+/// so the payload decides the spelling.
 pub(crate) fn ellipsis_print(
+    ctx: &mut CallCtx,
+    v: Value,
+    _kind: PrintKind,
+    sink: &mut dyn std::fmt::Write,
+) {
+    let is_not_implemented = match v {
+        Value::Heap(r) => matches!(ctx.arena.get(r), Obj::Instance(_)),
+        _ => false,
+    };
+    let _ = sink.write_str(if is_not_implemented {
+        "NotImplemented"
+    } else {
+        "Ellipsis"
+    });
+}
+
+/// `none_print` (`mp_type_roms.zig:191-201`, vendor `objnone.c`):
+/// the `NoneType` print slot — `None` for every kind (the JSON
+/// `"null"` branch is dead under full config, as the Zig's
+/// `_ = kind` notes). Until D1 the VM's `none_type` was built by
+/// `plain_type` with NO print slot, so `obj_print_helper` fell
+/// back to the default `"<NoneType>"` — `repr(None)` and
+/// `print(None)` were both wrong in master.
+pub(crate) fn none_print(
     _ctx: &mut CallCtx,
     _v: Value,
     _kind: PrintKind,
     sink: &mut dyn std::fmt::Write,
 ) {
-    let _ = sink.write_str("Ellipsis");
+    let _ = sink.write_str("None");
 }
 
 /// `next` as a `BuiltinFn` — a stub: the VM intercepts `next` by

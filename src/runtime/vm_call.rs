@@ -103,6 +103,54 @@ pub fn call_function_ctx(
             ctx, state, n_args, n_kw, args,
         );
     }
+    // The D1 stateful builtins are intercepted the same way
+    // (`builtin_vm.rs`): `globals` / `locals` need the VM's
+    // dicts; `dir` / `sorted` / `min` / `max` / `getattr` /
+    // `setattr` / `hasattr` / `delattr` / `iter` / `all` /
+    // `any` / `sum` need the dispatch loop's iteration seams
+    // and the ability to call user functions.
+    if fun == state.globals_builtin {
+        return crate::runtime::builtin_vm::call_globals_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.locals_builtin {
+        return crate::runtime::builtin_vm::call_locals_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.dir_builtin {
+        return crate::runtime::builtin_vm::call_dir_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.sorted_builtin {
+        return crate::runtime::builtin_vm::call_sorted_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.min_builtin {
+        return crate::runtime::builtin_vm::call_min_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.max_builtin {
+        return crate::runtime::builtin_vm::call_max_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.getattr_builtin {
+        return crate::runtime::builtin_vm::call_getattr_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.setattr_builtin {
+        return crate::runtime::builtin_vm::call_setattr_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.hasattr_builtin {
+        return crate::runtime::builtin_vm::call_hasattr_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.delattr_builtin {
+        return crate::runtime::builtin_vm::call_delattr_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.iter_builtin {
+        return crate::runtime::builtin_vm::call_iter_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.all_builtin {
+        return crate::runtime::builtin_vm::call_all_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.any_builtin {
+        return crate::runtime::builtin_vm::call_any_ctx(ctx, state, n_args, n_kw, args);
+    }
+    if fun == state.sum_builtin {
+        return crate::runtime::builtin_vm::call_sum_ctx(ctx, state, n_args, n_kw, args);
+    }
     match fun {
         Value::Heap(r) => match ctx.arena.get(r) {
             Obj::FunBc(_) => call_fun_bc_ctx(ctx, state, r, n_args, n_kw, args),

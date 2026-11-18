@@ -129,6 +129,11 @@ pub fn type_error(ctx: &mut CallCtx, state: &VmState, msg: &str) -> Value {
     new_exception_msg(ctx, state.exc.type_error, msg)
 }
 
+/// `ValueError(msg)` (D1: `min`/`max` on an empty sequence).
+pub fn value_error(ctx: &mut CallCtx, state: &VmState, msg: &str) -> Value {
+    new_exception_msg(ctx, state.exc.value_error, msg)
+}
+
 use crate::runtime::vm_call::{call_function_ctx, call_method_ctx};
 
 // ── `make_function` / `make_closure` ────────────────────────────────

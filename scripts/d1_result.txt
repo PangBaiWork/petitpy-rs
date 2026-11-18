@@ -1,0 +1,214 @@
+Lane D1: modbuiltins — builtin function family + module registration + NotImplemented
+======================================================================================
+
+§1 — Scope (what was done)
+--------------------------
+modbuiltins.zig (1,328 lines) — the whole builtin table, per the brief:
+
+NEW src/runtime/builtin_fns.rs (578 lines): plain BuiltinFn /
+BuiltinKwFn impls — abs, hash, divmod, bin, hex, oct, format,
+chr, ord, pow (+kw `mod`), repr, callable, id, len, round (+kw
+`ndigits`), open (stub), input (+ generic `input_read<R: BufRead,
+W: Write>` core). `binary_op_plain` mirrors the VM dispatcher's
+`generic_binary_op` (lhs slot, then the plain-arith reverse op,
+then the formatted `binop_unsupported` error); small-int fast
+path / float-complex promotion / `native_subclass_op` NOT
+reproduced (the int slot already delegates float/complex rhs,
+C18a; user-subclass overrides are not honoured by plain
+builtins — §4).
+
+NEW src/runtime/builtin_vm.rs (597 lines): VM-intercepted
+`call_*_ctx(ctx, state, n_args, n_kw, args)` impls — globals,
+locals, dir, sorted, min, max, getattr, setattr, hasattr,
+delattr, iter, all, any, sum. Wired by GcRef identity in
+`call_function_ctx` (vm_call.rs, 14 new branches, after `help`).
+
+NEW src/runtime/vm_builtins_bind.rs (217 lines): split out of
+`vm.rs` — the D1 binds (plain + intercepted + NotImplemented +
+isinstance/issubclass + `__name__` + `io` registration);
+`build_builtins` keeps the type/exception/print/next/
+__build_class__/eval/exec/compile/__import__/help binds.
+
+vm.rs: VmState gained 14 intercepted fields + `not_implemented`;
+`build_builtins` binds super/staticmethod/classmethod types,
+creates NotImplemented (Obj::Instance, header = the shared
+ellipsis type), binds `NotImplemented` + `__name__`="builtins",
+binds all plain + intercepted fns, registers the io module
+(`build_io_module` → `state.builtin_modules`).
+
+vm_types.rs: MRO patch — every VM-built type with an empty `mro`
+gets `[t, object]` (the Zig's `mroOf` appends `object` for a
+parentless type; `rom.rs` already patches its types the same
+way); `object` itself gets `[object]`. Fixes the pre-existing
+`isinstance(1, object) == False` bug in master. `none_type`
+now carries the `none_print` slot (vm_builtins.rs) — see §3.5.
+
+vm_rt_name.rs: `store_attr_ctx` rewired from the always-
+AttributeError stub to the real C14 `runtime_method::store_attr`
+(signature now `value: Option<Value>`, None = delete). Callers:
+vm_dispatch.rs STORE_ATTR (Some(v)), vm_rt_iter.rs:653
+`Vm::store_attr` (Some(v)).
+
+runtime_ops.rs: `is_plain_arith` / `to_reverse` made
+pub(crate). vm_rt_iter.rs: `drain_seam_raise` made pub(crate).
+vm_ops.rs: new `value_error` helper (next to `type_error`).
+
+Tests: src/runtime/builtin_vm_tests.rs (664) + builtin_vm_tests_b.rs
+(391) — 45 Fx end-to-end tests; src/runtime/builtin_fns_tests.rs
+(99) — 5 `input_read` direct tests (Cursor/Vec). The ignored
+`makenew_class_member_store` (vm_tests_b.rs) is un-ignored — it
+passes via the `store_attr_ctx` rewire.
+
+§2 — Verification (main-agent chain, run by the executor)
+---------------------------------------------------------
+- `cargo test --release --lib --tests`: 1300 passed, 0 failed,
+  3 ignored (baseline 1249 + 51 new: 45 + 5 + 1 un-ignored).
+- `cargo test --release --bins`: 9 passed.
+- `cargo build --release --lib --tests`: 0 warnings.
+- No `unsafe` in the diff (0 matches).
+- `scripts/check_compile_mpy.py`: PASS (552/552 byte-identical).
+- `git -C ~/workspace/petitpy-orig status --porcelain`: clean.
+- File sizes: vm.rs 792, vm_call.rs 790, builtin_fns.rs 578,
+  builtin_vm.rs 597, vm_builtins_bind.rs 217, builtin_vm_tests.rs
+  664, builtin_vm_tests_b.rs 391, builtin_fns_tests.rs 99,
+  value.rs 886 (UNCHANGED — no growth, as required).
+- Reference-binary probes: all §3 behaviours below were probed
+  on `~/workspace/petitpy-orig/zig-out/bin/petitpy` before
+  asserting them (scripts /tmp/p1.py–p18.py, this session).
+
+§3 — Findings (all probed on the reference binary unless noted)
+---------------------------------------------------------------
+3.1 `pow(2, 3, mod=None)` → TypeError "pow() with 3 arguments
+requires integers" — a PRESENT `mod` kwarg (even None) selects
+the 3-arg path. CORRECTS the pre-dispatch probe "pow(2,3,
+mod=None)=8" (that script aborted at `round(1.234, 2.0)`
+before reaching the pow line). `pow(2, 3, None)` positionally
+→ same error. Implemented in `pow_builtin_kw` / `pow_builtin`
+(present-kwarg detection via `kw_lookup`).
+
+3.2 STORE_ATTR pop order (real bug in master, C13-era): the
+compiler pushes the VALUE first, then the base — the stack is
+`[value, base]` with the base on top (CPython's convention;
+`vm.zig:657-662`: `mp_store_attr(sp[0], q, (sp - 1)[0])`,
+`sp[0]` is the top). The Rust handler popped `v` first, then
+`base` — swapped — so `c.x = 7` stored attr `'x'` on the int
+`7` (Kind::Other → AttributeError "no attribute 'x'"). Fixed
+in vm_dispatch.rs (pop base, then value). This is why
+`setattr(c, 'x', 7)` passed while `c.x = 7` failed: same
+`store_attr_ctx`, different (wrong) argument order at the
+opcode. `makenew_class_member_store` now passes.
+
+3.3 str LEN/BOOL on string literals (real bug in master):
+`str_unary_op` used the static-only `str_data` (resolves only
+qstr ids < 613), so `len('abc')` / `bool('')` on a dynamically-
+interned literal raised TypeError "object has no len". Fixed
+with `str_data_pool` (pool-aware, C13's note left this arm
+open). Also fixes `sorted(..., key=len)` on strings.
+
+3.4 Getitem-iterator exhaustion (real bug in master): the VM
+`for`/`min`/`max` path over a str raised IndexError "index out
+of range" at exhaustion instead of stopping. Cause: the slot
+collapses its error into a recorded raise (`call_subscr`
+turns a slot `PyRaise` into `NotImplemented`), so
+`obj_subscr` never returns `IndexOutOfRange` and the getitem
+seam's `Err(IndexOutOfRange) => Stop` arm never fired. Fixed
+in `iternext_allow_raise_ctx`'s getitem seam: classify on the
+recorded raise — the original's rule
+(`objgetitemiter.zig:excIsStopOrIndex`): a `StopIteration` or
+`IndexError` from `__getitem__` IS exhaustion (pending raise
+cleared); anything else propagates.
+
+3.5 `repr(None)` printed `"<NoneType>"` in master: the VM's
+`none_type` was built by `plain_type` with NO print slot, so
+`obj_print_helper` fell back to the default `"<{type}>"`.
+The original carries `none_print` (vendor objnone.c,
+mp_type_roms.zig:191-201 — prints "None", JSON branch dead
+under full). Added `none_print` (vm_builtins.rs) and wired it
+into `none_type` in `build_vm_types`.
+
+3.6 `min([])` / `max([])` raise ValueError "arg is an empty
+sequence" (not TypeError) — the Zig's `raiseMinMaxEmpty`.
+Fixed with the new `value_error` helper.
+
+3.7 `round(2.5, None)` ≡ `round(2.5)` — the Zig checks
+`args[1] == OBJ_NONE` for the POSITIONAL 2nd arg too, not just
+the kwarg. Fixed in `round_impl` (positional `None` normalises
+to the 1-arg form; `round(1.234, 2.0)` still raises
+"can't convert to int").
+
+3.8 `isinstance` / `issubclass` were never bound in
+`build_builtins` (the `Rom`-built FunBuiltin objects existed
+but no name pointed at them) — `isinstance(1, object)` raised
+NameError. Bound now via the same constructors `Rom` uses
+(`isinstance_fun_obj` / `issubclass_fun_obj` over fresh empty
+dicts).
+
+3.9 `dir(1)` == `['__class__', 'from_bytes', 'to_bytes']`;
+`dir('ab')` starts `['__class__', 'count', 'endswith', 'find',
+'format']`; `dir(1.5)` == `['__class__']`; `dir()` inside a
+function returns the MODULE globals (locals == globals at
+module level in Rust — matches). `__dir__` delegation works
+(`dir(D())` → `['z', 'a']`).
+
+3.10 `min([3, 1, 2], key=None)` → TypeError "object not
+callable" (explicit `key=None` IS called); `sorted([3, 1, 2],
+key=None)` == `[1, 2, 3]` (sorted treats None as absent);
+`min([1], foo=1)` == 1 (min/max's `unpackMinMaxKwargs` reads
+ONLY `key`/`default` — unknown kwargs ignored); `sum([1],
+foo=1)` → TypeError mismatch (sum enforces its kw set).
+
+3.11 `sorted` ties keep their original order, with and without
+`reverse=True` (stable, CPython-like — probed).
+
+3.12 `chr(0xD800)` → a 1-char string (`len` == 1,
+`ord` == 0xD800, CESU-8 bytes ED A0 80); `round(True)` == 1,
+`round(False)` == 0; `round(2.675, 2)` == 2.68 (ties-to-even
+on the exact IEEE product 267.5).
+
+3.13 `print("hello", file=s)` into a StringIO works on the
+reference — Rust `print` still IGNORES `file=`/`flush=` (no
+`sys.stdout` yet — D2, §4).
+
+3.14 `vars` is NOT in the `modbuiltins.zig` table (verified in
+the source) — not bound, as the brief's grounding resolved.
+
+§4 — Handovers / known limitations
+----------------------------------
+- `open` is a `NotImplementedError` stub ("open() not implemented
+  yet (D2)") in `builtin_fns.rs` (`open_builtin` /
+  `open_builtin_kw`); the io module's `open` member is this same
+  FunBuiltin value. D2 fills the body in place. Sig: kwVar,
+  min 1, max 0xffff, kw=true (`file_io.zig:518-529`).
+- `print(file=)` / `flush=`: DEFERRED to D2 (needs `sys.stdout`
+  as a stream object over fd 1; `stream_write_adaptor` exists).
+- `extensible_modules` left empty (D3/D4 fill it — the original's
+  extensible modules are modarray/moderrno/modstruct, NOT io).
+- FunBc dunder limitation (pre-existing, same class as C13b's
+  FunBc-collect gap): `binary_op` calls use stub seams, so a
+  user-defined `__lt__` / `__abs__` via FunBc raises PyRaise in
+  both the VM expression path and D1's builtins (min/max/sum/
+  sorted key comparisons). A VM-seam-aware collect/comparison
+  path is still needed (C15/D).
+- `sorted(key=...)` when the key CALL fails: Rust propagates
+  the error; the reference ABORTS rc=134 (e.g. `sort(key=len)`
+  on ints — the NULL key result is passed to the comparison,
+  `fromPtr(NULL)` panics at `mp_mirrors.zig:745`). Documented
+  divergence, same as C9b's list_sort doc.
+- `binary_op_plain` does NOT reproduce the dispatcher's
+  `native_subclass_op` / typing-union arms — user subclass
+  binary-op overrides are not honoured by plain builtins
+  (divmod/pow/sum); the VM expression path has them.
+- `makenew_class_attr_on_class` (`C.x` — `load_method_maybe_ctx`
+  looks in `type`'s dict) is NOT fixed by D1 — stays ignored in
+  vm_tests_b.rs (C14's real `mp_load_method` exists in
+  runtime_method.rs but the VM dispatch still uses the local
+  approximation).
+- `input()` reads fd 0 / writes fd 1 in production (std
+  stdin/stdout); the Ctrl-C path (0x03 byte → KeyboardInterrupt)
+  and EOF path (empty + Ctrl-D → EOFError) are tested at
+  `CallCtx` level only (`input_read` over Cursor/Vec).
+- vm.rs is 792 lines (8 headroom) and vm_call.rs 790 (10
+  headroom) after the D1 split (`vm_builtins_bind.rs` holds the
+  D1 binds; the stale top-of-file doc bullets were trimmed).
+  A future lane adding to either file must split again before
+  adding. value.rs stays 886 (recorded cap debt, unchanged).

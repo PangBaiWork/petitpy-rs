@@ -31,7 +31,7 @@ but it can never relax these.
 - Pure Rust std only. NO external crates.
 - NO new `unsafe` unless the original's semantics force it — and then
   only with a written justification in code and in the result file.
-- Every `.rs` file < 800 lines. Split before you exceed it.
+- Every `.rs` file < 2500 lines. Split before you exceed it. (Cap raised from 800 to 2500 by PangBai, 2026-11-18.)
 - `cargo build --release` must be clean (0 warnings). A file-level
   `allow` is permitted only with a written justification in code.
 - Mirror the original's module layout in Rust (e.g. `compiler/qstr.zig`

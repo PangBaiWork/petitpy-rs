@@ -50,6 +50,7 @@ use crate::objects::iters::objdeque::deque_make_new;
 use crate::objects::iters::objenumerate::enumerate_make_new;
 use crate::objects::iters::objfilter::filter_make_new;
 use crate::objects::iters::objmap::map_make_new;
+use crate::objects::iters::objnamedtuple::namedtuple_make_new;
 use crate::objects::iters::objzip::zip_make_new;
 use crate::objects::primitives::objbool::bool_make_new;
 use crate::objects::primitives::objcomplex::complex_make_new;
@@ -410,4 +411,25 @@ pub fn iobase_make_new_slot(
     n_kw: usize,
 ) -> PyResult<Value> {
     iobase_make_new(ctx, type_, args, n_kw).map_err(|e| ctx.record_typed(e))
+}
+
+/// `namedtuple` class (`objnamedtuple.zig:163-238`): the
+/// `namedtuple_make_new` fn takes an `InternFn` (keyword
+/// names arrive as qstrs from the VM, heap `Str`s from a
+/// direct caller — the pool interns them, the C15b
+/// `from_strn` path). D4 wires it: C11 built the class
+/// with `make_new: None`, so `P(1, 2)` through the VM
+/// raised `TypeError("can't create instance")` although the
+/// Zig attaches `namedtuple_make_new` as the class's slot 1
+/// (`objnamedtuple.zig:196,210`).
+pub fn namedtuple_make_new_slot(
+    ctx: &mut CallCtx,
+    type_: GcRef,
+    args: &[Value],
+    n_kw: usize,
+) -> PyResult<Value> {
+    let pool = ctx.pool;
+    let mut intern = |b: &[u8]| pool.from_strn(b).map(u32::from);
+    namedtuple_make_new(ctx, type_, args, n_kw, &mut intern)
+        .map_err(|e| ctx.record_typed(e))
 }

@@ -5,6 +5,8 @@
 //! `eval`/`exec`/`compile`, `__build_class__`, `__import__`,
 //! `help`, the D1 stateful builtins, and the D2 `sys`/`os`
 //! builtins all need VM state a `FunBuiltin` slot cannot see.
+//! D4 adds `micropython.opt_level` and `signal.signal` /
+//! `signal.getsignal` (the `state.d4` state).
 //! Returns `Some(result)` when `fun` is one of them, `None`
 //! otherwise (the caller falls through to the type dispatch).
 
@@ -165,6 +167,27 @@ pub(crate) fn intercept_builtin_call(
     // machinery, which a `FunBuiltin` slot cannot see.
     if fun == state.os_getattr_builtin {
         return Some(crate::runtime::modos::os_getattr_ctx(ctx, state, n_args, n_kw, args));
+    }
+    // `micropython.opt_level` is intercepted the same way
+    // (D4): it reads/writes `state.d4.optimise_value`, which
+    // a `FunBuiltin` slot cannot see.
+    if fun == state.d4.opt_level_builtin {
+        return Some(crate::modules::modmicropython::call_opt_level_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
+    // `signal.signal` / `signal.getsignal` are intercepted
+    // the same way (D4): they read/write the handler table
+    // in `state.d4`, which a `FunBuiltin` slot cannot see.
+    if fun == state.d4.signal_builtin {
+        return Some(crate::modules::modsignal::call_signal_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
+    if fun == state.d4.getsignal_builtin {
+        return Some(crate::modules::modsignal::call_getsignal_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
     }
     None
 }

@@ -98,5 +98,21 @@ pub struct BuiltinTypes {
     /// socket module is built and registered; the registrar
     /// stores `Some(type_ref)` after calling the builder).
     pub socket: Option<GcRef>,
+    /// `deque` (D4: the native deque type object, built by
+    /// `build_collections_module` — the `ucollections.deque`
+    /// type as well, once Phase E builds that module; the
+    /// frozen `collections` package re-exports it. `None`
+    /// until the collections module is built and registered;
+    /// the registrar stores `Some(type_ref)` after calling
+    /// the builder — the `socket` precedent).
+    pub deque: Option<GcRef>,
+    /// `OrderedDict` (D4: the ordered-dict type object, built
+    /// by `build_collections_module` — same shape as `deque`,
+    /// `None` until registered).
+    pub ordereddict: Option<GcRef>,
+    /// `namedtuple` (D4: the factory `FunBuiltin`, built by
+    /// `build_collections_module` — the `ucollections`
+    /// factory as well; `None` until registered).
+    pub namedtuple_fn: Option<GcRef>,
 }
 

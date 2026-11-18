@@ -64,7 +64,7 @@ use crate::compiler::mpy;
 use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::objtype::objexcept_types::ExceptionTypes;
-use crate::objects::value::{GcRef, Obj, Value};
+use crate::objects::value::{GcRef, Value};
 use crate::runtime::bc::CodeState;
 use crate::runtime::code_store::CodeStore;
 use crate::runtime::qstr::RuntimeQstr;
@@ -289,6 +289,10 @@ pub struct VmState {
     /// table — `import ufoo` maps to extensible `foo`).
     /// Added by C15b; filled by D1.
     pub extensible_modules: Vec<(u32, Value)>,
+    /// Lane D4 module state (`micropython.opt_level`, the
+    /// `__main__` module, the `signal` handler table — see
+    /// `d4state.rs`). Added by D4.
+    pub d4: crate::runtime::d4state::D4State,
     /// Loaded modules by name qstr (C15 fills this via imports).
     pub modules: HashMap<u32, GcRef>,
     /// The VM-owned type objects (fun_bc, gen_wrap, …) — kept in
@@ -389,6 +393,9 @@ impl Vm {
             native_init_wrapper: GcRef(0),
             property: GcRef(0),
             socket: None,
+            deque: None,
+            ordereddict: None,
+            namedtuple_fn: None,
         };
         let (types, vm_types, exc, empty_tuple, ellipsis) = {
             let mut ctx = CallCtx::new(&mut arena, &mut roots, &dummy, &pool, &mut pending_raise);
@@ -455,6 +462,7 @@ impl Vm {
                 frozen_modules: crate::runtime::frozen_modules::FrozenTable::new(),
                 builtin_modules: Vec::new(),
                 extensible_modules: Vec::new(),
+                d4: crate::runtime::d4state::D4State::default(),
                 modules: HashMap::new(),
                 vm_types,
                 extra_base: 0,
@@ -462,6 +470,7 @@ impl Vm {
         };
         vm.build_builtins();
         crate::runtime::vm_modules::build_d2_modules(&mut vm);
+        crate::runtime::vm_modules::build_d4_modules(&mut vm);
         vm
     }
 
@@ -535,33 +544,6 @@ impl Vm {
         )
         .map_err(VmError::Compile)?;
         self.load_module_from_mpy(&mpy, name)
-    }
-
-
-    /// Load a module from `.mpy` bytes (the `petitpy-vm` entry
-    /// point): read, register, run the module body.
-    pub fn load_module_from_mpy(&mut self, data: &[u8], name: &str) -> Result<Value, VmError> {
-        let (module_val, code_idx) = self.register_mpy_code(data, name, None, true)?;
-        let module_ref = match module_val {
-            Value::Heap(r) => r,
-            _ => unreachable!("new_module returns a heap module"),
-        };
-        // The module's globals dict is its `dict` — the frame's
-        // globals while the body runs.
-        let globals = match self.arena.get(module_ref) {
-            Obj::Module(m) => m.dict,
-            _ => unreachable!("module object"),
-        };
-        // Pin the module object (its dict is traced through it).
-        self.pin(module_val);
-        self.state.globals = globals;
-        // Run the module body as a 0-arg function call.
-        let fun = Value::Heap(self.call_module_fun(code_idx, module_val));
-        let result = crate::runtime::vm_ops::call_function(self, fun, 0, 0, &[]);
-        match result {
-            Ok(_) => Ok(module_val),
-            Err(exc) => Err(VmError::Raised(exc)),
-        }
     }
 
 

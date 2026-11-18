@@ -388,6 +388,16 @@ pub fn bytes_subscr(
 /// `len('abc')` / `bool('')` on a literal raised
 /// `TypeError("object has no len")` until D1 (the `str` slot
 /// gap C13's `str_data_pool` note left open).
+///
+/// F3: `HASH` — the vendor's `mp_unary_op` fast path
+/// (`runtime.c:330-337`) hashes a str/bytes arg directly
+/// (`qstr_compute_hash`, no slot needed), and a str subclass
+/// reaches it through the instance slot's SENTINEL delegation
+/// (`objtype.zig:1112` → `mp_unary_op(HASH, subobj[0])`). The
+/// Rust slot had no HASH arm, so `hash(S('ab'))` died in
+/// `hash_of_hook` with "unsupported type for operator" (E2j
+/// §4(a)) — the str data hashes exactly like `hash_of`'s heap
+/// `Str` arm (`qstr_compute_hash` as `usize`).
 pub fn str_unary_op(ctx: &mut CallCtx, op: UnaryOp, arg: Value) -> PyResult<Value> {
     let Some(data) = crate::objects::strings::objstr_a::str_data_pool(
         ctx.arena, ctx.pool, arg,
@@ -397,6 +407,9 @@ pub fn str_unary_op(ctx: &mut CallCtx, op: UnaryOp, arg: Value) -> PyResult<Valu
     match op {
         UnaryOp::Bool => Ok(Value::Bool(!data.is_empty())),
         UnaryOp::Len => Ok(Value::SmallInt(utf8_charlen(&data) as i64)),
+        UnaryOp::Hash => Ok(Value::SmallInt(
+            crate::qstr_table::qstr_compute_hash(&data) as i64,
+        )),
         _ => Err(PyError::PyRaise),
     }
 }

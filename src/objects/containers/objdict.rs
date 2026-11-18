@@ -341,6 +341,24 @@ pub fn dict_get_value(ctx: &mut CallCtx, dict: Value, key: Value) -> Result<Valu
     }
 }
 
+/// `mp_obj_dict_get` with an optional VM hook for instance keys
+/// (F3 — the E2h §4 subscript item): a subscript load (`d[key]`)
+/// runs the key's `__hash__` through the VM's real call hook, as
+/// the literal / comprehension store (`dict_store_hook`) already
+/// does. Without a hook this is exactly `dict_get_value`.
+pub fn dict_get_value_hook(
+    ctx: &mut CallCtx,
+    dict: Value,
+    key: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, DictError> {
+    let r = dict_ref_of(ctx.arena, dict);
+    match map_lookup_hook(ctx, ctx.types, r, key, LookupKind::Lookup, hook)? {
+        LookupOutcome::Found(i) => Ok(entry_value(ctx, r, i)),
+        _ => Err(DictError::KeyError(key)),
+    }
+}
+
 /// `mp_obj_dict_store`: `d[key] = value` (returns the dict, as the
 /// Zig does — the SUBSCR slot returns `None` instead; see
 /// `dict_subscr`).
@@ -392,6 +410,24 @@ fn dict_store_inner(
 pub fn dict_delete(ctx: &mut CallCtx, dict: Value, key: Value) -> Result<Value, DictError> {
     dict_get_helper(ctx, dict, key, LookupKind::Remove, None)?;
     Ok(dict)
+}
+
+/// `mp_obj_dict_delete` with an optional VM hook for instance
+/// keys (F3 — the same shape as `dict_get_value_hook`): `del
+/// d[key]` runs the key's `__hash__` through the hook. Without
+/// a hook this is exactly `dict_delete`.
+pub fn dict_delete_hook(
+    ctx: &mut CallCtx,
+    dict: Value,
+    key: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, DictError> {
+    let r = dict_ref_of(ctx.arena, dict);
+    ensure_not_fixed(ctx.arena, r)?;
+    match map_lookup_hook(ctx, ctx.types, r, key, LookupKind::Remove, hook)? {
+        LookupOutcome::Removed(_) => Ok(dict),
+        _ => Err(DictError::KeyError(key)),
+    }
 }
 
 /// `mp_obj_dict_len`: the live entry count.

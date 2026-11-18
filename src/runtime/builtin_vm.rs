@@ -264,6 +264,64 @@ pub fn call_hash_ctx(
     }
 }
 
+/// `str.format` (F3): intercepted by GcRef identity so an
+/// instance arg runs its `__format__` / `__str__` through the
+/// VM's real call hook (see `str_format_hook`); anything else
+/// keeps the ctx-only `str_format` behavior. Arity is
+/// `(self, *args, **kwargs)` — interception bypasses
+/// `call_fun_builtin`'s sig check, so the missing-self case is
+/// reproduced by hand (`str.format()` → mismatch, probed). A
+/// dunder raise is drained from the hook (`drain_hook_raise`),
+/// not the recorded `StrError` mapping.
+pub fn call_str_format_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if n_args < 1 {
+        return Err(mismatch(ctx, state));
+    }
+    let types = ctx.types;
+    let kws = kw_args(args, n_args, n_kw);
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
+    crate::objects::strings::objstr_format::str_format_hook(
+        ctx,
+        types,
+        &args[..n_args],
+        &kws,
+        Some(&mut hook),
+    )
+    .map_err(|e| {
+        let pe = ctx.record_typed(e);
+        crate::runtime::vm_seams::drain_hook_raise(ctx, state, pe)
+    })
+}
+
+/// `format(value[, spec])` (F3): intercepted by GcRef identity
+/// so an instance value runs its `__format__` through the VM's
+/// real call hook (see `format_builtin_hook`); anything else
+/// keeps the ctx-only `format_builtin` behavior. Arity is
+/// (1, 2), no kwargs — interception bypasses
+/// `call_fun_builtin`'s sig check, so the mismatch is
+/// reproduced by hand (probed: `format()`,
+/// `format(1, 'd', 3)`, `format(1, 'd', x=1)`).
+pub fn call_format_builtin_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if !(1..=2).contains(&n_args) || n_kw != 0 {
+        return Err(mismatch(ctx, state));
+    }
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
+    crate::runtime::builtin_fns::format_builtin_hook(ctx, &args[..n_args], Some(&mut hook))
+        .map_err(|e| crate::runtime::vm_seams::drain_hook_raise(ctx, state, e))
+}
+
 
 /// `array.extend` / `bytearray.extend` (E2i): the ctx-only
 /// `array_extend` collects its iterable with a `None` hook,

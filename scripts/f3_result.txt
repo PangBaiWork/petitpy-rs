@@ -1,0 +1,202 @@
+Lane F3 — native-subclass operands + enum/hash
+================================================
+Base: master 9b92299. Worktree ~/workspace/petitpy-rs-f3-subclass,
+branch lane/f3-subclass. One commit, NOT merged (main agent verifies).
+
+§1 — Acceptance (all re-run by the executor in the worktree)
+------------------------------------------------------------
+- cargo test --release --lib --tests: 1650 passed, 0 failed,
+  3 ignored (1636 + 14 new F3 tests in src/runtime/vm_tests_f3.rs);
+  --bins: 9 passed; --test entry_cli: 45 passed.
+- 0 warnings (forced recompile: touch src/lib.rs && cargo build
+  --release). No `unsafe` in the diff. Largest file vm_rt.rs 866
+  lines, vm_dispatch.rs 860 — all < 2500.
+- scripts/check_compile_mpy.py PASS (552/552 byte-identical);
+  scripts/check_frozen.py PASS (23/23, 38,141 bytes).
+- Full corpus: 545/552 — GREEN, exactly the 7 known-fails.
+- Integration: 188/202 (+2 vs base 186). The two flips are exactly
+  `enum_members` and `native_subclass_operands`; the remaining 14
+  fails are byte-identical to the base fail set (set-diffed).
+- Golden: 585/585 (rust==cpython 576/585). Capability: GREEN (67/67).
+- Stdlib: 8/8 (test_enum flips — the last stdlib failure).
+- Nano: 454/541, unchanged (report-only; Rust has no nano build).
+- Orig repo clean (gate-runner `__pycache__` removed).
+
+§2 — Mechanism (8 fixes; vendor grounding first, then the Rust site)
+-----------------------------------------------------------------------
+Shared helper: `native_base` — `src/objects/objtype/subclass.rs:161`
+(`opmethods.nativeBase`, opmethods.zig:27-40): `subobj[0]` for a
+subclass instance, the value itself otherwise.
+
+Fix 1 — `nativeSubclassOp` (`runtime.zig:510-548`, called at :580):
+`src/runtime/vm_rt.rs:387-480` (`is_native_scalar`, `reflected_op`,
+`native_subclass_op`), called at `:575` in `binary_op_ctx` after the
+EQUAL/NOT_EQUAL block, before the MODULO intercept (the vendor's
+position: after IS/EQUAL/EXCEPTION_MATCH + typing union, before the
+small-int fast path). `is_native_scalar` = small int | float | exact
+int | qstr | exact str (lists/bytes/dicts/tuples are NOT scalars).
+Reflected op: LESS<->MORE, LESS_EQUAL<->MORE_EQUAL, else fwd +
+(REVERSE_OR - OR) for fwd in OR..POWER — with an inplace op first
+converted to its plain form. Reflected method found via
+`real_load_maybe` + hook `call_pair` — result returned AS-IS,
+including `NotImplemented` (probed: `1 + W(2)` prints
+`NotImplemented`). No reflected method (or no reflected form) ->
+recurse `binary_op_ctx(op, lhs, native)` with the ORIGINAL op.
+The MODULO intercept sits after this call, as in the vendor the `%`
+dispatch is reached later through the str slot — `'%d' % R(2)`
+takes the same result either way (Fix 7 unwraps the rhs there).
+
+Fix 2 — SENTINEL full protocol for an instance lhs:
+`src/runtime/vm_seams.rs:202` in `try_instance_binary_op`. A stub-seams
+pre-lookup (`class_lookup`, the `try_instance_getiter` precedent):
+on a `NativeSlot` hit (and op not Equal/NotEqual/Contains) recurse
+`binary_op_ctx(ctx, state, op, sub0, rhs)`. The vendor's
+`instance_binary_op` SENTINEL arm calls the FULL `mp_binary_op`
+(objtype.zig:1167-1168); the Rust seam's `binary` is only the
+slot-level `call_binary`, so the reverse step never unwrapped the rhs
+(`L + L` raised `('L', 'L')`, `S < S` raised). The recursion composes
+through the reverse step (the loop re-enters `try_instance_binary_op`
+for the swapped lhs), which is what produces the vendor's
+`('list', 'list')` for `L + L` and `('list', 'L')` for `L < L`.
+Member hits and no-hits keep the existing path; EQUAL/NOT_EQUAL stay
+E2j's protocol; CONTAINS keeps the member-path bool-ify.
+
+Fix 3 — `HASH` arm in `str_unary_op`:
+`src/objects/strings/objstr_methods_c.rs:410` returns
+`qstr_compute_hash(&data)` (the same expression as `hash_of`'s heap
+`Str` arm). The vendor's `mp_unary_op` HASH fast path
+(runtime.c:330-337) hashes str/bytes directly, and a str subclass
+reaches it through the instance slot's SENTINEL delegation
+(objtype.zig:1112). Fixes E2j §4(a): `hash(S('ab'))` = 28198.
+
+Fix 4 — hook-aware dict subscript in the VM dispatch (E2h §4):
+`src/objects/containers/objdict.rs:349` `dict_get_value_hook`,
+`:419` `dict_delete_hook` (mirroring `dict_store_hook`, via
+`map_lookup_hook`); `src/runtime/vm_dispatch.rs` LOAD_SUBSCR
+(`:361`), STORE_SUBSCR set arm, DELETE_SUBSCR arm: an `Obj::Dict`
+base (`is_dict_or_ordered`) goes through the hook versions, else
+the existing `obj_subscr` path. Errors map via `record_typed` +
+`drain_hook_raise` (a `__hash__` raise is already swallowed to the
+vendor's TypeError by `hash_of_hook`, so nothing is stashed here).
+Root cause of test_enum: the literal store already used
+`dict_store_hook`, but subscript store/load were ctx-only, so a
+FunBc `__hash__` (`return id(self)`) could never run.
+
+Fix 5 — `nativeBase` in `str_join`:
+`src/objects/strings/objstr_methods_a.rs:349` unwraps each item
+before the type check (vendor `joinItem`, objstr.zig:1411).
+
+Fix 6 — hook-aware brace engine + interception:
+`src/objects/strings/objstr_format_brace.rs`: `str_format_hook`
+(`:508`; `str_format` delegates with `None`) threads the hook
+through `format_helper_into`; `print_conversion` (`:73`) runs an
+instance's `__str__` (then `__repr__`) through the hook for
+`{...!s}`/`{...!r}`; the spec step (`:280-315`) runs `__format__`
+via `real_load_maybe` + hook `call_pair` (spec consumed, result
+printed as-is) else `nativeBase(arg)` (objstr.zig:2871-2882).
+Native types expose no `__format__` (probed on the reference:
+`hasattr(7, '__format__')` is False), so plain values always take
+the `nativeBase` arm — themselves. `format_builtin_hook`:
+`src/runtime/builtin_fns.rs:188` (same ADDs, then
+`str_format_hook`). Interception: `VmState.str_format_builtin` +
+`format_builtin` (`src/runtime/vm.rs:196,202`), captured in
+`src/runtime/vm_builtins_bind.rs` (the `format` builtin value like
+`hash_builtin`; the `str.format` method handle by name lookup in
+the str type dict, like the join handles), arms in
+`src/runtime/vm_call_intercept.rs`, `call_str_format_ctx` /
+`call_format_builtin_ctx` in `src/runtime/builtin_vm.rs:276,310`
+(arity reproduced by hand: `str.format()` and `format()` /
+`format(1,'d',3)` / `format(1,'d',x=1)` are all "argument num/types
+mismatch", probed; kwargs pass through via `kw_args`).
+f-strings compile to `'{}'.format(x)`, so the `str.format`
+interception covers them.
+
+Fix 7 — `nativeBase` in the `%` engine:
+`src/objects/strings/objstr_format.rs:349`, after `conv` is known:
+for conv != s/r/a, `arg = native_base(arg)` (objstr.zig:2608).
+`'%d' % F(3.9)` -> 3 (via `arg_as_int`); `%s`/`%r`/`%a` keep the
+instance's own `__str__`/`__repr__`.
+
+Fix 8 — deferred `nativeBase` step in `obj_get_float_maybe`:
+`src/objects/obj.rs:588-616`. The Zig's `mp_obj_get_float_maybe`
+(obj.zig:676-684, TRUE-ZIG-PORT) falls through to
+`isFloat(nativeBase(arg))` — "a float subclass without its own
+`__float__`" — a step the Rust function had marked deferred.
+`float(F(2.5))` is now 2.5; `float(R(2))` still raises (an int base
+is not a float), as does `int(F(2.5))` (no `nativeBase` step on the
+int path — probed identical on the reference).
+
+§3 — Probe table (REF vs Rust; probes in ~/workspace/f3_verify/probes/)
+------------------------------------------------------------------------
+- p_all.py: IDENTICAL (all 24 base-Rust diff constructs fixed:
+  `1+R(2)`, `1<R(2)`, `2>R(1)`, `3//R(2)`, `1.5+F(1.0)`,
+  `'a'+S('b')`, `'a'<S('b')`, `1+W(2)` = NotImplemented, sorted-R,
+  sum-R, join-S, format-R, pct-d-F, f-Q, format-Q, float-F, hash-S,
+  dict-S-get, dict-S-get-plain, L<L, S<S, [0]+L, L+L, [1,2]+L,
+  1+R(2)-f; plus the already-passing constructs, unchanged).
+- p_iso.py: ONE remaining diff — `hash-B`: REF 133589455361952 vs
+  Rust 801. That is the DOCUMENTED identity-hash divergence (bytes
+  has no unary slot; REF hashes the raw address, Rust the arena
+  index). No action.
+- p_ord3.py–p_ord7.py, p_hash.py, p_enum_members.py,
+  p_native_ops.py, p_fmt1.py, p_fstr.py: IDENTICAL (incl. rc).
+- p_dict1.py / p_dict2.py: only the `hash` print lines differ
+  (REF raw addresses vs Rust arena indices — the same identity-hash
+  divergence class; all dict store/load lines identical).
+- p_float.py / p_float2.py: IDENTICAL (`float(F(2.5))` = 2.5,
+  `type(float(F(2.5)))` is `float`, `float(R(2))` raises "can't
+  convert to float" on both, `int(F(2.5))` raises "can't convert
+  to int" on both).
+- p_arity.py: IDENTICAL (`str.format()`, `'{}'.format()`,
+  `format()`, `format(1,'d',3)`, `format(1,'d',x=1)` errors).
+- p_keyerr.py: `str(KeyError(instance))` DIFFERS — see §4(d).
+- Integration sources `enum_members` / `native_subclass_operands`
+  run byte-identical to the reference's expected outputs (verified
+  via the integration runner: both flip to PASS).
+
+§4 — Left open (with the E2j §4(b) correction)
+-----------------------------------------------
+(a) CORRECTION to E2j §4(b): the claim "`L([1,2]) < L([1,3])` ->
+REF True" is WRONG. Probed directly: the reference raises
+`TypeError: unsupported types for __lt__: 'list', 'L'` (E2j's own
+edge probe `e2j_verify/edge/p_ord.py` shows the same REF traceback
+on its first line). Only `S('ab') < S('ac')` returns True. The
+brief's §1(b) wording repeats the E2j claim; the F3 tests
+(`f3_subclass_list_error_names`) assert the CORRECTED behavior:
+`L < L` raises `('list', 'L')`, `L + L` and `[1,2] + L` raise
+`('list', 'list')`.
+(b) `float()` of a class that DEFINES `__float__`: `float(G(1.5))`
+where `G.__float__` returns 9.9 is 9.9 on the reference, 1.5 on
+Rust (the FLOAT_MAYBE slot path cannot run a FunBc dunder through
+stub seams, so it falls through to the native value). Needs
+float-builtin interception (same shape as the `hash` interception)
+— a follow-up, not in this lane's acceptance.
+(c) Dict-lookup key EQUALITY for DISTINCT instances with a FunBc
+`__eq__`: `d[A()] = "x"; d[A()]` is `"x"` on the reference,
+`KeyError` on Rust. Fix 4 fixed the HASH half; the probe-loop
+comparison inside `compact_lookup` / `compact_rehash` is still
+ctx-only (`obj_equal`, stub seams), so a user `__eq__` never runs.
+Threading the hook through the map probe comparisons + rehash
+replays is a separate, larger change. @enum members are singletons
+(identity suffices) — that is what test_enum needs.
+(d) `str(KeyError(instance))`: the reference prints `str(arg)` via
+the real print (`Enum.__str__` -> `Color.RED`); Rust prints the
+ctx-only fallback (`<Color object at N>`) — the exception print
+slot has no hook (same family as Fix 6, but a separate mechanism:
+exception-arg printing). `str(KeyError('k'))` / `(42)` / `((1,2))`
+already match.
+(e) `dict.get` / `.pop` / `.setdefault` with instance keys: still
+ctx-only (`dict_get_helper` via the method slots, no hook) — the
+same hash path as Fix 4, reached via FunBuiltin methods instead of
+the dispatch; needs method interception.
+(f) Dict-SUBCLASS instances (`class D(dict)`) with instance keys:
+`try_instance_subscr` SENTINEL -> stub subscr -> the ctx-only dict
+slot (the same hash gap, one level down from Fix 4).
+(g) Identity-hash VALUES differ by design (REF raw ASLR address vs
+Rust arena index): `hash(B(b'ab'))`, `hash(Color.RED)` printed
+values. The mechanism is correct (stable per object, dicts work).
+(h) `type(iter(s))` still bare TypeError (E2b's known gap,
+untouched). All other E2i §4 items (list.extend(gen) hook gap,
+import_from FunBc fallback, `builtins.<newname>` existence check,
+exactly-16MiB repeat divergence, >=1e9-item generator list cap)
+unchanged by this lane.

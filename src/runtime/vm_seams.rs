@@ -26,8 +26,9 @@ use crate::objects::objtype::instance::{
     instance_binary_op, instance_call, instance_get_call, instance_getiter, instance_load_attr,
     instance_subscr, instance_unary_op,
 };
-use crate::objects::objtype::lookup::{class_lookup, SlotKind};
+use crate::objects::objtype::lookup::{binary_op_method_name, class_lookup, LookupHit, SlotKind};
 use crate::objects::objtype::seams::{with_call_hook_seams, with_hook_load_seams, with_stub_seams};
+use crate::objects::objtype::subclass::instance_subobj0;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BinaryOp, SubscrArg, UnaryOp};
 use crate::objects::value::{Obj, Value};
@@ -197,6 +198,58 @@ pub(crate) fn try_instance_binary_op(
 ) -> Result<Option<Value>, Value> {
     if !is_instance(ctx.arena, lhs) {
         return Ok(None);
+    }
+    // F3 — SENTINEL pre-check: when the class lookup for the op
+    // name hits the NATIVE slot (the type is a subclass of a
+    // native type that defines no such dunder), the vendor's
+    // `instance_binary_op` SENTINEL arm calls the FULL
+    // `mp_binary_op` on `(subobj[0], rhs)`
+    // (`objtype.zig:1167-1168`) — NOT the slot-level seam. The
+    // slot-level seam loses the full protocol: the reverse step
+    // never unwraps the rhs, so `L([1,2]) + L([3])` raised
+    // `('L', 'L')` where the reference raises `('list', 'list')`
+    // (the vendor's inner `mp_binary_op` reverse-swaps and
+    // unwraps the rhs too), and `S('ab') < S('ac')` raised
+    // instead of returning True. E2j did this for EQUAL /
+    // NOT_EQUAL inside `instance_binary_op` (the 2-pass
+    // protocol); the other ops need the full `binary_op_ctx`
+    // here, which the slot fn cannot reach (its seams' `binary`
+    // is always the slot-level `call_binary`). A Member hit or
+    // no hit keeps the existing path below (the dunder runs, or
+    // there is none). EQUAL / NOT_EQUAL / CONTAINS are excluded:
+    // equality is E2j's protocol, and CONTAINS bool-ifies in
+    // `finish_binary` on the member path. The pre-lookup is pure
+    // (a dict walk on stub seams, no user calls — the
+    // `try_instance_getiter` precedent).
+    if !matches!(
+        op,
+        BinaryOp::Equal | BinaryOp::NotEqual | BinaryOp::Contains
+    ) {
+        if let Some(name_q) = binary_op_method_name(op) {
+            let is_native_slot = with_stub_seams(|seams| {
+                let Some(type_) = obj_get_type(ctx.arena, ctx.types, lhs) else {
+                    return false;
+                };
+                matches!(
+                    class_lookup(
+                        ctx,
+                        Some(lhs),
+                        name_q,
+                        Some(SlotKind::BinaryOp),
+                        false,
+                        type_,
+                        seams
+                    ),
+                    Some(LookupHit::NativeSlot(_))
+                )
+            });
+            if is_native_slot {
+                if let Some(sub0) = instance_subobj0(ctx.arena, lhs) {
+                    return crate::runtime::vm_rt::binary_op_ctx(ctx, state, op, sub0, rhs)
+                        .map(Some);
+                }
+            }
+        }
     }
     let mut hook = make_hook(state);
     match with_call_hook_seams(&mut hook, |seams| instance_binary_op(ctx, op, lhs, rhs, seams)) {

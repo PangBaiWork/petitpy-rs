@@ -186,6 +186,20 @@ pub struct VmState {
     /// slot path cannot run a `FunBc` `__hash__`, so `hash(A())`
     /// needs the VM's real call hook.
     pub hash_builtin: Value,
+    /// The `str.format` method builtin (F3): the `FunBuiltin`
+    /// from the str type dict. Intercepted by GcRef identity in
+    /// `call_function_ctx` (see `call_str_format_ctx` in
+    /// `builtin_vm.rs`) — `str_format` is ctx-only and cannot
+    /// run a `FunBc` `__format__` / `__str__`, so
+    /// `'{:03d}'.format(R(7))` and `f'{Q():z}'` need the VM's
+    /// real call hook.
+    pub str_format_builtin: Value,
+    /// The `format` builtin (F3): the plain `FunBuiltin` from
+    /// the builtins dict. Intercepted by GcRef identity in
+    /// `call_function_ctx` (see `call_format_builtin_ctx` in
+    /// `builtin_vm.rs`) — `format(Q(), 'y')` needs the same
+    /// hook as `str.format`.
+    pub format_builtin: Value,
     pub min_builtin: Value,
     pub max_builtin: Value,
     pub getattr_builtin: Value,
@@ -476,6 +490,8 @@ impl Vm {
                 bytearray_extend_builtin: Value::None,
                 list_sort_builtin: Value::None,
                 hash_builtin: Value::None,
+                str_format_builtin: Value::None,
+                format_builtin: Value::None,
                 min_builtin: Value::None,
                 max_builtin: Value::None,
                 getattr_builtin: Value::None,

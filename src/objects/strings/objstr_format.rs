@@ -337,10 +337,17 @@ fn str_modulo_format_impl(
             arg_i += 1;
         }
         let arg = arg.unwrap();
-        // `nativeBase` (full builds) is the identity here: no user
-        // classes / subclass instances exist in Rust yet (C12/C13);
-        // documented, not silently dropped.
         let conv = pattern[p];
+        // `nativeBase` (full builds, `objstr.zig:2608`): an
+        // instance of an int, float or str subclass formats as
+        // its native value, except under `%s`, `%r` and `%a`,
+        // which call its own `__str__` / `__repr__` (F3 —
+        // `'%d' % F(3.9)` raised "can't convert to int": the
+        // float-subclass instance never reached `arg_as_int`).
+        let mut arg = arg;
+        if conv != b's' && conv != b'r' && conv != b'a' {
+            arg = crate::objects::objtype::subclass::native_base(ctx.arena, arg);
+        }
         match conv {
             b'c' => {
                 if is_str_value(ctx.arena, arg) {
@@ -456,4 +463,6 @@ pub fn str_modulo_format_hook(
 // The `{}`-format engine lives in `objstr_format_brace.rs`
 // (E2e split — this file was 868 lines, over the 800 cap);
 // re-exported so existing call sites keep working.
-pub use crate::objects::strings::objstr_format_brace::{str_format, str_format_builtin};
+pub use crate::objects::strings::objstr_format_brace::{
+    str_format, str_format_builtin, str_format_hook,
+};

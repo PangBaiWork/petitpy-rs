@@ -341,9 +341,13 @@ pub fn str_join(
         self_type
     };
     for item in &items {
-        // `joinItem` is `nativeBase` on full — identity until
-        // instances exist (C12).
-        let mut item_t = obj_get_type(ctx.arena, types, *item);
+        // `joinItem` is `nativeBase` on full
+        // (`objstr.zig:1411`): a subclass instance joins as its
+        // native value (F3 — `''.join([S('x'), 'y'])` raised
+        // `JoinType` while the instance's type differed from
+        // `str`).
+        let item = crate::objects::objtype::subclass::native_base(ctx.arena, *item);
+        let mut item_t = obj_get_type(ctx.arena, types, item);
         if item_t == Some(types.bytearray) {
             item_t = Some(types.bytes);
         }
@@ -354,7 +358,7 @@ pub fn str_join(
             out.extend_from_slice(&sep);
         }
         first = false;
-        let d = str_data_pool(ctx.arena, ctx.pool, *item).ok_or(StrError::BadImplicitConversion)?;
+        let d = str_data_pool(ctx.arena, ctx.pool, item).ok_or(StrError::BadImplicitConversion)?;
         out.extend_from_slice(&d);
     }
     let is_str = is_str_value(ctx.arena, self_value);

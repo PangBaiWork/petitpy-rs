@@ -600,6 +600,24 @@ pub fn obj_get_float_maybe(
                     }
                 }
             }
+            // F3: the deferred `nativeBase` step (the Zig's
+            // `mp_obj_get_float_maybe`, `obj.zig:676-684`): a
+            // float subclass without its own `__float__`
+            // converts as its native value (`float(F(2.5))` is
+            // 2.5 on the reference; the FLOAT_MAYBE slot answers
+            // NULL for the plain float). A class that DOES define
+            // `__float__` is answered by the slot above on the
+            // reference — the stub seams here cannot run a FunBc
+            // dunder, so such a class falls through to its native
+            // value instead (§4 of the F3 result file).
+            let nb = crate::objects::objtype::subclass::native_base(ctx.arena, arg);
+            if is_float(ctx.arena, types, nb) {
+                if let Value::Heap(r) = nb {
+                    if let Obj::Float(f) = ctx.arena.get(r) {
+                        return Some(*f);
+                    }
+                }
+            }
             None
         }
     }

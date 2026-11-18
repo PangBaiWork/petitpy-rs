@@ -47,6 +47,9 @@ use crate::compiler::emit::consts::{
     MP_BC_YIELD_FROM, MP_BC_YIELD_VALUE,
 };
 use crate::memory::gc::CallCtx;
+use crate::objects::containers::objdict::{
+    dict_delete_hook, dict_get_value_hook, dict_store_hook, is_dict_or_ordered,
+};
 use crate::objects::obj_ops::obj_subscr;
 use crate::objects::objtype::objexcept::{
     exception_set_cause, is_exception_instance, is_exception_type, new_exception_msg,
@@ -66,6 +69,7 @@ use crate::runtime::vm_dispatch_util::{
     stop, store_fast_local, unary_op_from_ordinal, unwind_jump, unwind_return, Flow,
 };
 use crate::runtime::vm_ops::{exc_from_obj_error, type_error};
+use crate::runtime::vm_seams::{drain_hook_raise, make_hook};
 use crate::runtime::vm_raise::{exception_from_pending, make_raise_obj};
 use crate::runtime::vm_rt::{binary_op_ctx, is_true_ctx, unary_op_ctx};
 use crate::runtime::vm_rt_iter::{getiter_vm_ctx, iternext_vm_ctx};
@@ -334,12 +338,51 @@ pub(crate) fn dispatch_loop(
                     Ok(Some(v)) => spush(frame, v),
                     Ok(None) => match list_slot(ctx, base, index) {
                         Some(v) => spush(frame, v),
-                        None => match obj_subscr(ctx, ctx.types, base, index, SubscrArg::Get) {
-                            Ok(v) => spush(frame, v),
-                            Err(e) => {
-                                return DispatchOutcome::Raised(exc_from_obj_error(ctx, state, e))
+                        None => {
+                            if is_dict_or_ordered(ctx.arena, base) {
+                                // F3: a dict base loads through the
+                                // hook-aware `dict_get_value_hook` —
+                                // an instance key runs its `__hash__`
+                                // through the VM's real call hook
+                                // (E2h's `dict_store_hook` already
+                                // did this for literal /
+                                // comprehension stores; subscript
+                                // loads went through the ctx-only
+                                // `dict_get_value` and raised
+                                // "unsupported type for operator"
+                                // for @enum members — E2g §4,
+                                // test_enum). A `__hash__` raise is
+                                // swallowed to that TypeError by
+                                // `hash_of_hook` (the vendor's
+                                // `mp_unary_op` rule), so no raise
+                                // is stashed here; `drain_hook_raise`
+                                // only covers the recorded KeyError.
+                                let mut hook = make_hook(state);
+                                match dict_get_value_hook(
+                                    ctx,
+                                    base,
+                                    index,
+                                    Some(&mut hook),
+                                ) {
+                                    Ok(v) => spush(frame, v),
+                                    Err(e) => {
+                                        let pe = ctx.record_typed(e);
+                                        return DispatchOutcome::Raised(drain_hook_raise(
+                                            ctx, state, pe,
+                                        ));
+                                    }
+                                }
+                            } else {
+                                match obj_subscr(ctx, ctx.types, base, index, SubscrArg::Get) {
+                                    Ok(v) => spush(frame, v),
+                                    Err(e) => {
+                                        return DispatchOutcome::Raised(exc_from_obj_error(
+                                            ctx, state, e,
+                                        ))
+                                    }
+                                }
                             }
-                        },
+                        }
                     },
                     Err(exc) => return DispatchOutcome::Raised(exc),
                 }
@@ -419,7 +462,24 @@ pub(crate) fn dispatch_loop(
                         ) {
                             Ok(Some(_)) => {}
                             Ok(None) => {
-                                if let Err(e) =
+                                if is_dict_or_ordered(ctx.arena, base) {
+                                    // F3: `del d[key]` through the
+                                    // hook-aware `dict_delete_hook`
+                                    // (same shape as the LOAD_SUBSCR
+                                    // get above).
+                                    let mut hook = make_hook(state);
+                                    if let Err(e) = dict_delete_hook(
+                                        ctx,
+                                        base,
+                                        index,
+                                        Some(&mut hook),
+                                    ) {
+                                        let pe = ctx.record_typed(e);
+                                        return DispatchOutcome::Raised(drain_hook_raise(
+                                            ctx, state, pe,
+                                        ));
+                                    }
+                                } else if let Err(e) =
                                     obj_subscr(ctx, ctx.types, base, index, SubscrArg::Delete)
                                 {
                                     return DispatchOutcome::Raised(exc_from_obj_error(ctx, state, e));
@@ -444,7 +504,29 @@ pub(crate) fn dispatch_loop(
                             ) {
                                 Ok(Some(_)) => {}
                                 Ok(None) => {
-                                    if let Err(e) = obj_subscr(
+                                    if is_dict_or_ordered(ctx.arena, base) {
+                                        // F3: `d[key] = v` through
+                                        // the hook-aware
+                                        // `dict_store_hook` (the
+                                        // STORE_MAP / STORE_COMP
+                                        // path already used it; the
+                                        // subscript store went
+                                        // through the ctx-only
+                                        // `dict_store` — E2h §4).
+                                        let mut hook = make_hook(state);
+                                        if let Err(e) = dict_store_hook(
+                                            ctx,
+                                            base,
+                                            index,
+                                            v,
+                                            Some(&mut hook),
+                                        ) {
+                                            let pe = ctx.record_typed(e);
+                                            return DispatchOutcome::Raised(drain_hook_raise(
+                                                ctx, state, pe,
+                                            ));
+                                        }
+                                    } else if let Err(e) = obj_subscr(
                                         ctx,
                                         ctx.types,
                                         base,

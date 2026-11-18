@@ -181,6 +181,29 @@ pub fn format_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     str_format(ctx, types, &[fmt, value], &[]).map_err(|e| ctx.record_typed(e))
 }
 
+/// `format_builtin` with the VM's real call hook (F3): the
+/// `str_format` step runs `__format__` / `__str__` through the
+/// hook (`format(Q(), 'y')` printed the instance fallback).
+/// Without a hook this is exactly `format_builtin`.
+pub fn format_builtin_hook(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    hook: Option<crate::objects::slots::CallHook<'_, '_>>,
+) -> PyResult<Value> {
+    use crate::objects::strings::objstr_format::str_format_hook;
+    let (value, spec) = match args {
+        [v] => (*v, Value::Qstr(0)),
+        [v, s] => (*v, *s),
+        _ => return Err(PyError::PyRaise),
+    };
+    let types = ctx.types;
+    let open = new_str(ctx, types, b"{:");
+    let fmt = binary_op_plain(ctx, BinaryOp::Add, open, spec)?;
+    let close = new_str(ctx, types, b"}");
+    let fmt = binary_op_plain(ctx, BinaryOp::Add, fmt, close)?;
+    str_format_hook(ctx, types, &[fmt, value], &[], hook).map_err(|e| ctx.record_typed(e))
+}
+
 /// `mp_builtin_chr` (`modbuiltins.zig`): `chr(i)` for
 /// `0 <= i <= 0x10FFFF`, else `ValueError("chr() arg not in
 /// range(0x110000)")`; a non-int raises "can't convert to int"

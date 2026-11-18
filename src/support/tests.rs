@@ -160,6 +160,117 @@ fn repl_read_line_semantics() {
     assert!(out.is_empty()); // the \n itself: stripped, count 1
 }
 
+/// A `BufRead` that hands out at most `chunk` bytes per
+/// `fill_buf`, modelling a pipe whose writes arrive in pieces.
+/// C `fgets` loops over such short reads; the pre-F2
+/// `fgets_chunk` returned the first short fill as a chunk.
+struct ShortFill<'a> {
+    data: &'a [u8],
+    pos: usize,
+    chunk: usize,
+}
+
+impl<'a> std::io::Read for ShortFill<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf
+            .len()
+            .min(self.chunk)
+            .min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl<'a> std::io::BufRead for ShortFill<'a> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        let end = (self.pos + self.chunk).min(self.data.len());
+        Ok(&self.data[self.pos..end])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos += amt;
+    }
+}
+
+#[test]
+fn f2_fgets_loops_over_short_fills() {
+    // A 4000-byte line arriving in 7-byte pipe pieces is ONE
+    // `fgets` chunk (4095 limit), not 572 lines — the F2 probe
+    // (`total20000`: reference 7 prompts, Rust 9 before the fix).
+    let mut data = vec![b'y'; 3999];
+    data.push(b'\n');
+    data.extend_from_slice(b"print(1)\n");
+    let mut r = ShortFill {
+        data: &data,
+        pos: 0,
+        chunk: 7,
+    };
+    let mut prompt_out = Vec::new();
+    let mut out = Vec::new();
+    assert_eq!(
+        repl_read_line(&mut r, &mut prompt_out, None, 4096, &mut out),
+        4000
+    );
+    assert_eq!(out.len(), 3999);
+    assert!(out.iter().all(|&b| b == b'y'));
+    out.clear();
+    assert_eq!(
+        repl_read_line(&mut r, &mut prompt_out, None, 4096, &mut out),
+        9
+    );
+    assert_eq!(out, b"print(1)");
+    // The same short-fill stream through `readline` (input()):
+    // 600-byte line in 11-byte pieces accumulates whole.
+    let long = vec![b'a'; 600];
+    let mut data = long.clone();
+    data.push(b'\n');
+    let mut r = ShortFill {
+        data: &data,
+        pos: 0,
+        chunk: 11,
+    };
+    out.clear();
+    assert_eq!(readline(&mut r, &mut prompt_out, None, &mut out), 0);
+    assert_eq!(out, long);
+}
+
+#[test]
+fn f2_repl_line_truncates_at_nul() {
+    // The Zig side measures the line with `strlen`: `print(1)`
+    // then NUL then junk — the reference prints 1 and the junk
+    // (already consumed by the `fgets`) never becomes a line.
+    let mut r = Cursor::new(b"print(1)\x00junk\nprint(2)\n".to_vec());
+    let mut prompt_out = Vec::new();
+    let mut out = Vec::new();
+    assert_eq!(
+        repl_read_line(&mut r, &mut prompt_out, None, 4096, &mut out),
+        8
+    );
+    assert_eq!(out, b"print(1)");
+    out.clear();
+    assert_eq!(
+        repl_read_line(&mut r, &mut prompt_out, None, 4096, &mut out),
+        9
+    );
+    assert_eq!(out, b"print(2)");
+    // A NUL-first line reads as length 0 (EOF), like the original.
+    let mut r = Cursor::new(b"\x00\nprint(2)\n".to_vec());
+    out.clear();
+    assert_eq!(
+        repl_read_line(&mut r, &mut prompt_out, None, 4096, &mut out),
+        0
+    );
+    assert!(out.is_empty());
+    // `input()` sees the same `strlen` rule: the line is "ab"
+    // and the status is EOF (the Zig `readline` adds the 2 bytes
+    // then hits EOF on the next `fgets`).
+    let mut r = Cursor::new(b"ab\x00cd\n".to_vec());
+    out.clear();
+    assert_eq!(readline(&mut r, &mut prompt_out, None, &mut out), CHAR_CTRL_D);
+    assert_eq!(out, b"ab");
+}
+
 #[test]
 fn qstr_hash_matches_zig_formula() {
     // djb2 (`hash * 33 ^ byte`), 16-bit mask, zero bumped to 1

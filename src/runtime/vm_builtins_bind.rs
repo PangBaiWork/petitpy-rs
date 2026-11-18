@@ -51,6 +51,7 @@ pub(crate) struct D1Bindings {
     pub repr_builtin: Value,
     pub len_builtin: Value,
     pub hash_builtin: Value,
+    pub format_builtin: Value,
     pub io_module: Value,
 }
 
@@ -164,7 +165,7 @@ pub(crate) fn bind_d1_builtins(
     let _ = mk_var(ctx, "callable", 1, 1, callable_builtin, pairs);
     let _ = mk_var(ctx, "chr", 1, 1, chr_builtin, pairs);
     let _ = mk_var(ctx, "divmod", 2, 2, divmod_builtin, pairs);
-    let _ = mk_var(ctx, "format", 1, 2, format_builtin, pairs);
+    let format_val = mk_var(ctx, "format", 1, 2, format_builtin, pairs);
     let hash_val = mk_var(ctx, "hash", 1, 1, hash_builtin, pairs);
     let _ = mk_var(ctx, "hex", 1, 1, hex_builtin, pairs);
     let _ = mk_var(ctx, "id", 1, 1, id_builtin, pairs);
@@ -229,6 +230,7 @@ pub(crate) fn bind_d1_builtins(
         repr_builtin: repr_val,
         len_builtin: len_val,
         hash_builtin: hash_val,
+        format_builtin: format_val,
         io_module,
     }
 }
@@ -522,6 +524,23 @@ impl Vm {
             }
         }
         state.hash_builtin = d1.hash_builtin;
+        state.format_builtin = d1.format_builtin;
+        // F3: the `str.format` method builtin (one `FunBuiltin`
+        // object in the str type dict). Looked up by name; a miss
+        // (impossible in practice — the table carries `format`)
+        // leaves the handle unset and `str.format` keeps its old
+        // ctx-only behavior.
+        let format_q = static_qstr_id(b"format").expect("format is a static qstr");
+        if let Obj::Type(d) = ctx.arena.get(ctx.types.str_) {
+            let str_dict = d.dict;
+            if let Ok(v) = crate::objects::containers::objdict::dict_get_value(
+                &mut ctx,
+                Value::Heap(str_dict),
+                Value::Qstr(format_q),
+            ) {
+                state.str_format_builtin = v;
+            }
+        }
         // E2i: the `array.extend` / `bytearray.extend` method
         // builtins (two different `FunBuiltin` objects — the
         // array dict and the bytearray dict are built from

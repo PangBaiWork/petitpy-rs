@@ -18,14 +18,19 @@
 //! precheck.
 
 use crate::memory::gc::CallCtx;
-use crate::runtime::vm_seams::make_hook;
 use crate::objects::containers::objlist::{is_exact_list, list_items_vec};
 use crate::objects::containers::objtuple::{is_exact_tuple, tuple_items};
-use crate::objects::obj::{call_binary, call_unary, obj_get_type, obj_is_true, SlotOutcome};
+use crate::objects::obj::{
+    call_binary, call_unary, is_exact_int, is_float, obj_get_type, obj_is_true, SlotOutcome,
+};
 use crate::objects::obj_ops::{obj_equal_not_equal, obj_type_name};
+use crate::objects::objtype::lookup::binary_op_method_name;
 use crate::objects::objtype::objexcept::{exception_match, is_exception_type};
+use crate::objects::objtype::seams::{real_load_maybe, with_call_hook_seams};
+use crate::objects::objtype::subclass::instance_subobj0;
 use crate::objects::primitives::ops::new_int_from_bigint;
 use crate::objects::slots::{BinaryOp, UnaryOp};
+use crate::runtime::vm_seams::make_hook;
 use crate::objects::value::{Obj, Value};
 use crate::runtime::vm::VmState;
 use crate::runtime::vm_ops::{exc_from_pyerror, exc_from_typed, type_error};
@@ -374,6 +379,97 @@ fn container_compare(
     Ok(Value::Bool(true))
 }
 
+/// `isNativeScalar` (`runtime.zig:506`): a small int, a float,
+/// an exact int, a qstr, or an exact str — the values
+/// `nativeSubclassOp` accepts on the left (and as the unwrapped
+/// native base on the right). Lists/bytes/dicts/tuples are NOT
+/// native scalars.
+fn is_native_scalar(ctx: &CallCtx, v: Value) -> bool {
+    match v {
+        Value::SmallInt(_) | Value::Qstr(_) => true,
+        Value::Heap(_) => {
+            is_float(ctx.arena, ctx.types, v)
+                || is_exact_int(ctx.arena, ctx.types, v)
+                || obj_get_type(ctx.arena, ctx.types, v) == Some(ctx.types.str_)
+        }
+        _ => false,
+    }
+}
+
+/// The reflected op `nativeSubclassOp` tries on the rhs
+/// (`runtime.zig:510-548`): LESS↔MORE, LESS_EQUAL↔MORE_EQUAL,
+/// else `fwd + (REVERSE_OR - OR)` for fwd in OR..POWER — where
+/// `fwd` is the op with an inplace op first converted to its
+/// plain form (INPLACE_ADD → ADD). Anything else (DIVMOD,
+/// CONTAINS, …) has no reflected form.
+fn reflected_op(op: BinaryOp) -> Option<BinaryOp> {
+    let mut fwd = op;
+    let v = fwd.as_u8();
+    if (9..=21).contains(&v) {
+        fwd = BinaryOp::from_u8(v + 13).unwrap_or(op);
+    }
+    match fwd {
+        BinaryOp::Less => Some(BinaryOp::More),
+        BinaryOp::More => Some(BinaryOp::Less),
+        BinaryOp::LessEqual => Some(BinaryOp::MoreEqual),
+        BinaryOp::MoreEqual => Some(BinaryOp::LessEqual),
+        _ => {
+            let v = fwd.as_u8();
+            if (22..=34).contains(&v) {
+                BinaryOp::from_u8(v + 15)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// `nativeSubclassOp` (`runtime.zig:510-548`, full builds only):
+/// an int/float/str subclass on the RIGHT of a native scalar
+/// works as its value. If the rhs defines the reflected method
+/// (`__radd__`, `__gt__` for `<`, …) it runs through the VM's
+/// real call hook and its result is returned AS-IS — including
+/// `NotImplemented` (probed: `1 + W(2)` prints `NotImplemented`
+/// where `W.__radd__` returns it). If it defines no reflected
+/// method — or the op has no reflected form — the op recurses
+/// on `(lhs, nativeBase(rhs))` with the ORIGINAL op. `None` =
+/// not applicable (lhs not a native scalar, rhs not a subclass
+/// instance, or the native base not a native scalar) — the
+/// caller falls through to the small-int fast path / generic
+/// loop exactly as before.
+fn native_subclass_op(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    op: BinaryOp,
+    lhs: Value,
+    rhs: Value,
+) -> Result<Option<Value>, Value> {
+    if !is_native_scalar(ctx, lhs) {
+        return Ok(None);
+    }
+    let Some(native) = instance_subobj0(ctx.arena, rhs) else {
+        return Ok(None);
+    };
+    if native == rhs || !is_native_scalar(ctx, native) {
+        return Ok(None);
+    }
+    if let Some(reflected) = reflected_op(op) {
+        if let Some(name_q) = binary_op_method_name(reflected) {
+            if let Some((fun, bound)) = real_load_maybe(ctx, rhs, name_q) {
+                let mut hook = make_hook(state);
+                let res = with_call_hook_seams(&mut hook, |seams| {
+                    seams.call_pair(ctx, fun, bound, 1, 0, &[lhs])
+                });
+                return match res {
+                    Ok(v) => Ok(Some(v)),
+                    Err(e) => Err(crate::runtime::vm_seams::drain_hook_raise(ctx, state, e)),
+                };
+            }
+        }
+    }
+    binary_op_ctx(ctx, state, op, lhs, native).map(Some)
+}
+
 pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lhs_in: Value, rhs_in: Value) -> Result<Value, Value> {
     use crate::objects::value::{SMALL_INT_MAX, SMALL_INT_MIN};
     let mut op = op_in;
@@ -465,9 +561,20 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
     // Full-only `int | None` typing union — needs the import
     // system (C15's `typingCall`); fall through to
     // `binopUnsupported` until then (documented stub).
-    // `nativeSubclassOp` — needs C12a's Instance (`nativeBase`
-    // returns the value itself until then); the reflected-method
-    // path is C12a's.
+    // `nativeSubclassOp` (F3 — see `native_subclass_op` below):
+    // an int/float/str subclass on the right of a native scalar
+    // works as its value (reflected method first, else recurse
+    // on the native base). Placed here — after EQUAL/NOT_EQUAL,
+    // before the MODULO intercept — as in the vendor
+    // (`runtime.zig:580`, after IS/EQUAL/EXCEPTION_MATCH and the
+    // typing union, before the small-int fast path). The MODULO
+    // intercept below is Rust's `%`-format hook, which the
+    // vendor reaches later through the str slot — a `'%d' % R(2)`
+    // takes the same result either way (the `%` engine unwraps
+    // the rhs via `nativeBase`).
+    if let Some(v) = native_subclass_op(ctx, state, op, lhs, rhs)? {
+        return Ok(v);
+    }
     // Small-int / small-int fast path.
     if let (Value::SmallInt(lhs_val), Value::SmallInt(rhs_val)) = (lhs, rhs) {
         let mut go_big = false;

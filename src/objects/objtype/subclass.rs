@@ -150,6 +150,18 @@ pub fn instance_subobj0(arena: &GcArena, inst: Value) -> Option<Value> {
     data.subobj.first().copied()
 }
 
+/// `opmethods.nativeBase` (`opmethods.zig:27-40`): the native
+/// value behind a subclass instance — `subobj[0]` when the
+/// instance's type is a Python subclass of a native type, the
+/// value itself otherwise (the Zig's `instance_count_native_bases`
+/// guard: a plain user instance has no native base). F3: the one
+/// shared spelling for the `%` / `str.format` / `str.join` /
+/// `nativeSubclassOp` unwrap — the old call sites each carried
+/// their own "identity until instances exist (C12)" comment.
+pub fn native_base(arena: &GcArena, v: Value) -> Value {
+    instance_subobj0(arena, v).unwrap_or(v)
+}
+
 /// The type object behind a `Value` that must be a type
 /// (`None` = not a type object).
 fn type_ref(arena: &GcArena, value: Value) -> Option<GcRef> {

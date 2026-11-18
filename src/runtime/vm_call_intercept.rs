@@ -137,6 +137,22 @@ pub(crate) fn intercept_builtin_call(
             ctx, state, n_args, n_kw, args,
         ));
     }
+    // `str.format` (F3): intercepted by GcRef identity so an
+    // instance arg runs its `__format__` / `__str__` through the
+    // VM's real call hook (see `call_str_format_ctx`); anything
+    // else keeps the ctx-only `str_format` behavior.
+    if fun == state.str_format_builtin {
+        return Some(crate::runtime::builtin_vm::call_str_format_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
+    // `format` (F3): intercepted the same way (see
+    // `call_format_builtin_ctx`).
+    if fun == state.format_builtin {
+        return Some(crate::runtime::builtin_vm::call_format_builtin_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     if fun == state.min_builtin {
         return Some(crate::runtime::builtin_vm::call_min_ctx(ctx, state, n_args, n_kw, args));
     }

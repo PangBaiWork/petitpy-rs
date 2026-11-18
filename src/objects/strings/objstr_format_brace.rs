@@ -13,9 +13,11 @@ use crate::objects::obj::{
     obj_get_float, obj_get_int, obj_get_type, BuiltinTypes, ObjError,
 };
 use crate::objects::obj_ops::obj_print_helper;
-use crate::objects::slots::PrintKind;
+use crate::objects::objtype::seams::{real_load_maybe, with_call_hook_seams};
+use crate::objects::objtype::subclass::native_base;
+use crate::objects::slots::{CallHook, PrintKind};
 use crate::objects::strings::objstr_a::{
-    new_str_via_qstr, slot_raise, str_data_pool, StrError,
+    new_str_via_qstr, slot_raise, static_qstr_id, str_data_pool, StrError,
 };
 use crate::objects::strings::objstr_b::new_str_type_from_vstr;
 use crate::objects::strings::objstr_format::{
@@ -24,7 +26,7 @@ use crate::objects::strings::objstr_format::{
 use crate::objects::strings::objstr_methods_c::KwArg;
 use crate::objects::strings::objstr_print::*;
 use crate::objects::strings::vstr::{Vstr, VstrSink};
-use crate::objects::value::Value;
+use crate::objects::value::{Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 
 // ── `str.format` ──────────────────────────────────────────────────────
@@ -57,11 +59,58 @@ fn spec_at(spec: &[u8], i: usize) -> u8 {
     spec.get(i).copied().unwrap_or(0)
 }
 
+/// Print `arg` for a `{...!s}` / `{...!r}` conversion, running an
+/// instance's `__str__` / `__repr__` through the VM hook when one
+/// is present (F3 — the vendor's `mp_obj_print_helper` runs the
+/// instance print slot, which loads the dunder; the ctx-only
+/// `obj_print_helper` can only run it through stub seams, so a
+/// FunBc dunder fell back to `<X object at N>` — `f'{Code.KERNEL}'`
+/// printed `<Code object at 352>`). Without a hook this is exactly
+/// `obj_print_helper`. A dunder raise propagates
+/// (`StrError::PyRaise`, drained by the caller); no dunder falls
+/// back to `obj_print_helper` (the `__str__`-then-`__repr__`
+/// order is `render_instance`'s, `builtin_str.rs`).
+fn print_conversion(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    arg: Value,
+    kind: PrintKind,
+    sink: &mut dyn std::fmt::Write,
+    mut hook: Option<CallHook<'_, '_>>,
+) -> Result<(), StrError> {
+    if let Some(h) = hook.as_deref_mut() {
+        let is_inst = matches!(arg, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::Instance(_)));
+        if is_inst {
+            let mut fun = static_qstr_id(if kind == PrintKind::Str {
+                b"__str__"
+            } else {
+                b"__repr__"
+            })
+            .and_then(|id| real_load_maybe(ctx, arg, id));
+            if fun.is_none() && kind == PrintKind::Str {
+                fun = static_qstr_id(b"__repr__").and_then(|id| real_load_maybe(ctx, arg, id));
+            }
+            if let Some((f, bound)) = fun {
+                let ret = with_call_hook_seams(h, |seams| {
+                    seams.call_pair(ctx, f, bound, 0, 0, &[])
+                })
+                .map_err(|_| StrError::PyRaise)?;
+                obj_print_helper(ctx, types, ret, PrintKind::Str, sink);
+                return Ok(());
+            }
+        }
+    }
+    obj_print_helper(ctx, types, arg, kind, sink);
+    Ok(())
+}
+
 /// `formatHelperInto` (`objstr.zig:2709-3039`): the `{}`-format
 /// walker. `args[0]` is the format string itself; `arg_i` is
 /// shared with nested specs (a nested `{...}` inside a format spec
 /// consumes args). `kwargs` is the keyword map (empty until
-/// C10/C13 pass real kwargs through).
+/// C10/C13 pass real kwargs through). `hook` (F3) is the VM's
+/// real call hook for `__format__` / `__str__` / `__repr__`
+/// dispatch; `None` is the ctx-only path (identical to before).
 fn format_helper_into(
     ctx: &mut CallCtx,
     types: &BuiltinTypes,
@@ -70,6 +119,7 @@ fn format_helper_into(
     args: &[Value],
     kwargs: &[KwArg],
     out: &mut Vstr,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<(), StrError> {
     let mut p = 0usize;
     let top = s.len();
@@ -203,7 +253,7 @@ fn format_helper_into(
             let mut tmp = Vstr::new(16);
             {
                 let mut sink = VstrSink(&mut tmp);
-                obj_print_helper(ctx, types, arg, kind, &mut sink);
+                print_conversion(ctx, types, arg, kind, &mut sink, hook.as_deref_mut())?;
             }
             arg = new_str_type_from_vstr(ctx, types, types.str_, &mut tmp);
         }
@@ -225,11 +275,40 @@ fn format_helper_into(
                 args,
                 kwargs,
                 &mut inner,
+                hook.as_deref_mut(),
             )?;
-            let spec = inner.as_bytes().to_vec();
-            // `__format__` / `nativeBase` (full builds): no user
-            // classes or methods exist in Rust yet (C12/C13/C14) —
-            // identity, documented.
+            let mut spec = inner.as_bytes().to_vec();
+            if let Some(h) = hook.as_deref_mut() {
+                // `__format__` / `nativeBase` (full builds,
+                // `objstr.zig:2871-2882`): a `__format__` method
+                // runs with the spec string and the spec is used
+                // up (the result is printed as-is by the tail
+                // below); else the arg formats as its native base
+                // (F3 — `'{:03d}'.format(R(7))` raised "bad
+                // format string" and `f'{Q():z}'` printed the
+                // instance fallback). Without a hook this step
+                // stays the identity (the ctx-only `str_format`
+                // path). Native types expose no `__format__`
+                // (probed on the reference: `hasattr(7,
+                // '__format__')` is False), so plain values
+                // always take the `nativeBase` arm — which is
+                // themselves.
+                if let Some(id) = static_qstr_id(b"__format__") {
+                    if let Some((fun, bound)) = real_load_maybe(ctx, arg, id) {
+                        let spec_str = new_str_via_qstr(ctx, types, &spec);
+                        let ret = with_call_hook_seams(h, |seams| {
+                            seams.call_pair(ctx, fun, bound, 1, 0, &[spec_str])
+                        })
+                        .map_err(|_| StrError::PyRaise)?;
+                        arg = ret;
+                        spec = Vec::new();
+                    } else {
+                        arg = native_base(ctx.arena, arg);
+                    }
+                } else {
+                    arg = native_base(ctx.arena, arg);
+                }
+            }
             let mut sp = 0usize;
             // [[fill]align]
             if is_alignment(spec_at(&spec, sp)) {
@@ -419,12 +498,26 @@ pub fn str_format(
     args: &[Value],
     kwargs: &[KwArg],
 ) -> Result<Value, StrError> {
+    str_format_hook(ctx, types, args, kwargs, None)
+}
+
+/// `str_format` with the VM's real call hook (F3): the hook
+/// threads into `format_helper_into` for `__format__` /
+/// `__str__` / `__repr__` dispatch on instance args. Without a
+/// hook this is exactly `str_format`.
+pub fn str_format_hook(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    args: &[Value],
+    kwargs: &[KwArg],
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, StrError> {
     let self_ = args[0];
     let data = str_data_pool(ctx.arena, ctx.pool, self_)
         .ok_or(StrError::BadImplicitConversion)?;
     let mut arg_i: i32 = 0;
     let mut out = Vstr::new(16);
-    format_helper_into(ctx, types, &data, &mut arg_i, args, kwargs, &mut out)?;
+    format_helper_into(ctx, types, &data, &mut arg_i, args, kwargs, &mut out, hook)?;
     let type_ = obj_get_type(ctx.arena, types, self_).unwrap_or(types.str_);
     Ok(new_str_type_from_vstr(ctx, types, type_, &mut out))
 }

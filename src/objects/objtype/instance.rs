@@ -69,7 +69,7 @@ use crate::pyerr::{PyError, PyResult};
 use super::errors::ObjTypeError;
 use super::lookup::{class_lookup, instance_dict_readonly, LookupHit, SlotKind};
 pub use super::instance_print::{instance_print, instance_print_slot};
-use super::seams::{with_stub_seams, SubscrError, VmSeams};
+use super::seams::{with_stub_seams, SeamHook, SubscrError, VmSeams};
 use super::subclass::instance_subobj0;
 use crate::objects::containers::objproperty::property_proxy;
 use crate::objects::obj::{FLAG_HAS_SPECIAL_ACCESSORS, FLAG_ITER_IS_ITERNEXT};
@@ -279,6 +279,49 @@ pub fn instance_binary_op(
             let Some(sub0) = instance_subobj0(ctx.arena, lhs) else {
                 return Ok(None);
             };
+            if op == BinaryOp::Equal || op == BinaryOp::NotEqual {
+                // E2j: the vendor's SENTINEL branch calls the FULL
+                // `mp_binary_op` (objtype.zig:1167-1168), and for
+                // EQUAL/NOT_EQUAL that is `mp_obj_equal_not_equal`
+                // — the 2-pass loop (runtime.zig:553-554,
+                // obj.zig:268-368). The seam's `binary` is only
+                // the lhs type's slot (`call_binary`), so it
+                // skipped the pass that would try the rhs's type
+                // and the pointer fallback: `X('b') == b'ab'`
+                // came back True (the array slot compares
+                // contents) where the vendor returns False (both
+                // passes skip — array/bytes flags are 0 — and
+                // the pointers differ), and `L([1,2]) ==
+                // L([1,2])` came back False (the list slot
+                // refuses a non-list rhs) where the vendor
+                // returns True (pass 1 reaches the instance
+                // slot, which delegates to subobj[0]). The hook
+                // for the inner protocol is the seam's `call`
+                // closure wrapped in `SeamHook`: a bare `None`
+                // hook would make the inner loop's instance
+                // pass run the stub slot, so a user `__eq__` on
+                // the rhs would raise instead of running and
+                // the inner protocol would answer a definitive
+                // False before the outer loop ever tried the
+                // rhs's type. `!=` is the same protocol's
+                // negation (`obj_equal_not_equal` inverts via
+                // `local_true`/`local_false`), not a separate
+                // path. Other ops keep the slot-level seam
+                // below (the `<` side was fixed by E2i).
+                let mut hook = SeamHook::new(&mut *seams.call);
+                let res = crate::objects::obj_ops::obj_equal_not_equal(
+                    ctx,
+                    ctx.types,
+                    op,
+                    sub0,
+                    rhs,
+                    Some(&mut hook),
+                )?;
+                return match res {
+                    v if crate::objects::obj::is_not_implemented(ctx, v) => Ok(None),
+                    v => Ok(Some(v)),
+                };
+            }
             // The runtime op's result is returned directly (the
             // CONTAINS bool-ify below applies only to the member
             // path — objtype.zig:1172-1176).

@@ -64,17 +64,10 @@ use crate::compiler::mpy;
 use crate::memory::gc::{CallCtx, GcArena, PendingRaise, RootSet};
 use crate::objects::obj::BuiltinTypes;
 use crate::objects::objtype::objexcept_types::ExceptionTypes;
-use crate::objects::primitives::objint::fun_n_args;
-use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::value::{DictData, FunBuiltinData, GcRef, MapData, Obj, Value};
+use crate::objects::value::{GcRef, Obj, Value};
 use crate::runtime::bc::CodeState;
-use crate::runtime::builtinevex::{compile_builtin_fn, eval_builtin_fn, exec_builtin_fn};
-use crate::runtime::builtinimport::import_builtin_fn;
 use crate::runtime::code_store::CodeStore;
 use crate::runtime::qstr::RuntimeQstr;
-use crate::runtime::vm_builtins::{
-    build_class_builtin_fn, next_builtin_fn, print_builtin, print_builtin_nokw,
-};
 use crate::runtime::vm_types::build_vm_types;
 
 /// The type objects the VM owns beyond `BuiltinTypes` (built once
@@ -108,6 +101,19 @@ pub struct VmTypes {
     /// The `enumerate` type (bound as `enumerate` in builtins,
     /// C13b).
     pub enumerate: GcRef,
+}
+
+/// The six `os` builtins that need VM state (the fd table),
+/// for the `call_function_ctx` interception (D2). The `func`s
+/// are stubs; the real bodies live in `modos_fd.rs`.
+#[derive(Clone, Copy, Debug)]
+pub struct OsFdBuiltins {
+    pub open: Value,
+    pub close: Value,
+    pub read: Value,
+    pub write: Value,
+    pub lseek: Value,
+    pub fsync: Value,
 }
 
 /// The VM's mutable state (the `Ctx` + `mp_state_ctx` pieces
@@ -212,6 +218,63 @@ pub struct VmState {
     /// C15b. A `Vec<String>` (not a Python list object — the
     /// `sys` module that exposes it is D's `modsys`).
     pub sys_path: Vec<String>,
+    /// The `sys.path` list OBJECT (`sys_mutable[0]`'s value,
+    /// `modsys.zig`): the same list `sys_path` is built from.
+    /// Python `sys.path.append(x)` mutates this object, and
+    /// the import search reads it (see `search_top_level`);
+    /// `set_sys_path` syncs it in place. `None` until D2's
+    /// module step builds it. Added by D2.
+    pub sys_path_list: Option<GcRef>,
+    /// The live `sys.modules` dict object
+    /// (`mp_loaded_modules_dict`, `modsys.zig`): the sys
+    /// dict's `modules` entry points at this dict, and the
+    /// import system keeps it in sync with `modules` (file
+    /// modules only — builtin modules are never registered,
+    /// probed). `None` until D2's module step builds it.
+    /// Added by D2.
+    pub sys_modules_dict: Option<GcRef>,
+    /// The `sys.argv` list object (`modsys.zig`): default
+    /// `[]`; Phase E's entry fills it in place. `None` until
+    /// D2's module step builds it. Added by D2.
+    pub sys_argv_list: Option<GcRef>,
+    /// The stdio stream objects (`npy_file_io_init`,
+    /// `file_io.zig`): `TextIOWrapper` over fds 0/1/2.
+    /// `sys.print_exception`'s default target is `sys_stdout`
+    /// (the ROM object — `sys.stdout` cannot be rebound,
+    /// probed 2026-11-18); D1's `input()` reads `sys_stdin`.
+    /// `Value::None` until D2's module step builds them.
+    /// Added by D2.
+    pub sys_stdin: Value,
+    pub sys_stdout: Value,
+    pub sys_stderr: Value,
+    /// The `sys.print_exception` builtin (intercepted by
+    /// GcRef identity in `call_function_ctx` — it needs the
+    /// VM's `sys_stdout` for its default target; its `func`
+    /// is a stub, like `next`'s). Added by D2.
+    pub sys_print_exception_builtin: Value,
+    /// The `os.open` fd table: fd → open `File`. `os.open`
+    /// inserts, `os.close` removes (closing the file),
+    /// `os.read`/`os.write`/`os.lseek`/`os.fsync` look up.
+    /// There is no safe `std` API for an arbitrary fd
+    /// (`from_raw_fd` is `unsafe`), so VM-opened files are
+    /// tracked here; fds 0/1/2 are handled inline via
+    /// `std::io::{stdin, stdout, stderr}`. Added by D2.
+    pub os_fds: HashMap<i32, std::fs::File>,
+    /// Stdio fds closed by `os.close(0/1/2)` — the real fd
+    /// cannot be closed in safe Rust, so the closure is
+    /// tracked here and every later use raises EBADF
+    /// (`modos_fd.rs`). Added by D2.
+    pub os_closed_stdio: std::collections::HashSet<i32>,
+    /// The `os.open`/`os.close`/`os.read`/`os.write`/
+    /// `os.lseek`/`os.fsync` builtins (intercepted by GcRef
+    /// identity in `call_function_ctx` — they need
+    /// `state.os_fds`; their `func`s are stubs, like
+    /// `next`'s). Added by D2.
+    pub os_fd_builtins: OsFdBuiltins,
+    /// The `os.__getattr__` builtin (intercepted by GcRef
+    /// identity — it needs the VM's import machinery, see
+    /// `modos.rs`). Added by D2.
+    pub os_getattr_builtin: Value,
     /// The frozen-module table (`frozen_modules.zig`): `(dotted
     /// name, .mpy bytes)` pairs. Empty by default (the default
     /// build has `MICROPY_FROZEN_TINY_ENABLED=0`); Phase D fills
@@ -312,6 +375,9 @@ impl Vm {
             dict: GcRef(0),
             array: GcRef(0),
             bytearray: GcRef(0),
+            fileio: GcRef(0),
+            textio: GcRef(0),
+            attrtuple: GcRef(0),
             type_: GcRef(0),
             object: GcRef(0),
             super_: GcRef(0),
@@ -368,6 +434,24 @@ impl Vm {
                 not_implemented: Value::None,
                 pending_sched: None,
                 sys_path: vec![String::new()],
+                sys_path_list: None,
+                sys_modules_dict: None,
+                sys_argv_list: None,
+                sys_stdin: Value::None,
+                sys_stdout: Value::None,
+                sys_stderr: Value::None,
+                sys_print_exception_builtin: Value::None,
+                os_fds: HashMap::new(),
+            os_closed_stdio: std::collections::HashSet::new(),
+                os_fd_builtins: OsFdBuiltins {
+                    open: Value::None,
+                    close: Value::None,
+                    read: Value::None,
+                    write: Value::None,
+                    lseek: Value::None,
+                    fsync: Value::None,
+                },
+                os_getattr_builtin: Value::None,
                 frozen_modules: crate::runtime::frozen_modules::FrozenTable::new(),
                 builtin_modules: Vec::new(),
                 extensible_modules: Vec::new(),
@@ -377,6 +461,7 @@ impl Vm {
             },
         };
         vm.build_builtins();
+        crate::runtime::vm_modules::build_d2_modules(&mut vm);
         vm
     }
 
@@ -410,7 +495,7 @@ impl Vm {
     pub fn rebuild_frame_roots(&mut self) {
         self.roots.extra.truncate(self.state.extra_base);
         for frame in self.state.frames.values() {
-            for v in frame_roots_of(frame) {
+            for v in crate::runtime::vm_roots::frame_roots_of(frame) {
                 self.roots.extra.push(v);
             }
         }
@@ -422,279 +507,17 @@ impl Vm {
     /// three builtins. The full builtins module (D1, `modbuiltins`)
     /// extends this dict; the names bound here are the ones C13
     /// itself owns.
-    fn build_builtins(&mut self) {
-        // (Capture the VmTypes refs before the split — `split`
-        // borrows `self`, so the fields are unreadable after it.
-        // `VmTypes` is `Copy`, so this is a plain copy.)
-        let vmt = self.state.vm_types;
-        let (mut ctx, state) = self.split();
-        let mut pairs: Vec<(Value, Value)> = Vec::new();
-        let bind = |name: &str, v: Value, pairs: &mut Vec<(Value, Value)>| {
-            let id = static_qstr_id(name.as_bytes())
-                .unwrap_or_else(|| panic!("builtin name is not a static qstr: {}", name));
-            pairs.push((Value::Qstr(id), v));
-        };
-        let t = ctx.types;
-        bind("int", Value::Heap(t.int), &mut pairs);
-        bind("str", Value::Heap(t.str_), &mut pairs);
-        bind("bytes", Value::Heap(t.bytes), &mut pairs);
-        bind("bool", Value::Heap(t.bool_), &mut pairs);
-        bind("float", Value::Heap(t.float), &mut pairs);
-        bind("complex", Value::Heap(t.complex), &mut pairs);
-        bind("list", Value::Heap(t.list), &mut pairs);
-        bind("tuple", Value::Heap(t.tuple), &mut pairs);
-        bind("dict", Value::Heap(t.dict), &mut pairs);
-        bind("set", Value::Heap(t.set), &mut pairs);
-        bind("frozenset", Value::Heap(t.frozenset), &mut pairs);
-        bind("range", Value::Heap(t.range), &mut pairs);
-        bind("object", Value::Heap(vmt.object), &mut pairs);
-        bind("type", Value::Heap(t.type_), &mut pairs);
-        bind("property", Value::Heap(vmt.property), &mut pairs);
-        bind("bytearray", Value::Heap(vmt.bytearray), &mut pairs);
-        bind("memoryview", Value::Heap(vmt.memoryview), &mut pairs);
-        bind("slice", Value::Heap(vmt.slice), &mut pairs);
-        bind("map", Value::Heap(vmt.map), &mut pairs);
-        bind("filter", Value::Heap(vmt.filter), &mut pairs);
-        bind("zip", Value::Heap(vmt.zip), &mut pairs);
-        bind("enumerate", Value::Heap(vmt.enumerate), &mut pairs);
-        bind("Ellipsis", state.ellipsis, &mut pairs);
-        bind("super", Value::Heap(t.super_), &mut pairs);
-        bind("staticmethod", Value::Heap(t.staticmethod), &mut pairs);
-        bind("classmethod", Value::Heap(t.classmethod), &mut pairs);
-        for (name, r) in [
-            ("BaseException", state.exc.base_exception),
-            ("SystemExit", state.exc.system_exit),
-            ("KeyboardInterrupt", state.exc.keyboard_interrupt),
-            ("GeneratorExit", state.exc.generator_exit),
-            ("Exception", state.exc.exception),
-            ("StopAsyncIteration", state.exc.stop_async_iteration),
-            ("StopIteration", state.exc.stop_iteration),
-            ("ArithmeticError", state.exc.arithmetic_error),
-            ("OverflowError", state.exc.overflow_error),
-            ("ZeroDivisionError", state.exc.zero_division_error),
-            ("AssertionError", state.exc.assertion_error),
-            ("AttributeError", state.exc.attribute_error),
-            ("EOFError", state.exc.eof_error),
-            ("ImportError", state.exc.import_error),
-            ("ModuleNotFoundError", state.exc.module_not_found_error),
-            ("LookupError", state.exc.lookup_error),
-            ("IndexError", state.exc.index_error),
-            ("KeyError", state.exc.key_error),
-            ("MemoryError", state.exc.memory_error),
-            ("NameError", state.exc.name_error),
-            ("OSError", state.exc.os_error),
-            ("RuntimeError", state.exc.runtime_error),
-            ("NotImplementedError", state.exc.not_implemented_error),
-            ("SyntaxError", state.exc.syntax_error),
-            ("IndentationError", state.exc.indentation_error),
-            ("TypeError", state.exc.type_error),
-            ("ValueError", state.exc.value_error),
-            ("UnicodeError", state.exc.unicode_error),
-        ] {
-            bind(name, Value::Heap(r), &mut pairs);
-        }
-        // `print` (KwFn: `sep`/`end`/`file`/`flush`).
-        let print_id = static_qstr_id(b"print").expect("print is a static qstr");
-        let print_fun = ctx.alloc(
-            Some(vmt.fun_builtin_var),
-            Obj::FunBuiltin(FunBuiltinData {
-                name: print_id,
-                n_args: fun_n_args(0, 255),
-                func: print_builtin_nokw,
-                kw_func: Some(print_builtin),
-            }),
-        );
-        let print_val = Value::Heap(print_fun);
-        bind("print", print_val, &mut pairs);
-        // `next` (1–2 args; intercepted by identity in
-        // `call_function` — its `func` is a stub).
-        let next_id = static_qstr_id(b"next").expect("next is a static qstr");
-        let next_fun = ctx.alloc(
-            Some(vmt.fun_builtin_var),
-            Obj::FunBuiltin(FunBuiltinData {
-                name: next_id,
-                n_args: fun_n_args(1, 2),
-                func: next_builtin_fn,
-                kw_func: None,
-            }),
-        );
-        let next_val = Value::Heap(next_fun);
-        bind("next", next_val, &mut pairs);
-        // `__build_class__` (intercepted by identity in
-        // `call_function` — its `func` is a stub).
-        let bc_id = static_qstr_id(b"__build_class__").expect("__build_class__ is a static qstr");
-        let bc_fun = ctx.alloc(
-            Some(vmt.fun_builtin_var),
-            Obj::FunBuiltin(FunBuiltinData {
-                name: bc_id,
-                n_args: fun_n_args(2, 255),
-                func: build_class_builtin_fn,
-                kw_func: None,
-            }),
-        );
-        let bc_val = Value::Heap(bc_fun);
-        bind("__build_class__", bc_val, &mut pairs);
-        // `eval` / `exec` (1–3 args) and `compile` (3–6 args):
-        // `MpObjFunBuiltinVar` objects (`builtinevex.zig:207-225`,
-        // sigs `(1, 3, false)` / `(1, 3, false)` / `(3, 6,
-        // false)`), intercepted by identity in `call_function_ctx`
-        // — their `func`s are stubs, as `next`'s is.
-        let mk_var = |ctx: &mut CallCtx,
-                      name: &str,
-                      min: u16,
-                      max: u16,
-                      func: crate::objects::slots::BuiltinFn,
-                      pairs: &mut Vec<(Value, Value)>|
-         -> Value {
-            let id = static_qstr_id(name.as_bytes())
-                .unwrap_or_else(|| panic!("builtin name is not a static qstr: {}", name));
-            let f = ctx.alloc(
-                Some(vmt.fun_builtin_var),
-                Obj::FunBuiltin(FunBuiltinData {
-                    name: id,
-                    n_args: fun_n_args(min, max),
-                    func,
-                    kw_func: None,
-                }),
-            );
-            let v = Value::Heap(f);
-            bind(name, v, pairs);
-            v
-        };
-        let eval_val = mk_var(&mut ctx, "eval", 1, 3, eval_builtin_fn, &mut pairs);
-        let exec_val = mk_var(&mut ctx, "exec", 1, 3, exec_builtin_fn, &mut pairs);
-        let compile_val = mk_var(&mut ctx, "compile", 3, 6, compile_builtin_fn, &mut pairs);
-        // `__import__` (1–5 args: `builtinimport.zig:179-184`,
-        // `MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(..., 1, 5, ...)`),
-        // intercepted by identity in `call_function_ctx` — its
-        // `func` is a stub, as `eval`'s is. Added by C15b.
-        let import_val =
-            mk_var(&mut ctx, "__import__", 1, 5, import_builtin_fn, &mut pairs);
-        // `help` (0–1 args: `MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN
-        // (mp_builtin_help_obj, 0, 1, ...)`, `builtinhelp.c:189`),
-        // intercepted by identity in `call_function_ctx` — its
-        // `func` is a stub, as `eval`'s is. Added by C18b.
-        let help_val = mk_var(
-            &mut ctx,
-            "help",
-            0,
-            1,
-            crate::runtime::builtinhelp::help_builtin_fn,
-            &mut pairs,
-        );
-        // The D1 binds (`vm_builtins_bind.rs`): plain builtins,
-        // VM-intercepted builtins, `NotImplemented`,
-        // `isinstance` / `issubclass`, `__name__`, the `io`
-        // module registration.
-        let d1 = crate::runtime::vm_builtins_bind::bind_d1_builtins(&mut ctx, state, &mut pairs);
 
-        let builtins = ctx.alloc(
-            None,
-            Obj::Dict(DictData {
-                map: MapData::from_pairs(pairs),
-            }),
-        );
-        state.builtins = builtins;
-        // No module loaded yet: globals default to builtins (a
-        // harmless default — `load_module` sets the real globals).
-        state.globals = builtins;
-        state.next_builtin = next_val;
-        state.build_class_builtin = bc_val;
-        state.eval_builtin = eval_val;
-        state.exec_builtin = exec_val;
-        state.compile_builtin = compile_val;
-        state.import_builtin = import_val;
-        state.help_builtin = help_val;
-        state.globals_builtin = d1.globals_builtin;
-        state.locals_builtin = d1.locals_builtin;
-        state.dir_builtin = d1.dir_builtin;
-        state.sorted_builtin = d1.sorted_builtin;
-        state.min_builtin = d1.min_builtin;
-        state.max_builtin = d1.max_builtin;
-        state.getattr_builtin = d1.getattr_builtin;
-        state.setattr_builtin = d1.setattr_builtin;
-        state.hasattr_builtin = d1.hasattr_builtin;
-        state.delattr_builtin = d1.delattr_builtin;
-        state.iter_builtin = d1.iter_builtin;
-        state.all_builtin = d1.all_builtin;
-        state.any_builtin = d1.any_builtin;
-        state.sum_builtin = d1.sum_builtin;
-        state.not_implemented = d1.not_implemented;
-        // Pin everything live: the types, the singletons, the
-        // builtins dict and the builtin values.
-        let mut pins: Vec<Value> = Vec::new();
-        for r in [
-            t.int,
-            t.str_,
-            t.bytes,
-            t.bool_,
-            t.none_type,
-            t.float,
-            t.complex,
-            t.tuple,
-            t.list,
-            t.set,
-            t.frozenset,
-            t.range,
-            t.dict,
-            t.type_,
-        ] {
-            pins.push(Value::Heap(r));
-        }
-        for r in [
-            vmt.fun_bc,
-            vmt.gen_wrap,
-            vmt.gen_instance,
-            vmt.closure,
-            vmt.bound_meth,
-            vmt.module,
-            vmt.object,
-            vmt.ellipsis,
-            vmt.slice,
-            vmt.fun_builtin_var,
-            vmt.array,
-            vmt.bytearray,
-            vmt.memoryview,
-            vmt.cell,
-            vmt.property,
-        ] {
-            pins.push(Value::Heap(r));
-        }
-        for r in state.exc.all() {
-            pins.push(Value::Heap(r));
-        }
-        pins.push(state.empty_tuple);
-        pins.push(state.ellipsis);
-        pins.push(Value::Heap(builtins));
-        pins.push(print_val);
-        pins.push(next_val);
-        pins.push(bc_val);
-        pins.push(eval_val);
-        pins.push(exec_val);
-        pins.push(compile_val);
-        pins.push(import_val);
-        pins.push(d1.globals_builtin);
-        pins.push(d1.locals_builtin);
-        pins.push(d1.dir_builtin);
-        pins.push(d1.sorted_builtin);
-        pins.push(d1.min_builtin);
-        pins.push(d1.max_builtin);
-        pins.push(d1.getattr_builtin);
-        pins.push(d1.setattr_builtin);
-        pins.push(d1.hasattr_builtin);
-        pins.push(d1.delattr_builtin);
-        pins.push(d1.iter_builtin);
-        pins.push(d1.all_builtin);
-        pins.push(d1.any_builtin);
-        pins.push(d1.sum_builtin);
-        pins.push(d1.not_implemented);
-        pins.push(d1.io_module);
-        drop(ctx);
-        for v in pins {
-            self.pin(v);
-        }
-    }
-
+    /// D2: build the `os`/`sys` modules + the stdio objects and
+    /// register them as builtin modules (the original's `mp_init`
+    /// registers ALL builtin modules at startup; D1's registration
+    /// owns the `io` module only — different names, so the
+    /// appends cannot collide). The stdio objects are reachable
+    /// from the sys dict (`stdin`/`stdout`/`stderr` entries)
+    /// and the `.buffer` siblings via `Obj::children()`, so
+    /// pinning `sys` roots them; the shared attrtuple type
+    /// (`os.stat` results + `sys.implementation` headers) is
+    /// pinned explicitly (header types are not traced).
     /// Load a module from source text: compile (bridge,
     /// `debug_mode` false — the `petitpy` entry point), read the
     /// `.mpy`, register it, and run the module body. Returns the
@@ -760,34 +583,3 @@ pub enum VmError {
     Raised(Value),
 }
 
-/// The live values of one frame, for rooting (stack + state +
-/// `fun` + the exc-stack `prev_exc`s).
-pub(crate) fn frame_roots_of(frame: &CodeState) -> Vec<Value> {
-    let mut out = Vec::new();
-    out.push(Value::Heap(frame.fun));
-    for v in &frame.state {
-        if let Some(v) = v {
-            out.push(*v);
-        }
-    }
-    for v in &frame.stack {
-        if let Some(v) = v {
-            out.push(*v);
-        }
-    }
-    for b in &frame.exc_stack {
-        if let Some(v) = b.prev_exc {
-            out.push(v);
-        }
-    }
-    out
-}
-
-/// Sync the current frame's live values into `ctx.roots.stack`
-/// (the dispatch calls this at the top of every iteration — see
-/// the module docs). `mark` is the `roots.stack` length on
-/// `execute_frame` entry.
-pub(crate) fn sync_frame_roots(ctx: &mut CallCtx, frame: &CodeState, mark: usize) {
-    ctx.roots.stack.truncate(mark);
-    ctx.roots.stack.extend(frame_roots_of(frame));
-}

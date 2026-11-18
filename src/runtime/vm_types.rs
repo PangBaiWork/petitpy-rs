@@ -13,6 +13,8 @@ use crate::objects::containers::objarray::{
 use crate::objects::containers::objarray_methods::ARRAY_METHODS;
 use crate::objects::containers::objdict::dict_type_data;
 use crate::objects::containers::objdict_methods::DICT_METHODS;
+use crate::objects::containers::objattrtuple::attrtuple_type_data;
+use crate::objects::containers::objfileio::build_fileio_types;
 use crate::objects::containers::objlist::list_type_data;
 use crate::objects::containers::objlist_methods::LIST_METHODS;
 use crate::objects::containers::objrange::range_type_data;
@@ -401,6 +403,22 @@ pub(crate) fn build_vm_types(
         static_qstr_id(b"function").expect("function is a static qstr"),
     );
 
+    // D2: the FILE stream types (one shared locals dict).
+    // Allocated with a `None` header here, like the other
+    // types; the fix-up loop below points them at `type_`.
+    let (fileio, textio) = build_fileio_types(ctx, fun_builtin_var);
+
+    // D2: the shared attrtuple type (ONE ROM type for
+    // `os.stat` results and `sys.implementation` — probed:
+    // `type(os.stat('.')) is type(sys.implementation)`).
+    // Its dict is empty (the tuple slots operate on the
+    // payload; the C11 shape, kept).
+    let attrtuple_dict = ctx.alloc(
+        None,
+        Obj::Dict(DictData { map: MapData::new() }),
+    );
+    let attrtuple = ctx.alloc(None, Obj::Type(attrtuple_type_data(attrtuple_dict)));
+
     // Point every type object's header at `type_` (C13b): a type
     // is an instance of `type` (the Zig sets `mp_type_type` as
     // the header at creation; Rust allocates the types first
@@ -416,6 +434,7 @@ pub(crate) fn build_vm_types(
         tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
         filter, zip, enumerate, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
         property, ellipsis, type_, super_, staticmethod, classmethod, native_init_wrapper,
+        fileio, textio, attrtuple,
     ] {
         ctx.arena.set_header_type(t, Some(type_));
     }
@@ -466,6 +485,9 @@ pub(crate) fn build_vm_types(
         dict,
         array,
         bytearray,
+        fileio,
+        textio,
+        attrtuple,
         type_,
         object,
         super_,

@@ -214,7 +214,7 @@ impl CFx {
         let name = self.q("m");
         let module = self.fx.arena.alloc(
             None,
-            Obj::Module(ModuleData { name, dict }),
+            Obj::Module(ModuleData { name, dict, delegation: None }),
             &self.fx.roots,
         );
         (module, dict_value)

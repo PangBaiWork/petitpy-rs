@@ -70,6 +70,16 @@ impl Vm {
         );
         if register {
             state.modules.insert(name_id, module_ref);
+            // Keep the live `sys.modules` dict in step (D2;
+            // file modules only — see `create_and_register`).
+            if let Some(mirror) = state.sys_modules_dict {
+                let _ = crate::objects::containers::objdict::dict_store(
+                    ctx,
+                    Value::Heap(mirror),
+                    Value::Qstr(name_id),
+                    module_val,
+                );
+            }
         }
         Ok((module_val, code_idx))
     }
@@ -384,8 +394,22 @@ impl Vm {
     /// module that exposes it is D's `modsys`; the default is
     /// `[""]`, the current directory — `runtime.zig:276-279`).
     /// Added by C15b for the import tests (and D1's `modsys`).
+    /// D2: the `sys.path` list OBJECT is synced in place
+    /// (clear + extend, keeping its identity — the delegation
+    /// slot and the import search both point at it).
     pub fn set_sys_path(&mut self, paths: Vec<String>) {
-        self.state.sys_path = paths;
+        let (mut ctx, state) = self.split();
+        let types = ctx.types;
+        let items: Vec<Value> = paths
+            .iter()
+            .map(|p| crate::objects::strings::objstr_a::new_str(&mut ctx, types, p.as_bytes()))
+            .collect();
+        state.sys_path = paths;
+        if let Some(list_ref) = state.sys_path_list {
+            if let Obj::List(l) = ctx.arena.get_mut(list_ref) {
+                l.items = items;
+            }
+        }
     }
 
     /// Replace the frozen-module table (`frozen_modules.zig`).

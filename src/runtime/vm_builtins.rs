@@ -18,16 +18,29 @@ use crate::pyerr::{PyError, PyResult};
 /// raises `TypeError: argument num/types mismatch`). `sep`/`end`
 /// go through `mp_obj_str_get_data` (probed: a non-str/bytes sep
 /// raises `TypeError: can't convert to str implicitly`; a bytes
-/// sep is accepted). `file=`/`flush=` are IGNORED — there are no
-/// stream objects yet (D lane's `sys.stdout`); output goes to
-/// `MP_PLAT_PRINT` (plain `write(1, …)`), exactly as the Zig's
-/// nano path does. Args print via `obj_print_helper` (`PRINT_STR`).
+/// sep is accepted). An explicit `file=` routes through the
+/// stream protocol (D2): `get_stream_raise(file, WRITE)` first,
+/// then `stream_write_adaptor` per piece; `flush=True` calls
+/// the file's `flush` method with 0 args (the Zig's
+/// `mp_load_method` + `mp_call_method_n_kw`). A non-stream
+/// file (or `file=None`) raises the vendor-C `OSError("stream
+/// operation not supported")` — the reference ABORTS here
+/// (rc=134, `mp_get_stream_raise` @panic), so Rust raising is
+/// the documented divergence. With no `file` kwarg the output
+/// goes to `MP_PLAT_PRINT` (plain `write(1, …)`), exactly as
+/// the Zig's nano path does — `sys.stdout` IS fd 1, so the
+/// bytes are identical. Args print via `obj_print_helper`
+/// (`PRINT_STR`).
 fn print_impl(
     ctx: &mut CallCtx,
     args: &[Value],
     kwargs: &[(u32, Value)],
 ) -> PyResult<Value> {
+    use crate::objects::obj::obj_is_true;
     use crate::objects::obj_ops::obj_print_helper;
+    use crate::runtime::runtime_call::call_method_n_kw;
+    use crate::runtime::runtime_method::load_method;
+    use crate::support::stream::{get_stream_raise, stream_write_adaptor, MP_STREAM_OP_WRITE};
     let terse = |ctx: &mut CallCtx| -> PyError {
         ctx.record_raise("TypeError", Some("argument num/types mismatch"));
         PyError::PyRaise
@@ -38,6 +51,8 @@ fn print_impl(
     let flush_q = static_qstr_id(b"flush");
     let mut sep: Option<Value> = None;
     let mut end: Option<Value> = None;
+    let mut file: Option<Value> = None;
+    let mut flush: Option<Value> = None;
     for (name, value) in kwargs {
         if Some(*name) == sep_q {
             if sep.is_some() {
@@ -49,8 +64,16 @@ fn print_impl(
                 return Err(terse(ctx));
             }
             end = Some(*value);
-        } else if Some(*name) == file_q || Some(*name) == flush_q {
-            // Ignored (no streams yet — D lane).
+        } else if Some(*name) == file_q {
+            if file.is_some() {
+                return Err(terse(ctx));
+            }
+            file = Some(*value);
+        } else if Some(*name) == flush_q {
+            if flush.is_some() {
+                return Err(terse(ctx));
+            }
+            flush = Some(*value);
         } else {
             return Err(terse(ctx));
         }
@@ -63,19 +86,71 @@ fn print_impl(
         Some(v) => sep_end_bytes(ctx, v)?,
         None => b"\n".to_vec(),
     };
-    let mut sink = MP_PLAT_PRINT;
-    let mut print = Print::new(&mut sink);
+    let flush = match flush {
+        Some(v) => obj_is_true(ctx, ctx.types, v)?,
+        None => false,
+    };
     let types = ctx.types;
-    for (i, arg) in args.iter().enumerate() {
-        if i > 0 {
-            let _ = mp_print_str(&mut print, &sep_bytes);
+    match file {
+        Some(f) => {
+            get_stream_raise(ctx, f, MP_STREAM_OP_WRITE)?;
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    stream_write_adaptor(ctx, f, &sep_bytes)?;
+                }
+                let mut s = String::new();
+                obj_print_helper(ctx, types, *arg, PrintKind::Str, &mut s);
+                stream_write_adaptor(ctx, f, s.as_bytes())?;
+            }
+            stream_write_adaptor(ctx, f, &end_bytes)?;
+            if flush {
+                let flush_id =
+                    static_qstr_id(b"flush").expect("flush is a static qstr");
+                let dest = load_method(ctx, f, flush_id, Value::None)
+                    .map_err(|e| rt_to_pyerror(ctx, e))?;
+                call_method_n_kw(ctx, 0, 0, &dest, &[])
+                    .map_err(|e| rt_to_pyerror(ctx, e))?;
+            }
+            Ok(Value::None)
         }
-        let mut s = String::new();
-        obj_print_helper(ctx, types, *arg, PrintKind::Str, &mut s);
-        let _ = mp_print_str(&mut print, s.as_bytes());
+        None => {
+            let mut sink = MP_PLAT_PRINT;
+            let mut print = Print::new(&mut sink);
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    let _ = mp_print_str(&mut print, &sep_bytes);
+                }
+                let mut s = String::new();
+                obj_print_helper(ctx, types, *arg, PrintKind::Str, &mut s);
+                let _ = mp_print_str(&mut print, s.as_bytes());
+            }
+            let _ = mp_print_str(&mut print, &end_bytes);
+            Ok(Value::None)
+        }
     }
-    let _ = mp_print_str(&mut print, &end_bytes);
-    Ok(Value::None)
+}
+
+/// Convert an `RtError` from the `flush` method call into the
+/// `PyError` a builtin slot returns: named variants are
+/// recorded on `ctx` (first record wins — the `load_method`
+/// `AttributeError("no attribute 'flush'")` is the common one);
+/// `PyRaise` is already recorded; `OutOfMemory` maps directly;
+/// `Raised(v)` cannot be carried through the slot convention
+/// (the pending slot holds name+arg, not an object) and falls
+/// back to the codebase's `to_pyerror()` — the caller builds a
+/// generic `TypeError` for it (see `scripts/d2_result.txt` §4).
+fn rt_to_pyerror(ctx: &mut CallCtx, e: crate::runtime::runtime::RtError) -> PyError {
+    match e {
+        crate::runtime::runtime::RtError::PyRaise => PyError::PyRaise,
+        crate::runtime::runtime::RtError::OutOfMemory => PyError::OutOfMemory,
+        crate::runtime::runtime::RtError::Raised(_) => PyError::PyRaise,
+        _ => {
+            let name = e.exc_name();
+            let msg = e.message();
+            ctx.record_raise(name, Some(&msg));
+            PyError::PyRaise
+        }
+    }
 }
 
 /// `mp_obj_str_get_data` for a `print` `sep`/`end` value: a qstr

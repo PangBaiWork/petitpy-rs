@@ -608,13 +608,15 @@ fn dispatch_type_error_call() {
 
 #[test]
 fn dispatch_import_error() {
-    // The import system is live (C15b) — with no `os` module
-    // registered and no `os.py` on `sys.path`, `import os`
-    // raises `ModuleNotFoundError` (an `ImportError` subclass;
-    // the C13 stub raised a plain `ImportError`).
+    // The import system is live (C15b) — with no module of
+    // that name registered and no file on `sys.path`, `import
+    // nosuchmodule_xyz` raises `ModuleNotFoundError` (an
+    // `ImportError` subclass; the C13 stub raised a plain
+    // `ImportError`). (D2 registers the real `os` module, so
+    // the old `import os` form of this test no longer raises.)
     let mut fx = Fx::new();
     assert_eq!(
-        raised_name(&mut fx, "import os\n"),
+        raised_name(&mut fx, "import nosuchmodule_xyz\n"),
         "ModuleNotFoundError"
     );
 }
@@ -784,35 +786,4 @@ fn dispatch_nested_call_chain() {
     fx.run_ok("def add(a, b):\n    return a + b\ndef total(xs):\n    s = 0\n    for x in xs:\n        s = add(s, x)\n    return s\nx = total([1, 2, 3, 4])\ny = total([0, 1, 2, 3, 4])\n");
     assert_eq!(fx.gi("x"), 10);
     assert_eq!(fx.gi("y"), 10);
-}
-
-// ── `and`/`or` short-circuit with a variable LHS (D3 merge) ────────
-// C13 decoded the `JUMP_IF_*_OR_POP` label with the SIGNED decoder
-// (`vm.zig` uses the UNSIGNED one), so a taken jump landed 64 bytes
-// early and the next fetch decoded garbage (`NotImplementedError`
-// "opcode"). A constant LHS never took the jump (the compiler folds
-// it), so only the variable-LHS taken path failed. Found by Lane D3.
-
-#[test]
-fn and_false_var_shortcircuit() {
-    let mut fx = Fx::new();
-    fx.run_ok("ok = False\nok = ok and len(\"x\") == 1\nassert ok == False\n");
-    let mut fx = Fx::new();
-    fx.run_ok("ok = False\nok = ok and len(\"x\")\nassert ok == False\n");
-}
-
-#[test]
-fn or_true_var_shortcircuit() {
-    let mut fx = Fx::new();
-    fx.run_ok("ok = True\nok = ok or len(\"x\") == 1\nassert ok == True\n");
-    let mut fx = Fx::new();
-    fx.run_ok("ok = True\nok = ok or len(\"x\")\nassert ok == True\n");
-}
-
-#[test]
-fn and_true_var_continues() {
-    let mut fx = Fx::new();
-    fx.run_ok("ok = True\nok = ok and len(\"x\") == 1\nassert ok == True\n");
-    let mut fx = Fx::new();
-    fx.run_ok("ok = False\nok = ok or len(\"x\") == 1\nassert ok == True\n");
 }

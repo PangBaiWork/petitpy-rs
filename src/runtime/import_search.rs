@@ -209,8 +209,34 @@ pub fn stat_component_in(root: &str, component: &str) -> Found {
 /// (`import_search.zig:286-303`). An empty `sys.path` finds
 /// nothing (the Zig returns not-found when `sys_mutable[0]` is
 /// null; the Rust default is `[""]`, never empty).
-pub fn search_top_level(state: &VmState, component: &str) -> Found {
-    for entry in &state.sys_path {
+///
+/// The entries come from the `sys.path` list OBJECT
+/// (`state.sys_path_list`, the `sys_mutable[0]` value — D2)
+/// when it exists, so Python `sys.path.append(x)` is visible
+/// to imports; otherwise from the `Vec<String>` (hand-built
+/// `VmState` fixtures in the import tests). Non-str entries
+/// are skipped (the C reads the list through the str slot,
+/// which fails the same way).
+pub fn search_top_level(ctx: &mut CallCtx, state: &VmState, component: &str) -> Found {
+    let mut owned: Vec<String> = Vec::new();
+    let entries: &[String] = match state.sys_path_list {
+        Some(list_ref) => {
+            if let Obj::List(l) = ctx.arena.get(list_ref) {
+                for item in &l.items {
+                    if let Some(b) = crate::objects::strings::objstr_a::str_data_pool(
+                        ctx.arena, ctx.pool, *item,
+                    ) {
+                        owned.push(String::from_utf8_lossy(&b).into_owned());
+                    }
+                }
+                &owned
+            } else {
+                &state.sys_path
+            }
+        }
+        None => &state.sys_path,
+    };
+    for entry in entries {
         let found = stat_component_in(entry, component);
         if found.kind != FoundKind::NotFound {
             return found;
@@ -522,7 +548,7 @@ fn load_frozen(
     match result {
         Ok(()) => Ok(module_obj),
         Err(e) => {
-            remove_from_loaded(state, full_qstr);
+            remove_from_loaded(ctx, state, full_qstr);
             Err(e)
         }
     }
@@ -533,6 +559,15 @@ fn load_frozen(
 /// `mp_obj_new_module` registers; the pin mirrors
 /// `load_module_from_mpy` — the module must survive a GC
 /// during its own body execution).
+///
+/// The live `sys.modules` dict (`state.sys_modules_dict`,
+/// D2) is kept in step with `state.modules` — builtin
+/// modules are never inserted (probed: after `import os`,
+/// `sys.modules` is still `{}`). A failed mirror store is
+/// ignored (the mirror is a view; the primary registration
+/// already happened — and a store into a fresh plain dict
+/// cannot fail short of OOM, which the module alloc would
+/// have hit first).
 fn create_and_register(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -546,6 +581,14 @@ fn create_and_register(
     if let Value::Heap(r) = module_val {
         state.modules.insert(full_qstr, r);
     }
+    if let Some(mirror) = state.sys_modules_dict {
+        let _ = crate::objects::containers::objdict::dict_store(
+            ctx,
+            Value::Heap(mirror),
+            Value::Qstr(full_qstr),
+            module_val,
+        );
+    }
     ctx.roots.extra.insert(state.extra_base, module_val);
     state.extra_base += 1;
     module_val
@@ -553,9 +596,21 @@ fn create_and_register(
 
 /// Remove a partially-registered module from `sys.modules`
 /// (`import_search.zig:456-459`, the Zig's `unload_module`).
-/// Used on not-found and on partial-init failure.
-pub fn remove_from_loaded(state: &mut VmState, modname_qstr: u32) {
+/// Used on not-found and on partial-init failure. The live
+/// `sys.modules` dict is kept in step (D2).
+pub fn remove_from_loaded(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    modname_qstr: u32,
+) {
     state.modules.remove(&modname_qstr);
+    if let Some(mirror) = state.sys_modules_dict {
+        let _ = crate::objects::containers::objdict::dict_delete(
+            ctx,
+            Value::Heap(mirror),
+            Value::Qstr(modname_qstr),
+        );
+    }
 }
 
 /// Public entry — called once per dotted component from
@@ -590,7 +645,7 @@ pub fn try_load_component(
             }
         }
         if let Ok(component) = std::str::from_utf8(level_slice) {
-            found = search_top_level(state, component);
+            found = search_top_level(ctx, state, component);
         }
     } else {
         // Submodule: frozen (by FULL dotted name) first, then
@@ -615,7 +670,7 @@ pub fn try_load_component(
     // Create + register the module under its full dotted name.
     let module_obj = create_and_register(ctx, state, full_qstr);
     if let Err(e) = load_found(ctx, state, &found, full_qstr, module_obj) {
-        remove_from_loaded(state, full_qstr);
+        remove_from_loaded(ctx, state, full_qstr);
         return Err(e);
     }
     Ok(Some(module_obj))

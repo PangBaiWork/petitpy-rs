@@ -200,7 +200,7 @@ fn module_store_attr_fixed_dict_paths() {
     // Fixed non-builtins dict -> unhandled (Ok(false)); the
     // caller raises AttributeError (probed: sys.foo = 42).
     let fixed = ctx.alloc(None, Obj::Dict(DictData { map: MapData::new_fixed(vec![]) }));
-    let m = ctx.alloc(Some(mt), Obj::Module(crate::objects::value::ModuleData { name: q(b"sys"), dict: fixed }));
+    let m = ctx.alloc(Some(mt), Obj::Module(crate::objects::value::ModuleData { name: q(b"sys"), dict: fixed, delegation: None }));
     let mut override_dict: Option<GcRef> = None;
     assert!(!module_store_attr(&mut ctx, Value::Heap(m), foo, Some(Value::SmallInt(1)), None, &mut override_dict).unwrap());
     // Fixed builtins dict -> the override dict (created on first use).

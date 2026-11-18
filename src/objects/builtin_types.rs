@@ -46,6 +46,19 @@ pub struct BuiltinTypes {
     /// `bytearray` (C13b: the `bytearray` make_new adapter needs
     /// the array type for the shared `array_new` helper).
     pub bytearray: GcRef,
+    /// `FileIO` (D2: `open()` in binary mode allocates with
+    /// this header type; `sys.stdin.buffer` etc. are FileIO
+    /// objects).
+    pub fileio: GcRef,
+    /// `TextIOWrapper` (D2: `open()` in text mode and the
+    /// stdio objects allocate with this header type).
+    pub textio: GcRef,
+    /// The shared attrtuple type (D2: ONE ROM type for
+    /// `os.stat` results and `sys.implementation` — probed:
+    /// `type(os.stat('.')) is type(sys.implementation)` is
+    /// True, while both `is tuple` are False. Built here so
+    /// both modules read it from `ctx.types`).
+    pub attrtuple: GcRef,
     /// `type` itself (the class-getitem branch of `mp_obj_subscr`).
     pub type_: GcRef,
     /// `object` (C12: the `isSubclassImpl` short-circuit, `mroOf`'s

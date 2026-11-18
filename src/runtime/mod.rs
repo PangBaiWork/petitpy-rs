@@ -46,6 +46,9 @@ pub mod code_store;
 pub mod compile_bridge;
 pub mod frozen_modules;
 pub mod import_search;
+pub mod modos;
+pub mod modos_fd;
+pub mod modsys;
 pub mod opmethods;
 pub mod persistentcode;
 pub mod qstr;
@@ -66,16 +69,19 @@ pub mod vm;
 pub mod vm_builtins;
 pub mod vm_builtins_bind;
 pub mod vm_call;
+pub mod vm_call_intercept;
 pub mod vm_dispatch;
 pub mod vm_dispatch_exec;
 pub mod vm_dispatch_util;
 pub mod vm_eval;
 pub mod vm_gen;
+pub mod vm_modules;
 pub mod vm_ops;
 pub mod vm_raise;
 pub mod vm_rt;
 pub mod vm_rt_iter;
 pub mod vm_rt_name;
+pub mod vm_roots;
 pub mod vm_types;
 pub mod warning;
 
@@ -93,6 +99,12 @@ mod builtin_vm_tests_b;
 mod builtinhelp_tests;
 #[cfg(test)]
 mod import_tests;
+#[cfg(test)]
+mod modsys_tests;
+#[cfg(test)]
+mod modos_tests;
+#[cfg(test)]
+mod vm_builtins_tests;
 #[cfg(test)]
 mod warning_tests;
 #[cfg(test)]

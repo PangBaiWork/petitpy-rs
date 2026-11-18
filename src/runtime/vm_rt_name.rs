@@ -212,6 +212,44 @@ pub fn load_method_maybe_ctx(
                 Err(e) => return Err(exc_from_pyerror(ctx, state, e)),
             }
         }
+        // D2: module `__getattr__` (PEP 562) — `module_attr`
+        // runs with seam None, so a module `__getattr__` fun
+        // never fires through it. Run it here, where
+        // (ctx, state) are both live for `call_function_ctx`
+        // (the C13 gap: "C13 wires the seam when the VM's
+        // call machinery lands"). Only for modules, only when
+        // the attr slot found nothing, never for `__getattr__`
+        // itself (no recursion). A raise from the
+        // `__getattr__` fun propagates unchanged (the
+        // `os.path` import failure is a ModuleNotFoundError,
+        // per the probe).
+        let module_dict = if let Value::Heap(r) = obj {
+            match ctx.arena.get(r) {
+                Obj::Module(m) => Some(m.dict),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(dict) = module_dict {
+            let getattr_id = static_qstr_id(b"__getattr__").unwrap_or(u32::MAX);
+            if attr != getattr_id {
+                use crate::objects::containers::objdict::dict_get_value;
+                if let Ok(fun) =
+                    dict_get_value(ctx, Value::Heap(dict), Value::Qstr(getattr_id))
+                {
+                    return crate::runtime::vm_call::call_function_ctx(
+                        ctx,
+                        state,
+                        fun,
+                        1,
+                        0,
+                        &[Value::Qstr(attr)],
+                    )
+                    .map(|v| (Some(v), None));
+                }
+            }
+        }
     }
     // The type locals-dict lookup + `convert_member_lookup`.
     if let Some(t) = type_ {
@@ -318,9 +356,16 @@ pub fn load_attr_ctx(
 /// `mp_store_attr` (`runtime.zig:1255-1275`): the real C14
 /// `runtime_method::store_attr` — the attr slot (C12a's), the
 /// `Instance` members map, descriptors. `value == None` deletes
-/// (the `delattr` path); the old stub always raised
-/// `AttributeError` (the C13b ignored test
-/// `makenew_class_member_store` waited on this).
+/// (the `delattr` path; `del x.attr` compiles to `LOAD_NULL;
+/// STORE_ATTR`, so the null slot arrives here as `None`,
+/// distinct from storing the `None` object). The old stub
+/// always raised `AttributeError` (the C13b ignored test
+/// `makenew_class_member_store` waited on this). The MODULE
+/// case goes through C14's `module_store_attr` (D2): `sys.path
+/// = [...]` stores into the delegation slot (probed on the
+/// reference), `del sys.path` / `sys.foo = 42` raise
+/// AttributeError, `del mymod.x` deletes from the module dict
+/// (missing → KeyError, per C14).
 pub fn store_attr_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,

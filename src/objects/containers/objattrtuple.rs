@@ -25,6 +25,7 @@ use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::PrintKind;
 use crate::objects::value::{AttrTupleData, GcRef, Obj, TypeData, Value};
+use crate::pyerr::PyResult;
 
 /// Extract a cloned `AttrTupleData` from a heap attrtuple value
 /// (panics on any other value — the slot/type-data contract).
@@ -110,9 +111,22 @@ pub fn attrtuple_attr(arena: &GcArena, self_v: Value, attr: u32) -> Option<Value
         .map(|i| data.items[i])
 }
 
+/// The `AttrFn` adapter over the load-only `attrtuple_attr`
+/// (D2: the field lookup was never wired into the type data,
+/// so `sys.implementation.name` raised AttributeError at the
+/// VM level — the Zig's `mp_type_attrtuple` carries the attr
+/// slot, `objattrtuple.zig:105-109`).
+pub fn attrtuple_attr_fn(
+    ctx: &mut CallCtx,
+    self_v: Value,
+    attr: u32,
+) -> PyResult<Option<Value>> {
+    Ok(attrtuple_attr(ctx.arena, self_v, attr))
+}
+
 /// `mp_type_attrtuple` ROM data (objattrtuple.zig:97-116): name
-/// `tuple`, flags `0x0000`; print slot only (the tuple slots are
-/// C9b's — see the module docs; wire them at the rebase).
+/// `tuple`, flags `0x0000`; the tuple slots are C9b's (see the
+/// module docs); the attr slot is the field lookup above.
 pub fn attrtuple_type_data(dict: GcRef) -> TypeData {
     TypeData {
         name: static_qstr_id(b"tuple").expect("MP_QSTR_tuple is in the static table"),
@@ -130,7 +144,7 @@ pub fn attrtuple_type_data(dict: GcRef) -> TypeData {
         subscr: Some(tuple_subscr),
         buffer: None,
         print: Some(attrtuple_print),
-        attr: None,
+        attr: Some(attrtuple_attr_fn),
         make_new: None,
         bases: None,
         namedtuple_fields: None,

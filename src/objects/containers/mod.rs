@@ -15,6 +15,7 @@ pub(crate) mod objattrtuple_tests;
 pub mod objdict;
 pub mod objdict_collect;
 pub mod objdict_methods;
+pub mod objfileio;
 pub mod objlist;
 pub mod objlist_methods;
 pub mod objproperty;
@@ -30,6 +31,8 @@ pub mod objstringio_types;
 pub(crate) mod objstringio_tests;
 #[cfg(test)]
 pub(crate) mod objstringio_tests_ctx;
+#[cfg(test)]
+pub(crate) mod objfileio_tests;
 pub mod objset;
 pub mod objset_methods;
 pub mod objslice;

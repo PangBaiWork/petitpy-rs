@@ -31,14 +31,11 @@
 //! 800-line cap, so there is no new `Obj` variant and no
 //! arena field for it. Fds are process-unique, so keying by
 //! fd is correct across VMs and threads; `close()` removes
-//! the entry and the fd closes when the owned object drops.
+//! the entry and the fd closes when the owned object drops
+//! (except a `fromfd` foreign fd — see below).
 //! Operations that can block (accept/recv/sendall) always
 //! work on a dup of the fd, never on the table's object,
 //! so the table lock is never held across I/O.
-//! - `fromfd` with a non-negative fd raises
-//!   `NotImplementedError`: wrapping a foreign fd needs
-//!   `from_raw_fd` / `borrow_raw`, both `unsafe`, and this
-//!   lane is pure-`std` with no `unsafe` (see `socket_fromfd`).
 //!
 //! Pure-`std` divergences from the Zig (all recorded here,
 //! see the result file §4):
@@ -52,11 +49,14 @@
 //!   accepted (the reference refuses it — `bind()` already
 //!   listens, backlog 128, and `listen(backlog)` is a
 //!   validation no-op after `bind()`).
-//! - `fromfd` duplicates the fd: closing the socket does not
-//!   close the caller's fd (the Zig wraps without dup;
-//!   CPython dups, like this port). `fromfd(-1, ...)`
-//!   creates an instance with fd -1 and no table entry, which
-//!   behaves exactly like a closed socket.
+//! - `fromfd` does NOT take ownership of the fd: closing the
+//!   socket drops the table entry but leaves the caller's fd
+//!   open (the Zig wraps without dup and closes it; CPython
+//!   dups it). Taking ownership needs `from_raw_fd` /
+//!   `borrow_raw`, both `unsafe`, and this tree is pure-`std`.
+//!   `fromfd(-1, ...)` creates an instance with fd -1 and no
+//!   table entry, which behaves exactly like a closed socket.
+//!   I/O on a foreign fd is EBADF (no dup-able object).
 //! - `getsockopt` has no stable-`std` implementation
 //!   (`UnixStream::peer_cred` is unstable
 //!   `peer_credentials_unix_socket`): after the `buflen`
@@ -130,6 +130,18 @@ enum SocketState {
     Listener(UnixListener),
     /// Connected (accepted).
     Stream(UnixStream),
+    /// A foreign fd wrapped by `fromfd` (F5b): NO owned object
+    /// — the fd is only a table key. `fileno()` returns it and
+    /// `close()` drops the entry and stores `-1`, but the OS fd
+    /// itself is NOT closed: taking ownership needs
+    /// `from_raw_fd`, which is `unsafe`, and this tree is
+    /// pure-`std`. The reference wraps the fd directly and DOES
+    /// close it on `close()` (probed: `os.close(fd)` after
+    /// `s.close()` is EBADF) — documented divergence, see
+    /// `scripts/f5b_result.txt` §4. I/O on a foreign fd
+    /// (`recv`/`sendall`/`setblocking`) is EBADF: there is no
+    /// dup-able object to work through.
+    Foreign,
 }
 
 fn sockets() -> std::sync::MutexGuard<'static, HashMap<RawFd, SocketState>> {
@@ -160,6 +172,8 @@ fn dup_fd(ctx: &mut CallCtx, fd: RawFd) -> PyResult<OwnedFd> {
         Some(SocketState::Unbound(f)) => f.as_fd().try_clone_to_owned(),
         Some(SocketState::Listener(l)) => l.as_fd().try_clone_to_owned(),
         Some(SocketState::Stream(s)) => s.as_fd().try_clone_to_owned(),
+        // A foreign fd has no owned object to dup (F5b).
+        Some(SocketState::Foreign) => return Err(raise_os_error(ctx, EBADF)),
         None => return Err(raise_os_error(ctx, EBADF)),
     };
     owned.map_err(|e| io_os_error(ctx, e))
@@ -328,12 +342,14 @@ fn socket_ctor(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// (`modsocket.zig` `py_socket_fromfd`, variadic 3..4).
 /// A negative fd creates an instance with no table entry,
 /// behaving exactly like a closed socket (the Zig wraps it
-/// directly and fails at use). A non-negative fd raises
-/// `NotImplementedError`: wrapping a foreign fd needs
-/// `from_raw_fd` / `borrow_raw`, both `unsafe`, and this
-/// lane is pure-`std` with no `unsafe` — there is no safe
-/// `std` way to take ownership of an arbitrary fd. (The
-/// Zig wraps it directly; CPython dups it.)
+/// directly and fails at use). A non-negative fd registers a
+/// `SocketState::Foreign` entry (F5b): `fileno()` returns the
+/// fd and `close()` drops the entry, but the OS fd is NOT
+/// closed — taking ownership needs `from_raw_fd` / `borrow_raw`
+/// (both `unsafe`; this lane is pure-`std`, no `unsafe`).
+/// The Zig wraps it directly and DOES close it (probed);
+/// CPython dups it. The difference is documented in
+/// `scripts/f5b_result.txt` §4.
 fn socket_fromfd(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let fd = int_arg(ctx, args[0])? as i32;
     let family = int_arg(ctx, args[1])? as i32;
@@ -345,10 +361,8 @@ fn socket_fromfd(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     if fd < 0 {
         return alloc_socket(ctx, fd, family, type_, proto);
     }
-    Err(crate::runtime::raise::raise_not_implemented(
-        ctx,
-        Some("fromfd requires taking ownership of a foreign fd"),
-    ))
+    sockets().insert(fd, SocketState::Foreign);
+    alloc_socket(ctx, fd, family, type_, proto)
 }
 
 // ── Methods (self = args[0] via type-method dispatch) ───────────────
@@ -510,6 +524,8 @@ fn sock_setblocking(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         Some(SocketState::Unbound(_))
         | Some(SocketState::Listener(_))
         | Some(SocketState::Stream(_)) => {}
+        // A foreign fd has no dup-able object (F5b).
+        Some(SocketState::Foreign) => return Err(raise_os_error(ctx, EBADF)),
         None => return Err(raise_os_error(ctx, EBADF)),
     }
     let dup = dup_fd(ctx, fd)?;

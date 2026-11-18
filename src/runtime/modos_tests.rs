@@ -310,14 +310,16 @@ os.rmdir(d)
 #[test]
 fn os_unimplemented_stubs() {
     // The reference implements these; the port has no std API
-    // for them (`kill`/`umask`/`chown` — see §4). The stubs
-    // raise NotImplementedError so the gap is loud, not silent.
+    // for `umask` (see §4) — the stub raises
+    // NotImplementedError so the gap is loud, not silent.
+    // `kill`/`chown` shell out to `/bin` helpers instead
+    // (F5b): `kill(1, 0)` succeeds (pid 1 exists), `chown`
+    // of /tmp to 0:0 succeeds as root.
     let (name, _) = fx_run_err_new("import os\nos.umask(0o022)\n");
     assert_eq!(name, "NotImplementedError");
-    let (name, _) = fx_run_err_new("import os\nos.kill(1, 0)\n");
-    assert_eq!(name, "NotImplementedError");
-    let (name, _) = fx_run_err_new("import os\nos.chown(\"/tmp\", 0, 0)\n");
-    assert_eq!(name, "NotImplementedError");
+    let mut fx = Sx::new();
+    // `run_ok` panics if either call raises.
+    fx.run_ok("import os\nos.kill(1, 0)\nos.chown(\"/tmp\", 0, 0)\n");
 }
 
 /// `run_err` on a fresh `Sx` (each stub test gets its own VM

@@ -53,7 +53,8 @@
 //!   string through to `execvpe`.
 
 use std::io::{Read, Write};
-use std::os::unix::io::AsFd;
+use std::os::unix::io::{AsFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -214,7 +215,12 @@ fn cwd_arg(ctx: &mut CallCtx, v: Value) -> PyResult<Option<String>> {
 /// Build the `Stdio` for one stream mode. `role` is 0 for
 /// stdin, 1 for stdout, 2 for stderr. `STDOUT` (-2) dups
 /// the parent's stdout (fd 1) onto the child fd — for
-/// stdout itself that is just `inherit()`.
+/// stdout itself that is just `inherit()`; for stderr it
+/// is only correct when the child's stdout IS the parent's
+/// (INHERIT) — the other stdout modes go through
+/// `stderr_stdio_for` / the shared pair in `spawn_and_wait`
+/// (the Zig's `dup2(1, 2)` dups the CHILD's stdout, after
+/// it was set up).
 fn stdio_for(ctx: &mut CallCtx, mode: i64, role: usize) -> PyResult<Stdio> {
     match mode {
         INHERIT => Ok(Stdio::inherit()),
@@ -250,6 +256,32 @@ fn stdio_for(ctx: &mut CallCtx, mode: i64, role: usize) -> PyResult<Stdio> {
             }
         }
         _ => Err(einval(ctx)),
+    }
+}
+
+/// The stderr `Stdio` when `stderr == STDOUT` and stdout
+/// is NOT a pipe (the pipe case is the shared pair in
+/// `spawn_and_wait`): the Zig's `dup2(1, 2)` redirects
+/// stderr to the CHILD's stdout stream, so stdout=DEVNULL
+/// means stderr is `/dev/null`, stdout=fd means stderr
+/// re-opens that fd write-only, and stdout=INHERIT (or
+/// the degenerate stdout=STDOUT) means a dup of the
+/// parent's stdout (the old `stdio_for` STDOUT arm).
+fn stderr_stdio_for(ctx: &mut CallCtx, modes: [i64; 3]) -> PyResult<Stdio> {
+    if modes[2] != STDOUT {
+        return stdio_for(ctx, modes[2], 2);
+    }
+    match modes[1] {
+        DEVNULL => Ok(Stdio::null()),
+        fd if fd >= 0 => {
+            let path = format!("/proc/self/fd/{fd}");
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|e| io_os_error(ctx, e))?;
+            Ok(Stdio::from(f))
+        }
+        _ => stdio_for(ctx, STDOUT, 2),
     }
 }
 
@@ -380,8 +412,40 @@ fn spawn_and_wait(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         cmd.current_dir(cwd);
     }
     cmd.stdin(stdio_for(ctx, modes[0], 0)?);
-    cmd.stdout(stdio_for(ctx, modes[1], 1)?);
-    cmd.stderr(stdio_for(ctx, modes[2], 2)?);
+    // `stderr=STDOUT` with `stdout=PIPE`: both streams share
+    // one socket pair (F5b) — the Zig dup2's the child's
+    // stdout fd onto stderr, so the two streams interleave
+    // in write order into the single drained result. A
+    // `UnixStream::pair` is the safe-std way to make one
+    // writable fd the child sees as both 1 and 2; the parent
+    // drains the other end. (A socket is not a pipe, but the
+    // child only writes bytes to it; ordering is preserved.)
+    let mut shared_read: Option<UnixStream> = None;
+    match (modes[1], modes[2]) {
+        (PIPE, STDOUT) => {
+            let (w, r) = UnixStream::pair().map_err(|e| io_os_error(ctx, e))?;
+            // `Stdio` has no `From<UnixStream>` — dup the
+            // write end twice as `OwnedFd`s (safe: `as_fd`
+            // + `try_clone_to_owned`, the socket module's
+            // pattern). The pair's own write end is dropped
+            // here, so the child holds the only writers.
+            let w_out: OwnedFd = w
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| io_os_error(ctx, e))?;
+            let w_err: OwnedFd = w
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| io_os_error(ctx, e))?;
+            cmd.stdout(Stdio::from(w_out));
+            cmd.stderr(Stdio::from(w_err));
+            shared_read = Some(r);
+        }
+        _ => {
+            cmd.stdout(stdio_for(ctx, modes[1], 1)?);
+            cmd.stderr(stderr_stdio_for(ctx, modes)?);
+        }
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -391,6 +455,14 @@ fn spawn_and_wait(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
             return Err(io_os_error(ctx, e));
         }
     };
+    // Drop the builder NOW: it still owns the parent's copies
+    // of the `Stdio` fds (e.g. the shared pair's write ends).
+    // Until they close, a drain thread reading the pipe/pair
+    // never sees EOF — `finish`'s `rx.recv()` would block
+    // forever (F5b: the shared-pair test hung here until
+    // this drop was added). The `Child` is independent of
+    // the builder, so this is safe.
+    drop(cmd);
     // Take the pipes: the reader/writer threads own them.
     let stdin_handle = match (modes[0] == PIPE, child.stdin.take(), &input) {
         (true, Some(s), Some(data)) => Some(feed_thread(s, data.clone())),
@@ -400,9 +472,15 @@ fn spawn_and_wait(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         }
         _ => None,
     };
-    let stdout_rx: Option<mpsc::Receiver<Vec<u8>>> = match (modes[1] == PIPE, child.stdout.take())
-    {
-        (true, Some(out)) => Some(drain_thread(out)),
+    let stdout_rx: Option<mpsc::Receiver<Vec<u8>>> = match (modes[1] == PIPE, shared_read) {
+        // The shared pair (stderr=STDOUT over a piped
+        // stdout): drain the pair's read end — it carries
+        // both streams, merged in write order.
+        (true, Some(r)) => Some(drain_thread(r)),
+        (true, None) => match child.stdout.take() {
+            Some(out) => Some(drain_thread(out)),
+            _ => None,
+        },
         _ => None,
     };
     let stderr_rx: Option<mpsc::Receiver<Vec<u8>>> = match (modes[2] == PIPE, child.stderr.take())

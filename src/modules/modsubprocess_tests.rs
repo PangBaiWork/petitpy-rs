@@ -222,6 +222,25 @@ r = _subprocess._spawn_and_wait(["/bin/sh", "-c", "echo out; echo err >&2"], Non
 }
 
 #[test]
+fn subprocess_stderr_stdout_merged() {
+    // `stderr=STDOUT` over a piped stdout: stderr joins the
+    // child's stdout stream (the Zig's `dup2(1, 2)`), so
+    // the drained stdout holds both lines in write order
+    // and stderr is None — NOT the parent's stdout (F5b).
+    let mut fx = Fx::new();
+    fx.run_ok(
+        r#"
+import _subprocess
+r = _subprocess._spawn_and_wait(["/bin/sh", "-c", "echo out; echo err >&2"], None, -1.0, None, None, -4, -1, -2)
+"#,
+    );
+    assert_eq!(
+        fx.g_result("r"),
+        (0, Some(b"out\nerr\n".to_vec()), None, false)
+    );
+}
+
+#[test]
 fn subprocess_devnull() {
     let mut fx = Fx::new();
     fx.run_ok(

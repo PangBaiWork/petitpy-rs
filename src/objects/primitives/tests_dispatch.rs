@@ -114,6 +114,9 @@ impl SlotFixture {
             native_init_wrapper,
             property,
             socket: None,
+            deque: None,
+            ordereddict: None,
+            namedtuple_fn: None,
         };
         SlotFixture { arena, roots, types, pool: RuntimeQstr::new(), pending_raise: None }
     }

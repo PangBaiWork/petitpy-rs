@@ -130,6 +130,9 @@ impl Fixture {
             native_init_wrapper,
             property,
             socket: None,
+            deque: None,
+            ordereddict: None,
+            namedtuple_fn: None,
         };
         Fixture { arena, roots, types, pool: RuntimeQstr::new(), pending_raise: None }
     }

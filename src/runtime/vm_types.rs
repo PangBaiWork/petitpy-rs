@@ -499,6 +499,9 @@ pub(crate) fn build_vm_types(
         native_init_wrapper,
         property,
         socket: None,
+        deque: None,
+        ordereddict: None,
+        namedtuple_fn: None,
     };
     let vm_types = VmTypes {
         fun_bc,

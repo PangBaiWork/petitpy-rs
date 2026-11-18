@@ -52,6 +52,15 @@ use crate::runtime::vm_ops::{exc_from_pyerror, type_error};
 /// Look a name up in a builtin-module table BYTES (no interning
 /// needed — the dispatch path cannot intern a genuinely-new
 /// name; the tables are small).
+///
+/// This is the `mp_module_get_builtin` (`objmodule.zig:102`)
+/// shape (the `objmodule.rs` `module_get_builtin` port is the
+/// same logic, test-only): the non-ext table first, then —
+/// on a miss, in the NON-ext call only — the `usys` special
+/// case and the `u`-prefix strip (`import ufoo` → extensible
+/// `foo`). D4 added the strip here: C15b's import path never
+/// had it, so `import uerrno` / `uarray` / `ucollections` /
+/// `usys` all raised `ModuleNotFoundError`.
 fn builtin_lookup_by_bytes(
     ctx: &CallCtx,
     state: &VmState,
@@ -66,6 +75,31 @@ fn builtin_lookup_by_bytes(
     for (q, v) in table {
         if ctx.pool.qstr_str(*q as u16) == name {
             return Some(*v);
+        }
+    }
+    if ext {
+        return None;
+    }
+    // `usys` special case (`objmodule.zig:111-113`): the sys
+    // module object itself (sys is builtin, not extensible,
+    // so the strip below would miss it).
+    if name == b"usys" {
+        for (q, v) in &state.builtin_modules {
+            if ctx.pool.qstr_str(*q as u16) == b"sys" {
+                return Some(*v);
+            }
+        }
+        return None;
+    }
+    // `u`-prefix strip (`objmodule.zig:114-120`): `import
+    // ufoo` maps to extensible `foo`. A lone `"u"` does not
+    // strip (the `objmodule.rs` port's `len() > 1` guard).
+    if name.first() == Some(&b'u') && name.len() > 1 {
+        let stripped = &name[1..];
+        for (q, v) in &state.extensible_modules {
+            if ctx.pool.qstr_str(*q as u16) == stripped {
+                return Some(*v);
+            }
         }
     }
     None
@@ -134,6 +168,17 @@ fn process_component(
         return Ok(cached);
     }
     if parent.is_none() {
+        // D4: `import __main__` resolves to the entry module
+        // (`state.d4.main_module`) — the original never caches
+        // it in `sys.modules`, so the cached lookup above
+        // cannot see it. Unset (no entry module loaded yet) it
+        // falls through to the normal path, which raises
+        // `ModuleNotFoundError`.
+        if level_slice == b"__main__" {
+            if let Some(main) = state.d4.main_module {
+                return Ok(Value::Heap(main));
+            }
+        }
         // Top-level: built-ins first (non-ext), then the search,
         // then built-ins (ext).
         if let Some(nb) = builtin_lookup_by_bytes(ctx, state, level_slice, false) {

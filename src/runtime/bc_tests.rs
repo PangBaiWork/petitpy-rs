@@ -117,6 +117,9 @@ impl Fixture {
             native_init_wrapper: mk(&mut arena, b"function"),
             property: mk(&mut arena, b"property"),
             socket: None,
+            deque: None,
+            ordereddict: None,
+            namedtuple_fn: None,
         };
         Fixture {
             arena,

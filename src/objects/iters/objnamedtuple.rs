@@ -26,8 +26,11 @@
 //!
 //! The `make_new` signature follows the other lanes':
 //! `(ctx, class, args, n_kw)` — the type-call machinery (C12)
-//! calls it directly; there is no `make_new` slot in
-//! `TypeData`.
+//! calls it directly through the `namedtuple_make_new_slot`
+//! adapter in `make_new.rs` (D4 wired the slot: C11 left
+//! `make_new: None`, so `P(1, 2)` raised "can't create
+//! instance" although the Zig attaches `namedtuple_make_new`
+//! as the class's slot 1).
 
 use super::iter::{
     value_to_qstr, InternFn, ARG_NUM_TYPES_MISMATCH, IterError,
@@ -40,6 +43,7 @@ use crate::objects::containers::objtuple::{
 use crate::objects::obj::ObjError;
 use crate::objects::slots::PrintKind;
 use crate::objects::value::{DictData, GcRef, MapData, Obj, TypeData, Value};
+use crate::pyerr::PyResult;
 
 /// `MP_TYPE_FLAG_EQ_CHECKS_OTHER_TYPE` (`0x0008`,
 /// `mp_mirrors.zig:678`) — the named-tuple class flag.
@@ -71,8 +75,8 @@ pub fn new_namedtuple_type(
         base: Some(ctx.types.tuple),
         mro: Vec::new(),
         dict,
-        attr: None,
-        make_new: None,
+        attr: Some(namedtuple_attr_fn),
+        make_new: Some(crate::objects::objtype::make_new::namedtuple_make_new_slot),
         bases: None,
         unary_op: Some(tuple_unary_op),
         binary_op: Some(tuple_binary_op),
@@ -142,8 +146,35 @@ fn items_to_qstrs(
     Ok(out)
 }
 
-/// Read a named-tuple class's field names (`None` = not a
-/// named-tuple class).
+/// The `AttrFn` adapter over the load-only `namedtuple_attr`
+/// (the `attrtuple_attr_fn` precedent, D2): the Zig's
+/// namedtuple class carries the attr slot
+/// (`objnamedtuple.zig:196,214`), but C11 left `attr: None`
+/// in `new_namedtuple_type`, so `P(1, 2).x` raised
+/// `AttributeError` at the VM level. D4 wires it.
+pub fn namedtuple_attr_fn(
+    ctx: &mut CallCtx,
+    self_v: Value,
+    attr: u32,
+) -> PyResult<Option<Value>> {
+    Ok(namedtuple_attr(ctx.arena, self_v, attr))
+}
+
+/// The `namedtuple(name, fields)` factory as a plain
+/// `BuiltinFn` (`mp_namedtuple_obj`, `FunBuiltin_2` —
+/// `objnamedtuple.zig:238-240`): builds the class via
+/// `new_namedtuple_type`, interning keyword/field names
+/// through the pool (the `make_new_slot` precedent in
+/// `make_new.rs`). The `collections` module binds this.
+pub fn namedtuple_factory_builtin(
+    ctx: &mut CallCtx,
+    args: &[Value],
+) -> PyResult<Value> {
+    let pool = ctx.pool;
+    let mut intern = |b: &[u8]| pool.from_strn(b).map(u32::from);
+    new_namedtuple_type(ctx, args[0], args[1], &mut intern)
+        .map_err(|e| ctx.record_typed(e))
+}
 pub fn namedtuple_fields_of(arena: &GcArena, class: GcRef) -> Option<Vec<u32>> {
     match arena.get(class) {
         Obj::Type(d) => d.namedtuple_fields.clone(),

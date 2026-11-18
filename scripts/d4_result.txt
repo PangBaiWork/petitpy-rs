@@ -1,0 +1,216 @@
+Lane D4: small modules — time/select/gc/errno/signal/pwd/grp/micropython/collections/array/main
+================================================================================================
+Worktree ~/workspace/petitpy-rs-d4-smallmod, branch lane/d4-smallmod, base master 17fd018.
+Reference binary ~/workspace/petitpy-orig/zig-out/bin/petitpy (0.9.0). Probes in /tmp/d4probe/.
+
+Acceptance (main-agent verification chain re-run by the executor):
+- cargo test --release --lib --tests: 1428 passed (1386 baseline + 42 new), 0 failed, 3 ignored
+  (the 3 pre-existing ignores: parser smoke test, makenew_class_attr_on_class, int_from_bytes_e2e)
+- cargo test --release --bins: 9 passed
+- scripts/check_compile_mpy.py: PASS (byte mismatches: 0, 552/552)
+- 0 warnings, no unsafe (grep over the diff, comments excluded), ~/workspace/petitpy-orig clean
+- File sizes: every file <800 lines (largest: objarray.rs 790, objnamedtuple.rs 709,
+  modd4_tests.rs 713, vm.rs 567, vm_eval.rs 469, vm_call.rs 690, value.rs 520, map.rs 860)
+- vm.rs 600 at first measure (over the brief's 592 cap) — fixed by moving
+  `load_module_from_mpy` to vm_eval.rs (vm.rs 567, vm_eval.rs 469); the move also
+  dropped the now-unused `Obj` import from vm.rs.
+
+§1 — Per-module mapping table
+--------------------------------
+Zig source -> Rust file (all in src/modules/ unless noted), table size, registration.
+
+time        modtime.zig 236  -> modtime.rs 181      10 entries (__name__ + 9). Builtin.
+            time/monotonic/time_ns/monotonic_ns/sleep/sleep_ms/ticks_ms/ticks_diff + perf_counter
+            (the SAME FunBuiltin object as monotonic). Monotonic clock: OnceLock<Instant> epoch.
+            sleep<0 -> OSError(22); sleep_ms n<=0 -> None; ticks_diff = a-b (wrapping).
+select      modselect.zig 216 -> modselect.rs 125    2 entries. Builtin. select sig (3,4).
+            Empty lists: exact (sleep the timeout, return three DISTINCT empty lists).
+            Non-empty: NotImplementedError. Non-list arg: TypeError.
+gc          modgc.zig 182    -> modgc.rs 88         7 entries (__name__ + 6). Builtin.
+            collect -> 0 (still runs), disable/enable/isenabled via arena flag,
+            mem_alloc/mem_free via arena.info().used/.free. NO threshold (see §3.1).
+errno       moderrno.zig 185  -> moderrno.rs 89      24 entries (__name__ + errorcode + 22).
+            Extensible. errorcode: int->name dict (22 entries), fixed afterwards.
+signal      modsignal.zig 168 -> modsignal.rs 169    14 entries (__name__ + 2 fns + 11 consts).
+            Builtin. signal/getsignal intercepted (state.d4 handler table, NSIG=64);
+            handlers pinned in a reserved 64-slot roots.extra region (see §1 note below).
+pwd         modpwd.zig 147   -> modpwd.rs 129       3 entries. Builtin. getpwnam/getpwuid ->
+            7-field attrtuple from /etc/passwd (sysdb.rs). Missing -> KeyError(arg).
+grp         modgrp.zig 147   -> modgrp.rs 126       3 entries. Builtin. getgrnam/getgrgid ->
+            4-field attrtuple (gr_mem is a list) from /etc/group. Missing -> KeyError(arg).
+micropython modmicropython.zig 122 -> modmicropython.rs 138  5 entries. Builtin.
+            const = identity; heap_lock/unlock = arena lock/unlock (unlock returns 0);
+            opt_level intercepted (state.d4.optimise_value, sig (0,1)).
+collections modcollections.zig 68 -> modcollections.rs 142  4 entries. Extensible.
+            deque type (C11 deque_type_data + DEQUE_METHODS: append/appendleft/extend/pop/
+            popleft) + namedtuple factory + OrderedDict (dict type renamed, base=dict,
+            mro [self, dict, object]). Returns type refs for the registrar.
+array       modarray.zig 66   -> modarray.rs 30      2 entries. Extensible. `array` = the
+            C9b array type object (no functions of its own).
+__main__    modmain.zig 24    -> modmain.rs 29 (docs only) + wiring in vm_eval.rs / vm.rs /
+            builtinimport.rs. No module built at Vm::new; see §1 note below.
+
+Shared helpers (new): src/modules/mod.rs — mk_fun / store / fix_dict / new_d4_module
+(the D2 modos.rs shape, shared so the eleven builders stay short).
+sysdb.rs — read_etc_file / find_row for pwd+grp (/etc/passwd, /etc/group).
+src/runtime/d4state.rs — D4State: optimise_value, main_module, signal_handlers[64],
+signal_base, opt_level_builtin, signal_builtin, getsignal_builtin.
+src/runtime/vm_modules.rs — build_d4_modules (called from Vm::new after build_d2_modules):
+7 builtin (time/select/gc/signal/pwd/grp/micropython) + 3 extensible (errno/collections/array);
+stores deque/ordereddict/namedtuple_fn into vm.types after drop(ctx); pins all 10 modules;
+reserves the 64 signal-handler root slots (D4State.signal_base).
+
+Registration / interception notes:
+- signal handlers: the table lives outside the arena, so each handler needs a GC root.
+  Reserving 64 root slots once (below extra_base, the vm.pin shape) lets signal()
+  replace a handler without growing the root set per call — the original's fixed
+  [NSIG]Obj table. The slots are traced through roots.extra (below extra_base,
+  so rebuild_frame_roots keeps them).
+- opt_level / signal / getsignal are intercepted by GcRef identity in
+  vm_call_intercept.rs (the D2 os-fd pattern); their FunBuiltin funcs are bare-raise stubs.
+  The intercept bodies live in their module files (call_opt_level_ctx,
+  call_signal_ctx, call_getsignal_ctx) with the D2 check_arity helper shape.
+- Import u-strip + usys (objmodule.zig:102-131) implemented in builtinimport.rs
+  builtin_lookup_by_bytes (non-ext path only): builtin table -> usys special case
+  (returns the sys module) -> strip 'u', look up the extensible table. The
+  objmodule.rs module_get_builtin port already had this logic but is test-only;
+  the live import path (process_component) never had it (see §3.3).
+- __main__: load_module_from_mpy sets state.d4.main_module when name == "__main__";
+  register_code_inner skips the state.modules insert AND the sys.modules mirror
+  insert for "__main__"; process_component special-cases top-level "__main__"
+  (before the builtin lookup) to return main_module if set, else falls through
+  to ModuleNotFoundError. (Moved load_module_from_mpy from vm.rs to vm_eval.rs
+  for the file-size cap — behaviour unchanged.)
+
+Namedtuple slot wiring (C11 gap, §3.4): make_new.rs gained namedtuple_make_new_slot;
+objnamedtuple.rs gained namedtuple_attr_fn + namedtuple_factory_builtin; new_namedtuple_type
+now sets attr + make_new (was None/None, so P(1,2) raised "can't create instance").
+
+BuiltinTypes gained deque / ordereddict / namedtuple_fn: Option<GcRef> (the D3 socket
+precedent); 8 test fixtures that construct BuiltinTypes literally gained the three
+fields (containers/tests.rs, obj_tests.rs, objtype_tests.rs, primitives/tests.rs,
+primitives/tests_dispatch.rs, strings/objstr_tests.rs, runtime/bc_tests.rs, runtime/vm.rs).
+
+§2 — Reference probes (all on ~/workspace/petitpy-orig/zig-out/bin/petitpy, 2026-11-18)
+----------------------------------------------------------------------------------------
+time: time() float >0; time_ns/monotonic_ns int; ticks_ms int >=0; ticks_diff(10,3)=7;
+  sleep(-1) -> OSError(22,); sleep_ms(-5) -> None; sleep_ms("x") -> TypeError "can't convert
+  to int"; sleep("x") -> TypeError "can't convert to float"; sleep_ms(1.5) -> TypeError
+  (float NOT convertible); sleep(inf) ABORTS rc=134 (@intFromFloat panic, modtime.zig:119);
+  sleep(nan) -> OSError(22,); sleep_ms(2**62) sleeps effectively forever.
+gc: collect()=0; isenabled() True -> disable -> False -> enable -> True; mem_alloc/mem_free
+  ints >=0. gc.threshold DOES NOT EXIST: AttributeError (see §3.1).
+errno: ENOENT=2, EPERM=1, EINVAL=22, EINPROGRESS=115; len(errorcode)=22; errorcode[2]='ENOENT';
+  errorcode[999] -> KeyError.
+select: select([],[],[],0) -> ([],[],[]); ([],[],[],0.01) same; ([],[],[],-1) -> OSError(22,);
+  select([],[]) -> TypeError "argument num/types mismatch"; select([],[],[],"x") -> TypeError
+  "can't convert to float"; select([0],[],[],0) -> ([],[],[]); select(1,[],[],0) ABORTS
+  rc=134 (alignment panic, MpObjList.fromObj, modselect.zig:132).
+signal: SIGTERM=15, SIGINT=2, SIGHUP=1, SIGUSR1=10, SIGUSR2=12, SIGKILL=9, SIG_DFL=0, SIG_IGN=1;
+  getsignal(15)=0 initially; signal(15,h) returns 0; getsignal(15) then returns h;
+  out-of-range (999, -1) -> 0 both ways.
+pwd/grp: getpwnam('root') = (pw_name='root', pw_passwd='x', pw_uid=0, pw_gid=0, pw_gecos='root',
+  pw_dir='/root', pw_shell='/bin/bash'); missing -> KeyError(arg); getpwnam(123) -> KeyError;
+  grp.getgrnam('root') gr_mem=[]; getpwuid(-1), getpwuid(2**40), getgrgid(-1) ABORT rc=134
+  (@intCast to c_uint panic, modpwd.zig:104 / modgrp.zig:97).
+micropython: opt_level()=0 default; const(5)=5, const("x")="x"; heap_lock()->None;
+  heap_unlock() after lock -> 0; double lock + two unlocks -> 0, 0; unmatched heap_unlock()
+  ABORTS rc=134 (integer-overflow panic, gc.zig:199 lock_depth -= 1).
+collections/ucollections: `import collections` loads the FROZEN petitpy-lib Python package
+  (Counter/defaultdict, list-backed deque with bases (<class 'list'>,), NO __file__);
+  `import ucollections` -> the extensible NATIVE module (ucollections.__name__=='collections'
+  but a DIFFERENT module object; ucollections.deque is collections.deque is False; the
+  native deque requires 2 args); namedtuple/OrderedDict ARE the same objects. sys.modules
+  keys after the imports: only ['collections']. deque_micropython.py FAILS on the reference
+  (rc=1, TypeError at deque((), 2, True)) — one of the 7 known-fails, because the frozen
+  package shadows the native deque. deque1.py passes (rc=0) with the Python deque.
+u-strip probe (18 names): OK (extensible): uerrno->errno, uarray->array,
+  ucollections->collections, usys->sys (hardcoded special case), uio->io, ustruct->struct,
+  ure->re. FAIL (ModuleNotFoundError): uos, ugc, utime, uselect, usignal, upwd, ugrp,
+  umicropython, ujson, umath, usocket.
+__main__: sys.modules is EMPTY at script start; import __main__ works, __main__.x==42,
+  __main__.__name__=='__main__', repr <module '__main__'>; sys.modules['__main__'] -> KeyError.
+Corpus: errno1.py (OSError(errno.EIO) rendering — C12b's table); gc1.py (threshold guarded by
+  hasattr — skipped); deque1.py/deque2.py (from collections import deque, 2-arg);
+  namedtuple1.py (T = namedtuple("Tup", ["foo","bar"]), T(1,2), kwargs); ordereddict1.py /
+  class_ordereddict.py; array_micropython.py (array.array('O')); int_big_to_small.py
+  (micropython.heap_lock/unlock).
+
+§3 — Bugs found / brief corrections (all verified against the original)
+--------------------------------------------------------------------------------
+3.1 gc.threshold DOES NOT EXIST on the reference build. modgc.zig's header comment claims
+    full -> MICROPY_GC_ALLOC_THRESHOLD=1, but port/mpconfigport.h:35 sets
+    MICROPY_CONFIG_ROM_LEVEL to MINIMUM even in the full build, so the macro is 0.
+    gc module = 7 entries, NO threshold (corpus gc1.py guards it with hasattr).
+3.2 heap_unlock() ALWAYS returns 0. The Zig returns state.threadState().gc_lock_depth
+    (mpstate.zig:150, u16), a field NEVER written anywhere; the real counter is the
+    module-level lock_depth in gc.zig:130. Rust returns SmallInt(0) always. Unmatched
+    heap_unlock() aborts the reference (gc.zig:199 underflow); Rust's GcArena::unlock
+    panics the same way (checked_sub + expect) — same abort class, never tested e2e.
+3.3 The Rust import had NO u-strip and NO usys case (C15b gap). The objmodule.rs
+    module_get_builtin port HAS both but is test-only; the live path
+    (builtinimport.rs builtin_lookup_by_bytes, used by process_component) had neither.
+    Implemented there, in the Zig's order (builtin -> usys -> strip -> extensible).
+3.4 C11 left namedtuple classes with make_new: None / attr: None, although the Zig
+    attaches namedtuple_make_new (slot 1) and namedtuple_attr (slot 5)
+    (objnamedtuple.zig:196,210). P(1,2) raised "can't create instance" and P(1,2).x
+    raised AttributeError through the VM. Wired in D4 (make_new slot adapter +
+    attr adapter + factory builtin); the D4 e2e test d4_collections_namedtuple
+    covers P(1,2), t.foo, t[1], and kwargs T(bar=1, foo=2).
+3.5 "deque is NOT a static qstr" (objdeque.rs:386 comment) is stale/wrong — deque IS in
+    the generated qstr header (static_qstr_id(b"deque") works; the collections
+    builder uses it).
+3.6 REAL MASTER BUG found by the D4 e2e test: array_make_new used the arena-only
+    str_data for the typecode, so array.array('i', [1,2]) raised TypeError("can't
+    convert to str implicitly") — 'i' is a DYNAMIC qstr (not in the static table),
+    invisible to str_data. Fixed with str_data_pool (the C13b str_equal fix class).
+    The bytearray path has no such call site (no typecode arg).
+3.7 help("modules") test fix (pre-existing test, not a brief item): help_modules_list_columns
+    retained out only io/sys/os from the real registries; D4 registers 10 more modules,
+    so the expected column output broke. The test now clears both tables first (same
+    expected output). No production code changed for this.
+3.8 Reference aborts Rust raises instead (intentional divergences, same class as
+    C8b/C9b): select() non-list arg (rc=134); getpwuid/getgrgid negative/huge ids
+    (rc=134); sleep(inf) (rc=134); opt_level(-1) wraps instead of aborting
+    (@intCast(usize) panic — the wrap round-trips through the read path).
+
+§4 — Not done / documented limitations
+---------------------------------------
+- select(): exact only for empty lists; any non-empty list raises NotImplementedError
+  ("select.select is not implemented (no std select API)" — the D2 os.kill stub
+  precedent). Pure std has no select/poll API; a listener-accept check would
+  destructively consume pending connections and FIFO/stdin readiness is unknowable.
+  The integration tests (tests/test_integration_os.py:662+) exercise the empty-lists
+  case plus real-fd cases; the real-fd cases are this gap.
+- signal handlers are recorded but NEVER dispatched on delivery (the Zig's MVP
+  limitation, documented in modsignal.zig's header — delivery needs a bytecode-loop
+  safepoint dispatcher, deferred in the original too). The process behaves per libc
+  defaults.
+- pwd/grp parse /etc/passwd + /etc/group only (no NSS/LDAP — same data on this machine).
+- getpwuid/getgrgid negative/huge ids raise KeyError instead of aborting (§3.8).
+- __main__ before any module load -> ModuleNotFoundError (the reference always has
+  dict_main from mp_init; Rust sets main_module only when a module is loaded as
+  "__main__" — Phase E entry work).
+- The reference's `import collections` loads the frozen Python package (Counter,
+  defaultdict, list-backed deque) — D5's frozen bundle reproduces the shadowing; the
+  native module is what ucollections (and a build without the frozen bundle) resolves to.
+- opt_level(-1) wraps instead of aborting (§3.8); sleep(inf) sleeps Duration::MAX
+  instead of aborting (§3.8); sleep(nan) -> OSError(EINVAL) (matches the reference).
+- vm.rs was 600 after the D4 edits (over the 592 cap) — load_module_from_mpy moved to
+  vm_eval.rs (vm.rs 567). objarray.rs is at 790 (10 headroom — the str_data_pool fix
+  added lines; do not grow without splitting).
+- map.rs (860) and gc.rs (830) remain over the cap (pre-existing, unscheduled).
+
+Files changed (20 modified + 14 new, brief scripts/d4_brief.md stays untracked):
+  new: src/modules/{modtime,modselect,modgc,moderrno,modsignal,modpwd,modgrp,
+       modmicropython,modcollections,modarray,modmain,sysdb}.rs, src/modules/modd4_tests.rs,
+       src/runtime/d4state.rs
+  modified: src/modules/mod.rs, src/objects/builtin_types.rs,
+       src/objects/containers/objarray.rs, src/objects/containers/tests.rs,
+       src/objects/iters/objnamedtuple.rs, src/objects/obj_tests.rs,
+       src/objects/objtype/make_new.rs, src/objects/objtype/objtype_tests.rs,
+       src/objects/primitives/tests.rs, src/objects/primitives/tests_dispatch.rs,
+       src/objects/strings/objstr_tests.rs, src/runtime/bc_tests.rs,
+       src/runtime/builtinhelp_tests.rs, src/runtime/builtinimport.rs, src/runtime/mod.rs,
+       src/runtime/vm.rs, src/runtime/vm_call_intercept.rs, src/runtime/vm_eval.rs,
+       src/runtime/vm_modules.rs, src/runtime/vm_types.rs

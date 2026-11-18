@@ -69,16 +69,25 @@ impl Vm {
             module_ref,
         );
         if register {
-            state.modules.insert(name_id, module_ref);
-            // Keep the live `sys.modules` dict in step (D2;
-            // file modules only — see `create_and_register`).
-            if let Some(mirror) = state.sys_modules_dict {
-                let _ = crate::objects::containers::objdict::dict_store(
-                    ctx,
-                    Value::Heap(mirror),
-                    Value::Qstr(name_id),
-                    module_val,
-                );
+            // D4: the entry module is `__main__` — the original
+            // never caches it in the loaded registry or in
+            // `sys.modules` (its globals dict is `dict_main`,
+            // initialised at `mp_init`); `import __main__`
+            // resolves through `state.d4.main_module` instead
+            // (set by `load_module_from_mpy`).
+            let is_main = ctx.pool.qstr_str(name_id as u16) == b"__main__";
+            if !is_main {
+                state.modules.insert(name_id, module_ref);
+                // Keep the live `sys.modules` dict in step (D2;
+                // file modules only — see `create_and_register`).
+                if let Some(mirror) = state.sys_modules_dict {
+                    let _ = crate::objects::containers::objdict::dict_store(
+                        ctx,
+                        Value::Heap(mirror),
+                        Value::Qstr(name_id),
+                        module_val,
+                    );
+                }
             }
         }
         Ok((module_val, code_idx))
@@ -421,4 +430,40 @@ impl Vm {
     ) {
         self.state.frozen_modules = table;
     }
+}
+
+impl Vm {
+    /// Load a module from `.mpy` bytes (the `petitpy-vm` entry
+    /// point): read, register, run the module body.
+    pub fn load_module_from_mpy(&mut self, data: &[u8], name: &str) -> Result<Value, VmError> {
+        let (module_val, code_idx) = self.register_mpy_code(data, name, None, true)?;
+        let module_ref = match module_val {
+            Value::Heap(r) => r,
+            _ => unreachable!("new_module returns a heap module"),
+        };
+        // The module's globals dict is its `dict` — the frame's
+        // globals while the body runs.
+        let globals = match self.arena.get(module_ref) {
+            Obj::Module(m) => m.dict,
+            _ => unreachable!("module object"),
+        };
+        // Pin the module object (its dict is traced through it).
+        self.pin(module_val);
+        // D4: the entry module is `__main__` — record it so
+        // `import __main__` resolves (the original's
+        // `dict_main`, never cached in `sys.modules`).
+        if name == "__main__" {
+            self.state.d4.main_module = Some(module_ref);
+        }
+        self.state.globals = globals;
+        // Run the module body as a 0-arg function call.
+        let fun = Value::Heap(self.call_module_fun(code_idx, module_val));
+        let result = crate::runtime::vm_ops::call_function(self, fun, 0, 0, &[]);
+        match result {
+            Ok(_) => Ok(module_val),
+            Err(exc) => Err(VmError::Raised(exc)),
+        }
+    }
+
+
 }

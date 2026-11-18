@@ -58,7 +58,7 @@ use crate::objects::containers::objarray_methods::array_extend_impl;
 use crate::objects::obj::{obj_get_int, obj_len_maybe, ObjError};
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
-use crate::objects::strings::objstr_a::{str_data, StrError};
+use crate::objects::strings::objstr_a::{str_data_pool, StrError};
 use crate::objects::strings::objstr_methods_b::str_print_quoted;
 use crate::objects::strings::objstr_methods_c::{kw_make_new, KwArg};
 use crate::objects::value::{ArrayData, GcRef, Obj, TypeData, Value};
@@ -399,11 +399,17 @@ pub fn array_make_new(
         None
     };
     let tc_str = match args.first() {
-        Some(&a) => match str_data(ctx.arena, a) {
+        // D4: the pool-aware `str_data_pool`, not the
+        // arena-only `str_data` — the typecode is usually a
+        // string literal (`'i'`), which is a DYNAMIC qstr
+        // (not in the static table), so `str_data` returned
+        // `None` and `array('i', ...)` raised "can't convert
+        // to str implicitly" (the C13b `str_equal` fix class).
+        Some(&a) => match str_data_pool(ctx.arena, ctx.pool, a) {
             Some(b) => b,
             None => return Err(ArrayError::NotStr),
         },
-        None => &[],
+        None => Vec::new(),
     };
     let tc = tc_str.first().copied().unwrap_or(0);
     if args.len() == 1 {

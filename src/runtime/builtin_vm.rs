@@ -264,6 +264,31 @@ pub fn call_hash_ctx(
     }
 }
 
+/// `gc.collect` (F6): intercepted by GcRef identity so the
+/// finaliser drain runs with full VM state (see
+/// `crate::runtime::finaliser::drain_pending_finalisers`). Runs
+/// the collector, then drains the pending-finaliser list
+/// (`__del__` on dropped files/sockets, protected), and returns
+/// 0 always (C4: the bumping collector never sets gc_collected).
+/// Arity is (0, 0) — interception bypasses `call_fun_builtin`'s
+/// sig check, so the mismatch is reproduced by hand
+/// (`gc.collect(1)` → `TypeError: argument num/types mismatch`,
+/// probed on both binaries).
+pub fn call_gc_collect_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    _args: &[Value],
+) -> Result<Value, Value> {
+    if n_args != 0 || n_kw != 0 {
+        return Err(mismatch(ctx, state));
+    }
+    let _ = ctx.arena.collect(ctx.roots);
+    crate::runtime::finaliser::drain_pending_finalisers(ctx, state);
+    Ok(Value::SmallInt(0))
+}
+
 /// `str.format` (F3): intercepted by GcRef identity so an
 /// instance arg runs its `__format__` / `__str__` through the
 /// VM's real call hook (see `str_format_hook`); anything else

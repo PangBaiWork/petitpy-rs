@@ -64,12 +64,16 @@ fn gc_mem_alloc_builtin(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> {
 }
 
 /// `build_gc_module` (`modgc.zig` table, full build): 7
-/// entries — NO `threshold` (see the module docs).
+/// entries — NO `threshold` (see the module docs). Returns
+/// `(module, collect_fn)`: the `collect` `FunBuiltin` is
+/// captured by `VmState.gc_collect_builtin` so `gc.collect()`
+/// can be intercepted (F6 — the finaliser drain needs full VM
+/// state; see `call_gc_collect_ctx`).
 pub fn build_gc_module(
     ctx: &mut CallCtx,
     fun_builtin_var: GcRef,
     module_type: GcRef,
-) -> PyResult<Value> {
+) -> PyResult<(Value, Value)> {
     let (module, dict) = new_d4_module(ctx, "gc", module_type);
     let collect = mk_fun(ctx, fun_builtin_var, "collect", 0, 0, gc_collect_builtin, None);
     let disable = mk_fun(ctx, fun_builtin_var, "disable", 0, 0, gc_disable_builtin, None);
@@ -84,5 +88,5 @@ pub fn build_gc_module(
     store(ctx, dict, "mem_free", mem_free);
     store(ctx, dict, "mem_alloc", mem_alloc);
     fix_dict(ctx, dict);
-    Ok(module)
+    Ok((module, collect))
 }

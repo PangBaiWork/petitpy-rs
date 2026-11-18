@@ -200,6 +200,13 @@ pub struct VmState {
     /// `builtin_vm.rs`) — `format(Q(), 'y')` needs the same
     /// hook as `str.format`.
     pub format_builtin: Value,
+    /// The `gc.collect` builtin (F6): the plain `FunBuiltin`
+    /// from the gc module dict. Intercepted by GcRef identity in
+    /// `call_function_ctx` (see `call_gc_collect_ctx` in
+    /// `builtin_vm.rs`) — the finaliser drain needs full VM state
+    /// to materialise a `__del__` raise for the protected print,
+    /// which the ctx-only `gc_collect_builtin` cannot do.
+    pub gc_collect_builtin: Value,
     pub min_builtin: Value,
     pub max_builtin: Value,
     pub getattr_builtin: Value,
@@ -492,6 +499,7 @@ impl Vm {
                 hash_builtin: Value::None,
                 str_format_builtin: Value::None,
                 format_builtin: Value::None,
+                gc_collect_builtin: Value::None,
                 min_builtin: Value::None,
                 max_builtin: Value::None,
                 getattr_builtin: Value::None,

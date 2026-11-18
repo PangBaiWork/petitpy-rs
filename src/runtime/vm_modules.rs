@@ -137,8 +137,12 @@ pub fn build_d4_modules(vm: &mut Vm) {
         .expect("D4 time module build cannot fail");
     let select = build_select_module(&mut ctx, fun_builtin_var, module_type)
         .expect("D4 select module build cannot fail");
-    let gc = build_gc_module(&mut ctx, fun_builtin_var, module_type)
+    let (gc, gc_collect) = build_gc_module(&mut ctx, fun_builtin_var, module_type)
         .expect("D4 gc module build cannot fail");
+    // F6: `gc.collect` is intercepted by GcRef identity so the
+    // finaliser drain runs with full VM state (see
+    // `call_gc_collect_ctx`).
+    state.gc_collect_builtin = gc_collect;
     let signal = build_signal_module(&mut ctx, &mut *state);
     let pwd = build_pwd_module(&mut ctx, fun_builtin_var, module_type)
         .expect("D4 pwd module build cannot fail");

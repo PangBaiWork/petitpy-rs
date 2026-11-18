@@ -51,7 +51,7 @@
 //!   unwritten slot, unreachable through the API) reads back as
 //!   `None`.
 
-use crate::memory::gc::CallCtx;
+use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::obj::{obj_get_int, ObjError};
 use crate::objects::value::{GcRef, Obj, Value, SMALL_INT_MAX, SMALL_INT_MIN};
 use crate::pyerr::PyError;
@@ -552,6 +552,38 @@ pub fn binary_set_val_array_from_int(
 /// (`array('x')` → `ValueError("bad typecode")`).
 pub fn array_item_size(typecode: u8) -> Result<usize, BinaryError> {
     Ok(binary_get_size(b'@', typecode)?.0)
+}
+
+/// Arena-only raw bytes of an `Obj::Array` (E2e): the
+/// `buffer_bytes` array logic without the `CallCtx` (the Qstr
+/// arm is not needed — `str_data_pool` handles qstrs itself).
+/// Resolves view chains from the arena (`source` is the base
+/// `Array` / `Bytes` / `Str`, `free` the element offset).
+/// `None` when the value is not an `Array`, the typecode is
+/// unknown, or a view runs past its base. Used by
+/// `str_data_pool` so the str methods read a bytearray `self`
+/// (the vendor's shared str/bytes/bytearray method table calls
+/// the same C functions on all three).
+pub fn array_raw_bytes(arena: &GcArena, r: GcRef) -> Option<Vec<u8>> {
+    let Obj::Array(a) = arena.get(r) else {
+        return None;
+    };
+    let tc = a.typecode & TYPECODE_MASK;
+    let sz = array_item_size(tc).ok()?;
+    match a.source {
+        None => a.data.get(..a.len.checked_mul(sz)?).map(|d| d.to_vec()),
+        Some(src) => {
+            let base = match arena.get(src) {
+                Obj::Array(_) => array_raw_bytes(arena, src)?,
+                Obj::Bytes(b) => b.bytes.clone(),
+                Obj::Str(s) => s.bytes.clone(),
+                _ => return None,
+            };
+            let off = a.free.checked_mul(sz)?;
+            let end = off.checked_add(a.len.checked_mul(sz)?)?;
+            base.get(off..end).map(|d| d.to_vec())
+        }
+    }
 }
 
 /// The readable bytes of a buffer-protocol value + its reported

@@ -393,6 +393,37 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
         };
         return result.map_err(|e| crate::runtime::vm_seams::drain_hook_raise(ctx, state, e));
     }
+    // MODULO on an exact str/bytes lhs (E2e): the `%`-format
+    // path needs the VM's hook for `__int__` dispatch in the
+    // `%d`/`%o`/`%x` arms (the slot's stub seams cannot run a
+    // FunBc `__int__` — `"%d" % A()` raised "can't convert to
+    // int"). The generic loop below would reach the same slot
+    // without a hook; intercept here so the hook is available.
+    // Only exact str/bytes: a subclass instance or an instance
+    // with `__mod__` keeps the generic loop (its
+    // `try_instance_binary_op` runs first there), and a
+    // reflected `__rmod__` never runs for a str lhs either way
+    // (the str slot answers first, in both paths).
+    if op == BinaryOp::Modulo || op == BinaryOp::InplaceModulo {
+        let lt = obj_get_type(ctx.arena, ctx.types, lhs);
+        if lt == Some(ctx.types.str_) || lt == Some(ctx.types.bytes) {
+            let types = ctx.types;
+            let result = {
+                let mut hook = crate::runtime::vm_seams::make_hook(state);
+                crate::objects::strings::objstr_format::str_modulo_format_hook(
+                    ctx,
+                    types,
+                    lhs,
+                    rhs,
+                    Some(&mut hook),
+                )
+            };
+            return result.map_err(|e| {
+                let pe = crate::objects::strings::objstr_a::slot_raise(ctx, e);
+                crate::runtime::vm_seams::drain_hook_raise(ctx, state, pe)
+            });
+        }
+    }
     // EXCEPTION_MATCH → `exception_match` (tuple form included).
     if op == BinaryOp::ExceptionMatch {
         if is_exception_type(ctx.arena, rhs, state.exc.base_exception) {

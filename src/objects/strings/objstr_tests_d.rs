@@ -11,10 +11,16 @@ use super::objstr_tests::{
     assert_err, assert_str, big_2_pow_70, bytes_of, dict_of, float_of, fmt_pct, fmt_str, iv,
     qid, Fx,
 };
-use crate::objects::strings::objstr_a::{StrError, StrExc};
+use crate::objects::containers::objarray::new_bytearray;
+use crate::objects::obj::obj_get_type;
+use crate::objects::slots::BinaryOp;
+use crate::objects::strings::objstr_a::{buffer_data, str_data_pool, StrError, StrExc};
 use crate::objects::strings::objstr_format::str_modulo_format;
-use crate::objects::strings::objstr_methods_c::KwArg;
-use crate::objects::value::Value;
+use crate::objects::strings::objstr_methods_a::{str_find, str_join};
+use crate::objects::strings::objstr_b::{str_center, str_count, str_partition};
+use crate::objects::strings::objstr_methods_c::{binary_op_inner, KwArg};
+use crate::objects::value::{Obj, Value};
+use crate::objects::value_data::ArrayData;
 
 // ── `%`-format ────────────────────────────────────────────────────────
 
@@ -452,4 +458,152 @@ fn format_mixing_errors() {
     let l = fx.list(vec![iv(1)]);
     let e = fmt_str(&mut fx, b"{:>5}", &[l], &[]).unwrap_err();
     assert_err(e, StrExc::TypeError, Some("can't convert to str implicitly"));
+}
+
+// ── E2e: `str.format` kwargs with dynamic names ─────────────────────────
+// `kwargs_lookup` used to require the field name to be a STATIC
+// qstr (`find_static_qstr`), so `"{foo}".format(foo="bar")` raised
+// `KeyError: foo` — kwarg names from source are dynamic qstrs.
+
+#[test]
+fn e2e_format_kwargs_dynamic_names() {
+    let mut fx = Fx::new();
+    let foo = fx.pool.from_strn(b"foo").unwrap() as u32;
+    let name = fx.s(b"bar");
+    let r = fmt_str(&mut fx, b"{foo}", &[], &[KwArg { name: foo, value: name }]).unwrap();
+    assert_str(&fx, r, b"bar");
+    // Nested spec fields from kwargs (corpus `string_format.py`).
+    let text = fx.pool.from_strn(b"text").unwrap() as u32;
+    let align = fx.pool.from_strn(b"align").unwrap() as u32;
+    let width = fx.pool.from_strn(b"width").unwrap() as u32;
+    let text_v = fx.s(b"foo");
+    let align_v = fx.s(b"<");
+    let r = fmt_str(
+        &mut fx,
+        b"{text:{align}{width}}",
+        &[],
+        &[
+            KwArg { name: text, value: text_v },
+            KwArg { name: align, value: align_v },
+            KwArg { name: width, value: iv(20) },
+        ],
+    )
+    .unwrap();
+    assert_str(&fx, r, b"foo                 ");
+}
+
+// ── E2e: bytes/array/bytearray buffer operands ──────────────────────────
+// `buffer_data` used to fail for array/bytearray (the `get_buffer`
+// raw pointer can only be read with `unsafe`), so `bytes +
+// array('b', ...)` raised `TypeError` and `bytes(array(...))`
+// raised "object not iterable".
+
+fn e2e_array_b(fx: &mut Fx, data: &[u8]) -> Value {
+    let types = fx.types;
+    Value::Heap(fx.ctx().alloc(
+        Some(types.array),
+        Obj::Array(ArrayData {
+            typecode: b'b',
+            free: 0,
+            len: data.len(),
+            data: data.to_vec(),
+            source: None,
+        }),
+    ))
+}
+
+#[test]
+fn e2e_bytes_buffer_operands() {
+    let mut fx = Fx::new();
+    let types = fx.types;
+    let arr = e2e_array_b(&mut fx, b"cd");
+    let d = buffer_data(&mut fx.ctx(), &types, arr).unwrap();
+    assert_eq!(d, b"cd");
+    let ba = Value::Heap(new_bytearray(&mut fx.ctx(), types.bytearray, b"cd"));
+    let d = buffer_data(&mut fx.ctx(), &types, ba).unwrap();
+    assert_eq!(d, b"cd");
+    // `bytes + array('b')` → bytes; `bytes + bytearray` → bytes.
+    let b = fx.b(b"ab");
+    let r = binary_op_inner(&mut fx.ctx(), &types, BinaryOp::Add, b, arr)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes_of(&fx, r), b"abcd");
+    let b = fx.b(b"ab");
+    let r = binary_op_inner(&mut fx.ctx(), &types, BinaryOp::Add, b, ba)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes_of(&fx, r), b"abcd");
+    // `bytes < bytearray` compares raw bytes.
+    let b = fx.b(b"ab");
+    let r = binary_op_inner(&mut fx.ctx(), &types, BinaryOp::Less, b, ba)
+        .unwrap()
+        .unwrap();
+    assert_eq!(r, Value::Bool(true));
+    // `array('b') in bytes` — the `Contains` arm reads the
+    // needle as a buffer too (slot convention: lhs is the
+    // container, rhs the needle).
+    let needle = e2e_array_b(&mut fx, b"b");
+    let hay = fx.b(b"abc");
+    let r = binary_op_inner(&mut fx.ctx(), &types, BinaryOp::Contains, hay, needle)
+        .unwrap()
+        .unwrap();
+    assert_eq!(r, Value::Bool(true));
+}
+
+// ── E2e: bytearray str methods ─────────────────────────────────────────
+// The bytearray type dict used to be `ARRAY_METHODS` only
+// (append/extend), so `bytearray(b"...").find(...)` raised
+// `AttributeError`; the str method implementations also read
+// `self` through `str_data_pool`, which returned `None` for
+// `Obj::Array`.
+
+#[test]
+fn e2e_bytearray_str_methods() {
+    let mut fx = Fx::new();
+    let types = fx.types;
+    // Pool-aware `bytes_of`: `str_data` is arena-only and
+    // returns `None` for `Obj::Array` results.
+    let ba_bytes = |fx: &Fx, v: Value| str_data_pool(&fx.arena, &fx.pool, v).unwrap().to_vec();
+    let ba = Value::Heap(new_bytearray(&mut fx.ctx(), types.bytearray, b"hello world"));
+    let needle = fx.b(b"ll");
+    let r = str_find(&mut fx.ctx(), &types, &[ba, needle]).unwrap();
+    assert_eq!(r, iv(2));
+    let sub = fx.b(b"l");
+    let r = str_count(&mut fx.ctx(), &types, &[ba, sub]).unwrap();
+    assert_eq!(r, iv(3));
+    let r = str_center(&mut fx.ctx(), &types, &[ba, iv(13)]).unwrap();
+    assert_eq!(ba_bytes(&fx, r), b" hello world ");
+    // `partition`'s middle element is a bytearray when the
+    // separator's type differs from self's (vendor
+    // `partitionerImpl`, `objstr.zig:2172-2176`).
+    let sep = fx.b(b"l");
+    let r = str_partition(&mut fx.ctx(), &types, &[ba, sep]).unwrap();
+    let items = match r {
+        Value::Heap(g) => match fx.arena.get(g) {
+            Obj::Tuple(items) => items.clone(),
+            _ => panic!("partition did not return a tuple"),
+        },
+        _ => panic!("partition did not return a heap value"),
+    };
+    assert_eq!(ba_bytes(&fx, items[0]), b"he");
+    assert_eq!(obj_get_type(&fx.arena, &types, items[1]), Some(types.bytearray));
+    assert_eq!(ba_bytes(&fx, items[1]), b"l");
+    assert_eq!(ba_bytes(&fx, items[2]), b"lo world");
+    // `bytes.join` accepts bytearray elements (integration
+    // `str_join_bytes_bytearray`); the result type stays the
+    // separator's type.
+    let sep = fx.b(b"-");
+    let elem_a = Value::Heap(new_bytearray(&mut fx.ctx(), types.bytearray, b"a"));
+    let elem_b = fx.b(b"b");
+    let elems = fx.list(vec![elem_a, elem_b]);
+    let r = str_join(&mut fx.ctx(), &types, &[sep, elems]).unwrap();
+    assert_eq!(ba_bytes(&fx, r), b"a-b");
+    assert_eq!(obj_get_type(&fx.arena, &types, r), Some(types.bytes));
+    let sep = Value::Heap(new_bytearray(&mut fx.ctx(), types.bytearray, b","));
+    let ea = fx.b(b"a");
+    let eb = fx.b(b"b");
+    let elems = fx.list(vec![ea, eb]);
+    let r = str_join(&mut fx.ctx(), &types, &[sep, elems]).unwrap();
+    assert_eq!(ba_bytes(&fx, r), b"a,b");
+    assert_eq!(obj_get_type(&fx.arena, &types, r), Some(types.bytearray));
 }

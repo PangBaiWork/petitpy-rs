@@ -156,7 +156,15 @@ pub fn partitioner_impl(
     }
     if let Some(pos) = crate::objects::strings::objstr_a::find_subbytes(&data, &sep, direction) {
         result[0] = new_str_of_type(ctx, types, self_type, &data[..pos]);
-        result[1] = arg;
+        // E2e: the vendor wraps a copy of the separator in
+        // self's type when the arg's type differs (bytes sep on
+        // a bytearray self → a bytearray sep;
+        // `objstr.zig:2172-2176`, the BYTEARRAY comment).
+        result[1] = if obj_get_type(ctx.arena, types, arg) != Some(self_type) {
+            new_str_of_type(ctx, types, self_type, &sep)
+        } else {
+            arg
+        };
         result[2] = new_str_of_type(ctx, types, self_type, &data[pos + sep.len()..]);
     }
     Ok(Value::Heap(ctx.alloc(

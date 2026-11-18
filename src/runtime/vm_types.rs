@@ -390,7 +390,39 @@ pub(crate) fn build_vm_types(
     let slice = ctx.alloc(None, Obj::Type(slice_type_data(slice_dict)));
     let array_dict = locals_dict_from_entries(ctx, fun_builtin_var, Some(classmethod), ARRAY_METHODS, &[], &[]);
     let array = ctx.alloc(None, Obj::Type(array_type_data(array_dict)));
-    let bytearray_dict = locals_dict_from_entries(ctx, fun_builtin_var, Some(classmethod), ARRAY_METHODS, &[], &[]);
+    // E2e: bytearray's locals are the vendor's shared table
+    // (`array_bytearray_str_bytes_locals_table`,
+    // `objstr.zig:3533-3614`) — `ARRAY_METHODS` (append, extend)
+    // plus `BYTES_METHODS` (hex, fromhex, decode, find, …,
+    // isalnum). The bytes entries take the bytes dict's
+    // (1, 255) sig (their wrappers enforce their own arity);
+    // `fromhex` stays a classmethod and `splitlines` keeps its
+    // kw wrapper, as on `bytes`.
+    let mut bytearray_entries: Vec<MethodEntry> = ARRAY_METHODS
+        .iter()
+        .map(|e| MethodEntry {
+            name: e.name,
+            func: e.func,
+            min: e.min,
+            max: e.max,
+            kw_func: e.kw_func,
+        })
+        .collect();
+    bytearray_entries.extend(BYTES_METHODS.iter().map(|(name, func)| MethodEntry {
+        name,
+        func: *func,
+        min: 1,
+        max: 255,
+        kw_func: None,
+    }));
+    let bytearray_dict = locals_dict_from_entries(
+        ctx,
+        fun_builtin_var,
+        Some(classmethod),
+        &bytearray_entries,
+        &[("splitlines", str_splitlines_kw_wrapper)],
+        &[("fromhex", fun_n_args(2, 3))],
+    );
     let bytearray = ctx.alloc(None, Obj::Type(bytearray_type_data(bytearray_dict)));
     let memoryview_dict = empty_dict(ctx);
     let memoryview = ctx.alloc(None, Obj::Type(memoryview_type_data(memoryview_dict)));

@@ -26,6 +26,7 @@
 
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::containers::map_set::set_items;
+use crate::objects::containers::objdict::DictError;
 use crate::objects::obj::{
     obj_get_int_maybe, obj_get_type, qstr_bytes, BuiltinTypes, ObjError, BUFFER_READ,
 };
@@ -69,6 +70,9 @@ pub fn str_data<'a>(arena: &'a GcArena, v: Value) -> Option<&'a [u8]> {
 /// module (`"hello"[1]`, `"a" + "b"`, `"%d" % x`) read as
 /// "not implemented" / "isn't subscriptable". Returns an owned
 /// copy (the pool and arena borrows have different lifetimes).
+/// E2e: a bytearray also reads here (its raw bytes — the
+/// vendor's shared str/bytes/bytearray method table); int
+/// arrays and memoryviews still return `None`.
 pub fn str_data_pool(
     arena: &GcArena,
     pool: &crate::runtime::qstr::RuntimeQstr,
@@ -79,6 +83,19 @@ pub fn str_data_pool(
         Value::Heap(r) => match arena.get(r) {
             Obj::Str(s) => Some(s.bytes.clone()),
             Obj::Bytes(b) => Some(b.bytes.clone()),
+            // E2e: a bytearray carries str/bytes semantics in the
+            // vendor's shared method table
+            // (`array_bytearray_str_bytes_locals_table`,
+            // `objstr.zig:3533-3614`), so the str methods read
+            // its raw bytes. Only the bytearray typecode (1):
+            // int arrays and memoryviews keep returning `None`
+            // here (their methods are append/extend / hex only).
+            Obj::Array(a)
+                if a.typecode
+                    == crate::objects::containers::binary::BYTEARRAY_TYPECODE =>
+            {
+                crate::objects::containers::binary::array_raw_bytes(arena, r)
+            }
             _ => None,
         },
         _ => None,
@@ -89,12 +106,10 @@ pub fn str_data_pool(
 /// (`npyStrGetBufferRaise` / `mp_get_buffer` with `MP_BUFFER_READ`):
 /// str/bytes payloads read via `str_data`; anything else probes
 /// `get_buffer` — no buffer → `BufferProtocol` ("object with buffer
-/// protocol required"). A buffer on a non-str/bytes object has no
-/// safe reader yet (this lane is `unsafe`-free and the raw pointer
-/// in `BufferInfo` can only be read with `unsafe` — C9 must add a
-/// safe copy when array/bytearray land, see the result file), so it
-/// reports the same error. Unreachable today: str/bytes are the
-/// only buffer providers.
+/// protocol required"). A buffer on a non-str/bytes object reads
+/// through the safe `buffer_bytes` copy (E2e: array/bytearray/
+/// memoryview are buffer providers since C13b, and the vendor's
+/// str slot reads any buffer rhs for a bytes lhs).
 pub fn buffer_data(
     ctx: &mut CallCtx,
     types: &BuiltinTypes,
@@ -108,6 +123,23 @@ pub fn buffer_data(
     // fix class).
     if let Some(d) = str_data_pool(ctx.arena, ctx.pool, v) {
         return Ok(d);
+    }
+    // E2e (item 1): array/bytearray/memoryview buffers read
+    // through the safe `buffer_bytes` copy
+    // (`containers::binary` — handles `Obj::Array` incl. view
+    // chains, `Obj::Bytes`, `Obj::Str`, Qstr). The vendor's str
+    // slot reads ANY buffer rhs for a bytes lhs via
+    // `npyStrGetBufferRead` (`objstr.zig:842-932`); the old code
+    // stopped at `get_buffer` `Ok(true)` because the raw pointer
+    // in `BufferInfo` can only be read with `unsafe` — the
+    // `buffer_bytes` copy is the safe reader C9 anticipated.
+    // (Float arrays: the reference cannot even construct
+    // `array('f', [1.0])` — its extend calls `mp_obj_get_int`
+    // on the float item — and `bytes(array('f', []))` panics it
+    // on a null items pointer; Rust returns the raw bytes /
+    // `b''` instead. Documented in `scripts/e2e_result.txt` §4.)
+    if let Some((bytes, _)) = crate::objects::containers::binary::buffer_bytes(ctx, v) {
+        return Ok(bytes);
     }
     let mut info = BufferInfo::empty();
     match get_buffer(ctx, types, v, &mut info, BUFFER_READ) {
@@ -179,6 +211,24 @@ pub fn iter_items(
             Obj::Dict(d) => JoinSource::Items(d.map.entries.iter().filter_map(|e| e.key).collect()),
             Obj::Set(s) => JoinSource::Items(set_items(&s.table)),
             Obj::Range(rg) => JoinSource::Range(rg.start, rg.stop, rg.step),
+            // E2e (item 1): a C11 iterator (`iter([128, 255])`)
+            // drains through the general collector (its
+            // `Protocol` arm runs `iternext` with the hook's
+            // seams, or the builtin-live stubs without one) —
+            // `bytes(iter([128, 255]))` is `b'\x80\xff'` on the
+            // reference. The error maps by kind: a raise inside
+            // the iterator is `PyRaise` (already stashed on the
+            // side channel), anything else is "not iterable".
+            Obj::Iterator(_) => {
+                return crate::objects::containers::objdict_collect::collect_iterable(
+                    ctx, arg, call,
+                )
+                .map_err(|e| match e {
+                    DictError::PyRaise => StrError::PyRaise,
+                    DictError::OutOfMemory => StrError::Obj(ObjError::OutOfMemory),
+                    _ => StrError::ObjectNotIterable,
+                });
+            }
             _ => return Err(StrError::ObjectNotIterable),
         },
         // Pool-aware (E2): `qstr_bytes` is static-only, so a
@@ -254,21 +304,31 @@ pub fn is_bytes_type(arena: &GcArena, types: &BuiltinTypes, v: Value) -> bool {
 }
 
 /// `str_check_arg_type` (`objstr.zig:664-680`): the argument's type
-/// must equal `self_type` (bytes ↔ bytearray are normalised to each
-/// other in the Zig; no bytearray type exists in Rust yet — C9 — so
-/// the normalisation is a no-op today and is recorded here, not
-/// silently dropped). Mismatch raises "can't convert to str
-/// implicitly".
+/// must equal `self_type`, with bytes ↔ bytearray normalised to
+/// each other first (the Zig normalises both sides to `bytes`).
+/// Mismatch raises "can't convert to str implicitly".
 pub fn str_check_arg_type(
     arena: &GcArena,
     types: &BuiltinTypes,
     self_type: Option<GcRef>,
     arg: Value,
 ) -> Result<(), StrError> {
-    // No bytearray type exists yet (C9); the Zig's bytes↔bytearray
-    // normalisation has nothing to normalise.
-    let arg_t = obj_get_type(arena, types, arg);
-    if arg_t != self_type {
+    // E2e: bytes ↔ bytearray are normalised to each other
+    // before the comparison (vendor `objstr.zig:664-680`,
+    // `str_check_arg_type` — "bytes and bytearray have the
+    // same byte-semantics"), so `bytearray(b"ab").find(b"a")`
+    // and `b"ab".find(bytearray(b"a"))` both pass. The old
+    // comment claimed no bytearray type existed in Rust (C9);
+    // it has existed since C13b.
+    let mut arg_t = obj_get_type(arena, types, arg);
+    let mut self_t = self_type;
+    if arg_t == Some(types.bytearray) {
+        arg_t = Some(types.bytes);
+    }
+    if self_t == Some(types.bytearray) {
+        self_t = Some(types.bytes);
+    }
+    if arg_t != self_t {
         return Err(StrError::BadImplicitConversion);
     }
     Ok(())
@@ -328,6 +388,23 @@ pub fn new_str_of_type(
 ) -> Value {
     if type_ == types.str_ {
         new_str(ctx, types, data)
+    } else if type_ == types.bytearray {
+        // E2e: the vendor's `mp_obj_new_str_type_from_vstr`
+        // builds a REAL bytearray for the bytearray type
+        // (`objstr.zig:3245-3247` — `mp_obj_new_bytearray_by_ref`),
+        // not a `Bytes` payload with a bytearray header (a
+        // `Bytes` payload would break `array_print` /
+        // `append` / mutation on the result).
+        Value::Heap(ctx.alloc(
+            Some(type_),
+            Obj::Array(crate::objects::value::ArrayData {
+                typecode: crate::objects::containers::binary::BYTEARRAY_TYPECODE,
+                free: 0,
+                len: data.len(),
+                data: data.to_vec(),
+                source: None,
+            }),
+        ))
     } else {
         Value::Heap(ctx.alloc(
             Some(type_),

@@ -319,8 +319,14 @@ fn object_new_checks() {
         object_new(&mut ctx, Value::Heap(int_t)),
         Err(ObjectError::TypeError(m)) if m == "arg must be user-type"
     ));
-    // An instance type passes both checks; allocation is C12a's.
-    assert!(matches!(object_new(&mut ctx, Value::Heap(foo)), Err(ObjectError::PyRaise)));
+    // An instance type passes both checks; allocation succeeds
+    // (E2g — `object.__new__` allocates via `new_instance`).
+    let v = object_new(&mut ctx, Value::Heap(foo)).expect("instance type allocates");
+    let Value::Heap(r) = v else {
+        panic!("object_new returns a heap value");
+    };
+    assert!(matches!(ctx.arena.get(r), Obj::Instance(_)));
+    assert_eq!(ctx.arena.header(r).type_, Some(foo));
 }
 
 #[test]
@@ -335,7 +341,8 @@ fn object_setattr_delattr_checks() {
     let dummy_v = Value::Heap(dummy);
     assert!(is_instance_type(ctx.arena, dummy_v));
     assert!(!is_instance_type(ctx.arena, Value::SmallInt(1)));
-    // Checks pass -> PyRaise stub (members map is C12a's).
+    // Checks pass, but the dummy has no Instance payload, so the
+    // members-map store has nowhere to go (E2g defensive arm).
     assert!(matches!(
         object_setattr(&mut ctx, dummy_v, Value::Qstr(a), Value::SmallInt(1)),
         Err(ObjectError::PyRaise)
@@ -373,7 +380,23 @@ fn object_locals_dict_has_four_entries() {
     for name in [b"__init__" as &[u8], b"__new__", b"__setattr__", b"__delattr__"] {
         let v = dict_get_value(&mut ctx, Value::Heap(dict), Value::Qstr(q(name)))
             .expect("locals entry present");
-        assert!(matches!(v, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::FunBuiltin(_))));
+        if name == b"__new__" {
+            // E2g: `__new__` is a StaticClassMethod wrapping the
+            // FunBuiltin (`objobject.zig:101-107`); the other three
+            // are plain builtins. Its header is `None` here (the
+            // staticmethod type does not exist yet at build time
+            // — the registry fixes it up via
+            // `fix_object_new_header`).
+            assert!(matches!(v, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::StaticClassMethod(_))));
+            assert!(matches!(v, Value::Heap(r) if ctx.arena.header(r).type_.is_none()));
+            if let Value::Heap(r) = v {
+                if let Obj::StaticClassMethod(d) = ctx.arena.get(r) {
+                    assert!(matches!(d.fun, Value::Heap(fr) if matches!(ctx.arena.get(fr), Obj::FunBuiltin(_))));
+                }
+            }
+        } else {
+            assert!(matches!(v, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::FunBuiltin(_))));
+        }
     }
     // The dict is fixed (ROM table).
     assert!(matches!(ctx.arena.get(dict), Obj::Dict(d) if d.map.is_fixed));

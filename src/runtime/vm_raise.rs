@@ -123,7 +123,19 @@ pub fn obj_from_entry(
 /// is itself; an exception type is instantiated with no args; anything
 /// else raises `TypeError("exceptions must derive from
 /// BaseException")` (built directly — it cannot fail).
-pub fn make_raise_obj(ctx: &mut CallCtx, state: &VmState, exc: Value) -> Value {
+///
+/// E2g: the type IS called with 0 args (the vendor calls
+/// `mp_call_function_n_kw(o, 0, 0, null)`) through
+/// `call_type_ctx`, so a user subclass's Python `__new__` runs
+/// (`gen().throw(BadException)` prints "BadException __new__").
+/// A call failure IS the raise value (the vendor's nlr from the
+/// call propagates — the call's exception object is already an
+/// exception instance, so no further validation applies); a
+/// non-exception call result takes the TypeError below. ROM
+/// exception types are unaffected: `call_type_ctx` keeps their
+/// direct `exception_make_new` path with 0 args, the same
+/// object `new_exception` built.
+pub fn make_raise_obj(ctx: &mut CallCtx, state: &mut VmState, exc: Value) -> Value {
     if is_exception_instance(ctx.arena, exc, state.exc.base_exception) {
         exc
     } else if is_exception_type(ctx.arena, exc, state.exc.base_exception) {
@@ -131,7 +143,20 @@ pub fn make_raise_obj(ctx: &mut CallCtx, state: &VmState, exc: Value) -> Value {
             Value::Heap(r) => r,
             _ => unreachable!("an exception type is a heap object"),
         };
-        new_exception(ctx, type_)
+        match crate::runtime::vm_call::call_type_ctx(ctx, state, type_, 0, 0, &[]) {
+            Ok(v) => {
+                if is_exception_instance(ctx.arena, v, state.exc.base_exception) {
+                    v
+                } else {
+                    new_exception_msg(
+                        ctx,
+                        state.exc.type_error,
+                        "exceptions must derive from BaseException",
+                    )
+                }
+            }
+            Err(e) => e,
+        }
     } else {
         new_exception_msg(
             ctx,

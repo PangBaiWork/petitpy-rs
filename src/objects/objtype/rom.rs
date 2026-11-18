@@ -69,7 +69,7 @@ use super::errors::arg_check_num_sig;
 use super::instance_create::{
     native_base_init_wrapper_obj, new_instance, static_class_method_make_new,
 };
-use super::objobject::{object_locals_dict, object_type_data};
+use super::objobject::{fix_object_new_header, object_locals_dict, object_type_data};
 use super::subclass::{isinstance_fun_obj, issubclass_fun_obj};
 use super::typecreate::{
     super_attr, super_make_new, super_print, type_attr, type_call_slot_fn, type_make_new,
@@ -260,6 +260,14 @@ pub fn build_rom(ctx: &mut CallCtx) -> Rom {
         Obj::Type(staticmethod_type_data(d)),
     );
     ctx.roots.push(Value::Heap(staticmethod));
+    // E2g: point `object.__new__`'s wrapper at the real
+    // staticmethod type (see `object_locals_dict` — it is
+    // allocated with header `None`).
+    let object_dict = match ctx.arena.get(object) {
+        Obj::Type(d) => d.dict,
+        _ => unreachable!("object is a type"),
+    };
+    fix_object_new_header(ctx, object_dict, staticmethod);
     let d = fresh_dict(ctx);
     let classmethod = ctx.alloc(
         Some(type_),

@@ -594,6 +594,8 @@ pub fn array_raw_bytes(arena: &GcArena, r: GcRef) -> Option<Vec<u8>> {
 /// - `memoryview` → the source's bytes at `free * sz`;
 /// - `Bytes` / `Str` → the bytes, `'B'` (the Zig's str/bytes
 ///   buffer slots report `'B'`).
+/// - `Instance` of a native buffer type (E2i/E2g) → recurse
+///   into `subobj[0]` (the native payload `new_instance` primes).
 /// `str` is included because the Zig's `mp_get_buffer`
 /// succeeds on it (probed: `"a" in bytearray(b'abc')` is
 /// `True`; `bytearray("ab", "utf-8")` works). This is the

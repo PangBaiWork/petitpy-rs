@@ -274,6 +274,25 @@ pub(crate) fn dispatch_loop(
                 let q = decode_qstr(state, code_idx, &mut ip);
                 let obj = spop(frame).unwrap_or(Value::None);
                 let type_v = spop(frame).unwrap_or(Value::None);
+                // (E2g, class_super_closure) — the vendor consumes
+                // THREE stack slots here, not two: the super()
+                // peephole (compile.zig §22, `compileAtomExprNormal`)
+                // first compiles the `super` atom itself, so the
+                // stack holds [super_fn, type, obj]; the vendor VM
+                // (`vm.zig:608-612`) calls `mp_load_super_method(q,
+                // sp - 1)` after `sp -= 1`, i.e. `dest[0]` is the
+                // loaded `super` value and `mp_load_super_method`
+                // (`objtype.zig:463-469`) overwrites it with the
+                // method (`dest[1]` = type, `dest[2]` = obj). The
+                // old code popped only (obj, type), leaving the
+                // `super` function under the (method, self) pair —
+                // harmless for a bare `return super().foo()` (the
+                // extra slot sits below the result) but fatal when
+                // the call is the iterable of a comprehension (or
+                // any other stack consumer follows): the next
+                // CALL_FUNCTION then takes `super` as the callable
+                // and the real result as its argument.
+                let _super_fn = spop(frame);
                 let type_ref = match type_v {
                     Value::Heap(r) => r,
                     _ => {

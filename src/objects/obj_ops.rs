@@ -504,25 +504,43 @@ pub fn get_buffer(
 // ── exception printing ────────────────────────────────────────────────
 
 /// Whether `value` is an exception instance (`obj.zig`'s
-/// `mp_obj_is_exception_instance`, extern C). Today: heap
-/// `Obj::Exception` values only — instances of Python exception
-/// subclasses need the instance representation (C12), so this is
-/// partial until then (the callers below degrade to "not an
-/// exception" for those).
+/// `mp_obj_is_exception_instance`, extern C): a native
+/// `Obj::Exception` payload, or an `Instance` of a user
+/// exception subclass (E2g — those are `Instance` payloads
+/// now, recognised by a ROM exception type in the header
+/// type's MRO, the `is_exception_type_obj` slot identity).
 pub fn is_exception_instance(arena: &GcArena, value: Value) -> bool {
-    matches!(value, Value::Heap(r) if matches!(arena.get(r), Obj::Exception(_)))
+    match value {
+        Value::Heap(r) => match arena.get(r) {
+            Obj::Exception(_) => true,
+            Obj::Instance(_) => {
+                let Some(t) = arena.header(r).type_ else {
+                    return false;
+                };
+                match arena.get(t) {
+                    Obj::Type(d) => d.mro.iter().any(|m| {
+                        crate::objects::objtype::objexcept::is_exception_type_obj(arena, *m)
+                    }),
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The `__cause__` of an exception (`npy_exception_get_cause`,
 /// `objexcept.zig:273`): the cause slot, or `None` when there is
-/// none (the Zig `cause == 0`).
+/// none (the Zig `cause == 0`). A user subclass instance reads
+/// through its native exception object in subobj[0] (E2g).
 pub fn exception_cause(arena: &GcArena, exc: Value) -> Option<Value> {
-    match exc {
-        Value::Heap(r) => match arena.get(r) {
+    match crate::objects::objtype::objexcept::native_exception_ref(arena, exc) {
+        Some(r) => match arena.get(r) {
             Obj::Exception(e) => e.cause,
             _ => None,
         },
-        _ => None,
+        None => None,
     }
 }
 
@@ -565,35 +583,35 @@ fn print_exception_chain<'r>(
         }
     }
     if is_exception_instance(ctx.arena, exc) {
-        if let Value::Heap(r) = exc {
-            if let Obj::Exception(e) = ctx.arena.get(r) {
-                if !e.traceback.is_empty() {
-                    // Frames are stored innermost-first
-                    // (`add_traceback` appends while unwinding,
-                    // `objexcept.zig:381`); the Zig renderer iterates
-                    // from `n - 3` down to 0 — oldest first.
-                    // No line numbers: `MICROPY_ENABLE_SOURCE_LINE`
-                    // is off at this ROM level (`mpconfig.h:908-909`
-                    // — `ROM_LEVEL_AT_LEAST_EXTRA_FEATURES`),
-                    // verified on the reference binary
-                    // (`File "<stdin>", in <module>`).
-                    let _ = sink.write_str("Traceback (most recent call last):\n");
-                    for frame in e.traceback.iter().rev() {
-                        let file = resolve(frame.name);
-                        let _ = write!(sink, "  File \"{}\"", String::from_utf8_lossy(file));
-                        match frame.block {
-                            Some(b) => {
-                                let name = resolve(b);
-                                let _ = write!(
-                                    sink,
-                                    ", in {}\n",
-                                    String::from_utf8_lossy(name)
-                                );
-                            }
-                            None => {
-                                let _ = sink.write_str("\n");
-                            }
-                        }
+        // Frames are stored innermost-first
+        // (`add_traceback` appends while unwinding,
+        // `objexcept.zig:381`); the Zig renderer iterates
+        // from `n - 3` down to 0 — oldest first.
+        // No line numbers: `MICROPY_ENABLE_SOURCE_LINE`
+        // is off at this ROM level (`mpconfig.h:908-909`
+        // — `ROM_LEVEL_AT_LEAST_EXTRA_FEATURES`),
+        // verified on the reference binary
+        // (`File "<stdin>", in <module>`).
+        // E2g: read through `exception_get_traceback` — a
+        // user subclass instance keeps its frames on the
+        // native exception object in subobj[0].
+        let tb = crate::objects::objtype::objexcept::exception_get_traceback(ctx.arena, exc);
+        if !tb.is_empty() {
+            let _ = sink.write_str("Traceback (most recent call last):\n");
+            for frame in tb.iter().rev() {
+                let file = resolve(frame.name);
+                let _ = write!(sink, "  File \"{}\"", String::from_utf8_lossy(file));
+                match frame.block {
+                    Some(b) => {
+                        let name = resolve(b);
+                        let _ = write!(
+                            sink,
+                            ", in {}\n",
+                            String::from_utf8_lossy(name)
+                        );
+                    }
+                    None => {
+                        let _ = sink.write_str("\n");
                     }
                 }
             }

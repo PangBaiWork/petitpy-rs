@@ -16,7 +16,8 @@ use crate::objects::callables::objfun::{call_fun_builtin, fun_bc_prepare_call};
 use crate::objects::callables::objgenerator::{gen_wrap_call, GenError};
 use crate::objects::containers::objtuple::new_tuple;
 use crate::objects::obj::obj_get_type;
-use crate::objects::objtype::objexcept::{exception_make_new, is_exception_type};
+use crate::objects::objtype::objexcept::{exception_make_new, is_exception_type_obj};
+use crate::objects::objtype::subclass::is_type_value;
 use crate::objects::objtype::typecreate::type_call;
 use crate::objects::primitives::objcell::cell_set;
 use crate::objects::primitives::ops::static_qstr_id;
@@ -370,10 +371,19 @@ fn resume_via_method_ctx(
 /// A type call (C13b): every non-exception type goes through
 /// C12a's `type_call` (`typecreate.rs:183`) — it dispatches on
 /// the type's `make_new` slot and raises `CantCreateInstance`
-/// ("can't create instance") when there is none. Exception
+/// ("can't create instance") when there is none. ROM exception
 /// types keep their direct path (`exception_make_new` — their
 /// `make_new` slot is the same fn, but the direct call
 /// preserves the pre-C13b error mapping, pinned by `vm_tests`).
+/// E2g: the direct path is taken ONLY when the type's
+/// `make_new` slot IS `exception_make_new_slot`
+/// (`is_exception_type_obj`) — a user exception subclass gets
+/// `instance_make_new` from `mp_obj_new_type` (the vendor
+/// routes it through `instance_make_new`, so a Python-defined
+/// `__new__` runs), and the old `is_exception_type` check sent
+/// those subclasses down the direct path too, so `__new__`
+/// never ran (`subclass_native_exc_new`: `GoodException
+/// __new__` never printed).
 pub(crate) fn call_type_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -382,7 +392,7 @@ pub(crate) fn call_type_ctx(
     n_kw: usize,
     args: &[Value],
 ) -> Result<Value, Value> {
-    if is_exception_type(ctx.arena, Value::Heap(type_), state.exc.base_exception) {
+    if is_exception_type_obj(ctx.arena, type_) {
         return exception_make_new(ctx, type_, args, n_kw)
             .map_err(|e| exc_from_typed(ctx, state, e));
     }
@@ -516,7 +526,19 @@ pub(crate) fn call_build_class_ctx(
         }
     };
     // Resolve the metaclass (`modbuiltins.zig:552-555`).
+    // E2g: a TYPE value is its own metaclass evidence — the
+    // vendor's `mp_obj_get_type(args[2])` works because the
+    // namedtuple type's header IS the type type in the Zig,
+    // but Rust allocates the namedtuple type with header
+    // `None` (`objnamedtuple.rs`), so `obj_get_type` returns
+    // `None` for it and a namedtuple base made every
+    // class-statement fail with a mismatch. The payload check
+    // (`is_type_value`, the same precedent `type_make_new`'s
+    // 1-arg path uses) resolves it: any type value's
+    // metaclass is `type` itself.
     let meta = if n_args == 2 {
+        Value::Heap(ctx.types.type_)
+    } else if is_type_value(ctx.arena, args[2]) {
         Value::Heap(ctx.types.type_)
     } else {
         match obj_get_type(ctx.arena, ctx.types, args[2]) {

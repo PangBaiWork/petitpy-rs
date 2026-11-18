@@ -1,0 +1,157 @@
+Lane F2 result — REPL polish + 文档 + 最终验收 (Phase F 最后一块)
+====================================================================
+Base: master bdf3c5b (full GREEN, integration 200/202, golden 585/585,
+capability GREEN, stdlib 8/8, nano 454/541, lib 1697 + 3 ignored).
+Worktree ~/workspace/petitpy-rs-f2-final, branch lane/f2-final.
+
+§1 Acceptance (all verified by the executor in the worktree)
+-----------------------------------------------------------
+- cargo test --release --lib --tests: 1700 passed, 0 failed,
+  3 ignored (1697 + 3 new: 2 readline + 1 io_error_name table).
+  bins: 9. entry_cli: 45. 0 warnings (forced recompile).
+  0 unsafe in the diff. Largest changed file tests.rs 397 lines
+  (< 2500). check_compile_mpy.py PASS, check_frozen.py PASS.
+- Full gate: GREEN (7 known-fails exactly).
+- Integration: 200/202 — fail set EXACTLY
+  {select_readable_fd_is_ready, select_timeout_zero_returns_promptly},
+  0 regressions vs base. Golden: 585/585 (rust==cpython 576/585).
+  Capability: GREEN. Stdlib: 8/8. Nano: 454/541 (report-only).
+- Benchmark (worktree-pointed copy of ~/workspace/bench_e3.py,
+  steady-state run 2): Rust 6.53s vs reference 37.91s = 0.172x,
+  PASS vs the ≤1.5x bar (run 1: 0.189x; binary 1,953,528 bytes).
+  The canonical script hardcodes master ROOT, so the main agent
+  re-runs it on master after the merge.
+- Gate outputs: ~/workspace/f2_verify/ (full_gate.txt,
+  integration.txt, golden.txt, capability.txt, stdlib.txt,
+  nano.txt, bench.txt). Probes: ~/workspace/f2_probe/
+  (repl_probe.py, ioerr/, fill.c, run_emfile.py).
+
+§2 Mechanisms
+--------------
+1. io_error_name full table (src/entry/mod.rs:34): was 7 errnos
+   with an OS-message fallback; now the union of the two errno
+   switches behind the reference's single `readFileAlloc[Options]`
+   call (main.zig:179/396, main_vm.zig:220) — `dirOpenFile`
+   (Zig 0.16.0 lib/std/Io/Dispatch.zig ~line 2598) for the open
+   half, `fileReadStreaming` (~line 1766, EIO->InputOutput) for
+   the read half. 22 rows + fallback `Unexpected`
+   (posix.unexpectedErrno, lib/std/posix.zig:1669, returns
+   error.Unexpected). Two E1 mappings were WRONG and are fixed
+   (see §3): 13 EACCES -> AccessDenied (not PermissionDenied),
+   22 EINVAL -> BadPathName (not InvalidArgument — that name is
+   not in the Zig switch at all). New probed rows: 24 EMFILE ->
+   ProcessFdQuotaExceeded, 6 ENXIO -> NoDevice. Serves both CLIs
+   (same fn; petitpy-vm prints `error: {name}` first line).
+2. fgets_chunk (src/support/readline.rs): two real C-fgets
+   semantic gaps fixed, nothing else touched (4096 param kept):
+   (a) loop `fill_buf` until \n / limit / EOF / error — a single
+   short pipe read used to end the chunk early, so a 4000-byte
+   REPL line arriving in pieces was exec'd as two lines
+   (prompt counts 9 vs reference 7); (b) truncate the returned
+   chunk at the first NUL byte (the Zig side measures the line
+   with `strlen`) while still consuming through the \n/limit
+   exactly as C fgets does — a NUL-first line reads as length 0,
+   which the REPL treats as EOF, like the original. A read error
+   still discards the partial line (fgets NULL semantics).
+   `readline` (input()) inherits both fixes through the same
+   helper. New tests in src/support/tests.rs: ShortFill BufRead
+   (≤7-byte fills), f2_fgets_loops_over_short_fills,
+   f2_repl_line_truncates_at_nul; io_error_name pinned by a
+   table-driven test in src/entry/mod.rs.
+3. README.md (NEW, repo root): what the project is, status table
+   with final numbers, build, both CLIs, embedding API, test
+   commands, layout, and the honest divergences list compiled
+   from F1/F3/F5a/F5b/F6 §4 + E1/E2 leftovers. docs/任务书.md
+   §3.5 F2 line updated with the final numbers.
+
+§3 Probes (release binary, ~/workspace/f2_probe/)
+------------------------------------------------
+io_error_name — stdout+stderr+rc byte-compare, both CLIs:
+- enoent/isdir/notdir/nametoolong(300-char)/eloop: IDENTICAL rc=2
+  (both before and after the fix — those 5 rows were already right).
+- eacces (chmod 000 file, run as nobody via setpriv; root bypasses
+  DAC so the nobody run is the only way): BEFORE — REF
+  `AccessDenied`, Rust `PermissionDenied`; AFTER — IDENTICAL rc=2.
+  E1's §4 admits PermissionDenied was "mapped but not triggered".
+- emfile (LD_PRELOAD constructor opens /dev/null to the
+  RLIMIT_NOFILE=16 cap, fill.c + run_emfile.py — plain `ulimit`
+  fails because the shell itself cannot redirect): BEFORE — REF
+  `ProcessFdQuotaExceeded`, Rust `Too many open files (os error 24)`;
+  AFTER — IDENTICAL rc=2.
+- enxid (unix socket file): BEFORE — REF `NoDevice`, Rust OS text;
+  AFTER — IDENTICAL rc=2.
+- petitpy-vm first lines: FileNotFound / AccessDenied /
+  ProcessFdQuotaExceeded / NoDevice — all IDENTICAL after the fix
+  (full-stderr compare still differs by the reference's Zig stack
+  trace after line 1 — E1 §3.4, runtime noise, not reproduced).
+- EPERM(1)/ENFILE(23)/ENOMEM(12): no CLI-triggerable path found
+  (EPERM: /proc/kmsg opens as root, /proc/1/mem and /proc/kcore
+  give EACCES not EPERM; ENFILE needs the system file table full
+  — not attempted; ENOMEM needs an allocation failure mid-read —
+  not attempted). Mapped per the cited Zig switch, see §4.
+- EINVAL: no CLI-triggerable path (open flags are fixed) — mapped
+  BadPathName per the switch, see §4.
+REPL — stdout+stderr+rc byte-compare, stdin pipe, 10 cases in
+repl_probe.py (run before AND after the readline fix):
+- line4094/4095/4096/5000, noeol (partial line at EOF), emptyline,
+  continuation (`if True:` + indented body): IDENTICAL before and
+  after (chunking at 4095 was already right; continuation never
+  happens on either side — vendor_stubs.zig:33 stubs
+  mp_repl_continue_with_input to false, re-verified by reading it).
+- line20000 / total20000 (5× 4000-char lines): BEFORE — DIFF
+  (prompt counts REF 7 vs Rust 9; the long-identifier chunks also
+  showed REF ENOMEM vs Rust NameError 'aa' — an artifact of the
+  split chunking: the same 4095-char identifier as a script is
+  ENOMEM on BOTH binaries); AFTER — IDENTICAL (7 prompts both).
+- nul (`print(1)\x00junk\nprint(2)\n`): BEFORE — DIFF (REF prints
+  1 then 2; Rust SyntaxError on line 1); AFTER — IDENTICAL (1, 2).
+- accum 16384: PROBED UNAVAILABLE — accum holds exactly one line
+  (≤4095 via fgets) because continuation never appends; no input
+  can reach the cap. Recorded in §4, NOT implemented (per brief).
+
+§4 Left-open / divergences (do NOT fix in this lane)
+----------------------------------------------------
+- Untriggerable errnos mapped from the Zig switch (source-cited,
+  not probed): 1 PermissionDenied, 23 SystemFdQuotaExceeded,
+  12 SystemResources, 22 BadPathName, 19 NoDevice, 11 WouldBlock,
+  16 DeviceBusy, 17 PathAlreadyExists, 26 FileBusy, 27/75
+  FileTooBig, 28 NoSpaceLeft, 95 FileLocksUnsupported, 5
+  InputOutput (read half). If a future Zig changes the switch,
+  the table must be re-read, not re-guessed. EFAULT/EBADF map to
+  `errnoBug` in Zig (internal bug, unreachable via CLI) and fall
+  to `Unexpected` here. `unexpected_error_tracing` (which would
+  print "unexpected errno: N" + a stack trace before returning
+  Unexpected) is off by default in std.options and was not
+  observed; not probed.
+- accum 16384: probed unobservable (see §3) — no accumulator
+  implemented, deliberately. If the original ever un-stubs
+  mp_repl_continue_with_input, the REPL needs the accum + `... `
+  continuation loop; until then it is dead code on both sides.
+- The 20000-char REPL case still exercises the 1 MiB GC heap
+  (OSError ENOMEM on huge identifiers/strings) — identical on
+  both binaries (script probe: longident.py ENOMEM both, rc 1);
+  that is VM heap behaviour, not a readline matter.
+- Divergences list in README.md is compiled from the merged
+  lanes' §4s (F1 host-kwargs/API __getitem__/NULL handling,
+  F3 float(__float__)/dict __eq__/str(KeyError(instance))/
+  identity-hash values, F5a |=/real_load_maybe, F5b select/fromfd/
+  SIGKILL/umask, F6 os.close/unbuffered-write/finaliser deferral/
+  SinkGuard, E1/E2 type(iter(s))/super_make_new/ctx-only
+  __missing__/vm stack trace). No new divergence was found by
+  this lane; the two E1 mapping errors it fixed were pre-existing
+  bugs, not divergences.
+- Benchmark caveat (unchanged from E3): the reference binary is
+  the 27 MB Debug build, so 0.172x is a lenient bar; a release
+  reference would be faster, but the margin leaves headroom.
+
+§5 Files changed (4 files, +~330/-~30)
+----------------------------------------
+- src/support/readline.rs (+~45/-~20): fgets_chunk loops over
+  short fills + NUL truncation; repl_read_line doc touch.
+- src/support/tests.rs (+~110): ShortFill + 2 new tests.
+- src/entry/mod.rs (+~90/-~15): io_error_name full table +
+  table-driven test (22 rows + fallback rows).
+- README.md (NEW, ~230 lines).
+- docs/任务书.md: §3.5 F2 line updated with final numbers.
+- Exclusions honored: no select/nano fix, no api.rs, no VM core
+  semantics, no agent-rules.md change, no test-expectation edits.

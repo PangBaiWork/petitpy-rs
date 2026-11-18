@@ -14,9 +14,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const USAGE: &str = "petitpy — a small Python runtime, MicroPython-compatible, written in Zig.\n\nUsage:\n  petitpy <script.py>       run a Python script (`ppy` is the same command)\n  petitpy -c CODE           run CODE (sys.argv[0] is '-c')\n  petitpy --emit-mpy F.py   compile only; print the .mpy as base64\n  petitpy --version         print version\n  petitpy --help            this message\n\n";
+const USAGE: &str = "petitpy — a small Python runtime, MicroPython-compatible, written in Zig.\n\nUsage:\n  petitpy <script.py>       run a Python script (`ppy` is the same command)\n  petitpy -c CODE           run CODE (sys.argv[0] is '-c')\n  petitpy --emit-mpy F.py   compile only; print the .mpy as base64\n  petitpy --version         print version\n  petitpy --help            this message\n";
 
-const VM_USAGE: &str = "petitpy-vm — VM-only runtime (loads pre-compiled .mpy files).\n\nUsage:\n  petitpy-vm <script.mpy>   run a compiled bytecode file\n  petitpy-vm --version      print version\n  petitpy-vm --help         this message\n\n";
+const VM_USAGE: &str = "petitpy-vm — VM-only runtime (loads pre-compiled .mpy files).\n\nUsage:\n  petitpy-vm <script.mpy>   run a compiled bytecode file\n  petitpy-vm --version      print version\n  petitpy-vm --help         this message\n";
 
 const BANNER: &str = "petitpy 0.9.0 — interactive REPL (Ctrl-D to exit)\n";
 

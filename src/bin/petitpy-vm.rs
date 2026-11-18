@@ -27,7 +27,10 @@ use petitpy_rs::runtime::vm::Vm;
 /// The usage text (`printUsage`, `main_vm.zig`) — to STDERR,
 /// exit 0. Byte-for-byte the original's, including the
 /// trailing blank line and the em-dash.
-const USAGE: &str = "petitpy-vm — VM-only runtime (loads pre-compiled .mpy files).\n\nUsage:\n  petitpy-vm <script.mpy>   run a compiled bytecode file\n  petitpy-vm --version      print version\n  petitpy-vm --help         this message\n\n";
+/// Usage text (`main_vm.zig`) — same Zig multiline-literal
+/// rule as the main binary: ends with a single `\n`
+/// (212 bytes, verified against the reference).
+const USAGE: &str = "petitpy-vm — VM-only runtime (loads pre-compiled .mpy files).\n\nUsage:\n  petitpy-vm <script.mpy>   run a compiled bytecode file\n  petitpy-vm --version      print version\n  petitpy-vm --help         this message\n";
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();

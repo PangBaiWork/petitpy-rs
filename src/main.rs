@@ -31,9 +31,11 @@ use petitpy_rs::entry::VERSION;
 use petitpy_rs::runtime::vm::Vm;
 
 /// The usage text (`printUsage`, `main.zig`) — to STDERR,
-/// exit 0. Byte-for-byte the original's, including the
-/// trailing blank line and the em-dash.
-const USAGE: &str = "petitpy — a small Python runtime, MicroPython-compatible, written in Zig.\n\nUsage:\n  petitpy <script.py>       run a Python script (`ppy` is the same command)\n  petitpy -c CODE           run CODE (sys.argv[0] is '-c')\n  petitpy --emit-mpy F.py   compile only; print the .mpy as base64\n  petitpy --version         print version\n  petitpy --help            this message\n\n";
+/// exit 0. Byte-for-byte the original's (369 bytes): Zig
+/// multiline literals join lines with `\n` and add NO trailing
+/// newline, so the final empty `\\` line only supplies the
+/// `\n` after "this message" — there is NO trailing blank line.
+const USAGE: &str = "petitpy — a small Python runtime, MicroPython-compatible, written in Zig.\n\nUsage:\n  petitpy <script.py>       run a Python script (`ppy` is the same command)\n  petitpy -c CODE           run CODE (sys.argv[0] is '-c')\n  petitpy --emit-mpy F.py   compile only; print the .mpy as base64\n  petitpy --version         print version\n  petitpy --help            this message\n";
 
 /// `emitMpy` (`main.zig`): compile `in_path` and print the
 /// `.mpy` to stdout as base64. Returns a process exit status:

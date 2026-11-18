@@ -1,0 +1,218 @@
+# Lane F5a result — typing generics (`runtime_annotations`)
+
+Base: master fdd1fc1 (F4 merged: full 545/552, integration 190/202,
+golden 585/585, capability 67/67, stdlib 7/8, nano 454/541, lib 1649).
+Worktree: ~/workspace/petitpy-rs-f5a-typing, branch lane/f5a-typing.
+Commit: (this lane's commit — see git log on the branch).
+
+## §1. Acceptance numbers
+
+- lib: **1660 passed / 0 failed / 3 ignored** (+11 new tests in NEW
+  `src/runtime/vm_tests_f5a.rs`), bins 9, entry_cli 45, 0 warnings
+  (forced recompile: `touch src/lib.rs && cargo build --release`),
+  no unsafe in the diff vs fdd1fc1, largest touched file
+  `src/runtime/vm_rt.rs` 780 lines (< 2500).
+- check_compile_mpy: PASS. check_frozen: PASS. orig clean.
+- Full corpus: **545/552**, gate GREEN (exactly the 7 known-fails).
+- Integration: **190/202 -> 191/202**. Fail-set diff vs base shows
+  ONLY `runtime_annotations` removed (0 regressions).
+- Golden: 585/585 (rust==cpython 576/585). Capability: GREEN.
+  Stdlib: 7/8 (only test_enum). Nano: 454/541 (report-only).
+- Gate outputs: ~/workspace/f5a_verify/ (full_gate, integration,
+  golden, capability, stdlib, nano .txt).
+
+## §2. The four mechanisms (all vendor hooks, no new Rust types)
+
+### (a) Type subscript → `typing._class_getitem` — `src/runtime/vm_seams.rs`
+###     (`typing_call_ctx` + `try_instance_subscr` widening)
+
+Vendor: `obj.zig:600-614` (`mpObjSubscrImpl`): after the type's
+subscr slot declines, on full, a Get on an exact-type base calls
+`typingCall(MP_QSTR__class_getitem, base, index)`; `typingCall`
+(`runtime.zig:538-545`) imports `typing` and calls the named
+attribute with two args.
+Rust: new `typing_call_ctx(ctx, state, name, a, b)` — the VM-path
+`typingCall` (real `import_name_ctx` + `load_attr_ctx` +
+`call_function_ctx`, so the callee is the frozen Python, not a
+Rust re-invention). The branch lives in `try_instance_subscr`:
+the LOAD_SUBSCR call site is in `vm_dispatch.rs` (the F3 lane's
+file — not touched), and the slot path (`obj_subscr`) is a pure
+`CallCtx` function with no import/call access, so the VM-hook
+path is the only place it can live. Guards, exactly as the
+vendor: Get only; base's header type is exactly `type`; the
+base's type (its metaclass) has NO subscr slot (the vendor tries
+the slot first — a metaclass `__getitem__` falls through to
+`obj_subscr`). `type_type_data` has `subscr: None`, so plain
+classes and builtin types take the branch.
+`_class_getitem` (frozen typing.py) builds `GenericAlias(cls,
+item)` when the class has no own hook, and calls the class's own
+`__class_getitem__` when it does (`G[int]` → `('G', <class 'int'>)`).
+Its `type(f) is _bound_method` check works: `type(g.__repr__)`
+is `<class 'bound_method'>` on both binaries (probed).
+
+### (b) Type `|` → `typing._union` — `src/runtime/vm_rt.rs`
+###     (`binary_op_ctx` + `is_type_or_none`)
+
+Vendor: `runtime.zig:575-578` (`mpBinaryOpImpl`): on full, op ==
+`MP_BINARY_OP_OR` with both sides a type or None
+(`isTypeOrNone`: `None` or exact `type`) and not both None →
+`typingCall(MP_QSTR__union, lhs, rhs)`, BEFORE the small-int
+path and BEFORE `nativeSubclassOp`.
+Rust: the same branch at the old stub comment in
+`binary_op_ctx` (which said "fall through to `binopUnsupported`
+until then"), using `typing_call_ctx`. `_union` (frozen
+typing.py) flattens nested unions, dedups preserving order, and
+returns the single member itself (`int | int` → `<class 'int'>`).
+`list[str] | None` needs no special case: `GenericAlias.__or__`
+is plain Python (`_union(self, o)`) once (a) works. `int | 5`
+and `None | None` do NOT take the branch (one side is not
+type-or-None / both None) and raise the vendor's
+`binopUnsupported` message (`unsupported types for __or__:
+'type', 'int'` — probed byte-identical).
+
+### (c) `isinstance` / `issubclass` with a UnionType — `src/objects/objtype/subclass.rs`
+###     + `src/objects/objtype/seams.rs` (`real_load_maybe` members step)
+
+Vendor: `objtype.zig:514-549` (`unionArgs` + `isSubclassImpl`):
+a classinfo WITH `__origin__` (a generic alias) is NOT a union;
+else its `__args__` tuple (if a tuple) is the classinfo tuple.
+Rust already had `union_args` + the `is_subclass` union branch —
+it was dead because the builtin adapters used `with_stub_seams`
+whose `load_maybe` always returns None. Fix, two halves:
+1. `isinstance_builtin` / `issubclass_builtin` now use
+   `with_seams(real_load_maybe, ...)` instead of stub seams.
+2. `real_load_maybe` reads the instance members map BEFORE
+   `class_lookup`: the vendor's `mp_load_method_maybe`
+   (`runtime.zig:1195-1229`) calls the type's attr slot before
+   the locals_dict search, and for a user instance that slot
+   reads the members map first (`instance_load_attr` step 1).
+   Without this, a UnionType's `__args__` tuple — an instance
+   member — was invisible and `isinstance(1, int | None)` fell
+   through to `IssubclassArg2`. Members are returned RAW,
+   unbound (`(value, None)` — an instance-dict function is not
+   bound, as in MicroPython/CPython). This also makes the
+   `__reversed__` / `__len__` / `__iter__` probes see an
+   instance member of the same name, as the vendor does (it
+   returns the member and the caller then fails to call it,
+   instead of silently falling through) — full gate stayed
+   GREEN, so no corpus program is affected.
+A generic alias still raises the arg-2 TypeError: its
+`__origin__` member makes `union_args` return `None`
+(`isinstance(1, list[int])` — probed byte-identical).
+
+### (d) `isinstance` / `issubclass` arg-error messages — `subclass.rs`
+###     (`record_typed`, pre-existing gap fixed in passing)
+
+The adapters returned only `e.to_pyerror()` without recording
+the typed raise, so the VM built a bare `TypeError` with an
+empty message. Verified pre-existing on base master:
+`isinstance(1, 5)` and `issubclass(1, int)` both raised bare
+`TypeError: ` on fdd1fc1. Now `.map_err(|e| ctx.record_typed(e))`
+(the `make_new.rs` precedent; `TypedRaise` for `ObjTypeError`
+landed in F4), so both messages match the reference
+(`issubclass() arg 1 must be a class` /
+`issubclass() arg 2 must be a class or a tuple of classes`).
+`BareTypeError` still records nothing (empty name) — same as
+before, only reachable while bootstrapping.
+
+### (e) `get_type_hints` — no Rust change
+
+The frozen `get_type_hints` runs as plain Python; every runtime
+behaviour it leans on already worked and was verified by probe
+on both binaries: `__annotations__` in the class dict (stored
+as source strings — `x: int` → `'int'`, `y: "list[str]"` →
+`"'list[str]'"`, so the double `eval` in typing.py is needed),
+`__bases__`, `__module__` (`__main__` for script classes —
+needed for `list[__main__.A]` too), `sys.modules.get("__main__")`
+→ `None` (sys.modules is empty at script start) with the
+`__import__("__main__")` fallback, and `eval(v, g, l)` with
+explicit globals/locals. The integration case's final line
+matches byte-for-byte.
+
+## §3. Probe table (REF vs Rust, byte-compared stdout+stderr+rc)
+
+All probes in ~/workspace/f5a_probe/ (REF =
+~/workspace/petitpy-orig/zig-out/bin/petitpy).
+
+- case.py (the integration case verbatim): REF and Rust
+  identical, rc=0/0:
+  `list[str] | None list[__main__.A] dict[str, tuple[int, ...]] [1]`
+  / `True <class 'int'> True None | int` / `True False` /
+  `('G', <class 'int'>)` /
+  `{'x': <class 'int'>, 'y': list[str], 'z': __main__.A | None, 'w': list[str] | None}`.
+- subscr.py (`list[str]`, `dict[str, tuple[int, ...]]`,
+  `list[int]([1])`, `type(list[int])`, `G[int]`,
+  `type(g.__repr__)`): identical, rc=0/0.
+- union.py (`int | str == str | int`, `int | int`,
+  `type(int | str)`, `None | int`, `int | None | str`,
+  `int | 5`): identical, rc=1/1 (the last line raises
+  `TypeError: unsupported types for __or__: 'type', 'int'`).
+- isinst.py (`isinstance(1, int | None)`,
+  `isinstance('a', int | None)`, `isinstance(1, int | str)`,
+  `isinstance(1.5, int | str)`, `issubclass(int, int | str)`,
+  `issubclass(str, int | str)`, `issubclass(bool, int | str)`,
+  `isinstance(1, list[int])`): identical, rc=1/1 (the last
+  line raises `TypeError: issubclass() arg 2 must be a class or
+  a tuple of classes`).
+- pieces.py / pieces2.py (grounding probes, REF only unless
+  noted): `isinstance(1, list[int])` raises the arg-2
+  TypeError; `A.__module__` is `__main__`;
+  `B.__dict__.get("__annotations__")` is
+  `OrderedDict({'x': 'int', 'y': "'list[str]'"})`;
+  `eval("list[str]", globals(), {})` works;
+  `sys.modules.get("__main__")` is `None`;
+  `__import__("__main__")` is `<module '__main__'>`;
+  `type(A.__init__)` raises `AttributeError: no attribute
+  '__init__'` (the class_lookup-skips-object quirk).
+- meta.py (custom metaclass, REF only): `class C(metaclass=M)`
+  itself raises `TypeError: argument num/types mismatch` on
+  the REFERENCE, so the metaclass-`__getitem__` corner is
+  unobservable there; the Rust code still implements the
+  vendor's exact-type + slot-presence guards.
+
+## §4. Left open
+
+- `type('T', (B,), {})`-style metaclass class creation is
+  limited on the reference itself (see meta.py above) — not
+  an F5a gap, recorded only because the probe was run.
+- The `InplaceOr` (`|=`) form on types does NOT take the
+  union branch (the vendor checks `MP_BINARY_OP_OR` only in
+  `runtime.zig:575-578`; the Rust generic loop converts
+  inplace→plain later, but the branch sits before the loop).
+  Probed on both binaries: `x = int; x |= str` raises
+  `TypeError: unsupported types for __or__: 'type', 'type'`
+  and `x |= None` raises `... 'type', 'NoneType'` — identical.
+  Deliberate vendor fidelity, not a gap.
+- `real_load_maybe` still has no `__class__` / `__next__`
+  special cases from `mp_load_method_maybe`
+  (`runtime.zig:1199-1210`) — no caller needs them yet.
+
+## §5. Files changed (one commit, do NOT merge)
+
+- `src/runtime/vm_seams.rs` (+~60): `typing_call_ctx` (the
+  VM-path `typingCall`) + the `__class_getitem__` branch in
+  `try_instance_subscr` (Get-only, exact-type base, no
+  metaclass subscr slot).
+- `src/runtime/vm_rt.rs` (+~25): the `int | None` union branch
+  in `binary_op_ctx` + `is_type_or_none` helper.
+- `src/objects/objtype/subclass.rs` (+~15/-5): builtin adapters
+  use `with_seams(real_load_maybe, ...)`; errors go through
+  `ctx.record_typed(e)` (arg-1/arg-2 messages no longer bare).
+- `src/objects/objtype/seams.rs` (+~20): `real_load_maybe`
+  reads the instance members map before `class_lookup`.
+- `src/runtime/mod.rs` (+2): register `vm_tests_f5a`.
+- NEW `src/runtime/vm_tests_f5a.rs` (11 tests): builtin type
+  subscript reprs, `list[A]` repr, user `__class_getitem__`,
+  type `|` incl. `int | int` → int and `list[str] | None`,
+  union `==`, isinstance/issubclass with a union, generic-alias
+  isinstance raises, arg-error messages, `int | 5` /
+  `None | None` raises, `get_type_hints`. (Two expectations use
+  the lib harness's `"<test>"` module name — `list[<test>.A]`,
+  `<test>.A | None` — with a comment; the `__main__` forms are
+  verified by the binary probes.)
+- Exclusions honored: no `objint*.rs`, no `gc.rs`, no
+  `src/entry/api.rs`, no `instance.rs` binary/unary op arms, no
+  `vm_dispatch.rs` (the subscript branch was placed in
+  `vm_seams.rs` precisely to avoid touching it while F3 works
+  there). typing.py untouched (frozen, read-only input); no
+  Rust GenericAlias/UnionType invented.

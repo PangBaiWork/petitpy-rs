@@ -300,8 +300,47 @@ pub(crate) fn try_instance_bool(
     }
 }
 
+/// `typingCall` (`runtime.zig:537-543`): `typing.<name>(a, b)` —
+/// the run-time forms of `list[str]` and `int | None` (F5a).
+/// Imports the frozen `typing` module through the VM's real
+/// import, loads `<name>` off it, and calls it with two args
+/// through the VM's real call — so the callee is the frozen
+/// Python (`_class_getitem` / `_union`), not a Rust re-invention.
+pub(crate) fn typing_call_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    name: u32,
+    a: Value,
+    b: Value,
+) -> Result<Value, Value> {
+    let typing_q =
+        crate::runtime::runtime::dunder(b"typing").expect("typing is a static qstr");
+    let module = crate::runtime::vm_rt_iter::import_name_ctx(
+        ctx,
+        state,
+        typing_q,
+        Value::None,
+        Value::SmallInt(0),
+    )?;
+    let fun = crate::runtime::vm_rt_name::load_attr_ctx(ctx, state, module, name)?;
+    crate::runtime::vm_call::call_function_ctx(ctx, state, fun, 2, 0, &[a, b])
+}
+
 /// Try an instance's subscr dunder (`__getitem__` /
 /// `__setitem__` / `__delitem__`) with the VM's real call hook.
+///
+/// F5a: the `list[str]` / `__class_getitem__` branch
+/// (`obj.zig:600-614`) also lives here. The LOAD_SUBSCR call
+/// site is in `vm_dispatch.rs` (the F3 lane's file — this lane
+/// must not edit it), and the branch needs the VM's real
+/// import+call, which the slot path (`obj_subscr`, a pure
+/// `CallCtx` function) cannot do — so the VM-hook path runs it:
+/// Get-only, base exactly a type (header type is `type`), and
+/// the base's type (its metaclass) has NO subscr slot (the
+/// vendor tries the slot first; a metaclass `__getitem__`
+/// falls through to `obj_subscr` below). A type with a custom
+/// metaclass and no slot does NOT take the branch either (the
+/// vendor's `typeOf(base) == &mp_type_type` exact check).
 pub(crate) fn try_instance_subscr(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -309,6 +348,22 @@ pub(crate) fn try_instance_subscr(
     index: Value,
     arg: SubscrArg,
 ) -> Result<Option<Value>, Value> {
+    if matches!(arg, SubscrArg::Get) {
+        if let Value::Heap(r) = base {
+            if ctx.arena.header(r).type_ == Some(ctx.types.type_) {
+                let meta = obj_get_type(ctx.arena, ctx.types, base);
+                let has_slot = match meta {
+                    Some(t) => matches!(ctx.arena.get(t), Obj::Type(d) if d.subscr.is_some()),
+                    None => false,
+                };
+                if !has_slot {
+                    let name = crate::runtime::runtime::dunder(b"_class_getitem")
+                        .expect("_class_getitem is a static qstr");
+                    return typing_call_ctx(ctx, state, name, base, index).map(Some);
+                }
+            }
+        }
+    }
     if !is_instance(ctx.arena, base) {
         return Ok(None);
     }

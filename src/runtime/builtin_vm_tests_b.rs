@@ -363,22 +363,24 @@ fn import_io() {
 }
 
 #[test]
-fn open_stub() {
+fn open_e2e_write_read() {
+    // D2 landed: `open()` is the real `file_io.zig`
+    // implementation now — D1's stub test retired. Write a
+    // temp file through the VM, read it back, and check the
+    // missing-file error.
+    let path = std::env::temp_dir()
+        .join(format!("petitpy-rs-open-e2e-{}-x.txt", std::process::id()));
+    let p = path.to_string_lossy().into_owned();
     let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "f = open('{p}', 'w')\nf.write('hi')\nf.close()\ng = open('{p}', 'r')\na = g.read()\ng.close()\n"
+    ));
+    assert_eq!(fx.gs("a"), "hi");
     assert_eq!(
-        fx.raised_msg("open('x')"),
-        (
-            "NotImplementedError".to_string(),
-            "open() not implemented yet (D2)".to_string()
-        )
+        fx.raised_msg(&format!("open('{p}.missing', 'r')")).0,
+        "OSError".to_string()
     );
-    assert_eq!(
-        fx.raised_msg("open('x', 'w')"),
-        (
-            "NotImplementedError".to_string(),
-            "open() not implemented yet (D2)".to_string()
-        )
-    );
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]

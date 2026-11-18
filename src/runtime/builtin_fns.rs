@@ -44,7 +44,7 @@ use crate::objects::strings::objstr_format::str_format;
 use crate::objects::value::{Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::raise::{
-    raise_not_implemented, raise_type_error, raise_value_error,
+    raise_type_error, raise_value_error,
 };
 use crate::runtime::runtime::RtError;
 use crate::runtime::runtime_ops::{binop_unsupported, is_plain_arith, to_reverse};

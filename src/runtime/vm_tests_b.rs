@@ -545,3 +545,46 @@ fn makenew_error_type_bad_name() {
     // the VM path (a known C12a gap, not this lane's).
     assert_eq!(raised(&mut fx, "x = type(1, (), {})\n").0, "TypeError");
 }
+
+// ── `and`/`or` short-circuit with a variable LHS (D3 merge) ────────
+// C13 decoded the `JUMP_IF_*_OR_POP` label with the SIGNED decoder
+// (`vm.zig` uses the UNSIGNED one), so a taken jump landed 64 bytes
+// early and the next fetch decoded garbage (`NotImplementedError`
+// "opcode"). A constant LHS never took the jump (the compiler folds
+// it), so only the variable-LHS taken path failed. Found by Lane D3.
+
+#[test]
+fn and_false_var_shortcircuit() {
+    let mut fx = Fx::new();
+    fx.run_ok("ok = False\nok = ok and len(\"x\") == 1\nassert ok == False\n");
+    let mut fx = Fx::new();
+    fx.run_ok("ok = False\nok = ok and len(\"x\")\nassert ok == False\n");
+}
+
+#[test]
+fn or_true_var_shortcircuit() {
+    let mut fx = Fx::new();
+    fx.run_ok("ok = True\nok = ok or len(\"x\") == 1\nassert ok == True\n");
+    let mut fx = Fx::new();
+    fx.run_ok("ok = True\nok = ok or len(\"x\")\nassert ok == True\n");
+}
+
+#[test]
+fn and_true_var_continues() {
+    let mut fx = Fx::new();
+    fx.run_ok("ok = True\nok = ok and len(\"x\") == 1\nassert ok == True\n");
+    let mut fx = Fx::new();
+    fx.run_ok("ok = False\nok = ok or len(\"x\") == 1\nassert ok == True\n");
+}
+
+// ── `del x.attr` through STORE_ATTR (D2 merge) ───────────────────────
+// The value slot holds NULL for `del x.attr` (LOAD_NULL;
+// STORE_ATTR) — the dispatch must pass the `None` through to
+// `store_attr_ctx` (delete), not coerce it to the `None` object
+// (which would STORE None instead of deleting). Probed on the
+// reference 2026-11-18: hasattr is False after `del c.x`.
+#[test]
+fn del_instance_attr_opcode() {
+    let mut fx = Fx::new();
+    fx.run_ok("class C:\n    pass\nc = C()\nc.x = 7\nassert hasattr(c, 'x')\ndel c.x\nassert not hasattr(c, 'x')\n");
+}

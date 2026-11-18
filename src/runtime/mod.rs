@@ -69,6 +69,7 @@ pub mod vm;
 pub mod vm_builtins;
 pub mod vm_builtins_bind;
 pub mod vm_call;
+pub mod vm_call_intercept;
 pub mod vm_dispatch;
 pub mod vm_dispatch_exec;
 pub mod vm_dispatch_util;

@@ -5,7 +5,7 @@
 use crate::memory::gc::CallCtx;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::PrintKind;
-use crate::objects::strings::mpprint::{Print, MP_PLAT_PRINT};
+use crate::objects::strings::mpprint::{Print, MP_PLAT_PRINT, MP_PLAT_PRINT_SINK_AWARE};
 use crate::objects::strings::objstr_format::str_format;
 use crate::objects::value::{Obj, Value};
 use crate::pyerr::{PyError, PyResult};
@@ -27,9 +27,10 @@ use crate::pyerr::{PyError, PyResult};
 /// operation not supported")` — the reference ABORTS here
 /// (rc=134, `mp_get_stream_raise` @panic), so Rust raising is
 /// the documented divergence. With no `file` kwarg the output
-/// goes to `MP_PLAT_PRINT` (plain `write(1, …)`), exactly as
-/// the Zig's nano path does — `sys.stdout` IS fd 1, so the
-/// bytes are identical. Args print via `obj_print_helper`
+/// goes to `MP_PLAT_PRINT_SINK_AWARE` (plain `write(1, …)` —
+/// or the embedding host's sink when one is installed on this
+/// thread, F1), exactly as the Zig's nano path does —
+/// `sys.stdout` IS fd 1, so the bytes are identical. Args print via `obj_print_helper`
 /// (`PRINT_STR`).
 fn print_impl(
     ctx: &mut CallCtx,
@@ -184,7 +185,7 @@ pub(crate) fn print_impl_with(
             Ok(Value::None)
         }
         None => {
-            let mut sink = MP_PLAT_PRINT;
+            let mut sink = MP_PLAT_PRINT_SINK_AWARE;
             let mut print = Print::new(&mut sink);
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {

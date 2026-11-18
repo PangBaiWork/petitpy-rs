@@ -141,6 +141,18 @@ pub struct RootSet {
     /// Extra pinned values (globals, exception state, temporaries a
     /// builtin roots across an allocation).
     pub extra: Vec<Value>,
+    /// Embedding-API handle slots (F1, `entry::api`): the handle
+    /// table IS this vector — `Some(v)` is a live handle, `None`
+    /// is a free slot, slot 0 is never handed out. Kept apart
+    /// from `extra` because `rebuild_frame_roots` truncates
+    /// `extra` to `extra_base` on every generator suspend/resume,
+    /// which would drop handle roots; this region is only touched
+    /// by the embedding layer's `new_handle` / `release_handle`.
+    /// The collector marks from it via `iter()` (the original's
+    /// slots block is reached from the global `interps` table,
+    /// so its data-segment scan keeps every held object alive —
+    /// `api.zig`'s file comment).
+    pub handles: Vec<Option<Value>>,
 }
 
 impl RootSet {
@@ -154,7 +166,11 @@ impl RootSet {
 
     /// All roots as one iterator.
     pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
-        self.stack.iter().chain(self.extra.iter()).copied()
+        self.stack
+            .iter()
+            .chain(self.extra.iter())
+            .chain(self.handles.iter().flatten())
+            .copied()
     }
 }
 

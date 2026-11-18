@@ -677,3 +677,21 @@ pub static MP_STDERR_PRINT: PrintT = PrintT {
 fn stderr_print_strn(bytes: &[u8]) {
     let _ = std::io::stderr().write_all(bytes);
 }
+
+/// `mp_plat_print` that consults the embedding host's sink
+/// (F1, ADR 022): with a sink installed on this thread the
+/// bytes go to the host's write callback as fd 1; otherwise
+/// plain stdout (the old behavior). Used by `print()`'s
+/// no-file path (`print_impl_with`); `__repl_print__` keeps
+/// `MP_PLAT_PRINT` (the REPL never runs under the embedding
+/// API, and its echo is a host-stream write, not program
+/// output).
+pub static MP_PLAT_PRINT_SINK_AWARE: PrintT = PrintT {
+    print_strn: plat_print_sink_aware,
+};
+
+fn plat_print_sink_aware(bytes: &[u8]) {
+    if !crate::support::output::write_sink(1, bytes) {
+        plat_print_strn(bytes);
+    }
+}

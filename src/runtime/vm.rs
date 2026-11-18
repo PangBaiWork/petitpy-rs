@@ -208,6 +208,16 @@ pub struct VmState {
     /// instance arg's `__str__` needs the VM's real call hook,
     /// see `builtin_str`). Added by E2.
     pub print_builtin: Value,
+    /// The embedding host-call builtin (F1, ADR 022's
+    /// `hostCall`): ONE shared `FunBuiltin` that every
+    /// `ppy_define_function` bound method wraps (its `self` is
+    /// the host's index in the interpreter's `hosts` list).
+    /// Intercepted by GcRef identity in `call_function_ctx`
+    /// (see `entry::api::call_host_ctx`) — a `FunBuiltin` slot
+    /// cannot see the host table. `Value::None` until
+    /// `build_builtins` creates it (every VM gets one; the CLI
+    /// never calls it).
+    pub host_call_builtin: Value,
     /// The `NotImplemented` singleton value (D1): an
     /// `Obj::Instance` with the shared ellipsis type as header
     /// (the vendor's `mp_type_singleton` carries both it and
@@ -479,6 +489,7 @@ impl Vm {
                 repr_builtin: Value::None,
                 len_builtin: Value::None,
                 print_builtin: Value::None,
+                host_call_builtin: Value::None,
                 not_implemented: Value::None,
                 pending_sched: None,
                 compiler_linked: true,

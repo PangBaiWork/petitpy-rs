@@ -33,7 +33,9 @@
 //! (3) `sys.stdin.flush()` is a no-op — glibc `fflush(stdin)`
 //! discards buffered input, which safe `std` cannot express.
 //! (4) The embedding-host output sink (`output.sink` in
-//! `npyFileWrite`) is Phase F's; stdio writes go to the
+//! `npyFileWrite`) is F1's: with an embedding sink installed
+//! on this thread, stdio writes go to the host's write callback
+//! (see `fileio_write`); otherwise stdio writes go to the
 //! process stdout/stderr directly, as `print()` does today.
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -141,9 +143,12 @@ pub fn fileio_read(ctx: &mut CallCtx, obj: Value, buf: &mut [u8]) -> PyResult<us
 /// `npyFileWrite` (`file_io.zig:159-176`): `fp == NULL` →
 /// `EBADF`; short `fwrite` → errno. One `write` call per
 /// invocation (the `mp_stream_rw` loop handles partial
-/// writes). Writing stdin is `EBADF`. The embedding-host
-/// sink branch (`output.sink != null`, stdio stdout/stderr)
-/// is Phase F's — see the module doc.
+/// writes). Writing stdin is `EBADF`. F1: a stdio stdout/stderr
+/// write with an embedding sink installed on this thread goes
+/// to the host's write callback (`output.sink`, `output.zig`)
+/// instead of the process streams — the sink consumes the whole
+/// buffer (it has no return value), so the full length is
+/// reported, exactly as the Zig's sink branch does.
 pub fn fileio_write(ctx: &mut CallCtx, obj: Value, buf: &[u8]) -> PyResult<usize> {
     let r = fileio_slot(ctx, obj)?;
     let (closed, handle) = match ctx.arena.get(r) {
@@ -155,8 +160,18 @@ pub fn fileio_write(ctx: &mut CallCtx, obj: Value, buf: &[u8]) -> PyResult<usize
     }
     let n = match &handle {
         FileHandle::Owned(rc) => rc.borrow_mut().write(buf),
-        FileHandle::Stdout => std::io::stdout().write(buf),
-        FileHandle::Stderr => std::io::stderr().write(buf),
+        FileHandle::Stdout => {
+            if crate::support::output::write_sink(1, buf) {
+                return Ok(buf.len());
+            }
+            std::io::stdout().write(buf)
+        }
+        FileHandle::Stderr => {
+            if crate::support::output::write_sink(2, buf) {
+                return Ok(buf.len());
+            }
+            std::io::stderr().write(buf)
+        }
         FileHandle::Stdin => return Err(raise_os_error(ctx, EBADF)),
         FileHandle::Closed => return Err(raise_os_error(ctx, EBADF)),
     };

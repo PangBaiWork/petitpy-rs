@@ -11,10 +11,11 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::map::{map_of, set_items};
-use crate::objects::iters::iter::{getiter, iternext, CallOutcome, IterError, IterSeams};
+use crate::objects::iters::iter::{getiter, next_sub, CallOutcome, IterError, IterSeams};
 use crate::objects::obj::ObjError;
 use crate::objects::obj_ops::obj_subscr;
 use crate::objects::objtype::call_via_type_slot;
+use crate::objects::objtype::seams::real_load_maybe;
 use crate::objects::slots::{CallHook, SubscrArg};
 use crate::objects::value::{GcRef, Obj, Value};
 use crate::pyerr::PyError;
@@ -66,10 +67,11 @@ pub(crate) fn view_next_entry(
 /// drains through the hook's `resume` operation (E2b — the
 /// `VmHook` pair: `list(gen())` / `sorted(gen())` / `dict(gen)`
 /// resume it step by step; the ctx-only path, with no hook,
-/// keeps `TypeError("object not iterable")`). A type with a
+/// keeps `TypeError("object not iterable")`). A user instance
+/// drains through the Protocol arm too (E2f — its `__iter__` /
+/// `__next__` run through the hook there). A type with a
 /// getiter slot but no direct arm here still raises
-/// `TypeError("object not iterable")` (the `__iter__` method load
-/// is C12/C14's).
+/// `TypeError("object not iterable")`.
 /// What `collect_iterable` does, decided from an immutable borrow
 /// first so the allocations below do not borrow the arena.
 /// Shared with the set lane (C9c: `set` construction / `update` /
@@ -88,7 +90,9 @@ enum IterPlan {
     /// `binary_get_val_array` below, where `&mut ctx` is free.
     ArrayBytes { tc: u8, bytes: Vec<u8>, n: usize },
     /// A C11 iterator to drain through the general `getiter` /
-    /// `iternext` protocol with stub seams (see the `fn` docs).
+    /// `iternext` protocol with stub seams (see the `fn` docs) —
+    /// or a user instance (E2f: its `__iter__` / `__next__` run
+    /// through the hook's `call` / `next` in the arm below).
     Protocol(Value),
     /// A generator to drain through the hook's `resume`
     /// operation (E2b — the `VmHook` pair): `Some` hook resumes
@@ -159,6 +163,11 @@ pub(crate) fn collect_iterable(
             // hook (the ctx-only path) there is no VM to resume
             // it, so it stays not-iterable there.
             Obj::Generator(_) => IterPlan::Generator(value),
+            // A user instance (E2f): `__iter__` / `__next__`
+            // run through the hook in the Protocol arm below —
+            // without this arm `list(myiter(5))` was
+            // `TypeError("object not iterable")` (iter1/iter2).
+            Obj::Instance(_) => IterPlan::Protocol(value),
             _ => return Err(DictError::TypeError(NOT_ITERABLE)),
         },
         Value::Qstr(id) => {
@@ -211,7 +220,9 @@ pub(crate) fn collect_iterable(
             })
             .collect()),
         IterPlan::Protocol(it) => {
-            let it = getiter(ctx, it).map_err(|e| iter_err_to_dict(ctx, e))?;
+            // NOTE: `getiter` runs AFTER the seams are built
+            // (E2f — a user instance's `__iter__` needs the call
+            // seam; see below).
             // The call seam (E2): `Some` hook → the VM's real
             // call hook (a `FunBc` callee actually executes, so
             // `list(map(f, xs))` works); `None` → the builtin-live
@@ -301,21 +312,25 @@ pub(crate) fn collect_iterable(
                     }
                 };
             // The `next` seam (E2c): resume a generator
-            // sub-iterator through the hook's `resume` — the
-            // `iternext` form, so exhaustion is `Ok(None)`
-            // (a `Stop`) and a raise inside the generator is a
-            // `Raise` (never confused with the mapped
-            // function's own `StopIteration`, which the call
-            // seam above correctly surfaces as a raise —
-            // probed on the reference). Without a hook there
-            // is no VM to resume with, so it records the old
-            // "object not an iterator" raise itself and
-            // returns `Raise` — the caller drains the recorded
-            // raise, so the ctx-only error is unchanged.
+            // sub-iterator through the hook — the `iternext`
+            // form, so exhaustion is `Ok(None)` (a `Stop`) and a
+            // raise inside the generator is a `Raise` (never
+            // confused with the mapped function's own
+            // `StopIteration`, which the call seam above correctly
+            // surfaces as a raise — probed on the reference).
+            // E2f: the seam is the hook's `next`, not `resume` —
+            // `next` steps any iterator (a user instance's
+            // `__next__` via `iternext_vm_ctx`, with a
+            // `StopIteration` — including a user subclass — as
+            // exhaustion), while `resume` only knows generators.
+            // Without a hook there is no VM to step with, so it
+            // records the old "object not an iterator" raise
+            // itself and returns `Raise` — the caller drains the
+            // recorded raise, so the ctx-only error is unchanged.
             let mut next_fn = |ctx2: &mut CallCtx, sub: Value| -> CallOutcome {
                 let mut guard = hook_cell.borrow_mut();
                 match guard.as_deref_mut() {
-                    Some(h) => match h.resume(ctx2, sub) {
+                    Some(h) => match h.next(ctx2, sub) {
                         Ok(Some(v)) => CallOutcome::Value(v),
                         Ok(None) => CallOutcome::Stop,
                         Err(PyError::OutOfMemory) => CallOutcome::Raise,
@@ -333,9 +348,48 @@ pub(crate) fn collect_iterable(
                 next: Some(&mut next_fn),
                 next_builtin: None,
             };
+            // E2f: `getiter` here — a user instance's `__iter__`
+            // is a FunBc and only runs through the call seam (the
+            // slot path, `instance_getiter_slot`, has stub seams).
+            // Load + call it via the seam; no `__iter__` member
+            // → the plain `getiter` (getitem fallback, native-base
+            // path). A raise from `__iter__` propagates — both
+            // `Stop` and `Raise` map to `PyRaise` (the Zig's
+            // `mp_call_method` failure inside
+            // `mp_obj_instance_getiter` is a raise, not
+            // exhaustion).
+            let it = if matches!(it, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::Instance(_)))
+            {
+                let iter_q = ctx.pool.find_strn(b"__iter__");
+                match (iter_q != 0)
+                    .then(|| real_load_maybe(ctx, it, iter_q as u32))
+                    .flatten()
+                {
+                    Some((fun, bound)) => {
+                        let args: Vec<Value> = match bound {
+                            Some(s) => vec![s],
+                            None => vec![],
+                        };
+                        match (seams.call)(ctx, fun, &args) {
+                            CallOutcome::Value(v) => v,
+                            _ => {
+                                return Err(iter_err_to_dict(ctx, IterError::PyRaise));
+                            }
+                        }
+                    }
+                    None => getiter(ctx, it).map_err(|e| iter_err_to_dict(ctx, e))?,
+                }
+            } else {
+                getiter(ctx, it).map_err(|e| iter_err_to_dict(ctx, e))?
+            };
             let mut out = Vec::new();
             loop {
-                match iternext(ctx, it, &mut seams) {
+                // `next_sub`, not `iternext`: a user iterator is
+                // its own `it` (an `Obj::Instance`, not an
+                // `Obj::Iterator`) and steps through the `next`
+                // seam; a C11 iterator takes the same `iternext`
+                // path as before (`next_sub` dispatches to it).
+                match next_sub(ctx, it, &mut seams) {
                     Ok(Some(v)) => out.push(v),
                     Ok(None) => break,
                     Err(e) => return Err(iter_err_to_dict(ctx, e)),

@@ -17,20 +17,19 @@
 //! raises `KeyError(0)` — probed). The port reproduces that
 //! through the generic `len` + `subscr` slots.
 //!
-//! The `__reversed__` load is an interim (C12 owns method
-//! lookup): it reads the operand type's dict for a
-//! `"__reversed__"` entry. Instance-dict lookup is C12's. The
-//! bound call passes the object as the method's first argument
-//! through the call seam (the Zig's `dest[1]`).
+//! The `__reversed__` load is the full lookup
+//! (`real_load_maybe` — class dict, MRO walk, bound; E2f):
+//! a user class's `__reversed__` is found and called through
+//! the call seam (the Zig's `dest[1]` bound call).
 
 use super::iter::{
     new_iter, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams, NOT_AN_ITERATOR,
     REVERSED_ITER_TAG, FLAG_ITER_IS_ITERNEXT,
 };
 use crate::memory::gc::CallCtx;
-use crate::objects::containers::objdict::{dict_get_value, DictError};
 use crate::objects::obj::{obj_get_int, obj_get_type, obj_len, ObjError};
 use crate::objects::objtype::make_new::reversed_make_new_slot;
+use crate::objects::objtype::seams::real_load_maybe;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::SubscrArg;
 use crate::objects::value::{GcRef, IteratorData, Obj, TypeData, Value};
@@ -63,6 +62,25 @@ pub fn reversed_type_data(dict: GcRef) -> TypeData {
     }
 }
 
+/// Call a method found by `real_load_maybe` through the call
+/// seam: the bound self (if any) is prepended, then `extra`.
+fn call_bound(
+    ctx: &mut CallCtx,
+    seams: &mut IterSeams<'_>,
+    fun: Value,
+    bound: Option<Value>,
+    extra: &[Value],
+) -> CallOutcome {
+    match bound {
+        Some(s) => {
+            let mut args = vec![s];
+            args.extend_from_slice(extra);
+            (seams.call)(ctx, fun, &args)
+        }
+        None => (seams.call)(ctx, fun, extra),
+    }
+}
+
 /// `mp_obj_reversed_make_new` (`objreversed.zig:17-51`).
 pub fn reversed_make_new(
     ctx: &mut CallCtx,
@@ -74,41 +92,54 @@ pub fn reversed_make_new(
     let Some(&obj) = args.first() else {
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
     };
-    // 1) `__reversed__` delegation (objreversed.zig:28-35).
+    // 1) `__reversed__` delegation (objreversed.zig:28-35): the
+    // Zig loads the method with `mp_load_method_maybe` (the full
+    // lookup — class dict, MRO walk, bound) and calls it with 0
+    // extra args. E2f: the old type-dict-only read missed
+    // `__reversed__` defined on a user class (and the call seam
+    // was Raise-always on the slot path — the hook is threaded
+    // through `reversed_make_new_slot` now).
     let rev_id = ctx.pool.find_strn(b"__reversed__");
     if rev_id != 0 {
-        if let Some(type_) = obj_get_type(ctx.arena, ctx.types, obj) {
-            let dict = match ctx.arena.get(type_) {
-                Obj::Type(d) => Value::Heap(d.dict),
-                _ => Value::None,
-            };
-            if let Value::Heap(_) = dict {
-                match dict_get_value(ctx, dict, Value::Qstr(rev_id as u32)) {
-                    Ok(fun) => {
-                        // The bound call: the method with the
-                        // object as its first (self) argument.
-                        return match (seams.call)(ctx, fun, &[obj]) {
-                            CallOutcome::Value(v) => {
-                                if sig_err {
-                                    Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH))
-                                } else {
-                                    Ok(v)
-                                }
-                            }
-                            CallOutcome::Stop | CallOutcome::Raise => {
-                                Err(IterError::PyRaise)
-                            }
-                        };
+        if let Some((fun, bound)) = real_load_maybe(ctx, obj, rev_id as u32) {
+            return match call_bound(ctx, seams, fun, bound, &[]) {
+                CallOutcome::Value(v) => {
+                    if sig_err {
+                        Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH))
+                    } else {
+                        Ok(v)
                     }
-                    Err(DictError::KeyError(_)) => {}
-                    Err(e) => return Err(map_dict_err(e)),
                 }
-            }
+                CallOutcome::Stop | CallOutcome::Raise => Err(IterError::PyRaise),
+            };
         }
     }
     // 2) Length + subscript fallback (objreversed.zig:36-50).
-    let len_v = obj_len(ctx, ctx.types, obj).map_err(IterError::from)?;
-    let len_i = obj_get_int(ctx, ctx.types, len_v).map_err(IterError::from)?;
+    // `len` is computed with the Zig `mp_obj_len` — the plain
+    // `obj_len` slot path cannot run a FunBc `__len__` on a user
+    // instance (stub seams), so on `NoLen` load + call it via
+    // the seam; if there is no `__len__` method the NoLen error
+    // stands.
+    let len_i = match obj_len(ctx, ctx.types, obj) {
+        Ok(len_v) => obj_get_int(ctx, ctx.types, len_v).map_err(IterError::from)?,
+        Err(e) => {
+            let len_q = ctx.pool.find_strn(b"__len__");
+            match (len_q != 0)
+                .then(|| real_load_maybe(ctx, obj, len_q as u32))
+                .flatten()
+            {
+                Some((fun, bound)) => match call_bound(ctx, seams, fun, bound, &[]) {
+                    CallOutcome::Value(v) => {
+                        obj_get_int(ctx, ctx.types, v).map_err(IterError::from)?
+                    }
+                    CallOutcome::Stop | CallOutcome::Raise => {
+                        return Err(IterError::PyRaise);
+                    }
+                },
+                None => return Err(IterError::from(e)),
+            }
+        }
+    };
     if sig_err {
         return Err(IterError::TypeError(ARG_NUM_TYPES_MISMATCH));
     }
@@ -122,13 +153,6 @@ pub fn reversed_make_new(
     ))
 }
 
-fn map_dict_err(e: DictError) -> IterError {
-    match e {
-        DictError::OutOfMemory => IterError::OutOfMemory,
-        _ => IterError::PyRaise,
-    }
-}
-
 /// `mp_obj_reversed_iternext` (`objreversed.zig:53-86`):
 /// `cur == 0` → stop; else `cur -= 1` and subscript. The
 /// cursor is decremented BEFORE the subscript (the Zig's
@@ -136,7 +160,20 @@ fn map_dict_err(e: DictError) -> IterError {
 /// A missing `subscr` slot raises `TypeError("object isn't
 /// subscriptable")` (the `mp_obj_subscr` fallback, obj.zig:172
 /// — probed: `reversed({1, 2})`).
-pub fn reversed_iternext(ctx: &mut CallCtx, it: Value) -> Result<Option<Value>, IterError> {
+///
+/// E2f: the subscript takes `seams` so a user instance's
+/// `__getitem__` runs through the call seam (the slot path
+/// cannot run a FunBc method — stub seams). Any raise from
+/// `__getitem__` propagates: the Zig's `mp_obj_subscr` has no
+/// `excIsStopOrIndex` classification here (unlike the getitem
+/// iterator). A user class with no `__getitem__` member falls
+/// through to the slot path (a user subclass of a native
+/// sequence subscripts through its base).
+pub fn reversed_iternext(
+    ctx: &mut CallCtx,
+    it: Value,
+    seams: &mut IterSeams<'_>,
+) -> Result<Option<Value>, IterError> {
     let (seq, cur) = match it {
         Value::Heap(r) => match ctx.arena.get(r) {
             Obj::Iterator(d) => (d.source, d.index),
@@ -151,6 +188,27 @@ pub fn reversed_iternext(ctx: &mut CallCtx, it: Value) -> Result<Option<Value>, 
     if let Value::Heap(r) = it {
         if let Obj::Iterator(d) = ctx.arena.get_mut(r) {
             d.index = next_cur;
+        }
+    }
+    if let Value::Heap(r) = seq {
+        if matches!(ctx.arena.get(r), Obj::Instance(_)) {
+            let getitem_q = ctx.pool.find_strn(b"__getitem__");
+            if getitem_q != 0 {
+                if let Some((fun, bound)) = real_load_maybe(ctx, seq, getitem_q as u32) {
+                    return match call_bound(
+                        ctx,
+                        seams,
+                        fun,
+                        bound,
+                        &[Value::SmallInt(next_cur as i64)],
+                    ) {
+                        CallOutcome::Value(v) => Ok(Some(v)),
+                        CallOutcome::Stop | CallOutcome::Raise => {
+                            Err(IterError::PyRaise)
+                        }
+                    };
+                }
+            }
         }
     }
     let type_ = obj_get_type(ctx.arena, ctx.types, seq);
@@ -216,9 +274,8 @@ mod tests {
                 next_builtin: None,
         };
         let r = reversed_make_new(ctx, &[seq], 0, &mut seams)?;
-        // `iternext` needs no seams (subscript is direct).
         let mut out = Vec::new();
-        while let Some(v) = reversed_iternext(ctx, r)? {
+        while let Some(v) = reversed_iternext(ctx, r, &mut seams)? {
             out.push(v);
         }
         Ok(out)
@@ -347,18 +404,16 @@ mod tests {
                 bytes: b"x".to_vec(),
             }),
         ));
-        let r = {
-            let (mut call, mut getitem) = rev_seams(Value::None);
-            let mut seams = IterSeams {
-                call: &mut call,
-                getitem: &mut getitem,
-                next: None,
-                next_builtin: None,
-            };
-            reversed_make_new(&mut ctx, &[obj], 0, &mut seams).unwrap()
+        let (mut call, mut getitem) = rev_seams(Value::None);
+        let mut seams = IterSeams {
+            call: &mut call,
+            getitem: &mut getitem,
+            next: None,
+            next_builtin: None,
         };
+        let r = reversed_make_new(&mut ctx, &[obj], 0, &mut seams).unwrap();
         assert_eq!(
-            reversed_iternext(&mut ctx, r),
+            reversed_iternext(&mut ctx, r, &mut seams),
             Err(IterError::Obj(ObjError::NotSubscriptable))
         );
     }

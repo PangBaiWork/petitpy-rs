@@ -29,7 +29,7 @@ use crate::objects::strings::objstr_a::{
     str_data_pool, str_index_to_ptr, StrError,
 };
 use crate::runtime::qstr::RuntimeQstr;
-use crate::objects::strings::objstr_methods_c::{bytes_make_new, str_make_new};
+use crate::objects::strings::objstr_methods_c::{bytes_make_new, kw_make_new, str_make_new, KwArg};
 use crate::objects::strings::unicode::{utf8_charlen, utf8_next_char};
 use crate::objects::strings::vstr::Vstr;
 use crate::objects::value::{BytesData, GcRef, ListData, Obj, StrData, Value};
@@ -709,6 +709,136 @@ pub fn str_splitlines_kw_wrapper(
         }
     }
     str_splitlines(ctx, types, &merged).map_err(|e| slot_raise(ctx, e))
+}
+
+/// Shared merge for the `kwVar` method wrappers below (E2f):
+/// `kw_make_new` over the vendor's names/defaults table, with the
+/// positional minimum the `builtin_method!` wrapper used to enforce
+/// — the pairs-table sig is (1, 255) for every method, so the VM
+/// cannot enforce a per-method minimum, and the positional impls
+/// index their required args unguarded (`str_replace` reads
+/// `args[1]`/`args[2]`; a short call through the kw wrapper would
+/// panic). `call_fun_builtin` routes through `kw_func` even when
+/// `n_kw == 0`, so the wrapper also serves the plain positional
+/// call (empty kwargs merge to `args` unchanged).
+fn method_kw_merge(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+    min: usize,
+    names: &[u32],
+    defaults: &[Option<Value>],
+) -> PyResult<Vec<Value>> {
+    if args.len() < min {
+        return Err(slot_raise(ctx, StrError::ArgNumTypesMismatch));
+    }
+    let kws: Vec<KwArg> = kwargs
+        .iter()
+        .map(|(name, value)| KwArg {
+            name: *name,
+            value: *value,
+        })
+        .collect();
+    kw_make_new(args, &kws, names, defaults).map_err(|e| slot_raise(ctx, e))
+}
+
+/// `str.split` / `str.rsplit` as a `BuiltinKwFn` (E2f):
+/// `kwVar(1, [0, sep, maxsplit], [NULL, None, -1], ...)`
+/// (`objstr.zig:3368-3371`).
+pub fn str_split_kw_wrapper(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let names = [
+        0,
+        static_qstr_id(b"sep").expect("sep is a static qstr"),
+        static_qstr_id(b"maxsplit").expect("maxsplit is a static qstr"),
+    ];
+    let defaults = [None, Some(Value::None), Some(Value::SmallInt(-1))];
+    let merged = method_kw_merge(ctx, args, kwargs, 1, &names, &defaults)?;
+    crate::objects::strings::objstr_methods_a::str_split(ctx, types, &merged)
+        .map_err(|e| slot_raise(ctx, e))
+}
+
+/// `str.rsplit` as a `BuiltinKwFn` (E2f): same `kwVar` table as
+/// `split` (`objstr.zig:3371`).
+pub fn str_rsplit_kw_wrapper(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let names = [
+        0,
+        static_qstr_id(b"sep").expect("sep is a static qstr"),
+        static_qstr_id(b"maxsplit").expect("maxsplit is a static qstr"),
+    ];
+    let defaults = [None, Some(Value::None), Some(Value::SmallInt(-1))];
+    let merged = method_kw_merge(ctx, args, kwargs, 1, &names, &defaults)?;
+    crate::objects::strings::objstr_methods_a::str_rsplit(ctx, types, &merged)
+        .map_err(|e| slot_raise(ctx, e))
+}
+
+/// `str.replace` as a `BuiltinKwFn` (E2f): `kwVar(3, [0, 0, 0,
+/// count], [NULL, NULL, NULL, -1], str_replace)`
+/// (`objstr.zig:3437`) — `old`/`new` stay positional-only.
+pub fn str_replace_kw_wrapper(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let names = [
+        0,
+        0,
+        0,
+        static_qstr_id(b"count").expect("count is a static qstr"),
+    ];
+    let defaults = [None, None, None, Some(Value::SmallInt(-1))];
+    let merged = method_kw_merge(ctx, args, kwargs, 3, &names, &defaults)?;
+    crate::objects::strings::objstr_methods_a::str_replace(ctx, types, &merged)
+        .map_err(|e| slot_raise(ctx, e))
+}
+
+/// `str.encode` as a `BuiltinKwFn` (E2f): `kwVar(1, [0,
+/// encoding, errors], [NULL, utf-8, NULL], str_encode)`
+/// (`objstr.zig:3495-3498`).
+pub fn str_encode_kw_wrapper(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let utf8 = Value::Qstr(static_qstr_id(b"utf-8").expect("utf-8 is a static qstr"));
+    let names = [
+        0,
+        static_qstr_id(b"encoding").expect("encoding is a static qstr"),
+        static_qstr_id(b"errors").expect("errors is a static qstr"),
+    ];
+    let defaults = [None, Some(utf8), None];
+    let merged = method_kw_merge(ctx, args, kwargs, 1, &names, &defaults)?;
+    str_encode(ctx, types, &merged).map_err(|e| slot_raise(ctx, e))
+}
+
+/// `bytes.decode` as a `BuiltinKwFn` (E2f): same `kwVar` table
+/// as `encode` (`objstr.zig:3497`).
+pub fn bytes_decode_kw_wrapper(
+    ctx: &mut CallCtx,
+    args: &[Value],
+    kwargs: &[(u32, Value)],
+) -> PyResult<Value> {
+    let types = ctx.types;
+    let utf8 = Value::Qstr(static_qstr_id(b"utf-8").expect("utf-8 is a static qstr"));
+    let names = [
+        0,
+        static_qstr_id(b"encoding").expect("encoding is a static qstr"),
+        static_qstr_id(b"errors").expect("errors is a static qstr"),
+    ];
+    let defaults = [None, Some(utf8), None];
+    let merged = method_kw_merge(ctx, args, kwargs, 1, &names, &defaults)?;
+    bytes_decode(ctx, types, &merged).map_err(|e| slot_raise(ctx, e))
 }
 
 /// `str.partition` slot wrapper.

@@ -353,8 +353,7 @@ fn d5_frozen_re_compile_ignored() {
 }
 
 #[test]
-#[ignore]
-fn d5_frozen_deque_ignored() {
+fn d5_frozen_deque() {
     let mut fx = Fx::new();
     fx.run_ok(
         "from collections import deque\n\

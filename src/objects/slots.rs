@@ -278,6 +278,17 @@ pub trait VmHook {
         lhs: Value,
         rhs: Value,
     ) -> PyResult<Value>;
+    /// Advance `it` one step (the `iternext` form — `Ok(Some(v))`
+    /// = a value, `Ok(None)` = exhausted, `Err(PyRaise)` = a
+    /// raise with the exception on the hook's side channel).
+    /// Default: the generator-only `resume` (E2f: `SeamHook`
+    /// keeps that — its ctx-only world has no VM to step a
+    /// user iterator with; `StateHook` overrides with the VM's
+    /// full `iternext_vm_ctx` — generators, C11 iterators,
+    /// streams and user `__next__`).
+    fn next(&mut self, ctx: &mut CallCtx, it: Value) -> Result<Option<Value>, PyError> {
+        self.resume(ctx, it)
+    }
 }
 
 /// The VM's user-code hook: `&mut dyn VmHook` — see `VmHook`.

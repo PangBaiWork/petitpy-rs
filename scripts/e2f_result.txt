@@ -1,0 +1,474 @@
+# Lane E2f — fix pass: __set_name__, __reversed__/slice attrs, frozen deque, builtin-method kwargs
+
+Base: master `b7f0b7e` (E2c merge). Branch `lane/e2f-class-kwargs`.
+Worktree `~/workspace/petitpy-rs-e2f-class-kwargs`. Executor: E2f lane agent.
+Do NOT merge from here — the main agent verifies independently, rebases
+onto current master at merge time, and merges.
+
+## §1 — Runners, comparison rules, rule changes
+
+- Runners (all under `scripts/`, all take `--bin`, default
+  `target/release/petitpy-rs`): `run_full_gate.py`,
+  `run_integration.py`, `run_golden.py`, `run_capability.py`,
+  `run_stdlib.py`, `run_nano.py`. **All `--bin` paths must be
+  ABSOLUTE** — the runners run with cwd = the orig repo root, so a
+  relative path resolves against
+  `~/workspace/petitpy-orig/target/release/petitpy-rs` and the run
+  fails with "interpreter not found".
+- Capability: `--vm` must be `petitpy-vm`, not `petitpy-rs` (E2b
+  note — passing `petitpy-rs` makes the vm column FAIL for every
+  construct). Invocation used:
+  `run_capability.py --vm <abs>/target/release/petitpy-vm`.
+- Golden uses the REFERENCE petitpy binary as oracle (E2 §1
+  adaptation — vendor MicroPython absent in this VM).
+- Comparison rule: every gate number below was set-diffed against
+  the E2c baseline (full corpus: E2c's 57 regression names in
+  `scripts/e2c_result.txt` §4(f); integration: E2b's 28 fails in
+  `scripts/e2b_result.txt` §4; golden: verified against a scratch
+  worktree at `b7f0b7e` built fresh, which reproduces E2c's 545/585
+  exactly — scratch worktree removed afterwards). "0 regressions"
+  means: no name present in this lane's fail set that was absent
+  from the baseline set.
+- **RULE CHANGE (PangBai, 2026-11-18): the per-file line cap is
+  now 2500 lines, raised from 800.** No splitting was needed in
+  this lane (largest touched file: `objstr_b.rs`, 916 lines).
+  `map.rs` (860) + `gc.rs` (830) are no longer cap debt.
+- **Master moved during this lane**: E2d merged as `67b7149`
+  (corpus 489/552) and E2e as `0223a3a` (corpus 508/552), plus the
+  cap-change commit `7fefd0c`. Per the main agent's instruction
+  this lane did NOT rebase mid-lane; it stayed on `b7f0b7e`. The
+  numbers in §2 are therefore measured against the E2c baseline
+  (488/552), NOT against current master. After the rebase, E2d's
+  `list_sort` and E2e's 19 fixes will already be in, so the
+  remaining-fail counts in §4 will drop accordingly (most of the
+  bytes/array/format names in the §4 list are E2e's fixes).
+- Cross-lane files were NOT touched: no edits to E2d's
+  `obj_ops.rs`, `objlist_methods.rs`, `objlist.rs`, tuple/dict
+  print paths, and no edits to E2e's `objstr_format.rs`,
+  `objarray.rs`, or the bytes-join path.
+
+## §2 — Gates (all re-run in the worktree, release build)
+
+- lib: **1577 passed, 0 failed, 3 ignored** (E2c 1562 + 14 new
+  e2f tests + 1 un-ignored deque test = 1577). Bins 9.
+  `tests/entry_cli.rs` 45. 0 warnings. No `unsafe` in the diff.
+  `scripts/check_compile_mpy.py` PASS (0 byte mismatches, 552/552).
+  `scripts/check_frozen.py` PASS (23/23, 38,141 bytes).
+  Binaries: petitpy-rs **1,879,480 B**, petitpy-vm **1,866,536 B**.
+  The 3 remaining ignored tests are all pre-existing, none is this
+  lane's: `smoke_empty_file_input_parses_to_single_struct`
+  (parser), `makenew_class_attr_on_class` (the type-object
+  attribute gap — `C.x`), `int_from_bytes_e2e_after_classmethod_wrap`
+  (same gap — still FAILS when run with `-- --ignored`).
+- Full corpus: **500/552** (E2c 488) — **+12, 0 regressions**.
+  52 fails = 45 regressions + 7 known-fails exactly.
+  Newly passing (12, set-diffed): builtin_reversed,
+  class_descriptor, class_setname_hazard,
+  class_setname_hazard_rand, deque1, deque2, iter0, iter1, iter2,
+  slice_attrs, subclass_native_init, subclass_native_iter.
+  (7 named targets + 5 extras — all 5 extras are the same two
+  mechanisms: the `super().__init__` fix (§3 Fix 5) and the
+  descriptor `__get__` wiring (§3 Fix 1).)
+- Integration: **178/202** (E2c 174) — **+4, 0 regressions**.
+  Newly passing: builtin_keyword_args (item 4 target),
+  collections_abc_import, deque_cpython_idiom, itertools_chain.
+- Golden: **553/585** (E2c 545) — **+8, 0 new failures**
+  (diffed against the fresh scratch E2c-base build, 545/585).
+  Works 552/584 + works-native-only 1/1. rust==cpython 546/585
+  (was 538). Newly passing: builtin_reversed, deque1, deque2,
+  iter0, iter1, iter2, subclass_native_init, subclass_native_iter.
+- Capability: **67/67 — GATE GREEN** (unchanged).
+- test-stdlib: **6/8** (same as E2c). Still failing: test_abc,
+  test_enum — both class-creation / descriptor territory (§4(c)).
+- Nano (report-only): **420/541** (E2c 416) — +4.
+
+## §3 — Fixes (every claim probed byte-identical vs the reference)
+
+### Fix 1 — `__set_name__` + descriptor `__get__` (item 1)
+Root cause: `call_set_name_methods` (typecreate.rs, the
+snapshot-then-call port of objtype.zig:1934-1968 — verified against
+`~/workspace/petitpy-orig/src/objects/objtype/objtype.zig:1968-2010`)
+EXISTS and is called from `new_type_finish`, but `type_make_new`
+always used `with_stub_seams`, whose `load_maybe` returns None
+always, so no `__set_name__` was ever captured. The same stub
+loader broke the descriptor scan: `scan_special_accessors_flag`
+uses `seams.load_maybe` to probe `__get__` on locals values —
+stub → None → the class never got `FLAG_HAS_SPECIAL_ACCESSORS` →
+`instance_load_attr` step (4) returned the descriptor member as-is
+instead of calling `__get__` (Zig objtype.zig:1329-1346). That is
+why `class_setname_hazard` failed AND why `class_descriptor`
+flipped as an extra.
+- `src/objects/objtype/seams.rs`: NEW `real_load_maybe(ctx, obj,
+  attr)` — class lookup (pure dict lookup via nested stub seams,
+  no call — the E2b `try_instance_getiter` precedent) +
+  `convert_member_lookup` binding; `NativeSlot` hits report "no
+  such attribute". NEW `with_hook_load_seams(hook, f)` — hook's
+  call + real load_maybe + stub subscr. Deliberately a separate
+  constructor from `with_call_hook_seams` (whose other users keep
+  the stub loader; their behaviour is pinned by their own lanes'
+  tests).
+- `src/objects/objtype/typecreate.rs`: `type_make_new` now uses
+  `with_hook_load_seams` when the hook is Some, stub seams when
+  None (ctx-only path unchanged — no runner for FunBc there).
+  `type_call` forwards the hook to make_new (verified).
+- `src/runtime/vm_seams.rs`: `try_instance_load_attr` now uses
+  `with_hook_load_seams` so the descriptor `__get__` step fires on
+  the VM path; the E2 `__getattr__` compensation after it stays as
+  a safety net (only runs when `instance_load_attr` returns None).
+- Verified: `class_setname_hazard` + `class_setname_hazard_rand`
+  byte-identical to the reference; `class_descriptor` flips too.
+
+### Fix 2 — slice attributes (item 2a)
+`slice_attr` exists at `objslice.rs:402` and is correct (`start` /
+`stop` / `step` return the stored bound, `indices` returns a bound
+method), BUT `slice_type_data` (objslice.rs:439) had `attr: None`
+with a stale comment ("attr is a standalone fn for C12 — TypeData
+has no attr field by the frozen C0 design"). Fix: added
+`slice_attr_slot` (mirrors `range_attr_slot` at objrange.rs:341,
+wraps `slice_attr` into `AttrFn`), wired `attr:
+Some(slice_attr_slot)` in `slice_type_data`, updated the stale
+comment. `slice_attrs.py` byte-identical to the reference
+(`1 2 None / 1 2 3 / AttributeError`).
+
+### Fix 3 — user `__reversed__` (item 2b)
+Original `objreversed.zig` (read 2026-11-18): make_new does
+`mp_load_method_maybe(args[0], __reversed__, &dest)`; if found,
+`mp_call_method_n_kw(0, 0, &dest)` (bound method, 0 extra args);
+else `cur_index = mp_obj_get_int(mp_obj_len(args[0]))`. iternext
+does `mp_obj_subscr(seq, index, SENTINEL)` — the RUNTIME subscr.
+Rust gaps: `reversed_make_new_slot` (make_new.rs:248) ignored the
+hook (`_call`) and built `IterSeams` with `call`/`getitem`
+closures that always return `CallOutcome::Raise`.
+`reversed_make_new` (objreversed.rs:67) step 1 read ONLY the
+operand type's own dict for `__reversed__` (no MRO walk, no
+instance-dict lookup) and called through the Raise seam; step 2
+used ctx-only `obj_len` (FunBc `__len__` can't run).
+`reversed_iternext` (objreversed.rs, called from iter.rs:517 as
+`reversed_iternext(ctx, it)` WITHOUT seams) subscripted via the
+type's subscr slot directly — FunBc `__getitem__` fails
+(instance_subscr_slot with stub seams).
+- (a) `reversed_make_new_slot` builds the `call` seam from the
+  hook when Some (maps hook raise → `CallOutcome::Raise`),
+  Raise-always when None.
+- (b) `reversed_make_new` step 1 uses `real_load_maybe` for
+  `__reversed__` + a new `call_bound` helper (bound self prepended,
+  then extra args); step 2 `__len__` fallback — on `obj_len`
+  NoLen, load + call `__len__` via the seam, else keep the NoLen
+  error.
+- (c) `reversed_iternext` now takes `&mut IterSeams` (iter.rs:517
+  updated; tests updated); for `Obj::Instance` sequences it loads
+  `__getitem__` via `real_load_maybe` + calls via the seam,
+  propagating ANY raise (the Zig's `mp_obj_subscr` has no
+  `excIsStopOrIndex` classification here, unlike the getitem
+  iterator); a class with no `__getitem__` member falls through
+  to the slot path (a user subclass of a native sequence subscripts
+  through its base).
+- (d) **Header-stamp bug found by probing**: `reversed_make_new_slot`
+  stamped the returned value's header type unconditionally — for a
+  delegated result (a list from `__reversed__`) this MUTATED the
+  list's header to the reversed type, so `print(reversed(B()))`
+  showed `<reversed>` (while `list(reversed(B()))` still gave
+  `[1, 2, 3]`). Fixed: stamp ONLY when the returned value is the
+  fresh reversed iterator (tag 114 in `extra[0]`); updated the
+  stale slot doc comment (it still claimed the seam was a stub).
+- (e) `find_strn` returns `u16`, `real_load_maybe` takes `u32` —
+  cast `as u32` at the three call sites (first compile failed
+  E0308 ×3).
+- Verified: reversed unit tests 11 passed; `builtin_reversed.py`
+  byte-identical to the reference.
+
+### Fix 4 — `iter0` / `iter1` / `iter2` (item 2c)
+Mechanism analysis (probed 2026-11-18): `for x in myiter(5)`
+already worked (VM's `iternext_vm_ctx` → `__next__` path); only
+the COLLECT path failed (`tuple(myiter(5))` / `list(myiter(0))` →
+"object not iterable") because `collect_iterable`'s plan match had
+no `Obj::Instance` arm, and its Protocol `next` seam only resumed
+generators (`h.resume`). `iter(range(4)).__next__()` failed
+because C11 iterators/generators carry header `None`, so the
+`__next__` fast path in `load_method_maybe_ctx` (gated on the
+header type's `FLAG_ITER_IS_ITERNEXT`) never fired.
+`is_stop_iteration` (vm_rt_iter.rs:84) uses
+`is_exception_instance` — subclass-aware, so a user
+`StopIteration` subclass is exhaustion.
+- (a) `VmHook` trait (slots.rs:253) gains a `next` method with a
+  DEFAULT impl delegating to `resume` (`SeamHook` keeps
+  generator-only behavior); `StateHook::next` (vm_seams.rs)
+  routes through `iternext_vm_ctx` (generators, C11 iterators,
+  streams, user `__next__`, exhaustion as `Ok(None)`; raises
+  stashed on `pending_exc`).
+- (b) `collect_iterable` (objdict_collect.rs): new
+  `Obj::Instance(_) => IterPlan::Protocol(value)` plan arm;
+  Protocol arm reordered so `getiter` runs AFTER the seams are
+  built — a user instance's `__iter__` is loaded via
+  `real_load_maybe` + called through the call seam (no `__iter__`
+  member → plain `getiter`, i.e. getitem fallback); the `next_fn`
+  seam now calls `h.next` instead of `h.resume`; the drain loop
+  uses `next_sub` instead of `iternext` (a user iterator is its
+  own `it`, an `Obj::Instance` not an `Obj::Iterator`; `next_sub`
+  dispatches C11 iterators to `iternext` unchanged). Imports
+  updated (`next_sub`, `real_load_maybe`; `iternext` import
+  removed as unused). Docs updated (stale "the `__iter__` method
+  load is C12/C14's" note).
+- (c) `load_method_maybe_ctx` (vm_rt_name.rs:170): `__next__`
+  fast path extended to fire when the OBJECT payload is
+  `Obj::Iterator | Obj::Generator` (bind `state.next_builtin` to
+  the object) — cannot recurse into `iternext_allow_raise_ctx`
+  because its `load_next_method_ctx` does a direct dict lookup
+  and never calls this function. Callers checked: vm_call.rs:562
+  (`__init_subclass__`), vm_rt_iter.rs:368 (`send`/`close`/
+  `throw`), vm_rt_name.rs:324 (LOAD_METHOD — the target),
+  vm_seams.rs:319 (`__getattr__`) — none passes `__next__` except
+  the target path.
+- Verified: `iter0`, `iter1`, `iter2` byte-identical to the
+  reference. (One test bug of mine, not code: my simplified
+  `__next__` lacked the corpus's `i == 10 → raise
+  StopIteration(42)` branch, so `tuple(myiter(12)) == (11, 10)`
+  was the wrong expectation — fixed the TEST to use the full
+  corpus `__next__`.)
+
+### Fix 5 — frozen deque `__init__` (item 3) — TWO bugs
+The ignored test: `d5_frozen_deque_ignored`
+(modre_frozen_tests.rs:357) — `from collections import deque;
+d = deque([1, 2, 3]); a = len(d); d.append(4); b = len(d);
+c = d.popleft()` expects a=3, b=4, c=1. The frozen deque is
+`class deque(list)` with `__init__(self, iterable=(),
+maxlen=None)` calling `super().__init__(iterable)`
+(`~/workspace/petitpy-orig/petitpy-lib/collections/__init__.py:94-117`).
+- Probes: `list.__init__` does NOT exist on either binary
+  (AttributeError); `object.__init__` exists on both (ref prints
+  `<function>`, Rust `<>` — a repr difference, out of scope);
+  `o.__init__(1,2,3)` → TypeError mismatch on both. Ref's
+  `super().__init__` inside `D(list).__init__` is a
+  `<bound_method>`, NOT `object.__init__` (`is` False), and
+  calling it with `[1,2]` WORKS and populates self. Rust's same
+  call raised "TypeError: can't create instance" (before fix (a)
+  below) — while `D()` still constructed (via the
+  instance_make_new tail, empty list).
+- Zig mechanism (objtype.zig:1572-1640): `super_attr` uses
+  `slot_offset = SLOT_OFFSET_MAKE_NEW` for `__init__`, walks the
+  MRO after the current type; a native base's make_new hit returns
+  SENTINEL → `dest[0] = native_base_init_wrapper_obj`,
+  `dest[1] = self_obj`.
+- **Bug (a) — wrong `native_init_wrapper` fixture**: the bound
+  method's func payload was a **Type** object (`TypeData { name:
+  425, flags: 0, make_new: None, mro: [GcRef(283), GcRef(7)]}`),
+  not the wrapper FunBuiltin — hence "can't create instance"
+  (type_call on a type with no make_new). Cause: `Vm::new()`
+  uses `build_vm_types` (vm_types.rs), whose
+  `native_init_wrapper` was a fixture `plain_type("function")` —
+  NOT the real wrapper FunBuiltin that `rom.rs` builds
+  (`native_base_init_wrapper_obj`). The fixture comment claimed
+  "the VM never calls instance_make_new, the only reader of this
+  field" — WRONG (`super_attr_impl` at typecreate.rs:402 and
+  instance_create.rs:97/284 also read it, and the VM does call
+  instance_make_new for user classes). The tail construction
+  worked because `new_instance` + the tail comparison are
+  self-consistent (both use the same wrong value); only the
+  `super().__init__()` call path exposed the bug. Fix
+  (`src/runtime/vm_types.rs`): build the REAL wrapper via
+  `native_base_init_wrapper_obj(ctx, wrapper_dict)` (same fn
+  `rom.rs` uses; import added), store the FunBuiltin VALUE's
+  GcRef in `types.native_init_wrapper`, `ctx.roots.push` it (GC
+  traces only from RootSet; the wrapper lives only in
+  BuiltinTypes, no builtin dict references it — same as rom.rs);
+  removed `native_init_wrapper` from the three type loops
+  (header fix-up loop — would have overwritten the wrapper
+  value's header; fixed-dict loop; MRO patch loop); corrected
+  the stale fixture comment. `plain_type` stays (still used for
+  `none_type`). Test fixtures (`src/objects/containers/tests.rs`,
+  `obj_tests.rs`, `objtype_tests.rs`, `primitives/tests.rs`) still
+  use a plain type named "function" for their local
+  `native_init_wrapper` — fine for their scope (they don't call
+  super().__init__ through it).
+  Verified after fix (a): `super().__init__` direct case
+  (`f = super().__init__; f([1, 2])`) byte-identical to the
+  reference.
+- **Bug (b) — `load_super_method_ctx` dict-only walk**: after
+  fix (a), the deque itself still failed with "TypeError:
+  argument num/types mismatch" inside `__init__`. Bisected:
+  `class D1(list): def __init__(self, iterable): f =
+  super().__init__; f(iterable)` WORKS on Rust;
+  `super().__init__(iterable)` direct (LOAD_METHOD + CALL) FAILS;
+  `super().__init__([9, 9])` (literal arg) also FAILS. The direct
+  form compiles to LOAD_SUPER_METHOD, whose handler
+  `load_super_method_ctx` (vm_rt_name.rs) walked mro[1..] dicts
+  only — `list`'s dict has no `__init__`, so it found
+  `object.__init__` and called it with `[self, iterable]` → arg
+  mismatch (sig (1,1)). Its own doc comment admitted the gap
+  ("The `__init__`-native-`make_new` SENTINEL case … needs C12a's
+  `make_new` slot — until then a native base's `__init__` is found
+  only if it sits in the parent's dict"). The direct wrapper call
+  was proven fine in isolation (scratch test: `call_fun_builtin`
+  on the wrapper with `[self, list]` → `Ok(None)`), pinning the
+  bug to the LOAD_SUPER_METHOD path. The Zig has no separate walk:
+  `mp_load_super_method` (objtype.zig:463-470) builds a temporary
+  super object and calls `mp_load_method` on it — i.e. the SAME
+  `super_attr` path `load_method_maybe_ctx` uses. Fix:
+  `load_super_method_ctx` now delegates to `super_attr_impl`
+  (with stub seams) and maps `Ok(None)` to the same
+  `AttributeError("no attribute '{name}'")` the old code raised.
+  The old MRO-dict walk is deleted.
+- Verified: all three bisection probes + the real frozen deque
+  (`deque([1,2,3])`, append, popleft, maxlen) byte-identical to
+  the reference. **The test is un-ignored** (renamed
+  `d5_frozen_deque_ignored` → `d5_frozen_deque`, `#[ignore]`
+  removed) and passes. This was the LAST `#[ignore]`d lane
+  test — the 3 remaining ignores are pre-existing (§2).
+
+### Fix 6 — builtin-method kwargs (item 4)
+The integration test `builtin_keyword_args` needs kwargs on
+`split(maxsplit=)`, `rsplit(sep, maxsplit=)`, `replace(count=)`,
+`encode(encoding=)`, `decode(errors=)`, plus `str/bytes/bytearray`
+constructors, `sum(start=)`, `round(ndigits=)`, `pow(mod=)`,
+`print(sep=, file=, flush=)`. Bisected on the pre-fix binary:
+**everything except the six str/bytes methods already worked**
+(`str(object=5)`, `bytes('a', encoding='utf-8')`,
+`sum([1,2], start=10)`, `round(2.567, ndigits=2)`,
+`round(2.5, None)`, `pow(2, 3, mod=5)`, `print(sep=, file=,
+flush=)` all pass; `print` already has a `kw_func` in
+vm_builtins.rs:196, the constructors already parse kwargs via
+`kw_make_new`). Only `split`/`rsplit`/`replace`/`encode`/`decode`
+raised "argument num/types mismatch" (`kw_func: None` + `n_kw > 0`
+→ `arg_check_num` fails).
+Vendor (`objstr.zig:3368-3371, 3437, 3495-3498`): all five are
+`argcheck.kwVar` wrappers — `split`/`rsplit`: names `[0, sep,
+maxsplit]`, defaults `[NULL, None, -1]`; `replace`: names `[0, 0,
+0, count]`, defaults `[NULL, NULL, NULL, -1]`; `encode`/`decode`:
+names `[0, encoding, errors]`, defaults `[NULL, utf-8, NULL]`.
+`KwPos.init` (argcheck.zig:172-191) contract, mirrored exactly:
+too many positionals / unknown keyword / duplicate (positional +
+keyword) / required slot left empty → terse TypeError; `n` = up
+to the highest slot given; slots in `[n_pos, n)` take defaults.
+- `src/objects/strings/objstr_methods_c.rs`: generalized
+  `kw_make_new` from fixed `[u32; 3]` / `[Option<Value>; 3]` to
+  slices (`&[u32]`, `&[Option<Value>]`) so `replace`'s 4 slots
+  fit (the two constructor callers pass `&[u32; 3]`, which
+  coerces; behaviour unchanged for them) + the `*q != 0` guard in
+  the slot match (the Zig's `KwPos.slot` skips `q == 0` —
+  positional-only slots never match a keyword).
+- `src/objects/strings/objstr_b.rs`: NEW shared
+  `method_kw_merge(ctx, args, kwargs, min, names, defaults)` —
+  the per-method positional minimum the `builtin_method!`
+  wrapper used to enforce (the pairs-table sig is (1, 255) for
+  every method, so the VM cannot enforce a per-method minimum,
+  and the positional impls index required args unguarded —
+  `str_replace` reads `args[1]`/`args[2]`; a short call through
+  the kw wrapper would panic, the E2c-sweep class).
+  `call_fun_builtin` routes through `kw_func` even when `n_kw ==
+  0`, so the wrapper also serves the plain positional call
+  (empty kwargs merge to `args` unchanged). NEW five wrappers:
+  `str_split_kw_wrapper`, `str_rsplit_kw_wrapper`,
+  `str_replace_kw_wrapper`, `str_encode_kw_wrapper`,
+  `bytes_decode_kw_wrapper` (each: vendor names/defaults table +
+  merge + the existing positional impl).
+- `src/runtime/vm_types.rs`: registered the wrappers as
+  `kw_overrides` for BOTH the str dict (`split`, `rsplit`,
+  `replace`, `encode`) and the bytes dict (`split`, `rsplit`,
+  `replace`, `decode`) — `BYTES_METHODS` shares the same
+  `BuiltinFn` entries, so both dicts needed the override.
+  (bytearray's methods come from `ARRAY_METHODS` — E2e's file,
+  untouched; the test doesn't use bytearray method kwargs.)
+- Verified: the full `builtin_keyword_args` script
+  byte-identical to the reference (all 7 output lines + both
+  `TypeError` lines); integration `builtin_keyword_args` flips.
+
+### Regression tests (NEW `src/runtime/vm_tests_e2f.rs`, 14 tests)
+`e2f_set_name_called`, `e2f_set_name_raise_propagates`,
+`e2f_descriptor_get_via_class_creation`, `e2f_slice_attrs`,
+`e2f_reversed_user_len_getitem`, `e2f_reversed_dunder_reversed`
+(includes `r.append(4)`, pinning the header-stamp bug),
+`e2f_reversed_getitem_raise_propagates`,
+`e2f_iter_user_iterator_tuple`,
+`e2f_iter_user_iterator_list_stop_forms`,
+`e2f_iter_missing_next_typeerror`, `e2f_iter_next_dunder`,
+`e2f_method_kwargs_split`, `e2f_method_kwargs_replace_encode_decode`,
+`e2f_method_kwargs_bad` (unknown kwarg, duplicate positional +
+keyword, positional-only kwarg (`old=` on replace), too many
+positionals, too few positionals — all terse TypeError). All 14
+pass. (Test bug, not code: `e2f_method_kwargs_bad` first failed
+because `check()` returns string LITERALS — `Value::Qstr`, not
+heap `Str` — the reader now handles both, like `exc_value`.)
+
+## §4 — Shortfalls, out-of-scope items, notes for the merger
+
+- (a) **Getitem-iterator over user instances — OUT OF SCOPE,
+  still failing**: `for x in A()` / `list(A())` where `A` defines
+  only `__getitem__` ("object isn't subscriptable"). Both getitem
+  seams (objdict_collect.rs and vm_rt_iter.rs) use ctx-only
+  `obj_subscr`; fixing it means threading a hook through them.
+  Not a line in any named target file; reported here, not fixed.
+- (b) **`type(iter(...))` — OUT OF SCOPE**: still a bare
+  TypeError (E2 §4(p) item, explicitly excluded by the brief).
+  Probe `/tmp/e2f_probe_next.py` differs from the reference ONLY
+  on the `type(iter([1]))` / `type(g)` lines; the `__next__()`
+  lines match.
+- (c) **test_abc / test_enum (stdlib 6/8)** — class-creation /
+  descriptor territory beyond items 1–4. test_abc's inner
+  failures are "argument num/types mismatch" instantiating a
+  concrete ABC subclass — a FunBc `__init__` dispatch through a
+  path item 3's super fix doesn't cover (needs its own probe +
+  fix, not this lane).
+- (d) **Remaining corpus fails (45, on base `b7f0b7e`)**:
+  array1 array_add array_intbig array_micropython builtin_hash
+  builtin_hash_intbig builtin_override builtin_str_hex bytearray1
+  bytearray_byte_operations bytearray_center bytearray_construct
+  bytearray_count bytearray_decode bytearray_partition bytes
+  bytes_add_array bytes_add_bytearray bytes_add_endian
+  bytes_compare_array bytes_compare_bytearray
+  bytes_construct_array bytes_construct_bytearray
+  bytes_construct_endian class_delattr_setattr class_new
+  class_store_class class_super_closure getitem
+  import_instance_method int_big_rshift int_bytes_intbig
+  int_parse io_iobase list_sort memoryerror object_new
+  ordereddict1 special_methods special_methods_intbig
+  stopiteration string_format string_format_modulo
+  subclass_native_buffer subclass_native_exc_new.
+  Dominated by E2e's (k)/(l)/(m) (bytes/array buffer paths,
+  bytearray str methods, `str.format` nested fields) — E2e merged
+  as `0223a3a` during this lane, so most of those names will
+  already be gone after the rebase. The rest are E2 §4 clusters
+  (n) descriptor / native-subclass dispatch, (p) the remainder
+  (int_parse, int_big_rshift, int_bytes_intbig, getitem,
+  import_instance_method, io_iobase, memoryerror, ordereddict1,
+  special_methods) — out of this lane's scope.
+- (e) **E2b's noted item, still open**: the direct (non-VM)
+  `str_join` still panics (SIGABRT) on a short call invoked
+  through the slot path without the VM intercept — user code
+  cannot reach it (all VM calls go through `call_join_ctx`'s
+  arity check), but a Rust-side direct caller could. Out of scope.
+- (f) **Rebase note for the merger**: this lane is on base
+  `b7f0b7e`; master is now `0223a3a` (E2d `67b7149` + E2e
+  `0223a3a` + cap change `7fefd0c`). Expected rebase touch
+  points: `src/runtime/mod.rs` (this lane adds
+  `vm_tests_e2f`; E2d/E2e added their own test modules — keep
+  all, same as E2e's rebase) and possibly `src/runtime/vm_types.rs`
+  (this lane adds kw_overrides + the real `native_init_wrapper`;
+  check E2e didn't touch it). Files changed in this lane (15
+  modified + 1 new): `src/modules/modre_frozen_tests.rs`
+  (un-ignore deque), `src/objects/containers/objdict_collect.rs`,
+  `src/objects/containers/objslice.rs`, `src/objects/iters/iter.rs`,
+  `src/objects/iters/objreversed.rs`,
+  `src/objects/objtype/make_new.rs`,
+  `src/objects/objtype/seams.rs`,
+  `src/objects/objtype/typecreate.rs`, `src/objects/slots.rs`,
+  `src/objects/strings/objstr_b.rs`,
+  `src/objects/strings/objstr_methods_c.rs`,
+  `src/runtime/mod.rs`, `src/runtime/vm_rt_name.rs`,
+  `src/runtime/vm_seams.rs`, `src/runtime/vm_types.rs`; NEW
+  `src/runtime/vm_tests_e2f.rs`. No E2d/E2e files touched.
+- (g) **Session gotchas** (for the next lane): release test
+  builds take ~5–8 min on this VM (1.5 CPUs) — poll
+  backgrounded execs, don't run parallel cargo. `cargo test...
+  e2f` filter runs only matching tests. A `sed -i` on mod.rs can
+  leave a dangling `#[cfg(test)]` attribute — verify with grep
+  after (hit twice this lane). `find_strn` returns `u16`,
+  `real_load_maybe` takes `u32` — cast. The pre-lane summary's
+  description of objreversed.rs was partly stale (no `check_sig`,
+  different `IteratorData` shape) — always read the actual file
+  before editing. The service restarted twice mid-lane and
+  SIGTERM'd backgrounded test runs — re-check state, then re-run;
+  nothing was lost. Runner `__pycache__` dirs
+  (`tests/__pycache__`, `tools/__pycache__`,
+  `scripts/__pycache__`) are recreated by every gate run — clean
+  them AFTER the last runner run; orig repo verified clean at
+  close-out.

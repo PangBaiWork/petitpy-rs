@@ -197,6 +197,23 @@ pub fn load_method_maybe_ctx(
                 }
             }
         }
+        // E2f: C11 iterators and generators carry header `None`
+        // (the `type(iter(...))` gap — out of scope here), so the
+        // flag check above never fires for them. The reference
+        // resolves `__next__` on both (probed:
+        // `iter([1]).__next__()` → the first element,
+        // `g.__next__()` → the first yield) — the payload IS an
+        // iterator, so bind the `next` builtin directly (the
+        // Zig's iterator type carries `__next__` in its locals;
+        // this is the same binding without the type). This path
+        // cannot recurse into `iternext_allow_raise_ctx`: its
+        // `load_next_method_ctx` does a direct dict lookup and
+        // never calls this function.
+        if let Value::Heap(r) = obj {
+            if matches!(ctx.arena.get(r), Obj::Iterator(_) | Obj::Generator(_)) {
+                return Ok((Some(state.next_builtin), Some(obj)));
+            }
+        }
     }
     // An instance tries its attribute load first, with the
     // VM's real call hook (E2): the members map, `__dict__`,
@@ -338,16 +355,18 @@ pub fn load_method_ctx(
 }
 
 /// `mp_load_super_method` (`objtype.zig:463` + vendor
-/// `super_attr`, `objtype.c:1349`): build the `super(type,
-/// obj)` lookup — walk the parent chain after `type` in
-/// `type`'s own MRO (single inheritance, so the parent chain
-/// IS `mro[1..]`), first dict hit wins, bound via
-/// `convert_member_lookup` against `obj`. A miss raises
-/// `AttributeError("no attribute '%q'")` (the `mp_load_method`
-/// fallback). The `__init__`-native-`make_new` SENTINEL case
-/// (`super_attr`'s `native_base_init_wrapper`) needs C12a's
-/// `make_new` slot — until then a native base's `__init__`
-/// is found only if it sits in the parent's dict.
+/// `super_attr`, `objtype.c:1349`): build the temporary
+/// `super(type, obj)` object and load the method through it —
+/// i.e. the SAME `super_attr` path `load_method_maybe_ctx`
+/// uses (E2f: the old MRO-dict-only walk below missed the
+/// native `__init__` SENTINEL — a native base's `make_new`
+/// reached via `SLOT_OFFSET_MAKE_NEW` — and fell through to
+/// `object.__init__`, so `super().__init__(iterable)` raised
+/// `TypeError("argument num/types mismatch")` while the stored
+/// form (`f = super().__init__; f(iterable)`, which goes
+/// through `load_method_maybe_ctx`) worked. The Zig has no
+/// separate walk: `mp_load_super_method` IS `mp_load_method`
+/// on a temporary super object.)
 pub fn load_super_method_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -355,27 +374,20 @@ pub fn load_super_method_ctx(
     obj: Value,
     attr: u32,
 ) -> Result<(Value, Option<Value>), Value> {
-    use crate::objects::containers::objdict::dict_get_value;
-    let mro: Vec<GcRef> = match ctx.arena.get(type_) {
-        Obj::Type(d) => d.mro.clone(),
-        _ => Vec::new(),
-    };
-    for class in mro.iter().skip(1) {
-        let dict = match ctx.arena.get(*class) {
-            Obj::Type(d) => d.dict,
-            _ => continue,
-        };
-        if let Ok(member) = dict_get_value(ctx, Value::Heap(dict), Value::Qstr(attr)) {
-            let (method, self_) = convert_member_lookup(ctx, Some(obj), *class, member);
-            return Ok((method, self_));
+    use crate::objects::objtype::seams::with_stub_seams;
+    use crate::objects::objtype::typecreate::super_attr_impl;
+    match with_stub_seams(|seams| super_attr_impl(ctx, type_, obj, attr, seams)) {
+        Ok(Some(method)) => Ok((method, None)),
+        Ok(None) => {
+            let name = String::from_utf8_lossy(ctx.pool.qstr_str(attr as u16)).into_owned();
+            Err(crate::objects::objtype::objexcept::new_exception_msg(
+                ctx,
+                state.exc.attribute_error,
+                &format!("no attribute '{name}'"),
+            ))
         }
+        Err(e) => Err(crate::runtime::vm_ops::exc_from_pyerror(ctx, state, e)),
     }
-    let name = String::from_utf8_lossy(ctx.pool.qstr_str(attr as u16)).into_owned();
-    Err(crate::objects::objtype::objexcept::new_exception_msg(
-        ctx,
-        state.exc.attribute_error,
-        &format!("no attribute '{name}'"),
-    ))
 }
 
 /// `mp_load_attr` (`runtime.zig:1126-1135`): `load_method` then

@@ -454,31 +454,35 @@ pub struct KwArg {
     pub value: Value,
 }
 
-/// `KwPos.init` (`argcheck.zig:172-191`) for a constructor: merge
-/// positional args + kwargs into positional slots `names` (filling
-/// `defaults` for slots the caller skipped), exactly as the
-/// original. `defaults[i] == None` means "no default — the slot is
-/// required". Failures are TERSE (`ArgNumTypesMismatch`,
+/// `KwPos.init` (`argcheck.zig:172-191`) for a constructor (and,
+/// E2f, for a builtin method's `kwVar` wrapper — same merge):
+/// merge positional args + kwargs into positional slots `names`
+/// (filling `defaults` for slots the caller skipped), exactly as
+/// the original. `defaults[i] == None` means "no default — the
+/// slot is required". Failures are TERSE (`ArgNumTypesMismatch`,
 /// "argument num/types mismatch"): too many positionals, an unknown
 /// keyword, a duplicate (positional + keyword), or a required slot
 /// left empty. Returns the merged positional args (trailing empty
-/// slots trimmed, as `r.n` does).
+/// slots trimmed, as `r.n` does). A `names` entry of 0 is a
+/// positional-only slot and never matches a keyword (the Zig's
+/// `KwPos.slot` skips `q == 0`).
 pub fn kw_make_new(
     args: &[Value],
     kwargs: &[KwArg],
-    names: &[u32; 3],
-    defaults: &[Option<Value>; 3],
+    names: &[u32],
+    defaults: &[Option<Value>],
 ) -> Result<Vec<Value>, StrError> {
+    debug_assert_eq!(names.len(), defaults.len());
     if args.len() > names.len() {
         return Err(StrError::ArgNumTypesMismatch);
     }
-    let mut merged: [Option<Value>; 3] = [None, None, None];
+    let mut merged: Vec<Option<Value>> = vec![None; names.len()];
     for (i, a) in args.iter().enumerate() {
         merged[i] = Some(*a);
     }
     let mut n = args.len();
     for kw in kwargs {
-        let Some(i) = names.iter().position(|q| *q == kw.name) else {
+        let Some(i) = names.iter().position(|q| *q != 0 && *q == kw.name) else {
             return Err(StrError::ArgNumTypesMismatch);
         };
         if merged[i].is_some() {

@@ -84,7 +84,8 @@
 use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
 use crate::runtime::qstr::RuntimeQstr;
 use crate::objects::containers::map::{
-    map_lookup, map_of, map_of_mut, map_set_value, map_value, LookupKind, LookupOutcome, MapError,
+    map_lookup, map_lookup_hook, map_of, map_of_mut, map_set_value, map_value, LookupKind,
+    LookupOutcome, MapError,
 };
 use crate::objects::obj::ObjError;
 use crate::objects::obj_ops::{obj_equal, obj_print_helper};
@@ -349,9 +350,34 @@ pub fn dict_store(
     key: Value,
     value: Value,
 ) -> Result<Value, DictError> {
+    dict_store_inner(ctx, dict, key, value, None)
+}
+
+/// `dict_store` with an optional VM hook for instance keys (E2h):
+/// the hook threads into `map_lookup_hook`'s hash computation, so
+/// a dict literal / comprehension store (`{A(): 1}`) runs the key's
+/// `__hash__` through the VM's real call hook. Without a hook this
+/// is exactly `dict_store`.
+pub fn dict_store_hook(
+    ctx: &mut CallCtx,
+    dict: Value,
+    key: Value,
+    value: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, DictError> {
+    dict_store_inner(ctx, dict, key, value, hook)
+}
+
+fn dict_store_inner(
+    ctx: &mut CallCtx,
+    dict: Value,
+    key: Value,
+    value: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, DictError> {
     let r = dict_ref_of(ctx.arena, dict);
     ensure_not_fixed(ctx.arena, r)?;
-    match map_lookup(ctx, ctx.types, r, key, LookupKind::Add)? {
+    match map_lookup_hook(ctx, ctx.types, r, key, LookupKind::Add, hook)? {
         LookupOutcome::Added(i) | LookupOutcome::Found(i) => {
             map_set_value(ctx.arena, r, i, value);
             Ok(dict)

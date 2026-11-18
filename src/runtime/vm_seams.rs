@@ -144,6 +144,12 @@ impl crate::objects::slots::VmHook for StateHook<'_> {
             }
         }
     }
+
+    /// E2h: take (and clear) the stashed raise — see the
+    /// `VmHook::take_pending` contract.
+    fn take_pending(&mut self) -> Option<Value> {
+        self.state.pending_exc.take()
+    }
 }
 
 /// Build the VM's hook from `state` (borrows `state` for `'s`).

@@ -105,7 +105,17 @@ pub fn shr_inpl(dest: &mut BigInt, lhs: &BigInt, rhs: u64) {
                     dest.dig.push(1);
                 } else {
                     // dest > 0, so can use mpn_add to add 1.
+                    // mpn::add needs out.len() >= a.len() + 1 for
+                    // the final carry — the truncate above shrank
+                    // dest to its logical length, so regrow the
+                    // spare digit the vendor's
+                    // mpz_need_dig(dest, lhs->len) provides
+                    // (mpz.c:1101); without it the carry write
+                    // panics (index out of bounds) when the
+                    // shifted value is all 1s, e.g.
+                    // (-0xffffffffffffffff) >> 32.
                     let tmp = dest.dig.clone();
+                    dest.dig.resize(tmp.len() + 1, 0);
                     let len = mpn::add(&mut dest.dig, &tmp, &[1]);
                     dest.dig.truncate(len);
                 }

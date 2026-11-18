@@ -118,6 +118,15 @@ pub(crate) fn intercept_builtin_call(
             ctx, state, n_args, n_kw, args,
         ));
     }
+    // `hash` (E2h): intercepted by GcRef identity so a user-class
+    // instance runs its `__hash__` through the VM's real call hook
+    // (see `call_hash_ctx`); anything else keeps the ctx-only
+    // `hash_builtin` behavior.
+    if fun == state.hash_builtin {
+        return Some(crate::runtime::builtin_vm::call_hash_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     if fun == state.min_builtin {
         return Some(crate::runtime::builtin_vm::call_min_ctx(ctx, state, n_args, n_kw, args));
     }

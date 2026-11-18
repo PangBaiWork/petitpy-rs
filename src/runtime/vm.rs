@@ -160,6 +160,13 @@ pub struct VmState {
     /// `PyRaise` for a non-`None` key, so `l.sort(key=f)`
     /// needs the VM's real call hook to run `f`.
     pub list_sort_builtin: Value,
+    /// The `hash` builtin (E2h): the plain `FunBuiltin` from
+    /// the builtins dict. Intercepted by GcRef identity in
+    /// `call_function_ctx` (see `call_hash_ctx` in
+    /// `builtin_vm.rs`) — `hash_builtin` is ctx-only and its
+    /// slot path cannot run a `FunBc` `__hash__`, so `hash(A())`
+    /// needs the VM's real call hook.
+    pub hash_builtin: Value,
     pub min_builtin: Value,
     pub max_builtin: Value,
     pub getattr_builtin: Value,
@@ -436,6 +443,7 @@ impl Vm {
                 str_join_builtin: Value::None,
                 bytes_join_builtin: Value::None,
                 list_sort_builtin: Value::None,
+                hash_builtin: Value::None,
                 min_builtin: Value::None,
                 max_builtin: Value::None,
                 getattr_builtin: Value::None,

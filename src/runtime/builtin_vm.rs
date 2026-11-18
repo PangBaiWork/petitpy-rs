@@ -30,7 +30,7 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objboundmeth::new_bound_meth;
-use crate::objects::containers::map::map_of;
+use crate::objects::containers::map::{hash_of_hook, map_of, MapError};
 use crate::objects::containers::objdict_collect::collect_iterable;
 use crate::objects::containers::objlist::new_list;
 use crate::objects::strings::objstr_methods_c::KwArg;
@@ -39,6 +39,7 @@ use crate::objects::objtype::objexcept::is_exception_instance;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::BinaryOp;
 use crate::objects::value::{Obj, Value};
+use crate::pyerr::PyError;
 use crate::runtime::import_search::rt_error_to_value;
 use crate::runtime::runtime::RtError;
 use crate::runtime::runtime_method::{load_attr, load_method_protected, MethodDest};
@@ -228,6 +229,37 @@ pub fn call_join_ctx(
         let pe = ctx.record_typed(e);
         exc_from_pyerror(ctx, state, pe)
     })
+}
+
+/// `mp_builtin_hash` (`modbuiltins.zig`) with the VM hook (E2h):
+/// the hash goes through `hash_of_hook` — a user-class instance
+/// runs its `__hash__` through the VM's real call hook (the
+/// member path truncates, the no-`__hash__` path applies the
+/// vendor's identity / `__eq__` rule, a raising `__hash__` is
+/// swallowed to `TypeError("unsupported type for operator")`,
+/// a non-int return to `TypeError("can't convert to int")`);
+/// anything else hashes through the ctx-only `hash_of`, exactly
+/// as the plain `hash_builtin` did. Arity is (1, 1) — interception
+/// bypasses `call_fun_builtin`'s sig check, so the mismatch is
+/// reproduced by hand.
+pub fn call_hash_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if n_args != 1 || n_kw != 0 {
+        return Err(mismatch(ctx, state));
+    }
+    let types = ctx.types;
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
+    match hash_of_hook(ctx, types, args[0], Some(&mut hook)) {
+        Ok(h) => Ok(Value::int(ctx.arena, Some(types.int), ctx.roots, h as i64)),
+        Err(MapError::TypeError(msg)) => Err(type_error(ctx, state, msg)),
+        Err(MapError::OutOfMemory) => Err(exc_from_pyerror(ctx, state, PyError::OutOfMemory)),
+        Err(MapError::PyRaise) => Err(exc_from_pyerror(ctx, state, PyError::PyRaise)),
+    }
 }
 
 /// `mp_builtin_min` / `mp_builtin_max` (`modbuiltins.zig:763+`):

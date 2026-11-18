@@ -11,7 +11,7 @@
 //! keep the item when the result is truthy.
 
 use super::iter::{
-    getiter, iternext, new_iter, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams,
+    getiter, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams,
     FILTER_ITER_TAG, FLAG_ITER_IS_ITERNEXT, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
@@ -69,7 +69,7 @@ pub fn filter_iternext(
         _ => return Err(IterError::TypeError(NOT_AN_ITERATOR)),
     };
     loop {
-        let Some(item) = iternext(ctx, sub, seams)? else {
+        let Some(item) = next_sub(ctx, sub, seams)? else {
             return Ok(None);
         };
         // The item is rooted across the predicate call (D6):
@@ -155,7 +155,7 @@ mod tests {
         call: &'a mut dyn FnMut(&mut CallCtx, Value, &[Value]) -> CallOutcome,
         getitem: &'a mut dyn FnMut(&mut CallCtx, Value, i64) -> CallOutcome,
     ) -> IterSeams<'a> {
-        IterSeams { call, getitem }
+        IterSeams { call, getitem, next: None, next_builtin: None }
     }
 
     /// A panicking getitem closure (filter never calls it).

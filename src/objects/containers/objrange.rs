@@ -320,8 +320,8 @@ pub fn range_print(ctx: &mut CallCtx, v: Value, _kind: PrintKind, sink: &mut dyn
 /// `range_attr` (objrange.zig:101-107, full config): `start` /
 /// `stop` / `step` return `mp_obj_new_int(...)` — a heap `Int`
 /// when the bound leaves the 62-bit window. Any other attr returns
-/// `None` (not found — C12 tries the next lookup). Standalone fn
-/// for C12 (`TypeData` has no `attr` field by the frozen C0 design).
+/// `None` (not found — C12 tries the next lookup). Wired into the
+/// type data via `range_attr_slot` below.
 pub fn range_attr(ctx: &mut CallCtx, range_v: Value, attr: u32) -> Option<Value> {
     let (start, stop, step) = range_data_of(ctx.arena, range_v);
     if attr == static_qstr_id(b"start").expect("MP_QSTR_start is in the static table") {
@@ -334,6 +334,16 @@ pub fn range_attr(ctx: &mut CallCtx, range_v: Value, attr: u32) -> Option<Value>
         return Some(Value::int(ctx.arena, Some(ctx.types.int), ctx.roots, step));
     }
     None
+}
+
+/// `range_attr` as an `AttrFn` slot (the `attrtuple_attr_fn`
+/// precedent): the type data wires this, not the bare fn.
+pub fn range_attr_slot(
+    ctx: &mut CallCtx,
+    range_v: Value,
+    attr: u32,
+) -> PyResult<Option<Value>> {
+    Ok(range_attr(ctx, range_v, attr))
 }
 
 /// `npy_rng_fn_getiter` (objrange.zig:207-210): a fresh
@@ -418,7 +428,7 @@ pub fn range_type_data(dict: GcRef) -> TypeData {
         subscr: Some(range_subscr),
         buffer: None,
         print: Some(range_print),
-        attr: None,
+        attr: Some(range_attr_slot),
         make_new: Some(crate::objects::objtype::make_new::range_make_new_slot),
         bases: None,
         namedtuple_fields: None,

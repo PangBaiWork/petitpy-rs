@@ -12,7 +12,7 @@
 //! then calls the function on the pulled items.
 
 use super::iter::{
-    getiter, iternext, new_iter, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams,
+    getiter, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, CallOutcome, IterError, IterSeams,
     FLAG_ITER_IS_ITERNEXT, MAP_ITER_TAG, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
@@ -90,7 +90,7 @@ pub fn map_iternext(
     let mark = ctx.roots.extra.len();
     let mut items = Vec::with_capacity(iters.len());
     for sub in &iters {
-        match iternext(ctx, *sub, seams)? {
+        match next_sub(ctx, *sub, seams)? {
             Some(v) => {
                 ctx.roots.extra.push(v);
                 items.push(v);
@@ -196,6 +196,8 @@ mod tests {
         let mut seams = IterSeams {
             call: &mut call,
             getitem: &mut getitem,
+            next: None,
+                next_builtin: None,
         };
         let items = collect_all(&mut ctx, m, &mut seams).unwrap();
         assert_eq!(items.len(), 2);
@@ -222,6 +224,8 @@ mod tests {
         let mut seams = IterSeams {
             call: &mut call,
             getitem: &mut getitem,
+            next: None,
+                next_builtin: None,
         };
         let items = collect_all(&mut ctx, m, &mut seams).unwrap();
         assert_eq!(items, vec![Value::SmallInt(11), Value::SmallInt(22)]);
@@ -273,6 +277,8 @@ mod tests {
             let mut seams = IterSeams {
                 call: &mut call,
                 getitem: &mut getitem,
+                next: None,
+                next_builtin: None,
             };
             // Construction succeeds (callability is not checked
             // there); the FIRST next raises — including when the
@@ -300,6 +306,8 @@ mod tests {
         let mut seams = IterSeams {
             call: &mut call,
             getitem: &mut getitem,
+            next: None,
+                next_builtin: None,
         };
         let items = collect_all(&mut ctx, outer, &mut seams).unwrap();
         assert_eq!(items.len(), 1);

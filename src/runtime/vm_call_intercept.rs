@@ -109,6 +109,15 @@ pub(crate) fn intercept_builtin_call(
     if fun == state.str_join_builtin || fun == state.bytes_join_builtin {
         return Some(crate::runtime::builtin_vm::call_join_ctx(ctx, state, n_args, n_kw, args));
     }
+    // `list.sort` (E2c): intercepted by GcRef identity so a
+    // non-`None` key runs through the VM's real call hook (see
+    // `call_list_sort_ctx`); a `None` key delegates to the
+    // ctx-only `list_sort_builtin`.
+    if fun == state.list_sort_builtin {
+        return Some(crate::runtime::builtin_vm::call_list_sort_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     if fun == state.min_builtin {
         return Some(crate::runtime::builtin_vm::call_min_ctx(ctx, state, n_args, n_kw, args));
     }

@@ -116,6 +116,9 @@ pub fn iternext_allow_raise_ctx(
     }
     if let Value::Heap(r) = it {
         if matches!(ctx.arena.get(r), Obj::Iterator(_)) {
+            // Copy the `next` builtin out BEFORE the seams
+            // below borrow `state` mutably (E0503).
+            let next_builtin = state.next_builtin;
             // The seams: `call` routes user-function calls
             // through the VM (capturing `state`); `getitem`
             // uses the subscr slot directly (no state needed).
@@ -177,6 +180,15 @@ pub fn iternext_allow_raise_ctx(
             let mut seams = IterSeams {
                 call: &mut call_seam,
                 getitem: &mut getitem_seam,
+                // No `next` closure (a second closure over
+                // `state` would collide with the `call` seam's
+                // borrow, E0524): the `next` builtin is supplied
+                // instead — `next_sub` advances a generator
+                // sub-iterator by calling it through the `call`
+                // seam, and the intercept routes it to the real
+                // resume (E2c).
+                next: None,
+                next_builtin: Some(next_builtin),
             };
             return match iternext(ctx, it, &mut seams) {
                 Ok(Some(v)) => Ok(v),

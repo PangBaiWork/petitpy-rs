@@ -31,9 +31,8 @@ use crate::runtime::vm_dispatch_util::{
     bc_byte, decode_qstr, decode_uint, decode_ulabel, jump_by, sget, spop, spush, spush_null,
     sset_top, stop, unwind_jump, unwind_return, DispatchOutcome, Flow,
 };
-use crate::runtime::vm_call::{
-    call_function_ctx, call_method_ctx, call_method_var_kw_ctx,
-};
+use crate::runtime::vm_call::{call_function_ctx, call_method_ctx};
+use crate::runtime::vm_call_var_kw::call_method_var_kw_ctx;
 use crate::runtime::vm_ops::{exc_from_obj_error, make_closure_ctx, make_function_ctx};
 use crate::runtime::vm_rt::is_true_ctx;
 use crate::runtime::vm_rt_name::load_method_ctx;

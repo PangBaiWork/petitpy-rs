@@ -11,7 +11,7 @@
 //! (the Zig has none — `zip(…, strict=True)` is a sig error).
 
 use super::iter::{
-    getiter, iternext, new_iter, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
+    getiter, new_iter, next_sub, ARG_NUM_TYPES_MISMATCH, IterError, IterSeams,
     FLAG_ITER_IS_ITERNEXT, ZIP_ITER_TAG, NOT_AN_ITERATOR,
 };
 use crate::memory::gc::CallCtx;
@@ -78,7 +78,7 @@ pub fn zip_iternext(
     let mark = ctx.roots.extra.len();
     let mut items = Vec::with_capacity(iters.len());
     for sub in &iters {
-        match iternext(ctx, *sub, seams)? {
+        match next_sub(ctx, *sub, seams)? {
             Some(v) => {
                 ctx.roots.extra.push(v);
                 items.push(v);
@@ -231,6 +231,8 @@ mod tests {
         let mut seams = IterSeams {
             call: &mut call,
             getitem: &mut getitem,
+            next: None,
+                next_builtin: None,
         };
         let items = collect_all(&mut ctx, z, &mut seams).unwrap();
         assert_eq!(items.len(), 2);

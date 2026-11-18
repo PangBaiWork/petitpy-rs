@@ -705,7 +705,9 @@ pub fn str_splitlines_kw_wrapper(
 
 /// `str.partition` slot wrapper.
 pub fn str_partition_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    if args.is_empty() {
+    // E2c sweep: reads `args[1]` unguarded — the old
+    // `args.is_empty()` guard let a short call panic (SIGABRT).
+    if args.len() < 2 {
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
@@ -714,7 +716,9 @@ pub fn str_partition_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Valu
 
 /// `str.rpartition` slot wrapper.
 pub fn str_rpartition_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    if args.is_empty() {
+    // E2c sweep: reads `args[1]` unguarded — the old
+    // `args.is_empty()` guard let a short call panic (SIGABRT).
+    if args.len() < 2 {
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
@@ -732,7 +736,9 @@ pub fn str_count_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 
 /// `str.center` slot wrapper.
 pub fn str_center_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    if args.is_empty() {
+    // E2c sweep: reads `args[1]` unguarded — the old
+    // `args.is_empty()` guard let a short call panic (SIGABRT).
+    if args.len() < 2 {
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
@@ -741,7 +747,9 @@ pub fn str_center_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
 
 /// `str.ljust` slot wrapper.
 pub fn str_ljust_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    if args.is_empty() {
+    // E2c sweep: reads `args[1]` unguarded — the old
+    // `args.is_empty()` guard let a short call panic (SIGABRT).
+    if args.len() < 2 {
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;
@@ -750,7 +758,9 @@ pub fn str_ljust_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 
 /// `str.rjust` slot wrapper.
 pub fn str_rjust_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    if args.is_empty() {
+    // E2c sweep: reads `args[1]` unguarded — the old
+    // `args.is_empty()` guard let a short call panic (SIGABRT).
+    if args.len() < 2 {
         return Err(PyError::PyRaise);
     }
     let types = ctx.types;

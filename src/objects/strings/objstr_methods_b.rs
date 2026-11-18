@@ -460,13 +460,17 @@ pub fn bytes_type_data(name: u32, dict: GcRef) -> TypeData {
 /// from the installed-types cell (the VM installs it at startup;
 /// C10/D1 drop these wrappers straight into `FunBuiltinData.func`).
 /// A specific `StrError` is recorded in the `CallCtx` pending
-/// raise before returning `PyRaise`; an empty `args` (no self —
-/// impossible after the VM's sig check) is plain `PyRaise` with no
-/// pending raise.
+/// raise before returning `PyRaise`; a short call (fewer args
+/// than the method reads — `$min`) is plain `PyRaise` with no
+/// pending raise. The VM's sig check rejects short calls before
+/// they reach here, so this is only reachable on the direct
+/// (non-VM) path — E2c sweep: the old `args.is_empty()` guard
+/// let `args[1]` / `args[2]` index out of bounds and panic
+/// (SIGABRT) on a short call.
 macro_rules! builtin_method {
-    ($name:ident, $f:path) => {
+    ($name:ident, $f:path, $min:literal) => {
         pub fn $name(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-            if args.is_empty() {
+            if args.len() < $min {
                 return Err(PyError::PyRaise);
             }
             let types = ctx.types;
@@ -475,35 +479,29 @@ macro_rules! builtin_method {
     };
 }
 
-builtin_method!(str_find_builtin, crate::objects::strings::objstr_methods_a::str_find);
-builtin_method!(str_rfind_builtin, crate::objects::strings::objstr_methods_a::str_rfind);
-builtin_method!(str_index_builtin, crate::objects::strings::objstr_methods_a::str_index);
-builtin_method!(str_rindex_builtin, crate::objects::strings::objstr_methods_a::str_rindex);
-builtin_method!(
-    str_startswith_builtin,
-    crate::objects::strings::objstr_methods_a::str_startswith
-);
-builtin_method!(
-    str_endswith_builtin,
-    crate::objects::strings::objstr_methods_a::str_endswith
-);
-builtin_method!(str_replace_builtin, crate::objects::strings::objstr_methods_a::str_replace);
-builtin_method!(str_join_builtin, crate::objects::strings::objstr_methods_a::str_join);
-builtin_method!(str_split_builtin, crate::objects::strings::objstr_methods_a::str_split);
-builtin_method!(str_rsplit_builtin, crate::objects::strings::objstr_methods_a::str_rsplit);
-builtin_method!(str_strip_builtin, crate::objects::strings::objstr_methods_a::str_strip);
-builtin_method!(str_lstrip_builtin, crate::objects::strings::objstr_methods_a::str_lstrip);
-builtin_method!(str_rstrip_builtin, crate::objects::strings::objstr_methods_a::str_rstrip);
-builtin_method!(str_lower_builtin, str_lower);
-builtin_method!(str_upper_builtin, str_upper);
-builtin_method!(str_title_builtin, str_title);
-builtin_method!(str_capitalize_builtin, str_capitalize);
-builtin_method!(str_zfill_builtin, str_zfill);
-builtin_method!(str_isspace_builtin, str_isspace);
-builtin_method!(str_isalpha_builtin, str_isalpha);
-builtin_method!(str_isdigit_builtin, str_isdigit);
-builtin_method!(str_isupper_builtin, str_isupper);
-builtin_method!(str_islower_builtin, str_islower);
-builtin_method!(str_isalnum_builtin, str_isalnum);
-builtin_method!(bytes_hex_builtin, bytes_hex);
-builtin_method!(bytes_fromhex_builtin, bytes_fromhex);
+builtin_method!(str_find_builtin, crate::objects::strings::objstr_methods_a::str_find, 2);
+builtin_method!(str_rfind_builtin, crate::objects::strings::objstr_methods_a::str_rfind, 2);
+builtin_method!(str_index_builtin, crate::objects::strings::objstr_methods_a::str_index, 2);
+builtin_method!(str_rindex_builtin, crate::objects::strings::objstr_methods_a::str_rindex, 2);
+builtin_method!(str_startswith_builtin, crate::objects::strings::objstr_methods_a::str_startswith, 2);
+builtin_method!(str_endswith_builtin, crate::objects::strings::objstr_methods_a::str_endswith, 2);
+builtin_method!(str_replace_builtin, crate::objects::strings::objstr_methods_a::str_replace, 3);
+builtin_method!(str_join_builtin, crate::objects::strings::objstr_methods_a::str_join, 2);
+builtin_method!(str_split_builtin, crate::objects::strings::objstr_methods_a::str_split, 1);
+builtin_method!(str_rsplit_builtin, crate::objects::strings::objstr_methods_a::str_rsplit, 1);
+builtin_method!(str_strip_builtin, crate::objects::strings::objstr_methods_a::str_strip, 1);
+builtin_method!(str_lstrip_builtin, crate::objects::strings::objstr_methods_a::str_lstrip, 1);
+builtin_method!(str_rstrip_builtin, crate::objects::strings::objstr_methods_a::str_rstrip, 1);
+builtin_method!(str_lower_builtin, str_lower, 1);
+builtin_method!(str_upper_builtin, str_upper, 1);
+builtin_method!(str_title_builtin, str_title, 1);
+builtin_method!(str_capitalize_builtin, str_capitalize, 1);
+builtin_method!(str_zfill_builtin, str_zfill, 2);
+builtin_method!(str_isspace_builtin, str_isspace, 1);
+builtin_method!(str_isalpha_builtin, str_isalpha, 1);
+builtin_method!(str_isdigit_builtin, str_isdigit, 1);
+builtin_method!(str_isupper_builtin, str_isupper, 1);
+builtin_method!(str_islower_builtin, str_islower, 1);
+builtin_method!(str_isalnum_builtin, str_isalnum, 1);
+builtin_method!(bytes_hex_builtin, bytes_hex, 1);
+builtin_method!(bytes_fromhex_builtin, bytes_fromhex, 2);

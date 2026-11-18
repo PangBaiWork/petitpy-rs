@@ -260,6 +260,10 @@ pub fn reversed_make_new_slot(
     let mut seams = IterSeams {
         call: &mut call,
         getitem: &mut getitem,
+        // No `next` seam: the slot is ctx-only (E2c — same as
+        // the `collect_iterable` fallback).
+        next: None,
+        next_builtin: None,
     };
     let v = reversed_make_new(ctx, args, n_kw, &mut seams).map_err(|e| ctx.record_typed(e))?;
     if let Value::Heap(r) = v {

@@ -1,0 +1,477 @@
+Lane E2c result — small single-mechanism fix pass
+=====================================================
+Branch: lane/e2c-small-fixes (worktree ~/workspace/petitpy-rs-e2c-small-fixes)
+Base: master db0dcea (E2b merged). Do NOT merge — main agent verifies.
+
+## §1 — What was done (grounding)
+
+Seven items from E2 §4, each probed against the reference
+binary (`~/workspace/petitpy-orig/zig-out/bin/petitpy`) before
+fixing, plus the direct-`str_join` panic sweep (last).
+
+1. `list.sort(key=<python fn>)` — `list_sort` (E2 §4 (c)).
+   `list_sort_builtin` (`objlist_methods.rs`) is ctx-only, so a
+   FunBc key could not run through it. Same hook-threading as
+   `sorted` (E2b `VmHook`): new `VmState.list_sort_builtin`
+   field (the `sort` method object, looked up by name in the
+   list type dict at startup in `vm_builtins_bind.rs`, the
+   join-lookup pattern), intercept arm in
+   `vm_call_intercept.rs` → new `call_list_sort_ctx` in
+   `builtin_vm.rs`. `sort_with_key` refactored into
+   `sort_items_with_key` (returns the sorted items) + a thin
+   wrapper; `call_list_sort_ctx` parses key/reverse, decorates
+   via `call_function_ctx`, sorts, writes the items back into
+   the original list's arena payload in place, returns None.
+   None key delegates to the plain `list_sort_builtin`.
+   The original's keyed sort calls the key PER COMPARISON
+   inside an in-place quicksort and ABORTS (rc=134) when a
+   key call or comparison fails (probed: `l.sort(key=len)` on
+   ints, `[3,'a',1,2].sort(key=lambda x: x)`); Rust
+   decorates once + stable-sorts and raises instead —
+   result-identical for pure keys, documented divergence.
+   6 tests. All `key=` / `reverse=` lines in `list_sort.py`
+   now pass; the file as a whole still fails (§4 (a)+(b)).
+
+2. `pow(0, 0)` — builtin (E2 §4 (d)). Root cause: the
+   vendor's `mp_builtin_pow` 2-arg form IS
+   `mp_binary_op(POWER)` (modbuiltins.c:369); small-int
+   pairs take the ans=1 loop (`mp_small_int_binary_op`,
+   runtime.c — `0**0=1`), while the slot path uses mpz
+   semantics (`pow_inpl` returns 0 for a zero base).
+   Probed reference: `pow(0,0)==1`, `pow(z,0)==1` (z =
+   heap-int-valued zero), `pow(0,0,5)==0`, `0.0**0==1.0`,
+   `pow(0,-1)` → ZeroDivisionError both. Fix in
+   `builtin_fns.rs` `pow_impl`: the 2-arg form routes
+   SmallInt×SmallInt pairs through `small_int_binary_op`
+   (existing pub(crate) helper in `runtime_smallint.rs`),
+   with a pre-check excluding `lv==0 && rv<0` (the only
+   error that path returns; the slot path already raises
+   ZeroDivisionError there) and `GoGeneric` falling through
+   to `binary_op_plain` with the heap-converted lhs. 5
+   tests. `builtin_pow3` / `builtin_pow3_intbig` already
+   passed at E2 (the `pow(0,0)` case is probe-only); all
+   probe lines now byte-identical to the reference.
+
+3. `bool(range(0))` + range attrs — builtin_range (E2 §4
+   (e)). Two separate bugs: (a) `bool()` used the
+   payload-only `Value::is_true` (a range has no falsy
+   payload → always True) instead of `obj_is_true` (BOOL
+   slot → `range_unary_op`, `len > 0`). Fix in
+   `objbool.rs` `bool_make_new`: now calls `obj_is_true`;
+   errors map to `PrimError::OutOfMemory` / new
+   **`PrimError::PyRaise`** variant (`ops.rs`: `exc_type`
+   None, `message` None, `to_pyerror` → `PyRaise` via the
+   existing `_` arm — the slot wrapper's `record_typed`
+   leaves the already-recorded pending raise alone).
+   (b) `range_attr` existed but was never wired:
+   `range_type_data` had `attr: None`. Fix in
+   `objrange.rs`: new `range_attr_slot` adapter (AttrFn
+   signature, attrtuple precedent) wired as
+   `attr: Some(range_attr_slot)`. Probed vs reference
+   after the fix: `bool(A())/bool(B())/bool(C())/bool(D())`
+   for user `__bool__`/`__len__` (False/False/False/True),
+   `bool(range(0))/bool(range(5))`, `r.start/r.stop/
+   r.step`, `bool("")/bool("x")/bool([])/bool([1])/bool({})/
+   bool(0)/bool(2.5)` — ALL byte-identical. 3 e2c tests +
+   34 range lib tests pass.
+   Fixture fix (test-only): the full-suite run after item
+   3 failed `bool_make_new_forms` (empty heap str/list
+   read as true) because the C7 test `Fixture` builds all
+   types with `unary_op: None` (no slots), so `obj_is_true`
+   (BOOL slot → LEN slot → default true) has nothing to
+   read. Production is correct (the VM wires real slots);
+   new `fixture_len_slot` (`UnaryOpFn`, answers `Len`
+   from the payload, `PyRaise` → `NotImplemented` for
+   anything else) in `primitives/tests.rs`, wired onto
+   the fixture's `str_`/`list` types.
+
+4. `callable(A())` — builtin_callable (E2 §4 (f)).
+   Original rule (vendor obj.c:200-205
+   `mp_obj_is_callable`): if the type's call slot is NOT
+   `mp_obj_instance_call`, callable iff the slot is
+   non-NULL; if it IS, delegate to
+   `mp_obj_instance_is_callable` (objtype.c:872-875 — a
+   `__call__` lookup hit exists). Fix in `obj.rs`:
+   `obj_is_callable` now takes `&mut CallCtx`
+   (signature changed from `(arena, types, value)`), and
+   when the type's call slot is `INSTANCE_CALL` (==
+   `instance_call_slot`, set on user classes at
+   typecreate.rs:631) it runs `instance_is_callable` via
+   `with_stub_seams`. Fn-pointer comparison uses
+   `std::ptr::fn_addr_eq` (plain `==` raised a warning).
+   Callers updated: `builtin_fns.rs:403`
+   (`callable_builtin`), `modre.rs:595`, test
+   `is_callable_needs_call_slot` in `obj_tests.rs`.
+   3 tests (plain instance, with `__call__`, inherited
+   `__call__`).
+
+5. NotImplemented binary-op fallback (E2 §4 (i)).
+   Two root causes, both grounded in the original:
+   (a) `class_notimpl`: vendor rule
+   (objtype.zig:1178-1181) — a member returning
+   NotImplemented → NULL ("try other fallbacks (e.g.
+   `__rop__`) and if nothing works, raise TypeError").
+   Rust's `instance_binary_op` returned the
+   NotImplemented VALUE as-is. Fix: new
+   `is_not_implemented(ctx, value)` helper in `obj.rs`
+   (D1 shape: `Obj::Instance` with empty members
+   `used == 0` + empty subobj, header type
+   `TypeData.name == 0` — the ellipsis type is the only
+   name-0 type that can head an empty instance; the cell
+   type also has name 0 but is `Obj::Cell`, not
+   `Instance`; no user code can instantiate the ellipsis
+   type). Used in `instance_binary_op`'s `finish_binary`
+   (Member arm; CONTAINS bool-ifies FIRST, as in the
+   vendor) and in the NativeSlot arm. The VM generic loop
+   then tries the reflected op and ends at
+   `binop_unsupported` → TypeError. Verified:
+   `class_notimpl.py` byte-identical to the reference;
+   5 tests (`e2c_notimpl_add/sub/lt_raises`,
+   `e2c_notimpl_reflected_wins` — `C() + D()` with
+   `D.__radd__` returning 42, `e2c_notimpl_unary_
+   untouched` — `-c` yields NotImplemented itself,
+   unary is NOT special-cased).
+   (b) `subclass_native_cmp`: vendor `tupleCmpHelper`
+   (objtuple.zig:150-162) has a SLOW path: when the rhs
+   type's iter slot is not the tuple's getiter, cast to
+   the native tuple base (`mp_obj_cast_to_native_base`)
+   instead of failing. Rust's `tuple_cmp` only had the
+   fast path (`rhs_has_tuple_getiter`, else `PyRaise`).
+   Fix in `objtuple.rs`: the slow path uses the existing
+   `cast_to_native_base` helper (subclass.rs) — a `class
+   mytuple(tuple)` instance is an `Obj::Instance` whose
+   subobj[0] IS the underlying tuple. If the cast returns
+   None → `PyRaise` as before. Verified:
+   `subclass_native_cmp.py` and
+   `subclass_native_specmeth.py` byte-identical to the
+   reference; test `e2c_tuple_subclass_cmp`. The error
+   message's rhs type name `''` in the old failure was a
+   red herring — `type(t).__name__` is correctly
+   `"mytuple"`; the `''` came from the
+   `binop_unsupported` path's name source.
+   `obj_binary_op` / `obj_unary_op` in obj_ops.rs
+   (:549/:565) were NOT changed: their callers are
+   internal (list-sort comparison, `seq_cmp_objs`
+   element comparison) and a reflected fallback there
+   would need the VM hook; the named targets go through
+   the VM's `binary_op_ctx` loop, not these helpers.
+   Recorded as a remaining gap (§4 (c)), not a
+   regression.
+
+6. `**kwargs` key interning (E2 §4 (o)). Split FIRST:
+   `vm_call.rs` was 780 lines. Moved
+   `call_method_var_kw_ctx` + `intern_kw_key` verbatim
+   into new `src/runtime/vm_call_var_kw.rs` (189 lines)
+   via a Python script (asserted the doc-comment start
+   and closing braces; brace balance verified after:
+   vm_call.rs 94/94, var_kw 35/35; vm_call.rs now 605
+   lines). Registered in `src/runtime/mod.rs`; import
+   updated in `vm_dispatch_exec.rs:35`. Two unused-import
+   warnings after the move removed from the new file's
+   header. Only caller of `call_method_var_kw_ctx` is the
+   dispatch loop (vm_dispatch_exec.rs:560,:579).
+   Fix: `intern_kw_key` now uses
+   `ctx.pool.from_strn(&bytes)` (`RuntimeQstr::from_strn
+   (&self, s) -> PyResult<Qstr>`, interns on miss — C15b
+   interior mutability) instead of `find_strn` +
+   `TypeError("keyword argument name is not an interned
+   string")`; errors map via `exc_from_pyerror` (a
+   >255-byte key → `OutOfMemory` → MemoryError).
+   Verified: `fun_calldblstar3.py` (the `Mapping.keys()`
+   20-char `'abcdefghijklmnopqrst'` pin) and
+   `fun_callstardblstar.py` byte-identical to the
+   reference; 2 tests. Side effect: stdlib
+   `test_dataclasses.py` now passes 26/26 (was 24/26 —
+   `test_required_field_raises_when_missing` DID NOT
+   RAISE; the generated `__init__` collects missing
+   fields via `**kw`).
+
+7. `map()` / `filter()` / `zip()` / `enumerate()` over a
+   generator iterable (E2b gap). Root cause (first
+   found): C11's `iternext` (`iters/iter.rs`) only
+   accepts `Obj::Iterator` — a generator sub-iterator
+   returns `Err(TypeError("object not an iterator"))`.
+   Baseline probes confirmed map, filter AND zip over a
+   genexpr all fail with bare TypeError on Rust while
+   the reference returns values.
+   Design (after hitting E0524 then E0503): `IterSeams`
+   gained TWO new fields — `next: Option<&mut dyn
+   FnMut(&mut CallCtx, Value) -> CallOutcome>` (resume
+   closure; C14 runtime supplies `resume_gen`) and
+   `next_builtin: Option<Value>` (the `next` builtin
+   object; VM supplies `state.next_builtin` — calling it
+   through the existing `call` seam routes via the
+   intercept to the real resume, avoiding a second
+   `&mut VmState` borrow, which the borrow checker
+   rejects: two closures over `state` → E0524; reading
+   `state.next_builtin` after the call seam is built →
+   E0503, fixed by copying it out before the closures).
+   New `next_sub` helper in iter.rs: Obj::Iterator →
+   C11 `iternext`; else `next` closure if present; else
+   `next_builtin` via the `call` seam (Value→Some,
+   Stop→None, Raise→Err(PyRaise)); else NOT_AN_ITERATOR
+   (exact old error). Pull sites switched to `next_sub`:
+   objmap.rs:93, objfilter.rs:72, objzip.rs:81,
+   objenumerate.rs:114. All 15 `IterSeams {`
+   construction sites updated (4 production:
+   objdict_collect.rs:290 `next: None, next_builtin:
+   None` — ctx-only, preserves old behavior;
+   make_new.rs:260 reversed stubs, both None;
+   runtime_iter.rs:192 `next: Some(resume_gen closure),
+   next_builtin: None`; vm_rt_iter.rs:177 `next: None,
+   next_builtin: Some(next_builtin)` — copied out
+   before the closures; 11 test sites, both None).
+   First failure round: the 9 item-7 tests were
+   initially written with tautological placeholder
+   assertions — rewritten with real bool-equality
+   assertions plus filter/zip/enumerate/two-iters/
+   nested-map/unpack/raises cases. They then ALL failed
+   with a bare TypeError, because `list()` goes through
+   `collect_iterable`'s `IterPlan::Protocol` arm
+   (objdict_collect.rs), NOT through `iternext_vm_ctx`
+   — the Protocol arm builds its own seams with
+   `next: None, next_builtin: None`.
+   Second round (wrong fix, then reverted): a
+   `fun == nb` identity check in the Protocol arm's call
+   seam + new `VmHook::next_builtin()` /
+   `VmHook::take_stop_iteration()` trait methods was
+   implemented to classify a StopIteration from the
+   `next` builtin as exhaustion. It made zip/enumerate
+   pass but map/filter still failed with a bare
+   TypeError, because C11's `iternext` dispatch
+   (`extra.len() == 2` branch) only recognises an
+   `Obj::Iterator` sub — a map-1/filter-1/zip-1 over a
+   generator has `extra = [TAG, gen]` (len 2) and
+   `second_is_iter` was false → NOT_AN_ITERATOR. Fix
+   applied and KEPT: `second_is_iter` in `iter.rs` now
+   also matches `Obj::Generator` (range `[stop, step]`
+   and enumerate's counter in `extra[1]` are SmallInts,
+   so unaffected; getitemiter is len 1). After that,
+   all 9 tests passed — but a probe of the edge case
+   `list(map(next, [x, x, x]))` (same generator three
+   times) showed the identity check is WRONG: reference
+   raises StopIteration, Rust gave a bare TypeError
+   (because `map_iternext` maps the call seam's `Stop`
+   to `PyRaise`, and the stashed exception had been
+   drained by `take_stop_iteration`). The `fun == nb`
+   check cannot distinguish `next_sub`'s call (generator
+   exhaustion → end the map) from `map_iternext` calling
+   `f == next` as the mapped function (StopIteration
+   from `next(gen)` → must RAISE). No `map(next,...)`
+   exists in the corpus/tests, but the divergence was
+   real and the mechanism was wrong.
+   Final fix (KEPT): reverted the `fun == nb`
+   classification and the `VmHook::next_builtin` /
+   `take_stop_iteration` trait methods + impls entirely.
+   The Protocol arm now shares ONE hook between the
+   `call` seam and a real `next` seam through a
+   `RefCell` (`hook_cell = RefCell::new(call.as_deref_
+   mut())`): the `next` seam is a plain closure local
+   `next_fn` calling `hook.resume(ctx, sub)` (the
+   `iternext` form — `Ok(None)` = exhaustion →
+   `CallOutcome::Stop`, a raise → `Raise`), and the
+   call seam borrows the same cell. Two closures over
+   the same `&mut` hook cannot be built (E0524 — the
+   E2b `VmHook` rationale), so the `RefCell` is the
+   standard sharing mechanism; the two seams are only
+   ever called sequentially by C11's `iternext` (pull
+   subs, then call the function) and a nested collection
+   builds its own hook and cell, so `borrow_mut` cannot
+   panic re-entrantly (documented in the code comment).
+   A first attempt using `Option<Box<dyn FnMut>>` +
+   `as_deref_mut()` failed with E0597 (the Box's
+   destructor tripped drop-order analysis); the
+   plain-closure local compiles. Without a hook the
+   `next` seam records `TypeError("object not
+   iterable")` itself and returns `Raise`, so the
+   ctx-only error is unchanged. Verified:
+   `list(map(next, [x,x,x]))` now raises StopIteration
+   exactly like the reference; all item-7 cases
+   (`['1','2']`, `[2]`, `[(1,3),(2,4)]`, `[(0,1),(1,2)]`)
+   match the reference. 9 tests.
+
+8. Direct `str_join` panic sweep (E2b §4, last).
+   The `builtin_method!` macro
+   (`objstr_methods_b.rs:466`) only guarded
+   `args.is_empty()`; the underlying fns index
+   `args[1]`/`args[2]` directly (`str_join` at
+   objstr_methods_a.rs:328 reads `args[1]`). The VM's
+   FunBuiltin sig check prevents short calls from user
+   code, so this is a direct-Rust-path hardening sweep
+   only. Arities verified by reading each fn (not by
+   grep alone): min 2 — find/rfind/index/rindex,
+   startswith/endswith, join, zfill, bytes_fromhex;
+   min 3 — replace (count is len-guarded); min 1 —
+   split/rsplit (sep/maxsplit len-guarded), strip/
+   lstrip/rstrip (chars len-guarded), lower/upper/title/
+   capitalize, isspace/isalpha/isdigit/isupper/islower/
+   isalnum, bytes_hex (sep len-guarded). The macro now
+   takes a `$min:literal` parameter (26 invocations
+   updated, verified each carries a literal); the 5
+   hand-written wrappers in objstr_b.rs that read
+   `args[1]` unguarded (partition, rpartition, center,
+   ljust, rjust) got `args.len() < 2`. The remaining
+   `args.is_empty()` sites elsewhere were audited and
+   are safe: list/array/tuple constructors and
+   `open_impl`/`sys_exit` read `args[0]` only after the
+   guard; `parse_sort_args` requires `args.len() == 1`;
+   `str_format` has no `args[1]` index; `str_count`
+   uses `args.get(1)` (WrongArgs on missing),
+   `bytes_decode`/`str_encode`/`str_splitlines` guard
+   their optional indexes themselves. 1 new test
+   (`e2c_short_direct_calls_error_not_panic`, table-
+   driven over the min-2 wrappers + min-1/min-3/empty
+   pins). objstr_b.rs 786, objstr_tests.rs 799 — both
+   trimmed to stay under the 800 cap (wrapper comments
+   shortened, test table-driven).
+
+## §2 — Gates (all re-run in the worktree, release build)
+
+- Full corpus: **488/552** (E2b 478) — **+10, 0 regressions**.
+  64 fails = 57 regressions + 7 known-fails exactly.
+  Newly passing (10): builtin_callable, builtin_map,
+  builtin_range, builtin_range_attrs,
+  builtin_range_maxsize, class_notimpl,
+  fun_calldblstar3, fun_callstardblstar,
+  subclass_native2_tuple, subclass_native_cmp.
+  (Set-diffed against E2's 86 minus E2b's 19; the E2
+  list extraction missed `subclass_native_specmeth` —
+  an E2b-fixed name, so the diff is unaffected.)
+- Integration: **174/202** (same as E2b, 0 regressions).
+  The 28 fails are the known set (enum_members,
+  init_subclass, native_subclass_operands,
+  runtime_annotations, json_cpython_behaviour, os_kill/
+  chown stubs, socket fromfd, select, subprocess, …);
+  `builtin_keyword_args` (builtin-method kwargs:
+  `split(maxsplit=)`, `replace(count=)`, `pow(mod=)`,
+  `print(sep=, file=)`) and `str_join_bytes_bytearray`
+  (`b'-'.join([bytearray, bytes])`) are pre-existing
+  gaps in different mechanisms from items 6/7 — see §4.
+- Golden: **545/585** (E2b 535) — **+10, 0 new failures**
+  (diffed against a fresh master-db0dcea build, which
+  reproduces 535/585 exactly). Newly passing:
+  builtin_callable.py, builtin_map.py,
+  builtin_range.py, builtin_range_attrs.py,
+  builtin_range_maxsize.py, fun_calldblstar3.py,
+  fun_callstardblstar.py, sort_advanced.py,
+  subclass_native2_tuple.py, subclass_native_cmp.py.
+  rust==cpython 538/585 (was 528).
+- Capability: **67/67 — GATE GREEN** (unchanged).
+- test-stdlib: **6/8** (E2b 5/8) — **+1:
+  test_dataclasses** (26/26; was 24/26 — see §1 item
+  6). Still failing: test_abc, test_enum (both
+  (n)-territory, out of scope).
+- Nano (invariant check only): **416/541** (E2b 408) —
+  +8, report-only.
+- lib: **1562 passed, 0 failed, 4 ignored** (1527 + 35
+  e2c); bins 9; entry_cli 45; **0 warnings** (forced
+  recompile after `touch src/lib.rs`); no unsafe
+  (grep hits are doc comments only).
+  `check_compile_mpy.py` PASS (552/552 byte-identical);
+  `check_frozen.py` PASS (23/23, 38,141 bytes).
+  Binaries: petitpy-rs 1,865,536 B, petitpy-vm
+  1,852,576 B.
+- Orig repo left clean (`tests/__pycache__` /
+  `tools/__pycache__` created by the runners, removed).
+
+## §3 — Named-target status
+
+- Item 1 `list_sort`: PARTIAL. All `key=`/`reverse=`
+  lines pass; the file still fails on the user-defined
+  ordering section (§4 (a)+(b)). `sort_advanced.py`
+  (golden) passes.
+- Item 2 `pow(0,0)`: FIXED (probe-verified; the
+  `builtin_pow3*` corpus files already passed at E2).
+- Item 3 `builtin_range` / `builtin_range_attrs` /
+  `builtin_range_maxsize`: ALL PASS.
+- Item 4 `builtin_callable`: PASSES.
+- Item 5 `class_notimpl`, `subclass_native_cmp`,
+  `subclass_native2_tuple`: ALL PASS.
+  (`subclass_native_specmeth` already passed at E2b.)
+- Item 6 `fun_calldblstar3`, `fun_callstardblstar`:
+  BOTH PASS. Side effect: stdlib test_dataclasses.
+- Item 7 `builtin_map`: PASSES. (`builtin_zip` already
+  passed at E2b; still passes.)
+- Sweep: `str_join` direct short call returns Err, no
+  panic; 1 regression test.
+
+## §4 — Remaining shortfalls (per-case root cause)
+
+(a) `list_sort` user-class ordering: `l.sort()` on
+    `[A(5), A(2), …]` with `__lt__` raises `TypeError:
+    unsupported types for __lt__: '', ''`. `sort_less`
+    (`objlist_methods.rs`) compares via ctx-only
+    `obj_binary_op` → `call_binary` → the slot
+    `instance_binary_op_slot`, whose seams are STUB
+    seams, so `seams.call_pair` on the FunBc `__lt__`
+    fails → `Ok(None)` → `PyRaise`. Top-level `A(5) <
+    A(2)` works (the VM's `binary_op_ctx` has the real
+    hook). Fix needs a `VmHook.binary_op` (or
+    comparison seam) threaded through BOTH sort paths
+    (`list_sort` + `sorted`'s `sort_items_with_key` —
+    `sorted([A(5), A(2)])` fails identically). Same
+    class as E2 cluster (n); out of E2c scope.
+(b) Container repr does not dispatch user `__repr__`:
+    `print([A()])` shows `[<A object at 244>]` on Rust
+    vs `[A!]` on the reference, while top-level
+    `print(A())` / `repr(A())` work. The container repr
+    path (list/tuple/dict) does not go through the
+    instance repr dispatch E2's Fix C wired at the top
+    level. Separate mechanism from (a); out of scope.
+    (a)+(b) together are why `list_sort.py` still fails
+    even though item 1's `key=` mechanism is fixed.
+(c) `obj_binary_op` / `obj_unary_op` reflected fallback:
+    internal callers (`sort_less`, `seq_cmp_objs`
+    element comparison) raise `PyRaise` on
+    `SlotOutcome::NotImplemented` instead of trying the
+    reflected op. Needs the VM hook at those call sites
+    (same threading as (a)).
+(d) Integration `builtin_keyword_args`: kwargs to
+    BUILTIN METHODS (`split(maxsplit=)`,
+    `replace(count=)`, `pow(mod=)`, `print(sep=,
+    file=)`) — a different mechanism from item 6's
+    `**`-dict key interning (which only covers user
+    functions). Out of scope.
+(e) Integration `str_join_bytes_bytearray`:
+    `b'-'.join([bytearray(b'a'), b'b'])` — bytes.join
+    does not normalize bytearray elements. Different
+    mechanism from item 7's generator join. Out of
+    scope.
+(f) Remaining 57 corpus regressions (verbatim):
+    array1 array_add array_intbig array_micropython
+    builtin_hash builtin_hash_intbig builtin_override
+    builtin_reversed builtin_str_hex bytearray1
+    bytearray_byte_operations bytearray_center
+    bytearray_construct bytearray_count bytearray_decode
+    bytearray_partition bytes bytes_add_array
+    bytes_add_bytearray bytes_add_endian
+    bytes_compare_array bytes_compare_bytearray
+    bytes_construct_array bytes_construct_bytearray
+    bytes_construct_endian class_delattr_setattr
+    class_descriptor class_new class_setname_hazard
+    class_setname_hazard_rand class_store_class
+    class_super_closure deque1 deque2 getitem
+    import_instance_method int_big_rshift
+    int_bytes_intbig int_parse io_iobase iter0 iter1
+    iter2 list_sort memoryerror object_new ordereddict1
+    slice_attrs special_methods special_methods_intbig
+    stopiteration string_format string_format_modulo
+    subclass_native_buffer subclass_native_exc_new
+    subclass_native_init subclass_native_iter.
+    (E2 §4 clusters (g)–(p) minus the 10 fixed here:
+    (g) `__set_name__`, (h) `__reversed__` / slice+range
+    attrs, (j) frozen deque `__init__` (the ONLY
+    remaining `#[ignore]`d test — untouched),
+    (k) bytes/array `__add__`/`__eq__` buffer paths,
+    (l) bytearray str methods, (m) `str.format` nested
+    fields, (n) descriptor / class-creation /
+    native-subclass dispatch, (p) the rest.)
+(g) Stdlib still failing (2): test_abc, test_enum —
+    class-creation / descriptor territory (n).
+(h) File-size watch: objstr_tests.rs 799, obj.rs 791,
+    objstr_b.rs 786, objarray.rs 793, vm_call.rs 605
+    (split by this lane), builtin_vm.rs 765,
+    vm_rt_iter.rs 762, instance.rs 758 — the next lane
+    touching any 79x file must split first. map.rs 860
+    + gc.rs 830 still over cap, pre-existing,
+    unscheduled.

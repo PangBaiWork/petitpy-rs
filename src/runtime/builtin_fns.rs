@@ -334,7 +334,32 @@ fn pow_impl(
             int_pow3(ctx, types, args[0], args[1], m).map_err(|e| ctx.record_typed(e))
         }
         None => match args {
-            [base, exp] => binary_op_plain(ctx, BinaryOp::Power, *base, *exp),
+            [base, exp] => {
+                // `mp_builtin_pow` 2-arg IS `mp_binary_op(POWER)`
+                // (modbuiltins.c:369) — so small-int pairs take
+                // the ans=1 loop (`runtime_smallint.rs`), and
+                // `pow(0, 0) == 1`; the slot path alone (mpz
+                // semantics, `pow_inpl` returning 0 for a zero
+                // base) would give 0. The pre-check excludes the
+                // one error the fast path can return
+                // (`0 ** -n` → ZeroDivisionError), which the
+                // slot path already raises correctly.
+                if let (Value::SmallInt(lv), Value::SmallInt(rv)) = (*base, *exp) {
+                    if !(lv == 0 && rv < 0) {
+                        use crate::runtime::runtime_smallint::{
+                            small_int_binary_op, SmallIntOutcome,
+                        };
+                        match small_int_binary_op(ctx, BinaryOp::Power, lv, rv, *base) {
+                            Ok(SmallIntOutcome::Done(v)) => return Ok(v),
+                            Ok(SmallIntOutcome::GoGeneric(heap_lhs)) => {
+                                return binary_op_plain(ctx, BinaryOp::Power, heap_lhs, *exp);
+                            }
+                            Err(_) => {} // unreachable after the pre-check
+                        }
+                    }
+                }
+                binary_op_plain(ctx, BinaryOp::Power, *base, *exp)
+            }
             [base, exp, modulus] => {
                 int_pow3(ctx, types, *base, *exp, *modulus).map_err(|e| ctx.record_typed(e))
             }
@@ -375,7 +400,7 @@ pub fn callable_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let [arg] = args else {
         return Err(PyError::PyRaise);
     };
-    Ok(Value::Bool(obj_is_callable(ctx.arena, ctx.types, *arg)))
+    Ok(Value::Bool(obj_is_callable(ctx, *arg)))
 }
 
 /// `mp_obj_id` (`obj.zig`): the tagged immediates / arena index.

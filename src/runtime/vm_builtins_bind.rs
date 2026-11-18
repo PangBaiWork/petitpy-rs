@@ -450,6 +450,22 @@ impl Vm {
                 *slot = v;
             }
         }
+        // E2c: the `list.sort` method builtin (one `FunBuiltin`
+        // object in the list type dict). Looked up by name;
+        // a miss (impossible in practice — the table carries
+        // `sort`) leaves the handle unset and `sort` keeps its
+        // old ctx-only behavior (a non-`None` key raises).
+        let sort_q = static_qstr_id(b"sort").expect("sort is a static qstr");
+        if let Obj::Type(d) = ctx.arena.get(ctx.types.list) {
+            let list_dict = d.dict;
+            if let Ok(v) = crate::objects::containers::objdict::dict_get_value(
+                &mut ctx,
+                Value::Heap(list_dict),
+                Value::Qstr(sort_q),
+            ) {
+                state.list_sort_builtin = v;
+            }
+        }
         state.min_builtin = d1.min_builtin;
         state.max_builtin = d1.max_builtin;
         state.getattr_builtin = d1.getattr_builtin;

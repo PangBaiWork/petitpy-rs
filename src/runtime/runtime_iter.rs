@@ -189,9 +189,31 @@ pub fn iternext(
                     Err(_) => CallOutcome::Raise,
                 }
             };
+            // E2c: the `next` seam — a generator sub-iterator
+            // of a map/filter/zip/enumerate resumes through
+            // `resume_gen` (the `mp_resume` fast path) instead
+            // of raising "object not an iterator". A raise
+            // inside the generator degrades to `Raise` here
+            // (the C14 seam type carries no exception value —
+            // same limitation as the `call` seam above).
+            let mut next_c = |ctx: &mut CallCtx, sub: Value| -> CallOutcome {
+                match resume_gen(ctx, sub, Value::None, None, seams) {
+                    Ok(ResumeOutcome::Yield(v)) => CallOutcome::Value(v),
+                    Ok(ResumeOutcome::Normal(_)) => CallOutcome::Stop,
+                    Ok(ResumeOutcome::Exception(_)) => CallOutcome::Raise,
+                    Err(_) => CallOutcome::Raise,
+                }
+            };
             let mut s = IterSeams {
                 call: &mut call_c,
                 getitem: &mut getitem_c,
+                next: Some(&mut next_c),
+                // No `next` builtin here: the C14 `next`
+                // object is the bare adapter (stub seams —
+                // `next(gen)` through it returns `PyRaise`),
+                // so the `next` closure above is the only
+                // resume path (E2c).
+                next_builtin: None,
             };
             match iter_iternext(ctx, it, &mut s) {
                 Ok(Some(v)) => Ok(IterNext::Value(v)),

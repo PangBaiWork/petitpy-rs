@@ -721,20 +721,55 @@ pub fn obj_is_true(ctx: &mut CallCtx, types: &BuiltinTypes, arg: Value) -> PyRes
     Ok(true)
 }
 
-/// `mp_obj_is_callable` (`obj.zig:492-501`): a call slot means
-/// callable. The instance nuance — `CALL` is the `mp_obj_type_t.
-/// call` slot and the original defers to `mp_obj_instance_is_callable`
-/// when it is `mp_obj_instance_call` — is C12's: no instance
-/// representation exists yet, so any call slot counts as callable
-/// here; C12 refines this when instances land.
-pub fn obj_is_callable(arena: &GcArena, types: &BuiltinTypes, value: Value) -> bool {
-    let Some(t) = obj_get_type(arena, types, value) else {
+/// `mp_obj_is_callable` (`obj.zig:492-501` + `obj.c:200-205`):
+/// a call slot means callable — EXCEPT when the slot is the
+/// instance-call slot, in which case the instance is callable
+/// only if a `__call__` lookup hits (`objtype.c:872-875`,
+/// `mp_obj_instance_is_callable`). The instance branch runs
+/// through the stub seams (same as `instance_call_slot`): a
+/// plain `__call__` method in the class dict needs no call.
+pub fn obj_is_callable(ctx: &mut CallCtx, value: Value) -> bool {
+    let types = ctx.types;
+    let Some(t) = obj_get_type(ctx.arena, types, value) else {
         return false;
     };
-    match arena.get(t) {
-        Obj::Type(d) => d.call.is_some(),
-        _ => false,
+    let call = match ctx.arena.get(t) {
+        Obj::Type(d) => d.call,
+        _ => return false,
+    };
+    let Some(f) = call else {
+        return false;
+    };
+    if std::ptr::fn_addr_eq(f, crate::objects::objtype::instance::INSTANCE_CALL) {
+        return crate::objects::objtype::seams::with_stub_seams(|seams| {
+            crate::objects::objtype::instance::instance_is_callable(ctx, value, seams)
+        });
     }
+    true
+}
+
+/// Is `value` the `NotImplemented` singleton? (D1: an
+/// `Obj::Instance` with the shared ellipsis type as header —
+/// the ellipsis type is the only type with name qstr 0 that
+/// can head an empty instance; the cell type also has name 0
+/// but is an `Obj::Cell`, not an `Instance`, and no user code
+/// can instantiate the ellipsis type.) Used by
+/// `instance_binary_op` (E2c): a dunder returning
+/// `NotImplemented` means "try the other fallbacks".
+pub fn is_not_implemented(ctx: &CallCtx, value: Value) -> bool {
+    let Value::Heap(r) = value else {
+        return false;
+    };
+    let Obj::Instance(inst) = ctx.arena.get(r) else {
+        return false;
+    };
+    if inst.members.used != 0 || !inst.subobj.is_empty() {
+        return false;
+    }
+    let Some(t) = ctx.arena.header(r).type_ else {
+        return false;
+    };
+    matches!(ctx.arena.get(t), Obj::Type(d) if d.name == 0)
 }
 
 /// `mp_obj_id` (`obj.zig:503-516`): the identity integer. For

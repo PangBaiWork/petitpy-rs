@@ -407,11 +407,11 @@ pub fn bytes_make_new_slot(
     _type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let types = ctx.types;
     let (pos, kwargs) = split_kwargs(ctx, args, n_kw)?;
-    bytes_make_new(ctx, types, pos, &kwargs).map_err(|e| ctx.record_typed(e))
+    bytes_make_new(ctx, types, pos, &kwargs, call).map_err(|e| ctx.record_typed(e))
 }
 
 /// `array` (`objarray.rs:389`): the sibling bytearray type
@@ -421,10 +421,10 @@ pub fn array_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let bytearray_type = ctx.types.bytearray;
-    array_make_new(ctx, type_, bytearray_type, args, n_kw)
+    array_make_new(ctx, type_, bytearray_type, args, n_kw, call)
         .map_err(|e| ctx.record_typed(e))
 }
 
@@ -436,11 +436,11 @@ pub fn bytearray_make_new_slot(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    _call: Option<CallHook<'_, '_>>,
+    call: Option<CallHook<'_, '_>>,
 ) -> PyResult<Value> {
     let array_type = ctx.types.array;
     let (pos, kwargs) = split_kwargs(ctx, args, n_kw)?;
-    bytearray_make_new(ctx, array_type, type_, pos, &kwargs)
+    bytearray_make_new(ctx, array_type, type_, pos, &kwargs, call)
         .map_err(|e| ctx.record_typed(e))
 }
 

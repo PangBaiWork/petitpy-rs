@@ -8,7 +8,7 @@ use std::fmt;
 
 use crate::memory::gc::CallCtx;
 use crate::objects::value::{GcRef, Value};
-use crate::pyerr::PyResult;
+use crate::pyerr::{PyError, PyResult};
 
 // ── Method-slot fn types (mirror `mp_obj_type_t` slots) ─────────────
 //
@@ -224,25 +224,48 @@ pub type BinaryOpFn = for<'a> fn(&mut CallCtx<'a>, BinaryOp, Value, Value) -> Py
 /// nothing breaks. Same process as C6's op-parameter amendment.
 pub type CallFn =
     for<'a> fn(&mut CallCtx<'a>, Value, usize, usize, &[Value]) -> PyResult<Value>;
-/// The VM's function-call hook (E2): `&mut dyn FnMut(&mut
-/// CallCtx, Value, n_args, n_kw, &[Value]) -> PyResult<Value>`
-/// — call `fun` as a function, through the VM when the caller
-/// has one (a `FunBc` callee actually executes). `None` =
-/// the ctx-only path: the stub seams' `call_via_type_slot`
-/// (a `FunBc` callee raises `PyRaise`, the pre-E2 behaviour).
-/// The VM builds it from `call_function_ctx` + the
-/// `state.pending_exc` side channel (the C14 factory contract:
-/// `PyError` cannot carry an object — the hook stashes the
-/// exception object there and returns `PyRaise`; the caller
-/// drains it with `drain_seam_raise`). The hook is passed DOWN
-/// as a parameter, never stored in `CallCtx` (a closure over
-/// `&mut VmState` cannot outlive the call that built it).
-/// Two lifetimes: `'r` is the reference borrow (shortened on
-/// every reborrow, so a caller can pass the hook down several
-/// times), `'h` is the closure's own lifetime.
-pub type CallHook<'r, 'h> = &'r mut (
-    dyn FnMut(&mut CallCtx, Value, usize, usize, &[Value]) -> PyResult<Value> + 'h
-);
+/// The VM's hook for running user code (E2b): one object carrying
+/// BOTH operations a collection / call site needs from the VM, so
+/// they share a single `&mut VmState` borrow. Two separate
+/// closures (one to call, one to resume) cannot be built from the
+/// same `&mut VmState` — E0499, the same wall E2's `vm_seams.rs`
+/// `__getattr__` comment documents — so the hook is a trait object
+/// with two methods instead.
+///
+/// `call` is E2's call hook: call `fun` as a function, through
+/// the VM when the caller has one (a `FunBc` callee actually
+/// executes). `None` = the ctx-only path: the stub seams'
+/// `call_via_type_slot` (a `FunBc` callee raises `PyRaise`, the
+/// pre-E2 behaviour). `resume` is the generator-resume hook
+/// (E2b): step a generator once, in the `iternext` form —
+/// `Ok(Some(v))` = yielded `v`, `Ok(None)` = exhausted,
+/// `Err(PyError)` = the generator raised (the exception object
+/// is stashed on the VM's `state.pending_exc` side channel, the
+/// C14 factory contract, exactly like `call` — the caller drains
+/// it). `call` and `resume` share the VM's `state.pending_exc`
+/// drain (`drain_seam_raise` / `call_type_ctx`'s drain).
+///
+/// The hook is passed DOWN as a parameter, never stored in
+/// `CallCtx` (an object over `&mut VmState` cannot outlive the
+/// call that built it). Two lifetimes: `'r` is the reference
+/// borrow (shortened on every reborrow, so a caller can pass the
+/// hook down several times), `'h` is the object's own lifetime.
+pub trait VmHook {
+    /// Call `fun` as a function (the `CallFn` layout).
+    fn call(
+        &mut self,
+        ctx: &mut CallCtx,
+        fun: Value,
+        n_args: usize,
+        n_kw: usize,
+        args: &[Value],
+    ) -> PyResult<Value>;
+    /// Resume `gen` one step (the `iternext` form).
+    fn resume(&mut self, ctx: &mut CallCtx, gen: Value) -> Result<Option<Value>, PyError>;
+}
+
+/// The VM's user-code hook: `&mut dyn VmHook` — see `VmHook`.
+pub type CallHook<'r, 'h> = &'r mut (dyn VmHook + 'h);
 
 /// `fn(&mut CallCtx, Value, n_args, n_kw, &[Value]) -> PyResult<Value>` —
 /// make_new slot (`mp_make_new_fun`, vendor `py/obj.h`): construct an

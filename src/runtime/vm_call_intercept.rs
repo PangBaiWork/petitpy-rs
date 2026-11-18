@@ -102,6 +102,13 @@ pub(crate) fn intercept_builtin_call(
     if fun == state.sorted_builtin {
         return Some(crate::runtime::builtin_vm::call_sorted_ctx(ctx, state, n_args, n_kw, args));
     }
+    // `str.join` / `bytes.join` (E2b): the method builtins are
+    // intercepted by GcRef identity so a generator / genexpr
+    // iterable is collected through the VM's real call hook
+    // before the ctx-only `str_join` runs (see `call_join_ctx`).
+    if fun == state.str_join_builtin || fun == state.bytes_join_builtin {
+        return Some(crate::runtime::builtin_vm::call_join_ctx(ctx, state, n_args, n_kw, args));
+    }
     if fun == state.min_builtin {
         return Some(crate::runtime::builtin_vm::call_min_ctx(ctx, state, n_args, n_kw, args));
     }

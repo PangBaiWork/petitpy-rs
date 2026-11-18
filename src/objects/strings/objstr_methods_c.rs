@@ -25,7 +25,7 @@ use crate::objects::obj::{
     obj_get_int, obj_get_int_maybe, obj_get_type, BuiltinTypes, BUFFER_READ,
 };
 use crate::objects::obj_ops::{get_index, obj_print_helper};
-use crate::objects::slots::{BinaryOp, BufferInfo, SubscrArg, UnaryOp};
+use crate::objects::slots::{BinaryOp, BufferInfo, CallHook, SubscrArg, UnaryOp};
 use crate::objects::strings::objstr_a::*;
 use crate::objects::strings::unicode::{utf8_charlen, utf8_next_char};
 use crate::objects::value::{GcRef, Obj, SliceData, Value};
@@ -614,6 +614,7 @@ pub fn bytes_make_new(
     types: &BuiltinTypes,
     args: &[Value],
     kwargs: &[KwArg],
+    call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, StrError> {
     let names = [
         static_qstr_id(b"source").unwrap_or(0),
@@ -660,7 +661,7 @@ pub fn bytes_make_new(
         Ok(data) => return Ok(new_bytes(ctx, types, &data)),
         Err(_) => {}
     }
-    let items = iter_items(ctx, types, arg0)?;
+    let items = iter_items(ctx, types, arg0, call)?;
     let mut out: Vec<u8> = Vec::new();
     for item in &items {
         let val = obj_get_int(ctx, types, *item)?;

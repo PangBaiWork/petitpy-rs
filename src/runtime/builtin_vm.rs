@@ -40,7 +40,6 @@ use crate::objects::objtype::objexcept::is_exception_instance;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::BinaryOp;
 use crate::objects::value::{Obj, Value};
-use crate::pyerr::PyError;
 use crate::runtime::import_search::rt_error_to_value;
 use crate::runtime::runtime::RtError;
 use crate::runtime::runtime_method::{load_attr, load_method_protected, MethodDest};
@@ -185,6 +184,51 @@ pub fn call_dir_ctx(
     Ok(Value::Heap(list))
 }
 
+/// `str.join` / `bytes.join` (E2b): `str_join` is ctx-only and
+/// cannot resume a generator, so `', '.join(gen())` /
+/// `', '.join(x for x in ...)` raised "object not iterable".
+/// The VM intercepts the method by GcRef identity (the `sorted`
+/// pattern — the handles live in `VmState`, `vm_builtins_bind.rs`)
+/// and materialises the iterable through the real call hook
+/// first, then delegates to the real `str_join` on `[sep, list]`
+/// — join of a list is the already-working path, so the result
+/// is identical for every non-generator iterable. Arity is
+/// checked here (interception bypasses `call_fun_builtin`'s sig
+/// check — probed: all three arity errors are `TypeError:
+/// argument num/types mismatch`). This also closes a Rust panic
+/// on `','.join()`: the direct `str_join` indexes `args[1]`
+/// unchecked, so a short call aborted (SIGABRT) before.
+pub fn call_join_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if n_args != 2 || n_kw != 0 {
+        return Err(mismatch(ctx, state));
+    }
+    let types = ctx.types;
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
+    let items = collect_iterable(ctx, args[1], Some(&mut hook)).map_err(|e| {
+        if let Some(exc) = state.pending_exc.take() {
+            return exc;
+        }
+        let pe = ctx.record_typed(e);
+        exc_from_pyerror(ctx, state, pe)
+    })?;
+    let list = new_list(ctx, types.list, &items);
+    crate::objects::strings::objstr_methods_a::str_join(
+        ctx,
+        types,
+        &[args[0], Value::Heap(list)],
+    )
+    .map_err(|e| {
+        let pe = ctx.record_typed(e);
+        exc_from_pyerror(ctx, state, pe)
+    })
+}
+
 /// `mp_builtin_sorted` (`modbuiltins.zig:443-451`): more than
 /// one positional arg → `TypeError("must use keyword argument
 /// for key function")`; else `list(iterable)` + `list.sort`
@@ -211,19 +255,13 @@ pub fn call_sorted_ctx(
     let types = ctx.types;
     // E2: the input iterable is materialised through the VM's
     // real call hook (the same pattern as `call_type_ctx` in
-    // vm_call.rs), so `sorted(map(f, xs))` runs `f`. A raise from
-    // `f` is stashed on `state.pending_exc` by the hook and
-    // drained first below; anything else goes through the
-    // recorded `pending_raise` as before.
-    let mut hook = |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
-        match call_function_ctx(ctx, state, fun, n, k, a) {
-            Ok(v) => Ok(v),
-            Err(exc) => {
-                state.pending_exc = Some(exc);
-                Err(PyError::PyRaise)
-            }
-        }
-    };
+    // vm_call.rs), so `sorted(map(f, xs))` runs `f`. E2b: the
+    // hook is the `VmHook` pair, so `sorted(gen())` also
+    // resumes the generator. A raise from `f` / the generator
+    // is stashed on `state.pending_exc` by the hook and drained
+    // first below; anything else goes through the recorded
+    // `pending_raise` as before.
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
     let items = collect_iterable(ctx, args[0], Some(&mut hook)).map_err(|e| {
         if let Some(exc) = state.pending_exc.take() {
             return exc;

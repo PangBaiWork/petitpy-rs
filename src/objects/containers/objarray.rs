@@ -57,7 +57,7 @@ use crate::objects::containers::binary::{
 use crate::objects::containers::objarray_methods::array_extend_impl;
 use crate::objects::obj::{obj_get_int, obj_len_maybe, ObjError};
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::{BinaryOp, PrintKind, UnaryOp};
+use crate::objects::slots::{BinaryOp, CallHook, PrintKind, UnaryOp};
 use crate::objects::strings::objstr_a::{str_data_pool, StrError};
 use crate::objects::strings::objstr_methods_b::str_print_quoted;
 use crate::objects::strings::objstr_methods_c::{kw_make_new, KwArg};
@@ -351,6 +351,7 @@ pub fn array_construct(
     bytearray_type: GcRef,
     typecode: u8,
     initializer: Value,
+    call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, ArrayError> {
     let init_is_bytes_like = typecode == BYTEARRAY_TYPECODE
         || matches!(initializer, Value::Heap(r) if ctx.arena.header(r).type_ == Some(ctx.types.bytes))
@@ -376,7 +377,7 @@ pub fn array_construct(
     }
     let r = array_new(ctx, array_type, bytearray_type, typecode, len)?;
     let arr = Value::Heap(r);
-    array_extend_impl(ctx, arr, initializer, len)?;
+    array_extend_impl(ctx, arr, initializer, len, call)?;
     Ok(arr)
 }
 
@@ -392,6 +393,7 @@ pub fn array_make_new(
     bytearray_type: GcRef,
     args: &[Value],
     n_kw: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, ArrayError> {
     let sig_err = if n_kw > 0 || args.is_empty() || args.len() > 2 {
         Some(ArrayError::ArgNumTypesMismatch)
@@ -419,7 +421,7 @@ pub fn array_make_new(
         let r = array_new(ctx, array_type, bytearray_type, tc, 0)?;
         return Ok(Value::Heap(r));
     }
-    let out = array_construct(ctx, array_type, bytearray_type, tc, args[1]);
+    let out = array_construct(ctx, array_type, bytearray_type, tc, args[1], call);
     if let Some(e) = sig_err {
         return Err(e);
     }
@@ -449,6 +451,7 @@ pub fn bytearray_make_new(
     bytearray_type: GcRef,
     args: &[Value],
     kwargs: &[KwArg],
+    call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, ArrayError> {
     let owned: Vec<Value>;
     let args: &[Value] = if kwargs.is_empty() {
@@ -496,7 +499,7 @@ pub fn bytearray_make_new(
     if is_str_value(ctx, args[0]) && args.len() == 1 {
         return Err(ArrayError::WrongNumArgs);
     }
-    let out = array_construct(ctx, array_type, bytearray_type, BYTEARRAY_TYPECODE, args[0]);
+    let out = array_construct(ctx, array_type, bytearray_type, BYTEARRAY_TYPECODE, args[0], call);
     if let Some(e) = sig_err {
         return Err(e);
     }

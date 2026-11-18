@@ -256,7 +256,7 @@ pub fn store_attr(
                 // setter actually runs; the stub
                 // `call_function_n_kw` on ctx-only paths.
                 match call.as_deref_mut() {
-                    Some(hook) => hook(ctx, fun, n_args, n_kw, args),
+                    Some(hook) => hook.call(ctx, fun, n_args, n_kw, args),
                     None => call_function_n_kw(ctx, fun, n_args, n_kw, args)
                         .map_err(|e| e.to_pyerror()),
                 }

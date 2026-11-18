@@ -131,3 +131,5 @@ mod vm_raise_tests;
 mod vm_tests_b;
 #[cfg(test)]
 mod vm_tests_e2;
+#[cfg(test)]
+mod vm_tests_e2b;

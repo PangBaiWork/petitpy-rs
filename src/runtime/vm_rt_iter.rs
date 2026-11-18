@@ -55,6 +55,18 @@ pub fn getiter_vm_ctx(
     value: Value,
 ) -> Result<Value, Value> {
     use crate::objects::iters::iter::getiter;
+    // E2b: a user instance's `__iter__` is a `FunBc` — it
+    // cannot run through the stub seams the slot path uses
+    // (`bound_meth_call_slot` has no runner for `FunBc`), so
+    // `getiter` silently falls back to a getitem iterator.
+    // Try the VM's real call hook first (the `try_instance_*`
+    // pattern); `Ok(None)` = no `__iter__` — fall through to
+    // the slot path (which tries the getitem fallback).
+    match crate::runtime::vm_seams::try_instance_getiter(ctx, state, value) {
+        Ok(Some(v)) => return Ok(v),
+        Ok(None) => {}
+        Err(exc) => return Err(exc),
+    }
     getiter(ctx, value).map_err(|e| exc_from_obj_error(ctx, state, e))
 }
 
@@ -114,12 +126,18 @@ pub fn iternext_allow_raise_ctx(
                     ) {
                         Ok(v) => CallOutcome::Value(v),
                         Err(exc) => {
-                            if is_stop_iteration(ctx2.arena, state, exc) {
-                                CallOutcome::Stop
-                            } else {
-                                state.pending_exc = Some(exc);
-                                CallOutcome::Raise
-                            }
+                            // E2b: stash EVERY raise on the side
+                            // channel — a `StopIteration` from the
+                            // mapped function carries its value
+                            // (`yield from` needs it as the
+                            // delegation result, `next()` as the
+                            // exception's args). `iternext_vm_ctx`
+                            // still swallows a `StopIteration` to
+                            // `Ok(None)` (the plain-`mp_iternext`
+                            // form), so `for`/collection iteration
+                            // is unchanged.
+                            state.pending_exc = Some(exc);
+                            CallOutcome::Raise
                         }
                     }
                 };

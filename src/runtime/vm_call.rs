@@ -13,20 +13,19 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objfun::{call_fun_builtin, fun_bc_prepare_call};
-use crate::objects::callables::objgenerator::gen_wrap_call;
+use crate::objects::callables::objgenerator::{gen_wrap_call, GenError};
 use crate::objects::containers::objtuple::new_tuple;
 use crate::objects::obj::obj_get_type;
-use crate::objects::objtype::objexcept::{exception_make_new, is_exception_type, new_exception};
+use crate::objects::objtype::objexcept::{exception_make_new, is_exception_type};
 use crate::objects::objtype::typecreate::type_call;
 use crate::objects::primitives::objcell::cell_set;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::value::{DictData, GcRef, MapData, Obj, Value};
-use crate::pyerr::PyError;
+use crate::objects::value::{DictData, GcRef, GenState, MapData, Obj, Value};
 use crate::runtime::runner::RunOutcome;
 use crate::runtime::vm::VmState;
 use crate::runtime::vm_gen::{close_generator_ctx, resume_generator_value_ctx};
 use crate::runtime::vm_ops::{exc_from_gen_error, exc_from_pyerror, exc_from_setup, exc_from_typed, type_error};
-use crate::runtime::vm_raise::{execute_frame, make_raise_obj};
+use crate::runtime::vm_raise::execute_frame;
 use crate::runtime::vm_rt_name::load_method_maybe_ctx;
 
 // ── Call dispatch ────────────────────────────────────────────────────
@@ -279,17 +278,23 @@ fn resume_via_method_ctx(
         }
         ResumeVia::Throw => {
             // `throw(type, value?)`: the second non-None arg IS
-            // the exception (C10b) — the VM inject path
-            // validates it (`exceptions must derive from
-            // BaseException`).
+            // the exception (C10b). Pass it RAW — the Zig passes
+            // `throw_value` straight through (`mp_resume`,
+            // runtime.zig:1430-1453: a sub-iterator's `throw`
+            // method receives the raw value; `mp_make_raise_obj`
+            // is only the no-`throw`-method fallback, which
+            // `resume_vm_ctx` already does). The conversion
+            // happens at the injection point (`dispatch_loop`:
+            // `make_raise_obj` when the frame does NOT sit on
+            // `YIELD_FROM`). Converting here double-converts:
+            // `g.throw(123)` into a `yield from Iter()` handed
+            // the `throw` method a `TypeError` object instead
+            // of `123` (E2b gen_yield_from_throw3).
             let exc = args.get(1).copied().unwrap_or(Value::None);
             let exc = if args.get(2).copied().unwrap_or(Value::None) != Value::None {
                 args.get(2).copied().unwrap()
             } else {
                 exc
-            };
-            let exc = {
-                make_raise_obj(ctx, state, exc)
             };
             resume_generator_value_ctx(ctx, state, gen, Value::None, Some(exc))
         }
@@ -310,28 +315,53 @@ fn resume_via_method_ctx(
             }
         }
         ResumeVia::PendThrow => {
-            // `pend_throw(type, value?)` stores the throw for
-            // the next resume (C10b's `gen_instance_pend_throw`).
+            // `pend_throw(type, value?)` queues a throw for the
+            // next resume and returns the PREVIOUSLY queued value
+            // (`genInstancePendThrowImpl`,
+            // objgenerator.zig:324-331: `prev = self.pend_exc;
+            // self.pend_exc = exc_in; return prev;` — initially
+            // `OBJ_NONE`). Three E2b fixes against the old arm,
+            // which always returned `None`: (1) return the
+            // previous value; (2) `pend_throw(None)` CLEARS the
+            // queue (the Zig stores `OBJ_NONE` and the resume
+            // ignores it — storing the `make_raise_obj(None)`
+            // TypeError instead made the resume throw it);
+            // (3) a running generator raises `ValueError
+            // ("generator already executing")` (the Zig's
+            // `pend_exc == OBJ_NULL` guard; the direct fn
+            // `gen_instance_pend_throw` already checks this).
             let exc = args.get(1).copied().unwrap_or(Value::None);
             let exc = if args.get(2).copied().unwrap_or(Value::None) != Value::None {
                 args.get(2).copied().unwrap()
             } else {
                 exc
             };
-            let exc = make_raise_obj(ctx, state, exc);
-            match gen {
-                Value::Heap(r) => match ctx.arena.get_mut(r) {
-                    Obj::Generator(d) => {
-                        d.pend_throw = Some(exc);
-                        Ok(Value::None)
-                    }
-                    _ => {
-                        Err(type_error(ctx, state, "pend_throw on a non-generator"))
-                    }
-                },
-                _ => {
-                    Err(type_error(ctx, state, "pend_throw on a non-generator"))
+            // The Running check first (immutable read), then the
+            // swap. Store the RAW value (`genInstancePendThrowImpl`:
+            // `self.pend_exc = exc_in`) — the conversion happens
+            // at the injection point (`dispatch_loop`:
+            // `make_raise_obj` when the frame does NOT sit on
+            // `YIELD_FROM`; `resume_vm_ctx` passes the raw value
+            // to a sub-iterator's `throw` method). Storing the
+            // converted object double-converts for `yield from`
+            // (same bug as the old `Throw` arm above).
+            let Value::Heap(r) = gen else {
+                return Err(type_error(ctx, state, "pend_throw on a non-generator"));
+            };
+            let is_gen = matches!(ctx.arena.get(r), Obj::Generator(_));
+            if !is_gen {
+                return Err(type_error(ctx, state, "pend_throw on a non-generator"));
+            }
+            if matches!(ctx.arena.get(r), Obj::Generator(d) if d.state == GenState::Running) {
+                return Err(exc_from_gen_error(ctx, state, GenError::AlreadyExecuting));
+            }
+            let queued = if exc != Value::None { Some(exc) } else { None };
+            match ctx.arena.get_mut(r) {
+                Obj::Generator(d) => {
+                    let prev = std::mem::replace(&mut d.pend_throw, queued);
+                    Ok(prev.unwrap_or(Value::None))
                 }
+                _ => Err(type_error(ctx, state, "pend_throw on a non-generator")),
             }
         }
     }
@@ -359,20 +389,15 @@ pub(crate) fn call_type_ctx(
     // E2: the type call carries the VM's real call hook, so a
     // Python `__new__` / `__init__` actually executes (a `FunBc`
     // callee runs through `call_function_ctx` + `execute_frame`).
-    // The hook stashes the exception OBJECT on the
-    // `state.pending_exc` side channel (the C14 contract:
-    // `PyError` cannot carry an object) and returns `PyRaise`;
-    // the drain below takes it first, else falls back to the
-    // recorded `pending_raise` via `exc_from_pyerror`.
-    let mut hook = |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
-        match call_function_ctx(ctx, state, fun, n, k, a) {
-            Ok(v) => Ok(v),
-            Err(exc) => {
-                state.pending_exc = Some(exc);
-                Err(PyError::PyRaise)
-            }
-        }
-    };
+    // E2b: the hook is the `VmHook` pair (call + resume), built
+    // once from `state` — a generator argument to a constructor
+    // (`list(gen())`) resumes through the same hook. The hook
+    // stashes the exception OBJECT on the `state.pending_exc`
+    // side channel (the C14 contract: `PyError` cannot carry an
+    // object) and returns `PyRaise`; the drain below takes it
+    // first, else falls back to the recorded `pending_raise`
+    // via `exc_from_pyerror`.
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
     type_call(ctx, Value::Heap(type_), n_args, n_kw, args, Some(&mut hook)).map_err(|e| {
         if let Some(exc) = state.pending_exc.take() {
             exc
@@ -409,18 +434,25 @@ fn call_via_type_slot_ctx(
 /// The `next` builtin (`mp_builtin_next`): `next(it)` raises
 /// `StopIteration` on exhaustion; `next(it, default)` returns
 /// the default. Intercepted by GcRef identity in
-/// `call_function` (its `func` is a stub).
+/// `call_function` (its `func` is a stub). E2b: the 1-arg form
+/// goes through `iternext_allow_raise_ctx` (not
+/// `iternext_vm_ctx`) — the translating form swallows the
+/// generator's return value into a bare `StopIteration`, but
+/// `next(g)` on a generator that `return`s 42 must raise
+/// `StopIteration(42)` (the `generator_return` corpus test:
+/// `yield from` reads the value through this path). The 2-arg
+/// form keeps the translating form (`Ok(None)` → default).
 pub(crate) fn call_next_ctx(ctx: &mut CallCtx, state: &mut VmState, n_args: usize, args: &[Value]) -> Result<Value, Value> {
     if n_args == 0 || n_args > 2 {
         return Err(type_error(ctx, state, "argument num/types mismatch"));
     }
     let it = args[0];
+    if n_args == 1 {
+        return crate::runtime::vm_rt_iter::iternext_allow_raise_ctx(ctx, state, it);
+    }
     match crate::runtime::vm_rt_iter::iternext_vm_ctx(ctx, state, it)? {
         Some(v) => Ok(v),
-        None => match args.get(1).copied() {
-            Some(d) => Ok(d),
-            None => Err(new_exception(ctx, state.exc.stop_iteration)),
-        },
+        None => Ok(args[1]),
     }
 }
 

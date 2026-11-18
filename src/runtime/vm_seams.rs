@@ -21,10 +21,12 @@
 //! (a raise from a builtin slot).
 
 use crate::memory::gc::{CallCtx, GcArena};
+use crate::objects::obj::obj_get_type;
 use crate::objects::objtype::instance::{
-    instance_binary_op, instance_call, instance_get_call, instance_load_attr, instance_subscr,
-    instance_unary_op,
+    instance_binary_op, instance_call, instance_get_call, instance_getiter, instance_load_attr,
+    instance_subscr, instance_unary_op,
 };
+use crate::objects::objtype::lookup::{class_lookup, SlotKind};
 use crate::objects::objtype::seams::{with_call_hook_seams, with_stub_seams};
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BinaryOp, SubscrArg, UnaryOp};
@@ -54,22 +56,62 @@ pub(crate) fn drain_hook_raise(
     }
 }
 
-/// The VM's call hook as a closure value (borrows `state` for
-/// `'s`): a `FunBc` callee runs through `call_function_ctx` +
-/// `execute_frame`; a raise stashes the exception object on
-/// `state.pending_exc` and returns `PyRaise` (the C14 contract).
-pub(crate) fn make_hook<'s>(
+/// The VM's user-code hook (E2b): ONE borrow of `state` serving
+/// both `VmHook` operations, so a collection site can call user
+/// code AND resume a generator without two competing `&mut
+/// VmState` borrows (E0499 — the two-closure shape cannot be
+/// built). `call` runs a `FunBc` callee through
+/// `call_function_ctx` + `execute_frame`; `resume` steps a
+/// generator once via `resume_generator_ctx` in the `iternext`
+/// form (`Ok(Some(v))` = yielded, `Ok(None)` = exhausted). A
+/// raise from either operation stashes the exception object on
+/// `state.pending_exc` and returns `PyRaise` (the C14 contract);
+/// the caller drains it (`drain_hook_raise` /
+/// `call_type_ctx`'s drain / `sorted`'s drain).
+pub(crate) struct StateHook<'s> {
     state: &'s mut VmState,
-) -> impl FnMut(&mut CallCtx, Value, usize, usize, &[Value]) -> PyResult<Value> + 's {
-    move |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
-        match call_function_ctx(ctx, state, fun, n, k, a) {
+}
+
+impl crate::objects::slots::VmHook for StateHook<'_> {
+    fn call(
+        &mut self,
+        ctx: &mut CallCtx,
+        fun: Value,
+        n: usize,
+        k: usize,
+        a: &[Value],
+    ) -> PyResult<Value> {
+        match call_function_ctx(ctx, self.state, fun, n, k, a) {
             Ok(v) => Ok(v),
             Err(exc) => {
-                state.pending_exc = Some(exc);
+                self.state.pending_exc = Some(exc);
                 Err(PyError::PyRaise)
             }
         }
     }
+
+    fn resume(&mut self, ctx: &mut CallCtx, gen: Value) -> Result<Option<Value>, PyError> {
+        match crate::runtime::vm_gen::resume_generator_ctx(
+            ctx,
+            self.state,
+            gen,
+            Value::None,
+            None,
+            false,
+        ) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.state.pending_exc =
+                    Some(crate::runtime::vm_ops::exc_from_gen_error(ctx, self.state, e));
+                Err(PyError::PyRaise)
+            }
+        }
+    }
+}
+
+/// Build the VM's hook from `state` (borrows `state` for `'s`).
+pub(crate) fn make_hook<'s>(state: &'s mut VmState) -> StateHook<'s> {
+    StateHook { state }
 }
 
 /// Try an instance's binary-op dunder (`__add__`, `__eq__`,
@@ -84,8 +126,8 @@ pub(crate) fn try_instance_binary_op(
     if !is_instance(ctx.arena, lhs) {
         return Ok(None);
     }
-    let hook = make_hook(state);
-    match with_call_hook_seams(hook, |seams| instance_binary_op(ctx, op, lhs, rhs, seams)) {
+    let mut hook = make_hook(state);
+    match with_call_hook_seams(&mut hook, |seams| instance_binary_op(ctx, op, lhs, rhs, seams)) {
         Ok(v) => Ok(v),
         Err(e) => Err(drain_hook_raise(ctx, state, e)),
     }
@@ -102,8 +144,8 @@ pub(crate) fn try_instance_unary_op(
     if !is_instance(ctx.arena, arg) {
         return Ok(None);
     }
-    let hook = make_hook(state);
-    match with_call_hook_seams(hook, |seams| instance_unary_op(ctx, op, arg, seams)) {
+    let mut hook = make_hook(state);
+    match with_call_hook_seams(&mut hook, |seams| instance_unary_op(ctx, op, arg, seams)) {
         Ok(v) => Ok(v),
         Err(e) => Err(drain_hook_raise(ctx, state, e)),
     }
@@ -145,8 +187,8 @@ pub(crate) fn try_instance_subscr(
     if !is_instance(ctx.arena, base) {
         return Ok(None);
     }
-    let hook = make_hook(state);
-    match with_call_hook_seams(hook, |seams| instance_subscr(ctx, base, index, arg, seams)) {
+    let mut hook = make_hook(state);
+    match with_call_hook_seams(&mut hook, |seams| instance_subscr(ctx, base, index, arg, seams)) {
         Ok(v) => Ok(Some(v)),
         Err(e) => Err(drain_hook_raise(ctx, state, e)),
     }
@@ -171,9 +213,45 @@ pub(crate) fn try_instance_call(
     if !has_call {
         return Ok(None);
     }
-    let hook = make_hook(state);
-    match with_call_hook_seams(hook, |seams| instance_call(ctx, fun, n_args, n_kw, args, seams))
+    let mut hook = make_hook(state);
+    match with_call_hook_seams(&mut hook, |seams| instance_call(ctx, fun, n_args, n_kw, args, seams))
     {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => Err(drain_hook_raise(ctx, state, e)),
+    }
+}
+
+/// Try an instance's `__iter__` with the VM's real call hook.
+/// The lookup runs first with stub seams (a pure dict lookup —
+/// no call), so a class without `__iter__` falls through to
+/// the slot path (which tries the getitem fallback). Without
+/// this, the slot path's `instance_getiter_slot` calls the
+/// `FunBc` dunder through stub seams — `bound_meth_call_slot`
+/// has no runner for `FunBc` — and `getiter` silently falls
+/// back to a getitem iterator (`for x in MyGen()` →
+/// "object isn't subscriptable"; `yield from Iter()` ditto).
+pub(crate) fn try_instance_getiter(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    value: Value,
+) -> Result<Option<Value>, Value> {
+    if !is_instance(ctx.arena, value) {
+        return Ok(None);
+    }
+    let has_iter = with_stub_seams(|seams| {
+        let Some(type_) = obj_get_type(ctx.arena, ctx.types, value) else {
+            return false;
+        };
+        let Some(q) = static_qstr_id(b"__iter__") else {
+            return false;
+        };
+        class_lookup(ctx, Some(value), q, Some(SlotKind::Iter), false, type_, seams).is_some()
+    });
+    if !has_iter {
+        return Ok(None);
+    }
+    let mut hook = make_hook(state);
+    match with_call_hook_seams(&mut hook, |seams| instance_getiter(ctx, value, seams)) {
         Ok(v) => Ok(Some(v)),
         Err(e) => Err(drain_hook_raise(ctx, state, e)),
     }
@@ -192,8 +270,8 @@ pub(crate) fn try_instance_load_attr(
     if !is_instance(ctx.arena, obj) {
         return Ok(None);
     }
-    let hook = make_hook(state);
-    let loaded = match with_call_hook_seams(hook, |seams| instance_load_attr(ctx, obj, attr, seams))
+    let mut hook = make_hook(state);
+    let loaded = match with_call_hook_seams(&mut hook, |seams| instance_load_attr(ctx, obj, attr, seams))
     {
         Ok(v) => v,
         Err(e) => return Err(drain_hook_raise(ctx, state, e)),

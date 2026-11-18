@@ -192,6 +192,19 @@ pub(crate) fn intercept_builtin_call(
     if fun == state.print_builtin {
         return Some(crate::runtime::builtin_str::call_print_ctx(ctx, state, n_args, n_kw, args));
     }
+    // The embedding host-call builtin (F1, ADR 022's
+    // `hostCall`): ONE shared `FunBuiltin` that every
+    // `ppy_define_function` bound method wraps (its `self`
+    // is the host's index in the interpreter's `hosts`
+    // list). `call_host_ctx` reads the host table from the
+    // thread-local current interpreter (set by the API
+    // bracket). Kwargs are rejected inside `call_host_ctx`,
+    // exactly as a plain var builtin rejects them.
+    if fun == state.host_call_builtin {
+        return Some(crate::entry::api::call_host_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     // `sys.print_exception` is intercepted the same way (D2):
     // its default target is the VM's `sys_stdout`, which a
     // `FunBuiltin` slot cannot see.

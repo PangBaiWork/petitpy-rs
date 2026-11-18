@@ -44,7 +44,11 @@ pub fn io_error_name(e: &std::io::Error) -> String {
     }
 }
 
+pub mod api;
 pub mod base64;
 pub mod embed_exec;
 pub mod embed_run_mpy;
 pub mod systemexit;
+
+#[cfg(test)]
+mod api_tests;

@@ -183,24 +183,6 @@ impl Vm {
         Self::register_code_inner(ctx, state, module, name_id, qstr_table, module_dict, false)
     }
 
-    /// Build the exception object for a compile failure
-    /// (`SyntaxError("invalid syntax")` /
-    /// `IndentationError("invalid syntax")` /
-    /// `OSError(12)` — the `raise_from_code` mapping,
-    /// `compile_bridge.rs`; the old version mapped
-    /// `IndentationError` to `"unexpected indent"` and
-    /// `OutOfMemory` to `MemoryError`, both wrong against the
-    /// original — see `scripts/import_result.txt` §5).
-    /// The traceback file is `"<string>"` (the eval source
-    /// name — a static qstr, so the resolve succeeds). Callers with a REGISTER-path allocation
-    /// failure must NOT pass `OutOfMemory` here — that class of
-    /// failure is `MemoryError("out of memory")`, built
-    /// directly at the call site.
-    fn compile_error_value(&mut self, e: CompileError) -> Value {
-        let (mut ctx, state) = self.split();
-        Self::compile_error_value_ctx(&mut ctx, state, e)
-    }
-
     /// The dispatch-path twin of `eval_exec` (the
     /// `call_function_ctx` interception of `eval`/`exec`):
     /// same steps — the qstr table resolves through the shared
@@ -349,6 +331,25 @@ impl Vm {
         globals: GcRef,
         locals: GcRef,
     ) -> Result<Value, Value> {
+        self.eval_exec_named(source, kind, "<string>", globals, locals)
+    }
+
+    /// `eval_exec` with a caller-chosen source name (F1: the
+    /// embedding API's `ppy_exec` compiles with the host-given
+    /// filename so tracebacks name it — `api_test.c`'s
+    /// `format_exception` check expects `File "<test>"`;
+    /// `ppy_eval` uses `"<string>"`). The module is registered
+    /// under the same name (eval modules are transient —
+    /// `register` is false — so the name only surfaces in
+    /// tracebacks).
+    pub fn eval_exec_named(
+        &mut self,
+        source: &[u8],
+        kind: InputKind,
+        name: &str,
+        globals: GcRef,
+        locals: GcRef,
+    ) -> Result<Value, Value> {
         // `petitpy-vm`: the compiler is not linked (the Zig's
         // `npy_zig_eval_exec` stub).
         if !self.state.compiler_linked {
@@ -359,14 +360,14 @@ impl Vm {
         }
         let source_str = match std::str::from_utf8(source) {
             Ok(s) => s,
-            Err(_) => return Err(self.compile_error_value(CompileError::SyntaxError)),
+            Err(_) => return Err(self.compile_error_value_named(CompileError::SyntaxError, name)),
         };
-        let mpy = match compile_to_mpy_named(source_str, kind, "<string>") {
+        let mpy = match compile_to_mpy_named(source_str, kind, name) {
             Ok(m) => m,
-            Err(ce) => return Err(self.compile_error_value(ce)),
+            Err(ce) => return Err(self.compile_error_value_named(ce, name)),
         };
         let (module_val, code_idx) =
-            match self.register_mpy_code(&mpy, "<string>", Some(globals), false) {
+            match self.register_mpy_code(&mpy, name, Some(globals), false) {
                 Ok(v) => v,
                 Err(VmError::OutOfMemory) => {
                     // Register-path allocation failure — NOT a

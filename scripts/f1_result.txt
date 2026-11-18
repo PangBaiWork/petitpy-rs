@@ -1,0 +1,381 @@
+Lane F1 — embedding API (entry/api.zig + petitpy.h as Rust cdylib/staticlib)
+Base: master 9b92299. Worktree: ~/workspace/petitpy-rs-f1-embed, branch lane/f1-embed.
+Executor completed 2026-11-19 ~03:0x CST. NOT merged (main agent verifies + merges).
+
+§1 — Acceptance numbers
+----------------------
+C acceptance — the original's own test programs, UNMODIFIED, linked against the
+built library (commands in §2; logs in ~/workspace/f1_c/):
+- api_test.c vs staticlib (target/release/libpetitpy_rs.a):
+    61/61 checks PASS, "all passed", rc 0
+    (api_test_static_final.log)
+- api_test.c vs staticlib, NPY_GC_STRESS=10:
+    61/61 checks PASS, "all passed", rc 0
+    (api_test_static_stress_final.log)
+- api_test.c vs cdylib (-Ltarget/release -lpetitpy_rs, LD_LIBRARY_PATH):
+    61/61 checks PASS, "all passed", rc 0
+    (api_test_cdylib.log)
+- api_test.c vs cdylib, NPY_GC_STRESS=10:
+    61/61 checks PASS, "all passed", rc 0
+    (api_test_cdylib_stress.log)
+  Every check(...) in api_test.c passes, including: frozen json import,
+  int overflow -> OverflowError (fetched type checked), format_exception's
+  EXACT traceback string (File "<test>", two frames), SystemExit(3) ->
+  PPY_EXIT + exit_code 3 + still running after, invalid/released handles,
+  dup outlives release, host functions twice/apply/reraise/count, nested
+  Python error caught by a host, second interpreter (separate globals /
+  modules / handles / write sink), 4 pthreads x 200 ppy_eval, output
+  capture exactly "1:a|1: |1:1|1:\n|1:b|2:c|2:\n|2:d|" (8 writes).
+- examples/embed/host.c vs staticlib: prints exactly "41", rc 0
+  (host_static.log). vs cdylib: "41", rc 0.
+- No cherry-picking: the C files were not edited; the only C-side inputs
+  are the -Iinclude path and -lpthread -lm (no -ldl needed).
+
+Rust-side (cargo test --release --lib --tests / --bins / --test entry_cli):
+- lib 1642 passed / 0 failed / 3 ignored (base 1636 + 6 new api tests)
+- bins 9 passed; entry_cli 45 passed
+- 0 warnings (forced recompile: touch src/lib.rs && cargo build --release)
+- scripts/check_compile_mpy.py PASS (byte mismatches: 0)
+- scripts/check_frozen.py PASS (23/23, 38,141 bytes)
+- orig clean (git status empty)
+
+Six gates (runners with defaults, no --bin except full_gate; outputs in
+~/workspace/f1_verify/): ALL UNCHANGED from base 9b92299 —
+- full corpus 545/552 — "Full gate: GREEN (matches known-fails baseline exactly)"
+- integration 186/202 — fail set name-identical to base (the 16 known ones)
+- golden 585/585 (works 584/584 + works-native-only 1/1; rust==cpython 576/585)
+- capability 67/67 — "GATE: GREEN (matches the baseline exactly)"
+- stdlib 7/8 — only test_enum fails (the E2g §4 hash-path failure, untouched)
+- nano 454/541 (report-only invariant)
+
+§2 — What was built
+-------------------
+NEW src/entry/api.rs (1,893 lines): the whole `ppy_*` C API — Interp
+(own Box<Vm>, handle tag, __main__ globals, hosts, stored err, exit code,
+output sink, type-name CString cache), the reentrant lock, the handle
+table, the run/produce bracket, call_host_ctx, and all 39 exports.
+NEW src/entry/api_tests.rs (203 lines): 6 Rust tests (handle tagging /
+slot 0 / free-slot reuse / cross-interp rejection / per-interp isolation /
+reentrant nested host call / handles survive NPY_GC_STRESS=10).
+NEW include/petitpy.h (6,328 bytes): the original's header copied VERBATIM
+(cmp identical) + include/README.md provenance note.
+Cargo.toml: [lib] crate-type = ["cdylib", "staticlib", "rlib"] (7 lines).
+
+Library artifacts (cargo build --release, 0 warnings):
+- target/release/libpetitpy_rs.so  2,018,024 B (cdylib, stripped)
+- target/release/libpetitpy_rs.a  33,342,578 B (staticlib; unstripped
+  objects + fat-LTO bytecode — normal for a staticlib, not a size gate)
+- target/release/libpetitpy_rs.rlib 16,403,642 B (the binaries' rlib)
+- target/release/petitpy-rs 1,920,752 B; petitpy-vm 1,908,064 B
+- nm -D libpetitpy_rs.so | grep -c " ppy_" = 39; nm libpetitpy_rs.a = 39
+  (exactly the header's 39 exports).
+
+C link commands (mirroring make test-embed):
+  cc -std=c99 -Wall -Wextra -Werror -Iinclude \
+     <orig>/tests/embed/api_test.c target/release/libpetitpy_rs.a \
+     -lpthread -lm -o api_test_static
+  cc ... -Iinclude <orig>/tests/embed/api_test.c -Ltarget/release \
+     -lpetitpy_rs -lpthread -lm -o api_test_cdylib
+  (same two forms for examples/embed/host.c; cdylib runs need
+  LD_LIBRARY_PATH=target/release)
+
+Changed tracked files (11, +206/-34): Cargo.toml, src/entry/mod.rs,
+src/memory/gc.rs, src/objects/containers/objfileio.rs,
+src/objects/strings/mpprint.rs, src/runtime/vm.rs,
+src/runtime/vm_builtins.rs, src/runtime/vm_builtins_bind.rs,
+src/runtime/vm_call_intercept.rs, src/runtime/vm_eval.rs,
+src/support/output.rs. Largest touched file: vm_builtins_bind.rs 643
+lines; largest new file api.rs 1,893 lines — all < 2500.
+
+§3 — Rust-side adaptations (with file:line pointers)
+----------------------------------------------------
+(a) Per-interpreter Vm (no save/load ported) — src/entry/api.rs:130-145
+    (Interp), :1038-1091 (ppy_new). Each `ppy_interp` owns its own
+    `Box<Vm>` (own arena, qstr pool, code store, modules, globals).
+    Verified by reading `Vm::new` (src/runtime/vm.rs:392): all state is
+    per-Vm; the only process-wide mutables in the tree are modsocket.rs'
+    sockets table (OnceLock<Mutex<HashMap>>, OS-level) and modtime.rs'
+    MONO_EPOCH (immutable after init). The Zig's `save`/`load`/`switchTo`
+    and `globals` list are NOT ported. `ppy_new` registers `__main__`
+    with an empty `run_main_source(b"", "<stdin>", None)` and keeps its
+    globals dict as `main_globals`; `set_sys_path`/`set_sys_argv` replace
+    (no PYTHONPATH / PETITPY_LIB wiring — sys.path holds ONLY the config).
+(b) Reentrant lock — src/entry/api.rs:176-235. `std::Mutex` is NOT
+    recursive, so reentrancy is `PROCESS_LOCK: Mutex<()>` +
+    `LOCK_OWNER: AtomicU64` + `LOCK_DEPTH: AtomicUsize` + a thread-local
+    `MutexGuard<'static, ()>` held by the outermost entry. Same-thread
+    reentry (a host function calling the API) bumps the depth and skips
+    the mutex; other threads block. The thread id is NOT
+    `ThreadId::as_u64` (unstable, #67939): each thread takes the next
+    number from `NEXT_THREAD_NUM` on first use (0 = never assigned =
+    lock free). The header's deadlock note is preserved in the module
+    docs. `LOCK_GUARD`'s `'static` is sound: the mutex is a `static`
+    and the guard is only dropped by the thread that took it.
+    Interpreter slots: `INTERP_BITS: AtomicU64` bitmask, no second mutex.
+(c) Handle roots — src/memory/gc.rs:31-56 (RootSet.handles) + :172-179
+    (iter). The handle table IS `RootSet.handles: Vec<Option<Value>>`
+    (slot 0 kept `None`, never handed out) — `RootSet::iter()` chains
+    it, so `collect_inner` marks handle values. A separate leg from
+    `extra` because `rebuild_frame_roots` truncates `extra` to
+    `extra_base` on generator suspend/resume, which would drop handle
+    roots. `new_handle` (api.rs:296) scans for the first free slot (no
+    explicit free list — same observable behavior: freed slots reused,
+    slot 0 never handed out). Tag = interp index << 26 (`SLOT_BITS`).
+    Verified by the stress runs (§1) + the Rust test
+    `handles_survive_gc_stress` (api_tests.rs).
+(d) Print sink — src/support/output.rs:40-100 (thread-local `CSink` +
+    `set_thread_sink` / `write_sink`), wired into
+    `src/objects/containers/objfileio.rs:147-176` (fileio_write Stdout /
+    Stderr arms) and `src/objects/strings/mpprint.rs:652-672`
+    (`MP_PLAT_PRINT_SINK_AWARE`, used by `print_impl_with`'s no-file
+    path in src/runtime/vm_builtins.rs:187). NOT a `VmState` field (the
+    output.rs doc's suggestion): the write sites are ctx-only and cannot
+    see `VmState`; the Zig keeps `output.sink` as a process-wide global
+    saved/restored per interpreter, and the Rust form is a thread-local
+    installed by the API bracket's `SinkGuard` (api.rs:256) and restored
+    on exit. `__repl_print__` keeps plain `MP_PLAT_PRINT` (the REPL
+    never runs under embedding). Verified by api_test's output-capture
+    checks (exact 8-write sequence, per-interpreter sinks).
+(e) Host functions — src/runtime/vm.rs:135-144 (`VmState.host_call_builtin`),
+    src/runtime/vm_builtins_bind.rs:243-268 (creation in `build_builtins`,
+    name `"__ppy_host_call__"` via `pool.from_strn`, sig (1,255),
+    `intercepted_stub_fn`), src/runtime/vm_call_intercept.rs:197-208
+    (GcRef-identity arm -> `entry::api::call_host_ctx`, api.rs:560-620).
+    ONE shared `FunBuiltin`; the bound method's `self` is the host index.
+    `call_host_ctx` validates args[0], builds TEMPORARY handles for
+    args[1..], releases them before returning, takes the exception from
+    `interp.err` on non-OK else `RuntimeError("host function failed")`,
+    result 0 -> `None`. n_kw > 0 -> `TypeError("argument num/types
+    mismatch")` (mirrors `call_fun_builtin`'s arg check for a kw-less
+    var builtin); kwargs are otherwise ignored like the Zig's hostCall
+    (argc = n_args - 1).
+(f) eval_exec_named — src/runtime/vm_eval.rs:117-208 (`eval_exec`
+    delegates with `"<string>"`). `ppy_exec` must compile with the
+    host-given filename so tracebacks name it — api_test's
+    `format_exception` check pins `File "<test>"` (two frames).
+(g) `ppy_new` calls `vm.arena.gc_init()` (api.rs:1056) — see §4(h).
+(h) `ppy_type_name` (api.rs:1545) locks + enters directly (no produce),
+    resolves via `obj_type_name`, and caches a `CString` per NAME
+    string in `interp.type_names` (keyed by name, not by type GcRef —
+    a GcRef key could go stale if the type were collected and its slot
+    reused; the name string is the value). NULL for a bad handle or a
+    name with an interior NUL.
+(i) `ppy_to_int` (api.rs:1406): `obj_get_int_maybe` — Ok(Some) -> value;
+    Ok(None) -> `TypeError("expected an int")` (explicit, NOT
+    `ObjError::IntConversion`'s "can't convert to int"); Err(Overflow)
+    -> `exc_from_obj_error` (OverflowError, message "overflow
+    converting long int to machine word"). api_test asserts the fetched
+    type is "OverflowError" for 2**64 — passes.
+(j) `ppy_to_str` / `ppy_to_bytes` (api.rs:442-480, `data_ptr_body`):
+    `Value::Qstr` -> pool bytes; exact-type `Obj::Str` / `Obj::Bytes`
+    -> buffer pointer; else `TypeError("expected a str" /
+    "expected bytes")`. Pointer valid while the handle is held
+    (handle-rooted, str/bytes immutable).
+(k) `ppy_raise` (api.rs:1797): type looked up in the builtins module
+    via `load_attr_ctx` (lookup failure propagates); not a type / not a
+    `BaseException` subclass (`is_subclass_fast`) -> `TypeError("not an
+    exception type")`; always returns PPY_ERROR (the body returns Err
+    in every path). `ppy_raise_exception` (api.rs:1822): object must be
+    an exception instance else `TypeError("not an exception")`; always
+    PPY_ERROR. `ppy_fetch_error` (api.rs:1836): NO `fetched` dance —
+    `new_handle` allocates no arena memory, so the error is taken
+    directly from `interp.err`.
+(l) `ppy_getitem` / `ppy_setitem` (api.rs:640-678, `subscr_body`): an
+    instance tries `__getitem__` / `__setitem__` first via
+    `try_instance_subscr` (the dispatch's LOAD/STORE_SUBSCR shape),
+    then the slot path (`obj_subscr`). `ppy_call` uses the VM-level
+    `call_function` (bound methods, classes, user `__call__` all work).
+    `ppy_get_global` / `ppy_set_global` use `dict_get_value` /
+    `obj_subscr` on `main_globals`; missing -> `ValueError("name is
+    not defined in __main__")`. `ppy_import` (api.rs:700): `import_impl`
+    with fromlist None (top module) + dotted-path walk with
+    `load_attr_ctx`. `ppy_define_function` (api.rs:755): module via
+    `get_or_create_module` (sys.modules lookup first, else `new_module`
+    + register in `state.modules` AND `sys.modules` — `mp_obj_new_module`,
+    objmodule.zig:81-99 — so `import host` finds it).
+(m) `run` / `produce` bracket (api.rs:361-462, `run_bracket` /
+    `run_produce` / `run_status`): lock, `CurrentGuard` (thread-local
+    current interp, for `call_host_ctx`), `SinkGuard`, `interp.err =
+    None`, `out` zeroed FIRST, body, Ok(Some) -> new handle, Ok(None)
+    -> no handle, Err -> `interp.err = Some(exc)` + SystemExit ->
+    PPY_EXIT (+ `exit_code`) else PPY_ERROR. `enter_python` /
+    `leave_python` are NOT called (nothing in the VM core calls them on
+    native either — gc.rs only references them in tests).
+
+§4 — Left open, unsafe audit, header-vs-code disagreements, seams
+------------------------------------------------------------------
+LEFT OPEN (all pre-existing or explicitly out of scope; none blocks the
+brief's acceptance):
+(a) Host-function kwargs are ignored (n_kw > 0 is rejected; a host
+    called WITH kwargs from Python raises "argument num/types mismatch"
+    — the Zig's hostCall computes argc = n_args - 1 and ignores kwargs,
+    but no api_test case covers kwargs; untested edge, noted here).
+(b) REENTRANCY CAVEAT (documented in api.rs module docs): a nested
+    `ppy_*` call from a host function creates a second `&mut` path to
+    the same `Vm`/`Interp` through the raw `*mut Interp` while the
+    outer call's `&mut` borrow is suspended. Sequential, lock-
+    serialized, outer borrow never used while a nested call is active —
+    the same guarantee the Zig relies on via process-wide globals. The
+    alternative (restructuring the VM to UnsafeCell interior mutability)
+    is out of scope and forbidden by the brief.
+(c) `modsocket.rs`'s process-wide sockets table (OnceLock<Mutex<HashMap>>)
+    is OS-level state shared across interpreters, same shape as the
+    original (its sockets table is also global). Not touched.
+(d) `new_handle` uses a free-slot scan instead of the Zig's explicit
+    free list — same observable behavior (freed slots reused, slot 0
+    never handed out); the scan is O(slots) per allocation, fine at
+    embedding scale (api_test's 100-handle garbage loop passes).
+(e) `ppy_getitem`/`ppy_setitem` on USER instances (the
+    `try_instance_subscr` path) is not covered by api_test (it uses
+    dict/list only) — the path is the dispatch's shape, but no C or
+    Rust test exercises a user `__getitem__` through the API.
+(f) `ppy_exec`'s filename is converted with `from_utf8_lossy` (the Zig
+    passes raw bytes as the source name; Rust's compiler needs `&str`).
+    Non-UTF-8 filenames lose bytes in tracebacks — untested edge.
+(g) Defensive NULL handling BEYOND the Zig (documented divergence):
+    NULL `py` -> PPY_ERROR / NULL / no-op; NULL out-pointers ->
+    PPY_ERROR; NULL `config` strings -> empty; NULL `argv`/`items`
+    with n > 0 -> PPY_ERROR. The Zig would fault on these. api_test
+    never passes NULL.
+(h) `Vm::new` does NOT call `arena.gc_init()` — `NPY_GC_STRESS` was
+    dead on EVERY path (CLI included) until this lane: `ppy_new` calls
+    `vm.arena.gc_init()` so the stress run is meaningful through the
+    library. The CLI path still never calls it (pre-existing tree gap,
+    out of this lane's scope — noted, not fixed, because the brief
+    forbids touching the CLI).
+(i) `ppy_str`/`ppy_repr` use `obj_print_helper` (the Zig's
+    `mp_obj_print_helper`) — for an instance with a raising `__str__` /
+    `__repr__`, the ctx-only print path's behavior is the tree's
+    existing one (E2d's hook lives in the VM dispatch, not in
+    `obj_print_helper`); api_test only prints tuples/lists/dicts.
+
+UNSAFE AUDIT — every occurrence, with justification. The VM core stays
+unsafe-free: `git diff HEAD` outside api.rs/output.rs contains NO
+`unsafe` (the only two files with `unsafe` are the ones below).
+- src/entry/api.rs (1,893 lines): 38x `pub unsafe extern "C" fn`
+  (the 39 exports; `ppy_api_version` is a plain `pub extern "C" fn`),
+  1x `unsafe extern "C" fn` type alias (`PpyFunction`, api.rs:110),
+  3x `unsafe fn` helpers (c_str_bytes:484, read_config:494,
+  read_str_array:513), 42x `unsafe { }` blocks at lines
+  406 411 420 486 499 502 503 520 526 581 601 608 736 1004 1045 1105
+  1135 1144 1174 1193 1280 1310 1394 1424 1454 1477 1500 1551 1597
+  1680 1698 1715 1732 1766 1786 1787 1807 1812 1847 1850 1858 1890.
+  Grouped by invariant (each block carries a one-line `FFI invariant`
+  comment directly above it — verified by script: 0 blocks without
+  one in a 3-line window):
+  * dereference a live-interp pointer (`&mut *py`, `(*py).exit_code`,
+    `Box::from_raw(py)`, `(&mut *ip).err.take()`): 406 411 420 608
+    1105 1551 1766 1847 1850 1858 1890 — "py is a live interpreter
+    from ppy_new" (wrappers NULL-check first; free checks not-freed).
+  * write through an out-pointer (`*out`, `*value`, `*len`,
+    `*utf8`/`*data`, `*exception`): 411 420 1394 1424 1454 1477
+    1500 1597 1847 1858 — "out points to a writable slot" (wrappers
+    NULL-check first).
+  * read a C string / pointer / array (`CStr::from_ptr`,
+    `&*config`, `*arr.add(i)`, `*argv.add(i)`, `*items.add(i)`,
+    `from_raw_parts`): 486 499 502 503 520 526 736 1004 1135 1144
+    1174 1193 1280 1310 1680 1698 1715 1732 1786 1787 1807 1812 —
+    "p is a valid NUL-terminated C string" / "arr/argv/items points
+    to n valid pointers" / "src/data points to len readable bytes".
+  * call a host callback (`fun(ip, userdata, argc, argv, &mut
+    result)`): 601 — "host callback + userdata valid for the
+    interpreter's lifetime; argv holds argc handles".
+  * read a `ppy_config` (`&*config`): 499 — "config points to a
+    valid ppy_config".
+  * call an `unsafe fn` helper (`read_config`, `read_str_array`,
+    `c_str_bytes`): 502 503 1045 1193 1680 1698 1715 1732 1786 1787
+    1807 1812 — covered by the same per-call invariant comment.
+- src/support/output.rs: 1x type alias (`PpyWriteFn`, :40) + 1x
+  `unsafe { }` block (:71, the sink call) with its own one-line
+  comment ("sink installed by the API bracket from a live
+  interpreter's config").
+- Total: 0 `unsafe` in the VM core (`src/objects/`, `src/runtime/`
+  except the two seam sites which contain none, `src/compiler/`,
+  `src/memory/` except the safe `RootSet.handles` addition).
+
+HEADER-VS-CODE DISAGREEMENTS (code wins, per the brief — each noted):
+(1) `ppy_exec`'s signature: the lane plan assumed (filename first,
+    with a result out-param); the header AND api.zig say
+    `ppy_exec(py, src, len, filename)` with NO result. The code won;
+    the plan was wrong (api.rs:1113).
+(2) `ppy_to_int` OverflowError: header ("an int that does not fit a
+    machine word raises OverflowError") and code agree — the vendor
+    `mp_obj_get_int_maybe` raises it itself; `raise()` does not
+    overwrite a pending exception. No disagreement in behavior, but
+    the implementation MUST route Err(Overflow) through
+    `exc_from_obj_error` and Ok(None) through an explicit "expected an
+    int" TypeError — the two messages are different code paths.
+(3) `ppy_fetch_error`'s `fetched` dance (api.zig `takeError`): needed
+    in the Zig because `run` clears `py.err` on entry; unnecessary in
+    Rust — `new_handle` allocates no arena memory, so the error is
+    taken directly from `interp.err` (api.rs:1836).
+(4) `NPY_GC_STRESS`: the brief said "the Rust GC already reads
+    NPY_GC_STRESS (gc.rs:414-418)" — true of `gc_init`, but `Vm::new`
+    never calls `gc_init`, so the env var was dead on every path.
+    `ppy_new` now calls it (see (g) above). The stress runs in §1
+    would have passed trivially WITHOUT this fix (no collections at
+    all); with it they actually exercise the handle roots.
+(5) `ppy_type_name`: header says the result is "possibly an interned
+    string of that interpreter" — the Rust pool bytes are NOT
+    NUL-terminated, so a `CString` copy per name is required (cached in
+    `interp.type_names`); the pointer stays valid for the interp's
+    lifetime, as the header promises.
+(6) `ppy_new`'s config: header allows NULL config; the Zig reads
+    `config->path` unconditionally when non-NULL — Rust copies the
+    arrays into `String`s (sys.path / sys.argv are `Vec<String>`), so
+    non-UTF-8 entries are lossy-converted (same caveat as (f)).
+
+SEAMS (beyond the brief's two — print sink + GC roots):
+- 3rd seam: the host-call seam — `VmState.host_call_builtin` (vm.rs),
+  its creation in `build_builtins` (vm_builtins_bind.rs), and the
+  intercept arm (vm_call_intercept.rs). A `FunBuiltin` slot cannot see
+  the host table, so the shared builtin + identity interception is the
+  minimal shape (same pattern as `next`/`hash`/`print`).
+- 4th seam: `eval_exec_named` (vm_eval.rs) — `eval_exec` hardcoded
+  `"<string>"`; `ppy_exec` needs the host-given filename. `eval_exec`
+  now delegates to it (no behavior change; the dead
+  `compile_error_value` helper it replaced was removed).
+- No other VM-core file was touched: `src/objects/` and `src/runtime/`
+  changes are exactly the four seams above + the `VmState` field init.
+  The CLI (`src/main.rs`, `src/bin/petitpy-vm.rs`) is untouched.
+  wasm / `api_wasm.zig` is out of scope (native only, as always).
+
+§5 — Session notes / gotchas
+----------------------------
+- First `cargo test --release --lib` after the gc.rs seam failed to
+  COMPILE: `RootSet::iter`'s chain ended in
+  `.filter_map(|h| *h)` (yields `Value`) + `.copied()` (expects
+  `&Value`) — E0271/E0599. Fixed with `.flatten()` on the
+  `Option<Value>` iterator (`handles.iter().flatten()` yields `&Value`).
+- `compile_error_value` became dead code after the `eval_exec_named`
+  refactor (1 warning) — removed, not annotated.
+- `ThreadId::as_u64()` is UNSTABLE (#67939) and returns
+  `NonZero<u64>` — the reentrant lock uses a thread-local
+  counter-assigned id instead (api.rs:208-228).
+- `1u64 << MAX_INTERPS` with MAX_INTERPS=64 overflows (deny
+  arithmetic_overflow) — the free mask is just `!bits`
+  (MAX_INTERPS == u64::BITS); kept a `debug_assert_eq!` so the const
+  stays referenced.
+- `read_config` was missing from the first write of api.rs (only
+  `read_str_array` was written) — caught by E0425 at the `ppy_new`
+  call site; added with its own FFI comment.
+- `obj_type_name` lives in `objects::obj_ops`, not `objects::obj`
+  (E0432) — the brief's grounding said obj_ops.rs:318; the import was
+  written from memory. An `obj_of` helper was written but never used
+  (`obj_or_invalid` covers all paths) — removed (1 warning).
+- `SubscrArg` derives Copy, so `subscr_body` can pass `arg` to both
+  `try_instance_subscr` and `obj_subscr`.
+- The FIRST api_test run passed 61/61 with zero failures — no C-side
+  debugging was needed. The `format_exception` exact-string check
+  (the reason for `eval_exec_named`) passed first time.
+- `cargo build --release` takes ~2m47s (full) / ~3m45s (lib test) on
+  this VM; the six gates take ~2min total. `cargo test --release
+  --lib` filters: `api_tests` = the 6 new tests.
+- Gate runners were invoked with defaults (no --bin except full_gate);
+  the relative---bin lesson from E2 was re-confirmed by reading the
+  runners' defaults before running.
+- Verification outputs live in ~/workspace/f1_verify/ (gates) and
+  ~/workspace/f1_c/ (C binaries + logs); the lane worktree is
+  ~/workspace/petitpy-rs-f1-embed. `scripts/__pycache__/` +
+  `tests/__pycache__/` + `tools/__pycache__/` in the worktree are
+  gate-runner byproducts — NOT committed.

@@ -406,6 +406,32 @@ impl Vm {
         // `isinstance` / `issubclass`, `__name__`, the `io`
         // module registration.
         let d1 = crate::runtime::vm_builtins_bind::bind_d1_builtins(&mut ctx, state, &mut pairs);
+        // The embedding host-call builtin (F1, ADR 022's
+        // `hostCall`): ONE shared `FunBuiltin` that every
+        // `ppy_define_function` bound method wraps (its `self`
+        // is the host's index in the interpreter's `hosts`
+        // list). Created here (not on first
+        // `ppy_define_function`) so its GcRef is stable from
+        // birth and `call_function_ctx` can intercept it by
+        // identity — a `FunBuiltin` slot cannot see the host
+        // table. Its `func` is the shared unreachable stub, as
+        // `next`'s is; its name is a dynamic qstr (never shown
+        // to Python — a bound method's `__name__` raises
+        // `AttributeError` for a `FunBuiltin`).
+        let host_call_id = ctx
+            .pool
+            .from_strn(b"__ppy_host_call__")
+            .expect("__ppy_host_call__ interns");
+        let host_call_fun = ctx.alloc(
+            Some(vmt.fun_builtin_var),
+            Obj::FunBuiltin(FunBuiltinData {
+                name: u32::from(host_call_id),
+                n_args: fun_n_args(1, 255),
+                func: intercepted_stub_fn,
+                kw_func: None,
+            }),
+        );
+        let host_call_val = Value::Heap(host_call_fun);
 
         let builtins = ctx.alloc(
             None,
@@ -536,6 +562,7 @@ impl Vm {
         state.repr_builtin = d1.repr_builtin;
         state.len_builtin = d1.len_builtin;
         state.print_builtin = print_val;
+        state.host_call_builtin = host_call_val;
         state.not_implemented = d1.not_implemented;
         // Pin everything live: the types, the singletons, the
         // builtins dict and the builtin values.
@@ -585,6 +612,7 @@ impl Vm {
         pins.push(Value::Heap(builtins));
         pins.push(builtins_module_val);
         pins.push(print_val);
+        pins.push(host_call_val);
         pins.push(next_val);
         pins.push(bc_val);
         pins.push(eval_val);

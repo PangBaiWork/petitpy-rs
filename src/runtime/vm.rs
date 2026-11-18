@@ -143,6 +143,16 @@ pub struct VmState {
     pub locals_builtin: Value,
     pub dir_builtin: Value,
     pub sorted_builtin: Value,
+    /// The `str.join` / `bytes.join` method builtins (E2b):
+    /// two DIFFERENT `FunBuiltin` objects (each type dict is
+    /// built from its own table, `vm_types.rs`), both wrapping
+    /// the same `str_join` fn. Intercepted by GcRef identity
+    /// in `call_function_ctx` (see `call_join_ctx` in
+    /// `builtin_vm.rs`) — `str_join` is ctx-only and cannot
+    /// resume a generator, so `', '.join(gen())` needs the
+    /// VM's real call hook to collect the iterable first.
+    pub str_join_builtin: Value,
+    pub bytes_join_builtin: Value,
     pub min_builtin: Value,
     pub max_builtin: Value,
     pub getattr_builtin: Value,
@@ -416,6 +426,8 @@ impl Vm {
                 locals_builtin: Value::None,
                 dir_builtin: Value::None,
                 sorted_builtin: Value::None,
+                str_join_builtin: Value::None,
+                bytes_join_builtin: Value::None,
                 min_builtin: Value::None,
                 max_builtin: Value::None,
                 getattr_builtin: Value::None,

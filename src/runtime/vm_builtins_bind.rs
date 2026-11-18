@@ -426,6 +426,30 @@ impl Vm {
         state.locals_builtin = d1.locals_builtin;
         state.dir_builtin = d1.dir_builtin;
         state.sorted_builtin = d1.sorted_builtin;
+        // E2b: the `str.join` / `bytes.join` method builtins
+        // (two different `FunBuiltin` objects, one per type
+        // dict — each dict is built from its own table, so the
+        // `join` entry is allocated twice). Looked up by name
+        // in the type dicts; `None` (impossible in practice —
+        // both tables carry `join`) leaves the handle unset
+        // and `join` keeps its old ctx-only behavior.
+        let join_q = static_qstr_id(b"join").expect("join is a static qstr");
+        for (type_, slot) in [
+            (ctx.types.str_, &mut state.str_join_builtin),
+            (ctx.types.bytes, &mut state.bytes_join_builtin),
+        ] {
+            let dict = match ctx.arena.get(type_) {
+                Obj::Type(d) => d.dict,
+                _ => continue,
+            };
+            if let Ok(v) = crate::objects::containers::objdict::dict_get_value(
+                &mut ctx,
+                Value::Heap(dict),
+                Value::Qstr(join_q),
+            ) {
+                *slot = v;
+            }
+        }
         state.min_builtin = d1.min_builtin;
         state.max_builtin = d1.max_builtin;
         state.getattr_builtin = d1.getattr_builtin;

@@ -325,7 +325,7 @@ pub fn str_join(
     // returns `None` for it (the C13-class dynamic-qstr gap;
     // same fix as D1's `len('abc')` and C13b's `str_equal`).
     let sep = str_data_pool(ctx.arena, ctx.pool, self_value).ok_or(StrError::BadImplicitConversion)?;
-    let items = iter_items(ctx, types, args[1])?;
+    let items = iter_items(ctx, types, args[1], None)?;
     let mut out: Vec<u8> = Vec::new();
     let mut first = true;
     for item in &items {

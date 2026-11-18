@@ -46,7 +46,7 @@ fn arr(fx: &mut Fixture, tc: &[u8], elems: Vec<Value>) -> Value {
     let t_arr = fx.array;
     let t_ba = fx.bytearray;
     let mut ctx = fx.ctx();
-    array_make_new(&mut ctx, t_arr, t_ba, &[tc_str, items], 0).unwrap()
+    array_make_new(&mut ctx, t_arr, t_ba, &[tc_str, items], 0, None).unwrap()
 }
 
 /// A `bytearray(b'...')` value, built through
@@ -56,7 +56,7 @@ fn ba(fx: &mut Fixture, bytes: &[u8]) -> Value {
     let t_arr = fx.array;
     let t_ba = fx.bytearray;
     let mut ctx = fx.ctx();
-    bytearray_make_new(&mut ctx, t_arr, t_ba, &[b], &[]).unwrap()
+    bytearray_make_new(&mut ctx, t_arr, t_ba, &[b], &[], None).unwrap()
 }
 
 /// The elements of an array/bytearray/memoryview, read back
@@ -111,14 +111,14 @@ fn array_make_new_basics() {
     let ctx = &mut ctx;
     assert_eq!(elems_of(ctx, a), ints(&[1, 2, 3]));
     // First char only is the typecode.
-    let a2 = array_make_new(ctx, t, t_ba, &[tc_ii, empty_items], 0).unwrap();
+    let a2 = array_make_new(ctx, t, t_ba, &[tc_ii, empty_items], 0, None).unwrap();
     assert_eq!(array_typecode(ctx, a2), Some(b'i'));
     // `array('i', b"\x01\x02")` — the memcpy path truncates to
     // a whole number of elements (len 2/4 = 0).
-    let a3 = array_make_new(ctx, t, t_ba, &[tc_i, b2], 0).unwrap();
+    let a3 = array_make_new(ctx, t, t_ba, &[tc_i, b2], 0, None).unwrap();
     assert_eq!(elems_of(ctx, a3), Vec::<Value>::new());
     // `array('i', [1.5])` → "can't convert to int".
-    match array_make_new(ctx, t, t_ba, &[tc_i2, items_half], 0) {
+    match array_make_new(ctx, t, t_ba, &[tc_i2, items_half], 0, None) {
         Err(ArrayError::Obj(ObjError::IntConversion)) => {}
         other => panic!("array('i', [1.5]): {other:?}"),
     }
@@ -139,22 +139,22 @@ fn array_make_new_errors() {
     let t_ba = fx.bytearray;
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
-    match array_make_new(ctx, t, t_ba, &[tc_empty, empty_items], 0) {
+    match array_make_new(ctx, t, t_ba, &[tc_empty, empty_items], 0, None) {
         Err(ArrayError::BadTypecode) => {}
         other => panic!("array(''): {other:?}"),
     }
-    match array_make_new(ctx, t, t_ba, &[tc_x, empty_items2], 0) {
+    match array_make_new(ctx, t, t_ba, &[tc_x, empty_items2], 0, None) {
         Err(ArrayError::BadTypecode) => {}
         other => panic!("array('x'): {other:?}"),
     }
     // Non-str typecode → "can't convert to str implicitly".
-    match array_make_new(ctx, t, t_ba, &[Value::SmallInt(1), empty_items3], 0) {
+    match array_make_new(ctx, t, t_ba, &[Value::SmallInt(1), empty_items3], 0, None) {
         Err(ArrayError::NotStr) => {}
         other => panic!("array(1): {other:?}"),
     }
     // Too many positionals → the polled sig error survives
     // (the construct path succeeds, so nothing overwrites it).
-    match array_make_new(ctx, t, t_ba, &[tc_i, items_i, extra], 0) {
+    match array_make_new(ctx, t, t_ba, &[tc_i, items_i, extra], 0, None) {
         Err(ArrayError::ArgNumTypesMismatch) => {}
         other => panic!("array('i', [1], [2]): {other:?}"),
     }
@@ -210,13 +210,13 @@ fn bytearray_make_new_basics() {
     let ctx = &mut ctx;
     assert_eq!(elems_of(ctx, b), ints(&[97, 98]));
     // Zero-filled count.
-    let b = bytearray_make_new(ctx, t_arr, t, &[Value::SmallInt(3)], &[]).unwrap();
+    let b = bytearray_make_new(ctx, t_arr, t, &[Value::SmallInt(3)], &[], None).unwrap();
     assert_eq!(elems_of(ctx, b), ints(&[0, 0, 0]));
     // `bytearray("ab", "utf-8")` → `b'ab'`.
-    let b = bytearray_make_new(ctx, t_arr, t, &[s_ab, enc], &[]).unwrap();
+    let b = bytearray_make_new(ctx, t_arr, t, &[s_ab, enc], &[], None).unwrap();
     assert_eq!(elems_of(ctx, b), ints(&[97, 98]));
     // `bytearray([1,2,300])` → `[1,2,44]` (truncation).
-    let b = bytearray_make_new(ctx, t_arr, t, &[items_12300], &[]).unwrap();
+    let b = bytearray_make_new(ctx, t_arr, t, &[items_12300], &[], None).unwrap();
     assert_eq!(elems_of(ctx, b), ints(&[1, 2, 44]));
     // Extra positional ignored (`bytearray(3, 4)`).
     let b = bytearray_make_new(
@@ -225,6 +225,7 @@ fn bytearray_make_new_basics() {
         t,
         &[Value::SmallInt(3), Value::SmallInt(4)],
         &[],
+        None,
     )
     .unwrap();
     assert_eq!(elems_of(ctx, b), ints(&[0, 0, 0]));
@@ -240,25 +241,25 @@ fn bytearray_make_new_errors() {
     let mut ctx = fx.ctx();
     let ctx = &mut ctx;
     // `bytearray("ab")` → "wrong number of arguments".
-    match bytearray_make_new(ctx, t_arr, t, &[s_ab], &[]) {
+    match bytearray_make_new(ctx, t_arr, t, &[s_ab], &[], None) {
         Err(ArrayError::WrongNumArgs) => {}
         other => panic!("bytearray('ab'): {other:?}"),
     }
     // `bytearray(-1)` — the reference ABORTS (rc=134,
     // `@intCast` panic); Rust raises ValueError("negative
     // count"), CPython's message.
-    match bytearray_make_new(ctx, t_arr, t, &[Value::SmallInt(-1)], &[]) {
+    match bytearray_make_new(ctx, t_arr, t, &[Value::SmallInt(-1)], &[], None) {
         Err(ArrayError::NegativeCount) => {}
         other => panic!("bytearray(-1): {other:?}"),
     }
     // `bytearray(True)` — bool is not int ("object not
     // iterable").
-    match bytearray_make_new(ctx, t_arr, t, &[Value::Bool(true)], &[]) {
+    match bytearray_make_new(ctx, t_arr, t, &[Value::Bool(true)], &[], None) {
         Err(ArrayError::NotIterable) => {}
         other => panic!("bytearray(True): {other:?}"),
     }
     // `bytearray(2**70)` → OverflowError (get_int overflows).
-    match bytearray_make_new(ctx, t_arr, t, &[big70], &[]) {
+    match bytearray_make_new(ctx, t_arr, t, &[big70], &[], None) {
         Err(ArrayError::Obj(ObjError::Overflow)) => {}
         other => panic!("bytearray(2**70): {other:?}"),
     }
@@ -284,6 +285,7 @@ fn bytearray_make_new_kwargs() {
         t,
         &[],
         &[KwArg { name: src, value: b }],
+        None,
     )
     .unwrap();
     assert_eq!(elems_of(ctx, v), ints(&[97, 98]));
@@ -294,6 +296,7 @@ fn bytearray_make_new_kwargs() {
         t,
         &[s_ab],
         &[KwArg { name: enc_id, value: enc }],
+        None,
     )
     .unwrap();
     assert_eq!(elems_of(ctx, v), ints(&[97, 98]));

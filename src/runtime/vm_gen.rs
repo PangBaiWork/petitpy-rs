@@ -11,7 +11,7 @@
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objgenerator::{gen_instance_close, gen_resume_and_raise, GenError};
 use crate::objects::objtype::objexcept::{new_exception, new_exception_args};
-use crate::objects::value::{Obj, Value};
+use crate::objects::value::{GenState, Obj, Value};
 use crate::runtime::bc::CodeState;
 use crate::runtime::runner::RunOutcome;
 use crate::runtime::vm::VmState;
@@ -83,7 +83,11 @@ pub fn close_generator_ctx(ctx: &mut CallCtx, state: &mut VmState, gen: Value, g
 /// The shared frame plumbing for the resume/close paths: take
 /// the frame out of `state.frames` (so the runner closure can
 /// re-borrow the state), root it, run `f`, put it back and
-/// re-root iff it yielded. Returns `(result, yielded)`.
+/// re-root iff it yielded — or iff an early resume error
+/// (`CantSendNonNone` / `AlreadyExecuting`) left the generator
+/// still alive (E2b — see the `keep` computation below). A
+/// closed generator's frame is dropped; the dummy frame is never
+/// stored. Returns `(result, yielded)`.
 fn run_gen_frame_ctx<R>(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -109,12 +113,14 @@ where
         }
     };
     let frame = state.frames.remove(&gen_ref);
+    let had_frame = frame.is_some();
     let mut frame = match frame {
         Some(f) => f,
         None => {
             // No suspended frame: Closed (fast path — the dummy
-            // frame is never used) or Running (re-entrant —
-            // `gen_resume` reports `AlreadyExecuting`).
+            // frame is never used) or Running (re-entrant — the
+            // OUTER resume holds the real frame, and `gen_resume`
+            // reports `AlreadyExecuting` before touching it).
             let fun = match ctx.arena.get(gen_ref) {
                 Obj::Generator(d) => d.fun,
                 _ => return (R::py_raise(), false),
@@ -142,9 +148,31 @@ where
     ctx.roots.stack.truncate(mark);
     // A yield suspends the frame: store it and re-root it (its
     // values changed during the run — the old `roots.extra`
-    // entries are stale).
+    // entries are stale). E2b: an early-error resume ALSO keeps
+    // the frame — `gen_resume` returns `CantSendNonNone` /
+    // `AlreadyExecuting` BEFORE running, so the generator is
+    // still `New` / `Suspended` and its frame must survive for
+    // the next resume (before this fix the frame was dropped
+    // here, the next resume built a dummy frame at ip 0 and
+    // executed garbage — `NotImplementedError("opcode")`). A
+    // `Closed` generator drops its frame. The dummy frame (no
+    // real frame was taken out — the outer resume holds it, or
+    // the generator is closed) is never stored.
     let yielded = result.yielded();
-    if yielded {
+    let keep = if yielded {
+        true
+    } else if had_frame {
+        matches!(
+            match ctx.arena.get(gen_ref) {
+                Obj::Generator(d) => Some(d.state),
+                _ => None,
+            },
+            Some(GenState::New | GenState::Suspended)
+        )
+    } else {
+        false
+    };
+    if keep {
         state.frames.insert(gen_ref, frame);
         let extra_base = state.extra_base;
         ctx.roots.extra.truncate(extra_base);

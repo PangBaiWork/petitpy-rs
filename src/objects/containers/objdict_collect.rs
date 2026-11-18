@@ -62,8 +62,12 @@ pub(crate) fn view_next_entry(
 /// and builtin types (`map(str, …)`) work; a user function
 /// (`FunBc`) runs only when the caller passes the VM's call hook
 /// (`Some`, E2 — the `MakeNewFn` hook threaded down from the
-/// type call), and raises through the stub otherwise. A type with
-/// a `getiter` slot but no direct arm here still raises
+/// type call), and raises through the stub otherwise. A generator
+/// drains through the hook's `resume` operation (E2b — the
+/// `VmHook` pair: `list(gen())` / `sorted(gen())` / `dict(gen)`
+/// resume it step by step; the ctx-only path, with no hook,
+/// keeps `TypeError("object not iterable")`). A type with a
+/// getiter slot but no direct arm here still raises
 /// `TypeError("object not iterable")` (the `__iter__` method load
 /// is C12/C14's).
 /// What `collect_iterable` does, decided from an immutable borrow
@@ -86,6 +90,11 @@ enum IterPlan {
     /// A C11 iterator to drain through the general `getiter` /
     /// `iternext` protocol with stub seams (see the `fn` docs).
     Protocol(Value),
+    /// A generator to drain through the hook's `resume`
+    /// operation (E2b — the `VmHook` pair): `Some` hook resumes
+    /// it step by step; `None` (the ctx-only path) keeps the
+    /// old `TypeError("object not iterable")`.
+    Generator(Value),
 }
 
 pub(crate) fn collect_iterable(
@@ -145,6 +154,11 @@ pub(crate) fn collect_iterable(
                     None => IterPlan::Protocol(value),
                 },
             },
+            // A generator (E2b): drain through the hook's
+            // `resume` — the `Generator` arm below. Without a
+            // hook (the ctx-only path) there is no VM to resume
+            // it, so it stays not-iterable there.
+            Obj::Generator(_) => IterPlan::Generator(value),
             _ => return Err(DictError::TypeError(NOT_ITERABLE)),
         },
         Value::Qstr(id) => {
@@ -213,7 +227,7 @@ pub(crate) fn collect_iterable(
             let mut call_seam =
                 |ctx2: &mut CallCtx, fun: Value, args: &[Value]| -> CallOutcome {
                     if let Some(h) = hook.as_deref_mut() {
-                        return match h(ctx2, fun, args.len(), 0, args) {
+                        return match h.call(ctx2, fun, args.len(), 0, args) {
                             Ok(v) => CallOutcome::Value(v),
                             Err(PyError::OutOfMemory) => CallOutcome::Raise,
                             Err(PyError::PyRaise) => CallOutcome::Raise,
@@ -283,6 +297,30 @@ pub(crate) fn collect_iterable(
                     Ok(Some(v)) => out.push(v),
                     Ok(None) => break,
                     Err(e) => return Err(iter_err_to_dict(ctx, e)),
+                }
+            }
+            Ok(out)
+        }
+        IterPlan::Generator(gen) => {
+            // E2b: drain the generator through the hook's
+            // `resume` (the `iternext` form — `Ok(Some(v))` =
+            // yielded, `Ok(None)` = exhausted). A raise inside
+            // the generator is `Err(PyRaise)` with the exception
+            // object stashed on the VM side channel (the
+            // `StateHook` contract) or recorded in
+            // `pending_raise` (the `SeamHook` contract) — either
+            // way the caller drains it from `DictError::PyRaise`.
+            // Without a hook there is no VM to resume it: the
+            // old `TypeError("object not iterable")`.
+            let Some(hook) = call.as_deref_mut() else {
+                return Err(DictError::TypeError(NOT_ITERABLE));
+            };
+            let mut out = Vec::new();
+            loop {
+                match hook.resume(ctx, gen) {
+                    Ok(Some(v)) => out.push(v),
+                    Ok(None) => break,
+                    Err(_) => return Err(DictError::PyRaise),
                 }
             }
             Ok(out)

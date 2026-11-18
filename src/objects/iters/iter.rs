@@ -344,8 +344,20 @@ pub fn getiter(ctx: &mut CallCtx, value: Value) -> Result<Value, IterError> {
             // — in `index`): it must fall through to the type's
             // getiter slot (`dict_view_getiter` → a fresh view
             // iterator), or `next(iter(d.keys()))` fails with
-            // "object not an iterator" (E2).
-            if !(it.extra.is_empty() && it.index <= 2) {
+            // "object not an iterator" (E2). E2b: the shape test
+            // alone misfires on SET iterators, which share the
+            // shape (no `extra`, the cursor in `index`) — a
+            // fresh set iterator fell through to the type's
+            // getiter slot, but the iterator's header type is
+            // `None`, so `iter(iter({1,2,3}))` raised "object
+            // not iterable". Discriminate by the SOURCE type: a
+            // dict source is a view (fall through); anything
+            // else — a set iterator, a list/tuple iterator, …
+            // — is an iterator in its own right.
+            let is_dict_view = it.extra.is_empty()
+                && it.index <= 2
+                && matches!(it.source, Value::Heap(sr) if matches!(ctx.arena.get(sr), Obj::Dict(_)));
+            if !is_dict_view {
                 return Ok(value);
             }
         }
@@ -396,7 +408,16 @@ pub fn iternext(
     if extra.is_empty() {
         // A dict VIEW (kind in `index`), not an iterator —
         // `as_dict_view`'s shape. The VM would load `__next__`
-        // and fail; same error here.
+        // and fail; same error here. E2b: a SET iterator shares
+        // this shape (no `extra`, the cursor in `index`) — its
+        // SOURCE is a Set, so discriminate on it and step it
+        // with `set_it_next` instead of failing.
+        if matches!(source, Value::Heap(sr) if matches!(ctx.arena.get(sr), Obj::Set(_))) {
+            return crate::objects::containers::objset::set_it_next(ctx, it).map_err(|e| {
+                let _ = ctx.record_typed(e);
+                IterError::PyRaise
+            });
+        }
         return Err(IterError::TypeError(NOT_AN_ITERATOR));
     }
     if extra.len() == 2 {

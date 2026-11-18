@@ -103,7 +103,25 @@ pub fn instance_print(
                         obj_print_helper(ctx, types, sub0, kind, sink);
                     }
                 }
-                None => print_fallback(ctx, value, type_, sink),
+                // E2b: no subobj — the value itself may be a
+                // user-exception instance built by the
+                // `call_type_ctx` shortcut (vm_call.rs): a bare
+                // `Obj::Exception` whose header type is the user
+                // class (the Zig builds `Obj::Instance` +
+                // exception subobj instead). Print it through
+                // the same exception-subclass branch, with the
+                // value itself as the exception payload.
+                None => {
+                    if is_shortcut_exception(ctx, value) {
+                        if kind != PrintKind::Str {
+                            let name = type_name(ctx, type_);
+                            let _ = write!(sink, "{name}");
+                        }
+                        exception_print_inner(ctx, value, kind, true, sink);
+                    } else {
+                        print_fallback(ctx, value, type_, sink);
+                    }
+                }
             }
         }
         None => print_fallback(ctx, value, type_, sink),
@@ -126,6 +144,31 @@ fn is_native_exception_subobj(ctx: &CallCtx, sub0: Value) -> bool {
         Some(t) => is_exception_type_obj(ctx.arena, t),
         None => false,
     }
+}
+
+/// Whether `value` is a user-exception instance built by the
+/// `call_type_ctx` shortcut (vm_call.rs): a bare
+/// `Obj::Exception` whose header type is a user class whose MRO
+/// contains a ROM exception type (a type whose `make_new` IS
+/// `exception_make_new_slot`). ROM exception instances never
+/// reach this printer (their print slot is `exception_print`),
+/// so an `Obj::Exception` here is always a shortcut value — the
+/// MRO check is the belt-and-braces guard that the header type
+/// really is an exception subclass.
+fn is_shortcut_exception(ctx: &CallCtx, value: Value) -> bool {
+    let Value::Heap(r) = value else {
+        return false;
+    };
+    if !matches!(ctx.arena.get(r), Obj::Exception(_)) {
+        return false;
+    }
+    let Some(t) = obj_get_type(ctx.arena, ctx.types, value) else {
+        return false;
+    };
+    let Some(td) = type_data(ctx.arena, t) else {
+        return false;
+    };
+    td.mro.iter().any(|mr| is_exception_type_obj(ctx.arena, *mr))
 }
 
 /// A type's name as a `String` (empty when the type data is

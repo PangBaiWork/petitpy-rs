@@ -95,6 +95,14 @@ pub fn as_dict_view(arena: &GcArena, v: Value) -> Option<(Value, DictViewKind)> 
     match v {
         Value::Heap(r) => match arena.get(r) {
             Obj::Iterator(it) if it.extra.is_empty() => {
+                // E2b: a SET iterator shares this shape (no
+                // `extra`, the cursor in `index`) — a fresh one
+                // (cursor 0) reads as a keys-view and the caller
+                // then panics in `dict_ref_of` on the Set source.
+                // Only a dict source is a view.
+                if !matches!(it.source, Value::Heap(sr) if matches!(arena.get(sr), Obj::Dict(_))) {
+                    return None;
+                }
                 DictViewKind::from_i32(it.index as i32).map(|k| (it.source, k))
             }
             _ => None,
@@ -108,6 +116,11 @@ pub fn as_dict_view_it(arena: &GcArena, v: Value) -> Option<(Value, DictViewKind
     match v {
         Value::Heap(r) => match arena.get(r) {
             Obj::Iterator(it) if it.extra.len() == 1 => {
+                // E2b: same source guard as `as_dict_view` (a
+                // view iterator's source is always its dict).
+                if !matches!(it.source, Value::Heap(sr) if matches!(arena.get(sr), Obj::Dict(_))) {
+                    return None;
+                }
                 let kind = match it.extra[0] {
                     Value::SmallInt(n) => DictViewKind::from_i32(n as i32)?,
                     _ => return None,

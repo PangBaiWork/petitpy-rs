@@ -47,7 +47,7 @@
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objboundmeth::new_bound_meth;
 use crate::objects::obj::{call_binary, call_subscr, call_unary, obj_get_type, ObjError, SlotOutcome};
-use crate::objects::slots::{BinaryOp, SubscrArg, UnaryOp};
+use crate::objects::slots::{BinaryOp, CallHook, SubscrArg, UnaryOp};
 use crate::objects::value::{GcRef, Value};
 use crate::pyerr::{PyError, PyResult};
 
@@ -272,17 +272,63 @@ pub fn with_seams<R>(
     )
 }
 
+/// A `VmHook` over a plain `call` closure (E2b): the seam's
+/// `call` entry is a `dyn FnMut`, not a `VmHook` — when a native
+/// base's `make_new` needs the hook (the `instance_make_new`
+/// tail forwards the seam's call so a native base built from an
+/// iterable gets the same hook the `__init__` path runs on),
+/// this adapter carries the seam's call down. `call` delegates;
+/// `resume` has no VM behind it (the ctx-only path never resumes
+/// a generator), so it records the collector's not-iterable
+/// raise and returns `PyRaise` — the same error
+/// `collect_iterable` produced for a generator before E2b added
+/// the `Generator` arm.
+pub struct SeamHook<'a> {
+    call: &'a mut dyn FnMut(&mut CallCtx, Value, usize, usize, &[Value]) -> PyResult<Value>,
+}
+
+impl<'a> SeamHook<'a> {
+    /// Wrap the seam's `call` closure.
+    pub fn new(
+        call: &'a mut dyn FnMut(&mut CallCtx, Value, usize, usize, &[Value]) -> PyResult<Value>,
+    ) -> Self {
+        SeamHook { call }
+    }
+}
+
+impl crate::objects::slots::VmHook for SeamHook<'_> {
+    fn call(
+        &mut self,
+        ctx: &mut CallCtx,
+        fun: Value,
+        n: usize,
+        k: usize,
+        a: &[Value],
+    ) -> PyResult<Value> {
+        (self.call)(ctx, fun, n, k, a)
+    }
+
+    fn resume(&mut self, ctx: &mut CallCtx, _gen: Value) -> Result<Option<Value>, PyError> {
+        ctx.record_raise("TypeError", Some("object not iterable"));
+        Err(PyError::PyRaise)
+    }
+}
+
 /// Run `f` with seams whose `call` is the VM's real call hook
 /// (E2 — a `FunBc` callee actually executes) and the other four
 /// entries are the builtin-live stubs. `instance_make_new` uses
 /// this on the VM's type-call path; the ctx-only path keeps
 /// `with_stub_seams` (`call_via_type_slot`, `FunBc` raises).
-pub fn with_call_hook_seams<R>(
-    call: impl FnMut(&mut CallCtx, Value, usize, usize, &[Value]) -> PyResult<Value>,
-    f: impl FnOnce(&mut VmSeams) -> R,
-) -> R {
+/// E2b: the hook is the `VmHook` trait object — its `call`
+/// operation is adapted into the seam's plain-`FnMut` `call`
+/// closure here (the seam itself only ever calls). The hook is
+/// reborrowed by the adapter closure, so the caller keeps it
+/// afterwards.
+pub fn with_call_hook_seams<R>(hook: CallHook<'_, '_>, f: impl FnOnce(&mut VmSeams) -> R) -> R {
     with_custom_seams(
-        call,
+        |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
+            hook.call(ctx, fun, n, k, a)
+        },
         |_ctx: &mut CallCtx, _obj: Value, _attr: u32| None,
         stub_subscr,
         f,

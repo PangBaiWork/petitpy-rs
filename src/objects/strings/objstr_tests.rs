@@ -385,28 +385,28 @@ fn str_make_new_kwargs() {
 fn bytes_make_new_forms() {
     let mut fx = Fx::new();
     let types = fx.types;
-    let r = bytes_make_new(&mut fx.ctx(), &types, &[], &[]).unwrap();
+    let r = bytes_make_new(&mut fx.ctx(), &types, &[], &[], None).unwrap();
     assert_eq!(bytes_of(&fx, r), b"");
     assert!(is_bytes_value(&fx.arena, r));
     let b = fx.b(b"ab");
-    let r = bytes_make_new(&mut fx.ctx(), &types, &[b], &[]).unwrap();
+    let r = bytes_make_new(&mut fx.ctx(), &types, &[b], &[], None).unwrap();
     assert_eq!(r, b); // returned as-is (identity)
     let s = fx.s(b"ab");
     let enc = Value::Qstr(qid(b"utf-8"));
-    let r = bytes_make_new(&mut fx.ctx(), &types, &[s, enc], &[]).unwrap();
+    let r = bytes_make_new(&mut fx.ctx(), &types, &[s, enc], &[], None).unwrap();
     assert_eq!(bytes_of(&fx, r), b"ab");
     assert!(is_bytes_value(&fx.arena, r));
-    let r = bytes_make_new(&mut fx.ctx(), &types, &[iv(3)], &[]).unwrap();
+    let r = bytes_make_new(&mut fx.ctx(), &types, &[iv(3)], &[], None).unwrap();
     assert_eq!(bytes_of(&fx, r), b"\x00\x00\x00");
-    let e = bytes_make_new(&mut fx.ctx(), &types, &[iv(-1)], &[]).unwrap_err();
+    let e = bytes_make_new(&mut fx.ctx(), &types, &[iv(-1)], &[], None).unwrap_err();
     assert_err(e, StrExc::ValueError, None); // NegLen: no message
-    let e = bytes_make_new(&mut fx.ctx(), &types, &[s], &[]).unwrap_err();
+    let e = bytes_make_new(&mut fx.ctx(), &types, &[s], &[], None).unwrap_err();
     assert_err(e, StrExc::TypeError, Some("wrong number of arguments"));
-    let e = bytes_make_new(&mut fx.ctx(), &types, &[iv(1), iv(2)], &[]).unwrap_err();
+    let e = bytes_make_new(&mut fx.ctx(), &types, &[iv(1), iv(2)], &[], None).unwrap_err();
     assert_err(e, StrExc::TypeError, Some("wrong number of arguments"));
-    let e = bytes_make_new(&mut fx.ctx(), &types, &[Value::Bool(true)], &[]).unwrap_err();
+    let e = bytes_make_new(&mut fx.ctx(), &types, &[Value::Bool(true)], &[], None).unwrap_err();
     assert_err(e, StrExc::TypeError, Some("object not iterable"));
-    let e = bytes_make_new(&mut fx.ctx(), &types, &[Value::SmallInt(0)], &[]).unwrap();
+    let e = bytes_make_new(&mut fx.ctx(), &types, &[Value::SmallInt(0)], &[], None).unwrap();
     assert_eq!(bytes_of(&fx, e), b"");
 }
 
@@ -415,17 +415,17 @@ fn bytes_make_new_iterable() {
     let mut fx = Fx::new();
     let types = fx.types;
     let l = fx.list(vec![iv(1), iv(2), iv(3)]);
-    let r = bytes_make_new(&mut fx.ctx(), &types, &[l], &[]).unwrap();
+    let r = bytes_make_new(&mut fx.ctx(), &types, &[l], &[], None).unwrap();
     assert_eq!(bytes_of(&fx, r), b"\x01\x02\x03");
     let l = fx.list(vec![iv(256)]);
-    let e = bytes_make_new(&mut fx.ctx(), &types, &[l], &[]).unwrap_err();
+    let e = bytes_make_new(&mut fx.ctx(), &types, &[l], &[], None).unwrap_err();
     assert_err(e, StrExc::ValueError, Some("bytes value out of range"));
     let a1 = fx.s(b"a");
     let l = fx.list(vec![a1]);
-    let e = bytes_make_new(&mut fx.ctx(), &types, &[l], &[]).unwrap_err();
+    let e = bytes_make_new(&mut fx.ctx(), &types, &[l], &[], None).unwrap_err();
     assert_err(e, StrExc::TypeError, Some("can't convert to int"));
     let rg = fx.range(0, 3, 1);
-    let r = bytes_make_new(&mut fx.ctx(), &types, &[rg], &[]).unwrap();
+    let r = bytes_make_new(&mut fx.ctx(), &types, &[rg], &[], None).unwrap();
     assert_eq!(bytes_of(&fx, r), b"\x00\x01\x02");
 }
 

@@ -291,8 +291,13 @@ pub fn instance_make_new_inner(
                         // native base built from an iterable
                         // (e.g. `class D(dict): ...; D([('k', 1)])`)
                         // gets the same hook the `__init__` path
-                        // runs on (E2).
-                        let result = f(ctx, nb, args, n_kw, Some(&mut *seams.call))?;
+                        // runs on (E2). E2b: the seam's `call` is
+                        // a plain `FnMut` — wrap it in a `SeamHook`
+                        // (call delegates; resume records the
+                        // not-iterable raise, the ctx-only path
+                        // never resumes a generator).
+                        let mut seam_hook = super::seams::SeamHook::new(&mut *seams.call);
+                        let result = f(ctx, nb, args, n_kw, Some(&mut seam_hook))?;
                         if let Obj::Instance(d) = ctx.arena.get_mut(ir) {
                             if !d.subobj.is_empty() {
                                 d.subobj[0] = result;

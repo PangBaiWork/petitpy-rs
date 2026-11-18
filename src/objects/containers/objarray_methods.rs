@@ -49,7 +49,7 @@ use crate::objects::containers::objdict_methods::collect_iterable;
 use crate::objects::containers::sequence::ARRAY_ITER_TAG;
 use crate::objects::obj::{ObjError, BUFFER_WRITE};
 use crate::objects::obj_ops::get_index;
-use crate::objects::slots::{BinaryOp, BufferInfo, SubscrArg};
+use crate::objects::slots::{BinaryOp, BufferInfo, CallHook, SubscrArg};
 use crate::objects::strings::objstr_a::{fast_slice_indexes, find_subbytes};
 use crate::objects::strings::objstr_methods_c::seq_cmp_bytes;
 use crate::objects::value::{ArrayData, Obj, Value};
@@ -126,8 +126,9 @@ pub fn array_extend_impl(
     array: Value,
     arg: Value,
     len: usize,
+    call: Option<CallHook<'_, '_>>,
 ) -> Result<(), ArrayError> {
-    let items = collect_iterable(ctx, arg, None).map_err(iter_error)?;
+    let items = collect_iterable(ctx, arg, call).map_err(iter_error)?;
     if len == 0 {
         for it in items {
             array_append(ctx, array, it)?;
@@ -199,7 +200,7 @@ pub fn array_extend(ctx: &mut CallCtx, self_: Value, arg: Value) -> Result<Value
         }
         return Ok(Value::None);
     }
-    array_extend_impl(ctx, self_, arg, 0)?;
+    array_extend_impl(ctx, self_, arg, 0, None)?;
     Ok(Value::None)
 }
 

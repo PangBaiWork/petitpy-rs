@@ -1,0 +1,424 @@
+Lane E2b result — generator collection + yield-from fix pass
+=============================================================
+Branch: lane/e2b-generator (worktree ~/workspace/petitpy-rs-e2b-generator)
+Base: master 2a65adb (E2 gates merged). Do NOT merge — main agent verifies.
+
+## §1 — What was done (grounding)
+
+The E2 gate's biggest shortfall cluster was (a) generator
+collection: `list(gen())`, genexprs and `','.join(gen())` all
+raised "object not iterable", and the yield-from family
+(`gen_yield_from*`) died in delegation. Root causes, each
+verified against the original (`~/workspace/petitpy-orig`) or
+the reference binary before fixing:
+
+1. `VmHook` trait (`src/objects/slots.rs`): the E2 `CallHook`
+   was a call-only `&mut dyn FnMut`. Two separate `&mut
+   VmState` closures (call + resume) hit E0499 — the wall
+   E2's `vm_seams.rs` `__getattr__` comment documents. So
+   ONE hook object now carries both operations:
+   `call(ctx, fun, n, k, args)` and `resume(ctx, gen)`.
+   `StateHook` (`vm_seams.rs`, backed by `&mut VmState`:
+   call → `call_function_ctx`, resume →
+   `resume_generator_ctx` iternext form + `exc_from_gen_error`)
+   and `SeamHook` (adapts the ctx-only `FnMut` seams; resume
+   records `TypeError("object not iterable")` and returns
+   `PyRaise` — the pre-E2b error, preserved on ctx-only
+   paths). `MakeNewFn`'s signature did NOT change — the
+   resume capability rides the existing hook parameter through
+   `type_call` → `make_new` → `collect_iterable`.
+   `IterSeams.call` (iter.rs) is a separate seam type, unaffected.
+
+2. `collect_iterable` generator arm (`objdict_collect.rs`):
+   new `IterPlan::Generator(Value)`, drained via
+   `hook.resume(...)`; `None` hook → `NOT_ITERABLE` (old
+   behavior on ctx-only paths). This fixes `list(gen())`,
+   `sorted/tuple/set/dict(gen())`, genexprs, and — via the
+   `MakeNewFn` threading — `bytes(gen())`,
+   `bytearray(genexpr)` (`array_extend_impl` →
+   `collect_iterable`, `array_construct` / `array_make_new` /
+   `bytearray_make_new` gain the `call` param) and
+   `iter_items` (`objstr_a.rs`: `str_join`'s helper gains the
+   hook + a `Generator` arm; new `StrError::PyRaise`, the
+   `DictError::PyRaise` precedent).
+
+3. Frame-restore fix (`vm_gen.rs`, `run_gen_frame_ctx`):
+   `g.send(1)` on a new generator raised `TypeError`
+   correctly, but `gen_resume` returned
+   `Err(CantSendNonNone)` BEFORE running the frame, the frame
+   had already been removed from `state.frames`, and the next
+   resume built a dummy frame (ip=0, empty state) and executed
+   garbage → `NotImplementedError: opcode`. Now the frame is
+   re-inserted iff it yielded OR the post-run state is still
+   New/Suspended after an early error; the dummy is never
+   stored; Closed drops the frame.
+
+4. `next()` keeps the `StopIteration` value (`vm_call.rs`,
+   `call_next_ctx`): the 1-arg form went through
+   `iternext_vm_ctx` + a bare `new_exception(StopIteration)`,
+   dropping the generator's return value. Now it uses
+   `iternext_allow_raise_ctx` (whose Generator arm builds the
+   object with args via `exc_from_gen_error`).
+
+5. `pend_throw` VM arm (`vm_call.rs`,
+   `resume_via_method_ctx`, `ResumeVia::PendThrow`) — three
+   bugs vs the Zig (`genInstancePendThrowImpl`,
+   objgenerator.zig:324-331, `prev = self.pend_exc;
+   self.pend_exc = exc_in; return prev;`): (1) it always
+   returned `None` — now returns the previously queued value;
+   (2) `pend_throw(None)` stored the `make_raise_obj(None)`
+   `TypeError` — now CLEARS (the Zig stores `OBJ_NONE` and
+   the resume ignores it, `genResumeAndRaiseImpl` line 200);
+   (3) no Running check — now raises `ValueError("generator
+   already executing")` (the Zig's `pend_exc == OBJ_NULL`
+   guard). The same eager-conversion bug was found in
+   `ResumeVia::Throw` and in the `PendThrow` store (see 8):
+   both now pass/store the RAW value.
+
+6. User-exception repr (`instance_print.rs`): root cause is
+   NOT the payload — `call_type_ctx` shortcuts ALL exception
+   subclasses (incl. user classes) to `exception_make_new`,
+   creating a bare `Obj::Exception` with header = user class,
+   while the Zig creates `Obj::Instance` + exception subobj.
+   The shortcut representation is KEPT (payload checks
+   `is_exception_instance` / `exception_cause` depend on
+   `Obj::Exception`); the print layer now detects it:
+   `is_shortcut_exception` (value is `Obj::Exception` AND its
+   header type's MRO contains a ROM exception type, detected
+   by `make_new == exception_make_new_slot`) prints the
+   subclass name + `exception_print_inner`. Zig ground truth:
+   `instance_print` (objtype.zig:1638-1685) — SENTINEL →
+   subobj exception branch prints subclass name then base
+   with `PRINT_EXC_SUBCLASS`; every new user type gets
+   `instance_print` as its print slot at creation
+   (objtype.zig:1901; Rust typecreate.rs:635).
+   `repr(CancelledError())` was `<CancelledError object at
+   23f>`, now `CancelledError()`.
+
+7. Set iterators (`iter.rs`, `objdict_methods.rs`):
+   `iter(iter({1,2,3}))` failed "object not iterable" and
+   `list(iter({1,2,3}))` PANICKED at objdict.rs:225 ("dict
+   operation on a non-dict value"). Root cause: set iterators
+   are `Obj::Iterator { source: set, index: cursor, extra:
+   [] }` — the same shape as a dict VIEW, and `getiter`'s
+   discriminator (`extra.is_empty() && index <= 2`) matched a
+   fresh set iterator (cursor 0) as a view. `getiter` now
+   discriminates by SOURCE type (Dict → view, else the value
+   IS an iterator); `iternext` gains a set arm
+   (`set_it_next`, `SetError` → `IterError::PyRaise`);
+   `as_dict_view` / `as_dict_view_it` gained the same
+   Dict-source guard (that was the panic: `collect_iterable`'s
+   Iterator arm misclassified the set iterator as a dict view
+   and `dict_ref_of` panicked on the Set source). Frozensets
+   share the `Obj::Set` payload, so the arm covers them.
+   `type(iter(s))` still fails (bare TypeError, header None;
+   ref `<class 'iterator'>`) — out of scope (E2 §4(p)
+   iter-protocol territory; no target test calls `type()` on
+   an iterator).
+
+8. Yield-from delegation (three fixes, all in the resume
+   path):
+   (a) `try_instance_getiter` (`vm_seams.rs`, used by
+   `getiter_vm_ctx` in `vm_rt_iter.rs`): a user instance's
+   `__iter__` is a `FunBc` — it cannot run through the stub
+   seams the slot path uses (`bound_meth_call_slot` has no
+   runner for `FunBc`), so `getiter` silently fell back to a
+   getitem iterator (`for x in MyGen()` → "object isn't
+   subscriptable"; `yield from Iter()` ditto). The probe
+   runs `class_lookup` with stub seams first (pure dict
+   lookup — no call), so a class without `__iter__` falls
+   through to the slot path's getitem fallback; with the
+   hook, the `FunBc` runs. This fixes `gen_yield_from_close`
+   (gen9: `yield from Iter()` + `close`), `gen_yield_from_ducktype`
+   (MyGen / Incrementer / MyIter) and `gen_yield_from_throw3`,
+   plus `for` over any user iterable.
+   (b) Map call-seam value preservation (`vm_rt_iter.rs`,
+   `iternext_allow_raise_ctx` Iterator arm): the seam
+   classified a `StopIteration` from the mapped function as
+   bare exhaustion, dropping its value — `yield from
+   map(gen7, range(100))` lost the `444`. The seam now
+   stashes EVERY raise on `state.pending_exc` and returns
+   `Raise`; the arm drains it as the `StopIteration` object.
+   `iternext_vm_ctx` still swallows a `StopIteration` to
+   `Ok(None)` (the plain-`mp_iternext` form), so
+   `for`/collection iteration is unchanged. This is the Zig's
+   two-form split: `mp_iternext_allow_raise` propagates the
+   object, plain `mp_iternext` swallows it.
+   (c) `throw` raw-value fix (`vm_call.rs`): `ResumeVia::Throw`
+   called `make_raise_obj` eagerly, so `g.throw(123)` into a
+   `yield from Iter()` handed the `throw` method a `TypeError`
+   object, and `g.throw(ZeroDivisionError)` handed it an
+   instance. Zig (`mp_resume`, runtime.zig:1430-1453):
+   `dest[2] = throw_value` — the `throw` method receives the
+   RAW value; `mp_make_raise_obj` is only the no-`throw`-method
+   fallback (which `resume_vm_ctx` already does). The
+   conversion happens at the injection point
+   (`dispatch_loop`: `make_raise_obj` when the frame does NOT
+   sit on `YIELD_FROM`) — the `PendThrow` store had the same
+   double-conversion and now stores the raw value too (the Zig
+   stores `exc_in` as-is). The direct `gen_instance_throw`
+   already passed the value raw (its doc says so).
+
+9. `join` of a genexpr (`builtin_vm.rs` `call_join_ctx`,
+   `vm_call_intercept.rs`, `VmState` handles, `vm_builtins_bind.rs`):
+   `str_join` is ctx-only, so `', '.join(gen())` raised "object
+   not iterable". The VM intercepts `str.join` / `bytes.join`
+   by GcRef identity (the `sorted` pattern — two DIFFERENT
+   `FunBuiltin` objects, one per type dict, both wrapping the
+   same `str_join` fn, so two handles looked up by name in the
+   str/bytes type dicts at build time). `call_join_ctx`
+   collects the iterable through `make_hook`, then delegates
+   to the real `str_join` on `[sep, list]` — join of a list is
+   the already-working path, so non-generator input is
+   byte-identical. The BoundMeth arm recurses into
+   `call_function_ctx`, so the intercept sees the raw fun with
+   `[sep, iterable]` for both `', '.join(x)` and
+   `str.join(sep, x)`. Arity is checked here (interception
+   bypasses the sig check — probed: all three arity errors are
+   `TypeError: argument num/types mismatch`). Side effect:
+   this also closes a Rust PANIC on `','.join()` — the direct
+   `str_join` indexes `args[1]` unchecked (SIGABRT before);
+   VM calls now arity-check first. The direct path still
+   panics on a short call (Rust-only callers); noted in §4.
+
+10. `objstr_a.rs` split (806 lines, over the 800 cap):
+    the `StrError`/`StrExc` block (lines 37–353, verbatim)
+    moved to new `src/objects/strings/objstr_errors.rs`
+    (333 lines); `objstr_a.rs` is now 494 lines and
+    re-exports (`pub use` for the types, `pub(crate) use` for
+    `slot_raise`/`result_type`). All existing imports keep
+    working. Missed test callers found along the way:
+    `objstr_tests.rs` had 13 four-arg `bytes_make_new` calls
+    (the E2b signature change) — all now pass `None`.
+
+Regression tests: new `src/runtime/vm_tests_e2b.rs` (400
+lines, 19 tests, `e2b_` prefix, `Fx` harness copied from
+`vm_tests_e2.rs`): list/sorted/tuple/set/dict of a generator,
+genexpr collection, generator raising through `list()`,
+send-frame-survives, `next()` StopIteration value,
+pend_throw returns-previous / None-clears / running-raises,
+user-exception repr/str, set iter-of-iter + for-over-set,
+bytes(bytearray) of a genexpr, yield-from list + map
+StopIteration value + user iterable + throw raw value,
+join of a genexpr (str + bytes) + join arity. One test bug
+found by the suite itself and fixed: `e2b_pend_throw_running_raises`
+first read `r` as a module global, but `r` assigned inside
+`g()` is a generator local (both binaries agree: `NameError`)
+— the test now declares `global r`.
+
+## §2 — Gate numbers (all re-run against the worktree release binary)
+
+Acceptance chain: lib **1527 passed, 0 failed, 4 ignored**
+(1508 + 19 new e2b tests); bins **9**; entry_cli **45**;
+**0 warnings**; no unsafe. `check_compile_mpy.py` PASS
+(552/552 byte-identical, 0 byte mismatches);
+`check_frozen.py` PASS (23/23, 38,141 bytes). All files
+< 800 lines (largest: objarray.rs 793, vm_call.rs 780,
+vm_rt_iter.rs 750, builtin_vm.rs 693; map.rs 860 + gc.rs 830
+unchanged, pre-existing cap debt, not grown).
+
+E2 baseline re-measured in a scratch worktree at master
+2a65adb (release build) to make the deltas exact: full
+459/552, integration 168/202, golden 510/585, capability
+65/67, stdlib 3/8, nano 390/541 — identical to E2's report.
+
+- Full corpus: **478/552** (was 459) — **+19, 0 regressions**.
+  Actual fails 74 (67 regressions + 7 known-fails exactly).
+  Newly passing (19): all 14 must-fix targets
+  (generator_args, generator_close, generator_pend_throw,
+  generator_return, generator_send, gen_yield_from,
+  gen_yield_from_close, gen_yield_from_ducktype,
+  gen_yield_from_exc, gen_yield_from_iter,
+  gen_yield_from_throw3, bytes_gen, memoryview_gc,
+  set_iter_of_iter) + 5 extras (array_construct2,
+  builtin_zip, string_join, subclass_native3,
+  subclass_native_specmeth). NOTE: the mid-lane "7/14 PASS"
+  baseline in the session log was measured on a binary that
+  already contained most E2b fixes — the TRUE E2 baseline
+  fails gen_yield_from_exc / gen_yield_from_iter in the gate
+  (they match the reference's stdout but the gate compares
+  against the golden .out files, which append `\n[exit N]`).
+- Integration: **174/202** (was 168) — **+6, 0 regressions**.
+  Newly passing: generator, genexpr_filter (targets) +
+  itertools_accumulate, itertools_count_islice,
+  re_long_alternation_compiles, string_capwords.
+- Golden: **535/585** (was 510) — **+25, 0 regressions**
+  (rust==cpython on 528/585, was 503). Newly passing:
+  test_kmp, test_lis, test_bellman_ford (targets) +
+  generator_expr, generators, sorted_comprehensive,
+  sorted_numbers + the corpus names above.
+- Capability: **67/67** (was 65/67) — **GATE: GREEN**.
+  `generator` and `generator_send_less` are `ok` in the vm
+  column now. (Invocation note: `--vm` must be `petitpy-vm`
+  — passing `petitpy-rs` makes the vm column FAIL for every
+  construct, because it cannot run .mpy files.)
+- test-stdlib: **5/8** (was 3/8). Newly passing:
+  test_argparse, test_pytest_lite. Still failing:
+  test_abc (5 inner, "argument num/types mismatch"),
+  test_dataclasses (2 inner), test_enum (1 inner).
+- Nano (invariant check only): **408/541** (was 390/541)
+  — report-only; Rust has no nano build.
+
+Reference for scale: full 545/552, integration 201/202,
+golden 585/585, capability 67/67, stdlib 8/8.
+
+## §3 — Per-fix notes
+
+- The `VmHook` design was chosen over two closures because
+  of E0499 (documented in the `vm_seams.rs` header and the
+  `__getattr__` comment); `MakeNewFn`'s signature is
+  unchanged, so the diff touches call sites, not the
+  type-call plumbing.
+- The map-seam change (§1.8b) is the only behavior change
+  outside generator paths: a `StopIteration` raised by a
+  `map`/`filter`/`zip`/`enumerate` function now surfaces as
+  the exception object through `iternext_allow_raise_ctx`
+  (previously bare exhaustion). `iternext_vm_ctx` swallows
+  it, so `for`/`list()`/`sorted()` are unaffected — verified
+  by the 0-regression gate diffs.
+- `call_join_ctx` delegates to the REAL `str_join` on a
+  materialised list, so join semantics (item-type check,
+  separator handling, error messages) are unchanged by
+  construction; only the iterable's provenance changed.
+- `subclass_native3` / `subclass_native_specmeth` flipped
+  via the getiter fix (user-iterable subclasses); `builtin_zip`
+  via the map-seam / collection fixes; `array_construct2`
+  via the array hook threading; `string_join` via the join
+  intercept; `sorted_comprehensive` / `sorted_numbers` (golden)
+  via generator collection in sort inputs.
+- Stdlib gains (argparse, pytest_lite) are side effects of
+  generator collection / join — both suites exercise genexprs
+  and `str.join` heavily; no stdlib-specific code was touched.
+
+## §4 — What is still failing (root causes, per case)
+
+Out-of-scope clusters from E2 §4, unchanged except where
+noted; the brief's out-of-scope list is honoured (none of
+(c)–(p) was attempted beyond the §1 fixes above):
+
+- (c) `list.sort(key=FunBc)`: `sorted(key=)` works,
+  `l.sort(key=)` raises bare TypeError (pinned line:
+  `l.sort(key=lambda x: -x)` in list_sort.py). `list_sort_builtin`
+  is ctx-only; needs the same hook-threading as `sorted`.
+- (d) `pow(0,0)==0` in builtin while `0**0==1` (probed:
+  Rust `0 1`, ref `1 1`).
+- (e) `bool(range(0))` True on Rust, False on ref (probed).
+- (f) `callable(A())` True on Rust, False on ref (probed).
+- (g) `__set_name__` never called (probed).
+- (h) `__reversed__` / slice+range attrs.
+- (i) NotImplemented binary-op fallback (probed: class_notimpl
+  gives `C(0) - 2` where ref raises TypeError).
+- (j) frozen deque `__init__` (probed: `deque([1,2])` →
+  TypeError mismatch from frozen collections.py) — the ONLY
+  remaining `#[ignore]`d test (d5_frozen_deque_ignored).
+- (k) bytes/array `__add__`/`__eq__` buffer paths (probed:
+  bytes+bytearray → TypeError, ref b'abcd').
+- (l) bytearray missing str methods (probed: `.center(6)` →
+  AttributeError).
+- (m) `str.format` nested spec fields (probed:
+  `"{text:{align}{width}}".format(...)` → KeyError('text')).
+- (n) descriptor / class-creation / native-subclass dispatch
+  (class_descriptor, subclass_native* remaining, special_methods).
+- (o) `**kwargs` key interning (probed: "keyword argument name
+  is not an interned string" — C13 `intern_kw_key` divergence).
+- (p) remaining single-mechanism gaps (builtin_hash,
+  builtin_str_hex "no attribute 'hex'",
+  builtin_override, int_parse, int_big_rshift,
+  int_bytes_intbig, getitem "object isn't subscriptable",
+  import_instance_method, io_iobase, memoryerror,
+  ordereddict1 returns None for present key,
+  special_methods, iter0/1/2).
+  NOTE: iter0/1/2 still fail — the getiter fix closed
+  `for`/`yield from` over user iterables, but the iter*
+  corpus tests exercise `type(iter(...))` and the iterator
+  protocol further (e.g. `type(iter(s))` → bare TypeError,
+  header None; ref `<class 'iterator'>`).
+- Integration still failing (28): enum_members,
+  init_subclass, native_subclass_operands,
+  runtime_annotations, json_cpython_behaviour,
+  cpython_platform_import_slice_mro, class_repr,
+  bytes_interop, deque_cpython_idiom, itertools_chain,
+  itertools_cpython_functions, builtin_keyword_args,
+  collections_abc_import, dict_missing_basic,
+  dict_missing_counter_pattern,
+  object_setattr_method_available,
+  str_join_bytes_bytearray, uuid4_shape,
+  index_error_store_leaves_container_intact,
+  gc_reclaims_garbage, gc_closes_dropped_files_and_sockets,
+  os_kill_esrch_raises, os_chown_self_noop,
+  socket_fromfd_wraps_fd, select_timeout_zero_returns_promptly,
+  select_readable_fd_is_ready,
+  subprocess_check_raises_on_nonzero,
+  subprocess_streams_env_cwd_text (stdout/stderr interleave
+  ordering: expected `"inherited\n'e1\\nerr\\n' None\n/\nNone\nb'co\\n'\n"`,
+  got `"inherited\nerr\n'e1\\n' None\n/\nNone\nb'co\\n'\n"`).
+- Golden still failing (50): the corpus fail list, minus the
+  25 fixed — dominated by (k)/(l) bytes/bytearray, (m)
+  str.format, (n) subclass/dunder, (d) pow, (e)/(f).
+- Stdlib still failing (3): test_abc, test_dataclasses,
+  test_enum — all class-creation / descriptor territory (n).
+- Newly found, NOT fixed (out of scope, small): the direct
+  (non-VM) `str_join` still panics (SIGABRT, index out of
+  bounds at objstr_methods_a.rs:328) on a short call such as
+  `str.join(',', [])` invoked through the slot path without
+  the VM intercept — user code cannot reach it (all VM calls
+  go through `call_join_ctx`'s arity check), but a Rust-side
+  direct caller could. The same unchecked-index shape may
+  exist in other `builtin_method!` wrappers (they only check
+  `args.is_empty()`); worth a sweep in a later lane.
+- File-size watch: vm_call.rs 780, objarray.rs 793 — both
+  under cap but within 20 lines of it; the next lane that
+  touches either must split first (as E2b did for
+  objstr_a.rs). map.rs 860 + gc.rs 830 remain over cap
+  (pre-existing, unscheduled).
+
+## §5 — Files changed (29, this lane only)
+
+- src/objects/slots.rs — `VmHook` trait, `CallHook` alias.
+- src/runtime/vm_seams.rs — `StateHook`, `make_hook`,
+  `try_instance_getiter`.
+- src/objects/objtype/seams.rs — `SeamHook` adapter,
+  `with_call_hook_seams` takes `CallHook`.
+- src/objects/containers/objdict_collect.rs — `IterPlan::Generator`.
+- src/runtime/vm_gen.rs — frame-restore fix.
+- src/runtime/vm_call.rs — `call_next_ctx` StopIteration
+  value; `ResumeVia::Throw` / `PendThrow` raw values.
+- src/objects/objtype/instance_print.rs — shortcut-exception
+  repr.
+- src/objects/iters/iter.rs — set-iterator discrimination
+  + set arm.
+- src/objects/containers/objdict_methods.rs — `as_dict_view`
+  Dict-source guard.
+- src/objects/strings/objstr_a.rs — `iter_items` hook +
+  Generator arm; `StrError::PyRaise`; split (see §1.10).
+- src/objects/strings/objstr_errors.rs — NEW (split).
+- src/objects/strings/mod.rs — register objstr_errors.
+- src/objects/strings/objstr_methods_a.rs — `str_join` None
+  hook (unchanged behavior).
+- src/objects/strings/objstr_methods_c.rs — `bytes_make_new`
+  hook param.
+- src/objects/strings/objstr_tests.rs — 13 call-site fixes.
+- src/objects/objtype/make_new.rs — hook forwarding
+  (bytes/bytearray slots).
+- src/objects/objtype/instance_create.rs — `SeamHook` for
+  native-base make_new.
+- src/objects/containers/objarray.rs — hook threading
+  (construct/make_new).
+- src/objects/containers/objarray_methods.rs — `array_extend_impl`
+  hook param.
+- src/objects/containers/objarray_tests.rs — call-site fixes.
+- src/runtime/vm_rt_iter.rs — `getiter_vm_ctx` try path;
+  map-seam value preservation; `resume_vm_ctx` unchanged
+  except via the above.
+- src/runtime/vm_call_intercept.rs — join routing.
+- src/runtime/builtin_vm.rs — `call_join_ctx`.
+- src/runtime/vm.rs — `str_join_builtin` /
+  `bytes_join_builtin` fields.
+- src/runtime/vm_builtins_bind.rs — join handle lookup.
+- src/runtime/runtime_method.rs — `hook.call(...)`.
+- src/runtime/mod.rs — register vm_tests_e2b.
+- src/runtime/vm_tests_e2b.rs — NEW, 19 regression tests.
+- scripts/e2b_result.txt — this file.
+
+Orig left clean (verified `git status` empty; the runners'
+`__pycache__` dirs removed).

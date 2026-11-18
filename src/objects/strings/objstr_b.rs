@@ -396,9 +396,9 @@ pub fn str_encode(
 ) -> Result<Value, StrError> {
     if args.len() == 1 {
         let utf8 = Value::Qstr(static_qstr_id(b"utf-8").unwrap_or(0));
-        bytes_make_new(ctx, types, &[args[0], utf8], &[])
+        bytes_make_new(ctx, types, &[args[0], utf8], &[], None)
     } else {
-        bytes_make_new(ctx, types, args, &[])
+        bytes_make_new(ctx, types, args, &[], None)
     }
 }
 

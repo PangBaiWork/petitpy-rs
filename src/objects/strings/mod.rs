@@ -11,6 +11,7 @@
 pub mod mpprint;
 pub mod objstr_a;
 pub mod objstr_b;
+pub mod objstr_errors;
 pub mod objstr_format;
 pub mod objstr_iters;
 pub mod objstr_methods_a;

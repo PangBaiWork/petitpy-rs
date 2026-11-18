@@ -318,26 +318,19 @@ except AttributeError:
     );
 }
 
-/// C13 VM BUG (not a D3 bug): `and` with a False left
-/// followed by a call raises `TypeError("object not
-/// callable")` in the Rust VM — the `JUMP_IF_FALSE_OR_POP`
-/// path leaves the stack misaligned when the jump is
-/// taken, so the following call pops a wrong callee. The
-/// reference prints `False` cleanly. Minimal repro; the
-/// fixing lane removes the `#[ignore]`.
-/// (Found by Lane D3 while bisecting `struct_pack`:
-/// every pack line passes in isolation, the chain failed
-/// only once an intermediate link went False.)
-#[test]
-#[ignore = "C13 VM and-short-circuit bug: jump-taken path misaligns the stack"]
-fn and_false_shortcircuit_vm_bug() {
-    let mut fx = Fx::new();
-    fx.run_ok(
-        r#"
-import struct
-ok = False
-ok = ok and struct.pack('<i', 1) == b'\x01\x00\x00\x00'
-assert ok == False
-"#,
-    );
-}
+// C13 VM BUG (not a D3 bug), FIXED at the D3 merge
+// (integration commit): `and`/`or` with a variable left
+// side whose jump is taken raised `NotImplementedError`
+// ("opcode") in the Rust VM — the `JUMP_IF_*_OR_POP`
+// arms decoded the label with the SIGNED decoder
+// (`decode_slabel`, -0x40 bias) while the original
+// (`vm.zig:751-761`) uses the UNSIGNED decoder, so a
+// taken jump landed 64 bytes early and the next fetch
+// decoded garbage. The regression tests live in
+// `vm_tests.rs` (`and_false_var_shortcircuit`,
+// `or_true_var_shortcircuit`); the `struct.pack` chain
+// that found it is covered by the struct tests once the
+// module is registered (Phase E entry work).
+// (Found by Lane D3 while bisecting `struct_pack`:
+// every pack line passes in isolation, the chain failed
+// only once an intermediate link went False.)

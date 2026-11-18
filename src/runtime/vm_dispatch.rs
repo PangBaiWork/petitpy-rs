@@ -489,7 +489,15 @@ pub(crate) fn dispatch_loop(
                 }
             }
             MP_BC_JUMP_IF_TRUE_OR_POP => {
-                let off = decode_slabel(state, code_idx, &mut ip);
+                // (`vm.zig:751-756`): the `*_OR_POP` jumps take an
+                // UNSIGNED label (`decodeUlabel`), NOT the signed
+                // one — the signed decode subtracts 0x40, so a
+                // taken jump landed 64 bytes early and the next
+                // fetch decoded garbage (`NotImplementedError`
+                // "opcode"). Found by Lane D3 bisecting
+                // `struct.pack` in an `and` chain; fixed at the
+                // D3 merge (integration).
+                let off = decode_ulabel(state, code_idx, &mut ip);
                 let v = stop(frame).unwrap_or(Value::None);
                 match is_true_ctx(ctx, state, v) {
                     Ok(true) => jump_by(&mut ip, off),
@@ -500,7 +508,9 @@ pub(crate) fn dispatch_loop(
                 }
             }
             MP_BC_JUMP_IF_FALSE_OR_POP => {
-                let off = decode_slabel(state, code_idx, &mut ip);
+                // Unsigned label too (`vm.zig:758-761`) — see the
+                // `JUMP_IF_TRUE_OR_POP` arm above.
+                let off = decode_ulabel(state, code_idx, &mut ip);
                 let v = stop(frame).unwrap_or(Value::None);
                 match is_true_ctx(ctx, state, v) {
                     Ok(false) => jump_by(&mut ip, off),

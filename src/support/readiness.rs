@@ -416,6 +416,50 @@ pub fn wait_buffered(fd: i32) -> bool {
     true
 }
 
+/// Drain the monitor's read-ahead bytes for `fd` into
+/// `buf`, blocking while a live monitor may still deliver
+/// more. Returns `(n, need_os)`: `n` bytes drained;
+/// `need_os` says whether the caller should read the
+/// remainder from the OS object (true only when no live
+/// monitor is left to feed the buffer: no monitor, or a
+/// dead one). When `need_os` is false the buffer is full or
+/// EOF was reached. A live monitor with an empty buffer
+/// BLOCKS here until it delivers bytes — a blocking read
+/// must wait for data, not report EOF (`stream_rw_loop`
+/// reads a 0 return as EOF, and `os.read` returns whatever
+/// one read yields), and the monitor is the only reader of
+/// the shared offset while it lives (an OS read now would
+/// skip the bytes it still holds). Used by both read paths
+/// (`fileio_read` and `os.read`).
+pub fn drain_into(fd: i32, buf: &mut [u8]) -> (usize, bool) {
+    let Some(mon) = monitor_for(fd) else {
+        return (0, true);
+    };
+    let mut n = take_buffered(fd, buf);
+    if n == buf.len() {
+        return (n, false);
+    }
+    loop {
+        // EOF is terminal: no more bytes will ever arrive.
+        if mon.is_eof() {
+            return (n, false);
+        }
+        // Dead (read error / stale): the OS read surfaces
+        // the error, or EOF, for the remainder.
+        if mon.is_dead() {
+            return (n, true);
+        }
+        // Live monitor, empty buffer: wait for data / EOF /
+        // death (blocks — this is a blocking read).
+        wait_buffered(fd);
+        let m = take_buffered(fd, &mut buf[n..]);
+        n += m;
+        if n == buf.len() {
+            return (n, false);
+        }
+    }
+}
+
 /// The monitor for `fd`, if one is live (dead entries are
 /// still returned — the caller checks `is_dead` — so a
 /// just-finished monitor's buffered bytes are not lost).

@@ -280,12 +280,20 @@ pub fn os_close_ctx(
             return Err(errno_exc(ctx, state, e));
         }
         state.os_fds.remove(&fd);
+        // H-select: the monitor's read-ahead bytes belong to
+        // a closed description — mark it stale (and clear the
+        // buffer) so a later file reusing this fd number
+        // starts fresh.
+        crate::support::readiness::note_closed(fd);
         return Ok(Value::None);
     }
     #[cfg(not(feature = "unsafe-ffi"))]
     {
         match state.os_fds.remove(&fd) {
-            Some(_) => Ok(Value::None),
+            Some(_) => {
+                crate::support::readiness::note_closed(fd);
+                Ok(Value::None)
+            }
             None => Err(errno_exc(ctx, state, EBADF)),
         }
     }
@@ -324,7 +332,24 @@ pub fn os_read_ctx(
         }
         1 | 2 => return Err(errno_exc(ctx, state, EBADF)),
         _ => match state.os_fds.get_mut(&fd) {
-            Some(f) => f.read(&mut buf[..n as usize]),
+            Some(f) => {
+                // H-select: drain the monitor's read-ahead
+                // first (it already consumed those bytes from
+                // the shared offset — an OS read now would
+                // skip them); read the remainder from the OS
+                // only when no live monitor is left.
+                // `os.read` returns what one read yields — a
+                // drained buffer counts as the read.
+                let (n0, need_os) = crate::support::readiness::drain_into(
+                    fd,
+                    &mut buf[..n as usize],
+                );
+                if !need_os {
+                    Ok(n0)
+                } else {
+                    f.read(&mut buf[n0..n as usize]).map(|n1| n0 + n1)
+                }
+            }
             None => return Err(errno_exc(ctx, state, EBADF)),
         },
     };
@@ -469,6 +494,10 @@ pub fn os_lseek_ctx(
             // mapping touches `state` again.
             let at: std::io::Result<u64> = f.seek(seek_from);
             let at = at.map_err(|e| io_exc(ctx, state, e))?;
+            // H-select: the offset moved, so the monitor's
+            // read-ahead bytes (from the old offset) are
+            // stale — invalidate it.
+            crate::support::readiness::note_seek(fd);
             Ok(Value::SmallInt(at as i64))
         }
         None => Err(errno_exc(ctx, state, EBADF)),

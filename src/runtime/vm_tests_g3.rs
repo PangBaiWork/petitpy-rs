@@ -297,3 +297,38 @@ fn g3_h5_dict_in_instance_key() {
     assert!(fx.gb("ok1"));
     assert!(fx.gb("ok2"));
 }
+
+// ── H4: dict-subclass instance subscripts instance keys ───────────
+
+#[test]
+fn g3_h4_dict_subclass_get_instance_key() {
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "{A_DEF}class D(dict):\n    pass\nd = D()\nd[A()] = 'x'\nok1 = (d[A()] == 'x')\nok2 = (d.get(A()) == 'x')\n"
+    ));
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+}
+
+#[test]
+fn g3_h4_dict_subclass_set_del_instance_key() {
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "{A_DEF}class D(dict):\n    pass\nd = D()\nd[A()] = 'x'\nd[A()] = 'y'\nok1 = (d[A()] == 'y')\ndel d[A()]\nok2 = (len(d) == 0)\n"
+    ));
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+}
+
+#[test]
+fn g3_h4_dict_subclass_missing() {
+    // The F4 `__missing__` protocol still works through the
+    // hook subscr: a miss consults `__missing__`, and without
+    // it the miss still raises `KeyError`.
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "class D(dict):\n    def __missing__(self, k):\n        return 'miss:' + str(k)\nd = D()\nok1 = (d['zz'] == 'miss:zz')\nclass E(dict):\n    pass\ne = E()\nok2 = False\ntry:\n    x = e['zz']\nexcept KeyError:\n    ok2 = True\n",
+    );
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+}

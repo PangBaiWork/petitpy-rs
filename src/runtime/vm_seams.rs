@@ -27,7 +27,9 @@ use crate::objects::objtype::instance::{
     instance_subscr, instance_unary_op,
 };
 use crate::objects::objtype::lookup::{binary_op_method_name, class_lookup, LookupHit, SlotKind};
-use crate::objects::objtype::seams::{with_call_hook_seams, with_hook_load_seams, with_stub_seams};
+use crate::objects::objtype::seams::{
+    with_call_hook_seams, with_call_hook_subscr_seams, with_hook_load_seams, with_stub_seams,
+};
 use crate::objects::objtype::subclass::instance_subobj0;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BinaryOp, SubscrArg, UnaryOp};
@@ -368,7 +370,11 @@ pub(crate) fn try_instance_subscr(
         return Ok(None);
     }
     let mut hook = make_hook(state);
-    match with_call_hook_seams(&mut hook, |seams| instance_subscr(ctx, base, index, arg, seams)) {
+    // G3/H4: the subscr seam shares the hook (`with_call_hook_subscr_seams`) —
+    // a dict-subclass instance subscripts instance keys through a running
+    // FunBc `__eq__` (its subobj[0] is the exact dict). Every other
+    // `try_instance_*` caller keeps `with_call_hook_seams` (stub subscr).
+    match with_call_hook_subscr_seams(&mut hook, |seams| instance_subscr(ctx, base, index, arg, seams)) {
         Ok(v) => Ok(Some(v)),
         Err(e) => Err(drain_hook_raise(ctx, state, e)),
     }

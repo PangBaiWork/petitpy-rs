@@ -34,12 +34,17 @@ use crate::objects::containers::objdict::is_ordered_dict_value;
 use crate::objects::containers::objlist::list_items_vec;
 use crate::objects::containers::objset::is_frozenset;
 use crate::objects::containers::objtuple::tuple_items;
-use crate::objects::obj::obj_is_true;
-use crate::objects::obj_ops::obj_print_helper;
+use crate::objects::obj::{is_float, obj_get_type, obj_is_true, type_data};
+use crate::objects::primitives::objfloat::new_float;
+use crate::objects::obj_ops::{exception_cause, is_exception_instance, obj_print_helper};
+use crate::objects::objtype::objexcept::{
+    errno_name, exception_get_traceback, is_exception_type_obj,
+};
+use crate::objects::objtype::subclass::instance_subobj0;
 use crate::objects::objtype::lookup::{class_lookup, LookupHit, SlotKind};
 use crate::objects::objtype::seams::with_stub_seams;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::{ByteBuf, ByteSink, PrintKind};
+use crate::objects::slots::{ByteBuf, ByteSink, PrintKind, UnaryOp};
 use crate::objects::value::{Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::vm::VmState;
@@ -152,6 +157,251 @@ fn is_container(ctx: &CallCtx, value: Value) -> bool {
 /// divergence (same class as the other abort-vs-fallback
 /// cases). Only the `str` / `repr` BUILTINS propagate a
 /// dunder raise (see the module docs).
+/// Hook-aware exception rendering (G4/H7): mirrors
+/// `exception_print_inner` (`objexcept.rs`) but renders the
+/// args through `print_helper_hook`, so a `__str__` /
+/// `__repr__` dunder on an arg runs (`str(KeyError(A()))` is
+/// `A-str` on REF, `<A object at …>` through the ctx-only
+/// path). The `PRINT_EXC_SUBCLASS` flag is spelled out as the
+/// `is_subclass` parameter, exactly as `exception_print_inner`
+/// takes it.
+///
+/// An exception-subclass INSTANCE takes the `instance_print`
+/// branch first (objtype.zig:1659-1672): a user `__str__` /
+/// `__repr__` on the class itself wins (the dunder lookup
+/// precedes the exception branch); with no dunder, the
+/// subclass name is written for non-STR kinds and the native
+/// exception subobj renders with `is_subclass = true`. A
+/// raising dunder falls through to the ctx-only slot path
+/// (the vendor's `print_fallback`).
+pub fn exception_print_hook(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    value: Value,
+    kind: PrintKind,
+    sink: &mut dyn crate::objects::slots::ByteSink,
+) {
+    if is_instance(ctx.arena, value) {
+        match render_instance(ctx, state, value, kind) {
+            Ok(Some(text)) => {
+                let _ = sink.write_str(&text);
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                obj_print_helper(ctx, ctx.types, value, kind, sink);
+                return;
+            }
+        }
+        if let Some(sub0) = instance_subobj0(ctx.arena, value) {
+            if is_native_exception_subobj(ctx, sub0) {
+                if kind != PrintKind::Str {
+                    let _ = sink.write_str(&type_name_of(ctx, value));
+                }
+                exception_print_payload_hook(ctx, state, sub0, kind, true, sink);
+                return;
+            }
+        }
+        obj_print_helper(ctx, ctx.types, value, kind, sink);
+        return;
+    }
+    exception_print_payload_hook(ctx, state, value, kind, false, sink);
+}
+
+/// The `mp_obj_exception_print` body (`objexcept.zig:184`)
+/// with hook-aware arg rendering: the OSError branch, the
+/// single-arg `Str` / `Exc` form, and the tuple form (args as
+/// a tuple, items always repr) are the same as
+/// `exception_print_inner` — only the three `obj_print_helper`
+/// call sites become `print_helper_hook`.
+fn exception_print_payload_hook(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    value: Value,
+    kind: PrintKind,
+    is_subclass: bool,
+    sink: &mut dyn crate::objects::slots::ByteSink,
+) {
+    let (args, type_name): (Vec<Value>, String) = match value {
+        Value::Heap(r) => match ctx.arena.get(r) {
+            Obj::Exception(e) => {
+                let name = header_type(ctx.arena, value)
+                    .and_then(|t| match ctx.arena.get(t) {
+                        Obj::Type(td) => Some(td.name),
+                        _ => None,
+                    })
+                    .map(|id| String::from_utf8_lossy(ctx.pool.qstr_str(id as u16)).into_owned())
+                    .unwrap_or_default();
+                (e.args.clone(), name)
+            }
+            _ => return,
+        },
+        _ => return,
+    };
+    if !is_subclass && (kind == PrintKind::Repr || kind == PrintKind::Exc) {
+        let _ = sink.write_str(&type_name);
+    }
+    if kind == PrintKind::Exc {
+        let _ = sink.write_str(": ");
+    }
+    if kind == PrintKind::Str || kind == PrintKind::Exc {
+        if args.is_empty() {
+            return;
+        }
+        // OSError: "[Errno N] NAME" (+ ": msg" with 2 args).
+        if is_oserror_payload(ctx, value) && args.len() < 3 {
+            if let Value::SmallInt(n) = args[0] {
+                if let Some(name) = errno_name(n) {
+                    let _ = write!(sink, "[Errno {}] {}", n, name);
+                    if args.len() > 1 {
+                        let _ = sink.write_str(": ");
+                        print_helper_hook(ctx, state, args[1], PrintKind::Str, sink);
+                    }
+                    return;
+                }
+            }
+        }
+        if args.len() == 1 {
+            print_helper_hook(ctx, state, args[0], PrintKind::Str, sink);
+            return;
+        }
+    }
+    // Tuple form (repr, multi-arg str/exc, json/raw, OSError
+    // fall-through): the args as a tuple, items always repr
+    // (the Rust tuple print ignores kind — the vendor tuple
+    // print does the same).
+    let tuple = Value::Heap(ctx.alloc(Some(ctx.types.tuple), Obj::Tuple(args)));
+    print_helper_hook(ctx, state, tuple, kind, sink);
+}
+
+/// The header type of a heap value (`None` for immediates and
+/// for header-less bootstrapping objects) — the
+/// `exception_print_inner` helper, repeated here because that
+/// module keeps it private.
+fn header_type(arena: &crate::memory::gc::GcArena, value: Value) -> Option<crate::objects::value::GcRef> {
+    match value {
+        Value::Heap(r) => arena.header(r).type_,
+        _ => None,
+    }
+}
+
+/// Is the exception's header type exactly `OSError`? The
+/// `is_oserror_type` check (`objexcept.rs`), repeated here
+/// because that module keeps it private: exact type, not a
+/// subclass, spelled as a type-NAME check (only the `OSError`
+/// type object carries that name).
+fn is_oserror_payload(ctx: &CallCtx, exc: Value) -> bool {
+    let Some(t) = header_type(ctx.arena, exc) else {
+        return false;
+    };
+    let name = match ctx.arena.get(t) {
+        Obj::Type(td) => td.name,
+        _ => return false,
+    };
+    ctx.pool.qstr_str(name as u16) == b"OSError"
+}
+
+/// Whether `sub0` is a native exception instance: an
+/// `Obj::Exception` payload whose header type is an exception
+/// type — the `is_native_exception_subobj` check
+/// (`instance_print.rs`), repeated here because that module
+/// keeps it private.
+fn is_native_exception_subobj(ctx: &CallCtx, sub0: Value) -> bool {
+    let Value::Heap(r) = sub0 else {
+        return false;
+    };
+    if !matches!(ctx.arena.get(r), Obj::Exception(_)) {
+        return false;
+    }
+    match obj_get_type(ctx.arena, ctx.types, sub0) {
+        Some(t) => is_exception_type_obj(ctx.arena, t),
+        None => false,
+    }
+}
+
+/// A value's type name as a `String` (empty when the type data
+/// is missing) — the `type_name` helper (`instance_print.rs`),
+/// repeated here because that module keeps it private.
+fn type_name_of(ctx: &CallCtx, value: Value) -> String {
+    let Some(t) = obj_get_type(ctx.arena, ctx.types, value) else {
+        return String::new();
+    };
+    match type_data(ctx.arena, t) {
+        Some(td) => String::from_utf8_lossy(ctx.pool.qstr_str(td.name as u16)).into_owned(),
+        None => String::new(),
+    }
+}
+
+/// Hook-aware `obj_print_exception` (G4/H7): the cause chain
+/// + traceback frames, with the exception line rendered
+/// through `print_helper_hook` so instance args run their
+/// dunders. Mirrors `print_exception_chain` (`obj_ops.rs`)
+/// — the frame loop is copied verbatim; only the final
+/// render differs (and a non-exception value keeps the
+/// ctx-only render exactly).
+pub fn print_exception_hook<'r>(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    exc: Value,
+    resolve: &'r dyn Fn(u32) -> &'r [u8],
+    sink: &mut dyn crate::objects::slots::ByteSink,
+) {
+    print_exception_chain_hook(ctx, state, exc, resolve, 16, sink);
+}
+
+fn print_exception_chain_hook<'r>(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    exc: Value,
+    resolve: &'r dyn Fn(u32) -> &'r [u8],
+    depth: u8,
+    sink: &mut dyn crate::objects::slots::ByteSink,
+) {
+    if depth > 0 && is_exception_instance(ctx.arena, exc) {
+        if let Some(cause) = exception_cause(ctx.arena, exc) {
+            if !cause.is_none() {
+                print_exception_chain_hook(ctx, state, cause, resolve, depth - 1, sink);
+                let _ = sink.write_str(
+                    "\nThe above exception was the direct cause of the following exception:\n\n",
+                );
+            }
+        }
+    }
+    if is_exception_instance(ctx.arena, exc) {
+        // Frames are stored innermost-first; the Zig renderer
+        // iterates from `n - 3` down to 0 — oldest first. No
+        // line numbers: `MICROPY_ENABLE_SOURCE_LINE` is off at
+        // this ROM level (see `print_exception_chain`).
+        let tb = exception_get_traceback(ctx.arena, exc);
+        if !tb.is_empty() {
+            let _ = sink.write_str("Traceback (most recent call last):\n");
+            for frame in tb.iter().rev() {
+                let file = resolve(frame.name);
+                let _ = write!(sink, "  File \"{}\"", String::from_utf8_lossy(file));
+                match frame.block {
+                    Some(b) => {
+                        let name = resolve(b);
+                        let _ = write!(
+                            sink,
+                            ", in {}\n",
+                            String::from_utf8_lossy(name)
+                        );
+                    }
+                    None => {
+                        let _ = sink.write_str("\n");
+                    }
+                }
+            }
+        }
+    }
+    if is_exception_instance(ctx.arena, exc) {
+        print_helper_hook(ctx, state, exc, PrintKind::Exc, sink);
+    } else {
+        obj_print_helper(ctx, ctx.types, exc, PrintKind::Exc, sink);
+    }
+    let _ = sink.write_str("\n");
+}
+
 pub fn print_helper_hook(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -159,6 +409,10 @@ pub fn print_helper_hook(
     kind: PrintKind,
     sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
+    if is_exception_instance(ctx.arena, value) {
+        exception_print_hook(ctx, state, value, kind, sink);
+        return;
+    }
     if is_instance(ctx.arena, value) {
         match render_instance(ctx, state, value, kind) {
             Ok(Some(text)) => {
@@ -285,6 +539,14 @@ pub(crate) fn call_str_ctx(
                     return Ok(new_str_value(ctx, s.as_bytes()));
                 }
             }
+            // G4/H7: an exception arg renders its instance args
+            // through the hook (`str(KeyError(A()))` is `A-str`
+            // on REF); the type-call path below is ctx-only.
+            if is_exception_instance(ctx.arena, arg) {
+                let mut s = String::new();
+                print_helper_hook(ctx, state, arg, PrintKind::Str, &mut s);
+                return Ok(new_str_value(ctx, s.as_bytes()));
+            }
             // E2d: a container renders through the hook-aware
             // helper, so a nested instance's `__repr__` runs
             // (the ctx-only path falls back to `<A object …>`).
@@ -315,6 +577,13 @@ pub(crate) fn call_repr_ctx(
                 if let Some(s) = render_instance(ctx, state, arg, PrintKind::Repr)? {
                     return Ok(new_str_value(ctx, s.as_bytes()));
                 }
+            }
+            // G4/H7: an exception arg renders its instance args
+            // through the hook (see `call_str_ctx`).
+            if is_exception_instance(ctx.arena, arg) {
+                let mut s = String::new();
+                print_helper_hook(ctx, state, arg, PrintKind::Repr, &mut s);
+                return Ok(new_str_value(ctx, s.as_bytes()));
             }
             // E2d: a container renders through the hook-aware
             // helper (see `call_str_ctx`).
@@ -355,6 +624,68 @@ pub(crate) fn call_bool_ctx(
         }
     }
     let r = ctx.types.bool_;
+    call_type_ctx(ctx, state, r, n_args, n_kw, args)
+}
+
+/// `float(x)` through the VM (G4/H1): a 1-arg instance call runs
+/// `__float__` with the real hook; anything else delegates to the
+/// type-call path (`float()`, `float(1.5)`, arg errors).
+/// The original's `mp_obj_get_float_maybe` (`obj.zig:662-690`)
+/// requires the `__float__` result to BE a float object — a
+/// non-float return falls through to the native-base step and
+/// then to `TypeError: can't convert to float`. A raising
+/// `__float__` is swallowed the same way: the unary op returns
+/// NULL, so the conversion fails with TypeError (probed on the
+/// reference: `float(GR())` with a ValueError-raising `__float__`
+/// is `TypeError: can't convert to float`). Both cases fall
+/// through to the type-call path, whose stub-seam slot cannot
+/// run the FunBc dunder and therefore raises exactly that
+/// TypeError. A float-subclass instance WITHOUT `__float__`
+/// falls through the same way (the native-base step in
+/// `obj_get_float_maybe` answers it — F3).
+pub(crate) fn call_float_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if n_args == 1 && n_kw == 0 {
+        if let Some(arg) = args.first().copied() {
+            if is_instance(ctx.arena, arg) {
+                match try_instance_unary_op(ctx, state, UnaryOp::FloatMaybe, arg) {
+                    Ok(Some(v)) => {
+                        if is_float(ctx.arena, ctx.types, v) {
+                            if let Value::Heap(r) = v {
+                                if let Obj::Float(f) = ctx.arena.get(r) {
+                                    return Ok(new_float(ctx, ctx.types, *f));
+                                }
+                            }
+                        }
+                        // A non-float return: fall through to
+                        // the type-call path (TypeError, like
+                        // the original).
+                    }
+                    Ok(None) => {
+                        // No `__float__`: fall through (the
+                        // native-base step answers float
+                        // subclasses).
+                    }
+                    Err(_) => {
+                        // A raising `__float__` is swallowed by
+                        // the original's conversion (see the docs
+                        // above): fall through to the type-call
+                        // path, which raises TypeError. The raise
+                        // was already drained by
+                        // `try_instance_unary_op` /
+                        // `drain_hook_raise`, so no stale pending
+                        // raise survives into the fall-through.
+                    }
+                }
+            }
+        }
+    }
+    let r = ctx.types.float;
     call_type_ctx(ctx, state, r, n_args, n_kw, args)
 }
 
@@ -402,7 +733,16 @@ fn render_print_arg(
     v: Value,
     s: &mut ByteBuf,
 ) -> PyResult<()> {
-    if is_instance(ctx.arena, v) {
+    // G4/H7: an exception arg renders its instance args
+    // through the hook (`print(KeyError(A()))` is `A-str` on
+    // REF); the instance arm below would fall through to the
+    // ctx-only slot path for an exception-subclass instance
+    // with no `__str__`, and an `Obj::Exception` is not an
+    // instance at all.
+    if is_exception_instance(ctx.arena, v) {
+        print_helper_hook(ctx, state, v, PrintKind::Str, s);
+        Ok(())
+    } else if is_instance(ctx.arena, v) {
         match render_instance(ctx, state, v, PrintKind::Str) {
             Ok(Some(text)) => {
                 s.write_bytes(text.as_bytes());
@@ -598,10 +938,16 @@ pub(crate) fn call_print_ctx(
     // E2d: the hook path also runs when an arg is a container
     // (it may hold an instance — the render closure recurses
     // it through `print_helper_hook`); plain scalars still
-    // take the `print_builtin` path below.
+    // take the `print_builtin` path below. G4/H7: an exception
+    // arg likewise takes the hook path (its instance args run
+    // their dunders).
     let has_hook_arg = args[..n_args]
         .iter()
-        .any(|a| is_instance(ctx.arena, *a) || is_container(ctx, *a));
+        .any(|a| {
+            is_instance(ctx.arena, *a)
+                || is_container(ctx, *a)
+                || is_exception_instance(ctx.arena, *a)
+        });
     if !has_hook_arg {
         return crate::runtime::vm_builtins::print_builtin(ctx, &args[..n_args], &pairs)
             .map_err(|e| crate::runtime::vm_ops::exc_from_pyerror(ctx, state, e));
@@ -622,4 +968,37 @@ pub(crate) fn call_print_ctx(
         )
     };
     result.map_err(|e| crate::runtime::vm_seams::drain_hook_raise(ctx, state, e))
+}
+
+/// `__repl_print__` through the VM (G4/H7): the REPL echo —
+/// if the argument is not `None`, print its `repr` followed
+/// by `\n` to stdout (`MP_PLAT_PRINT`, the same fd-1 path
+/// `print` uses with no `file` kwarg), and return `None`
+/// (`modbuiltins.zig:355`, sig (1, 1)). Intercepted by
+/// GcRef identity (see `vm_call_intercept.rs`) so an
+/// exception arg renders its instance args through the hook
+/// (`KeyError(A())` echoes `KeyError(A-repr,)` on REF); the
+/// ctx-only `repl_print_builtin` falls back to
+/// `<A object at …>`.
+pub(crate) fn call_repl_print_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    use crate::objects::strings::mpprint::{mp_print_str, Print, MP_PLAT_PRINT};
+    if n_args != 1 || n_kw != 0 {
+        return Err(crate::runtime::builtin_vm::mismatch(ctx, state));
+    }
+    let arg = args[0];
+    if arg != Value::None {
+        let mut s = ByteBuf::new();
+        print_helper_hook(ctx, state, arg, PrintKind::Repr, &mut s);
+        let mut sink = MP_PLAT_PRINT;
+        let mut print = Print::new(&mut sink);
+        let _ = mp_print_str(&mut print, &s.0);
+        let _ = mp_print_str(&mut print, b"\n");
+    }
+    Ok(Value::None)
 }

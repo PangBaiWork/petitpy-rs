@@ -625,10 +625,11 @@ pub fn array_get_buffer(
 /// (`objarray.zig:703-755`): a heap `Obj::Iterator` (tag
 /// `ARRAY_ITER_TAG`, C9a's iterator convention) whose cursor
 /// advances in place; the offset is derived from the array
-/// bits on the fly (`free` for a view, else 0).
+/// bits on the fly (`free` for a view, else 0). Header is the
+/// `iterator` ROM type (G4/H8 — `mp_type_polymorph_iter`).
 pub fn array_getiter(ctx: &mut CallCtx, self_: Value) -> PyResult<Value> {
     Ok(Value::Heap(ctx.alloc(
-        None,
+        Some(ctx.types.iterator),
         Obj::Iterator(crate::objects::value::IteratorData {
             source: self_,
             index: 0,

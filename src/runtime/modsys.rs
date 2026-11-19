@@ -189,10 +189,11 @@ pub fn print_exception_ctx(
     // resolve closure without borrowing `ctx`
     // (`runtime_utils.rs: print_exc`).
     let pool = ctx.pool;
-    let types = ctx.types;
-    crate::objects::obj_ops::obj_print_exception(
+    // G4/H7: the hook-aware printer — an exception's instance
+    // args run their dunders (see `print_exception_hook`).
+    crate::runtime::builtin_str::print_exception_hook(
         ctx,
-        types,
+        state,
         exc,
         &|id| pool.qstr_str(id as u16),
         &mut out,

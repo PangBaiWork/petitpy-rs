@@ -14,7 +14,12 @@ use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::slots::{BinaryOp, UnaryOp};
 use crate::objects::value::{Obj, Value};
 use crate::runtime::bc::CodeState;
+use crate::runtime::runtime::dunder;
+use crate::runtime::runtime_import::str_bytes;
+use crate::runtime::runtime_method::load_method_maybe;
+use crate::runtime::runtime_names::dict_lookup_qstr;
 use crate::runtime::vm::{Vm, VmState};
+use crate::runtime::vm_call::call_function_ctx;
 use crate::runtime::vm_ops::{exc_from_obj_error, exc_from_pyerror, exc_from_typed, type_error};
 use crate::runtime::vm_rt::{binary_op_ctx, is_true_ctx, pending_exc_or_type_error, unary_op_ctx};
 use crate::objects::objtype::lookup::convert_member_lookup;
@@ -651,6 +656,18 @@ pub fn import_name_ctx(
 /// `runtime_import::import_from`): the `IMPORT_FROM` opcode path.
 /// The name is interned for real (`from_strn` takes `&self`
 /// since C15b).
+///
+/// G4/H9: the `import_name` fallback inside `import_from`
+/// calls a FunBc `__import__` override through the ctx-only
+/// `call_function_n_kw` (`runtime_import.rs`), which cannot run
+/// it — `from pkg import sub` then fails with a bare TypeError
+/// (probed: REF runs the override for `pkg.sub`, Rust rc=1).
+/// The override check lives here (the `import_name_ctx`
+/// precedent): peek the attribute + package, and if the
+/// fallback will run and an override exists, call it through
+/// the VM's real call with `(dot_name, globals, None, True,
+/// 0)`; the ctx-only path below then passes
+/// `override_dict: None`.
 pub fn import_from_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -659,9 +676,21 @@ pub fn import_from_ctx(
 ) -> Result<Value, Value> {
     let globals = Value::Heap(state.globals);
     let next_obj = state.next_builtin;
+    if let Some(custom) = custom_import_override(ctx, state)? {
+        if let Some(dot_q) = import_from_fallback_dot(ctx, state, module, qst) {
+            let args = [
+                Value::Qstr(dot_q),
+                globals,
+                Value::None,
+                Value::Bool(true),
+                Value::SmallInt(0),
+            ];
+            return call_function_ctx(ctx, state, custom, 5, 0, &args);
+        }
+    }
     let builtins = crate::runtime::runtime::Builtins {
         globals: Value::Heap(state.builtins),
-        override_dict: state.builtins_override_dict,
+        override_dict: None,
     };
     let pool = ctx.pool;
     let mut intern = |b: &[u8]| {
@@ -683,6 +712,74 @@ pub fn import_from_ctx(
             crate::runtime::import_search::rt_error_to_value(ctx, state, other)
         }
     })
+}
+
+/// The `__import__` override from the builtins override dict
+/// (`None` = no override): the `import_name_ctx` lookup, shared
+/// here so the `IMPORT_FROM` fallback takes the same VM-level
+/// path. A lookup error is returned mapped (the ctx-only
+/// `import_name` would surface the same error).
+fn custom_import_override(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+) -> Result<Option<Value>, Value> {
+    let Some(od) = state.builtins_override_dict else {
+        return Ok(None);
+    };
+    let import_q = dunder(b"__import__").expect("__import__ is a static qstr");
+    match dict_lookup_qstr(ctx, od, import_q) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(crate::runtime::import_search::rt_error_to_value(
+            ctx, state, e,
+        )),
+    }
+}
+
+/// The fallback submodule's interned `"pkg.name"` (`None` =
+/// the fallback will not run, or the peek is inconclusive):
+/// attribute miss + the module is a package (`__path__`
+/// present) + `__name__` reads as a string + the dotted name
+/// fits the 512-byte buffer — the `import_from` fallback's own
+/// conditions (`runtime_import.rs`), repeated here so the H9
+/// override call only fires where the fallback would. A peek
+/// error returns `None` and the `import_from` call below
+/// reproduces the exact error.
+fn import_from_fallback_dot(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    module: Value,
+    qst: u32,
+) -> Option<u32> {
+    let next_obj = state.next_builtin;
+    // Attribute first: a hit means no fallback.
+    match load_method_maybe(ctx, module, qst, next_obj) {
+        Ok(Some(_)) => return None,
+        Ok(None) => {}
+        Err(_) => return None,
+    }
+    // Package? (`__path__` present).
+    let path_q = dunder(b"__path__").expect("__path__ is a static qstr");
+    match load_method_maybe(ctx, module, path_q, next_obj) {
+        Ok(Some(_)) => {}
+        _ => return None,
+    }
+    // `__name__` as a string; `"pkg.name"` in a 512-byte buffer.
+    let name_attr_q = dunder(b"__name__").expect("__name__ is a static qstr");
+    let pkg_name = match load_method_maybe(ctx, module, name_attr_q, next_obj) {
+        Ok(Some(dest)) => str_bytes(ctx, dest.func)?,
+        _ => return None,
+    };
+    let sub_name = ctx.pool.qstr_str(qst as u16);
+    let total = pkg_name.len() + 1 + sub_name.len();
+    if total > 512 {
+        return None;
+    }
+    let mut dot_name = Vec::with_capacity(total);
+    dot_name.extend_from_slice(&pkg_name);
+    dot_name.push(b'.');
+    dot_name.extend_from_slice(sub_name);
+    let pool = ctx.pool;
+    pool.from_strn(&dot_name).ok().map(u32::from)
 }
 
 /// `mp_import_all` (`runtime.zig:1550-1570` via C14's

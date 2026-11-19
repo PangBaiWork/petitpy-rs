@@ -764,11 +764,11 @@ pub fn set_print(ctx: &mut CallCtx, v: Value, _kind: PrintKind, sink: &mut dyn c
 }
 
 /// `npy_set_getiter` (objset.zig:167-173): an `Obj::Iterator` over
-/// the set, header type `None` until C12 (the dict-view precedent);
-/// `set_it_next` advances it in table order.
+/// the set, header the `iterator` ROM type (G4/H8 —
+/// `mp_type_polymorph_iter`); `set_it_next` advances it in table order.
 pub fn set_getiter(ctx: &mut CallCtx, self_v: Value) -> PyResult<Value> {
     Ok(Value::Heap(ctx.alloc(
-        None,
+        Some(ctx.types.iterator),
         Obj::Iterator(IteratorData {
             source: self_v,
             index: 0,

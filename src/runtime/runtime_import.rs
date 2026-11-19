@@ -30,8 +30,9 @@ use crate::runtime::runtime_names::{dict_lookup_qstr, store_name};
 
 /// The string bytes of a value: a qstr id from the pool, a
 /// heap `Str`'s bytes, else `None` (the Zig's
-/// `mp_obj_str_get_str` returning NULL).
-fn str_bytes(ctx: &CallCtx, v: Value) -> Option<Vec<u8>> {
+/// `mp_obj_str_get_str` returning NULL). `pub(crate)` for the
+/// G4/H9 `import_from` fallback peek (`vm_rt_iter.rs`).
+pub(crate) fn str_bytes(ctx: &CallCtx, v: Value) -> Option<Vec<u8>> {
     match v {
         Value::Qstr(id) => Some(ctx.pool.qstr_str(id as u16).to_vec()),
         Value::Heap(r) => match ctx.arena.get(r) {

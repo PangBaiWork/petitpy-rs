@@ -30,6 +30,7 @@ use super::objdict::ARG_NUM_TYPES_MISMATCH;
 use super::objslice::{slice_indices_polled, SliceError};
 use crate::memory::gc::{CallCtx, GcArena, TypedRaise};
 use crate::runtime::qstr::RuntimeQstr;
+use crate::objects::iters::iter::FLAG_ITER_IS_ITERNEXT;
 use crate::objects::obj::{obj_get_int, ObjError};
 use crate::objects::obj_ops::get_index;
 use crate::objects::primitives::ops::static_qstr_id;
@@ -350,9 +351,8 @@ pub fn range_attr_slot(
 /// `Obj::Iterator` over the range (no `iter_buf` reuse in Rust).
 /// The iterator stores `cur` in `index` (bit-cast) and
 /// `stop`/`step` as `Value::int` results in `extra` (a heap `Int`
-/// when out of the 62-bit window). Header type `None` until C12
-/// (the dict-view precedent); the type's flags are `0x0080`
-/// (`ITER_IS_ITERNEXT`, recorded for C11/C12). `self_v` is rooted
+/// when out of the 62-bit window). Header is the `range_it` ROM
+/// type (G4/H8 — `mp_type_range_it`). `self_v` is rooted
 /// in `ctx.roots.extra` across the allocations (D6: every Value
 /// held across an alloc must be rooted — `alloc_inner` can collect
 /// under the stress rule).
@@ -363,7 +363,7 @@ pub fn range_getiter(ctx: &mut CallCtx, self_v: Value) -> PyResult<Value> {
     let stop_v = Value::int(ctx.arena, Some(ctx.types.int), ctx.roots, stop);
     let step_v = Value::int(ctx.arena, Some(ctx.types.int), ctx.roots, step);
     let it = ctx.alloc(
-        None,
+        Some(ctx.types.range_it),
         Obj::Iterator(IteratorData {
             source: self_v,
             index: start as usize,
@@ -414,6 +414,34 @@ pub fn range_it_next(ctx: &mut CallCtx, iter_v: Value) -> Result<Option<Value>, 
 /// binary_op under full — see the module docs). `make_new` is the
 /// type-call path, wired by C12, not a `TypeData` slot (the
 /// `dict_type_data` precedent).
+/// `mp_type_range_it` ROM (`objrange.zig:213-228`): name
+/// `iterator`, flags `0x0080` (`ITER_IS_ITERNEXT`), iter slot
+/// only, no locals dict. (G4/H8: the header for range
+/// iterators. Distinct from `mp_type_polymorph_iter` although
+/// both are named `iterator` — the reference reports
+/// `type(iter(range(3))) is type(iter([1]))` False.)
+pub fn range_it_type_data(dict: GcRef) -> TypeData {
+    TypeData {
+        name: static_qstr_id(b"iterator").expect("iterator is a static qstr"),
+        flags: FLAG_ITER_IS_ITERNEXT,
+        base: None,
+        mro: Vec::new(),
+        dict,
+        attr: None,
+        make_new: None,
+        bases: None,
+        unary_op: None,
+        binary_op: None,
+        call: None,
+        getiter: Some(|_ctx: &mut CallCtx, self_: Value| Ok(self_)),
+        subscr: None,
+        buffer: None,
+        print: None,
+        namedtuple_fields: None,
+        protocol: None,
+    }
+}
+
 pub fn range_type_data(dict: GcRef) -> TypeData {
     TypeData {
         name: static_qstr_id(b"range").expect("MP_QSTR_range is in the static table"),

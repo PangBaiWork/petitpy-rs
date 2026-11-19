@@ -26,7 +26,7 @@ Final acceptance (F2, master `bdf3c5b` + this lane):
 | Capability matrix (`scripts/run_capability.py`) | 67/67 GREEN |
 | Test-stdlib (`scripts/run_stdlib.py`) | 8/8 |
 | Nano config (`scripts/run_nano.py`) | 454/541, report-only (no Rust nano build exists) |
-| `cargo test --release --lib --tests` | 1734 passed, 0 failed, 1 ignored with `--features unsafe-ffi`; 1726 / 0 / 1 default (master `12e244e` + lane G5) |
+| `cargo test --release --lib --tests` | 1743 passed, 0 failed, 1 ignored with `--features unsafe-ffi`; 1735 / 0 / 1 default (master `f4210de` + lane G4) |
 | `cargo test --release --bins` / `--test entry_cli` | 9 / 45 passed |
 | Benchmark vs reference binary | 0.172x wall-clock (limit ≤ 1.5x; `~/workspace/bench_e3.py`, steady-state run 2) |
 
@@ -190,15 +190,29 @@ pass a gate.
   writes are buffered through a 4096-byte `BufWriter` (G5 P3),
   so `/dev/full` errors now surface at flush/close as on the
   reference.
-- **`float()` of a class defining `__float__` falls through to
-  the native value** (F3): `float(G(1.5))` with `G.__float__`
-  returning 9.9 is 9.9 on the reference, 1.5 on Rust.
+- **`float()` of a class defining `__float__`** (F3, fixed by
+  G4/H1): `float(G(1.5))` with `G.__float__` returning 9.9 is 9.9
+  on both binaries now — the `float` type object is intercepted
+  by GcRef identity and the dunder runs through the VM hook. A
+  raising `__float__` is swallowed into the same `TypeError:
+  can't convert to float` (probed on the reference).
 - **Dict lookup with distinct instances using a FunBc `__eq__`**
   (F3, fixed by G3/H2–H4): the probe comparison, `dict.get` /
   `.pop` / `.setdefault`, and dict-subclass subscripts all run
-  through the VM hook now. Remaining from that family:
-  `str(KeyError(instance))` (exception-arg printing has no hook
-  — it shows the `<Color object at N>` fallback).
+  through the VM hook now.
+- **Exception-arg printing is hook-aware** (F3, fixed by G4/H7):
+  `str(KeyError(A()))` is `A-str`, `repr(KeyError(A()))` is
+  `KeyError(A-repr,)`, uncaught tracebacks and `sys.print_exception`
+  and the REPL echo render instance args through their dunders.
+  A raising `__str__`/`__repr__` on an exception arg falls back
+  to `<E object at N>` (print) or propagates (str/repr builtins);
+  the reference aborts (rc=134, null-pointer panic at
+  `mp_mirrors.zig:745`) there — the abort is not reproduced.
+- **`type(iter(...))` is the `iterator` type** (E1/E2, fixed by
+  G4/H8): sequence iterators carry the `mp_type_polymorph_iter`
+  header, range iterators `mp_type_range_it`, dict iterators
+  `mp_type_dict_view_it` — all named `iterator`, distinct objects
+  exactly as the reference reports them.
 - **Identity-hash values differ by design** (F3): the reference
   prints raw ASLR addresses, Rust prints arena indices. The
   mechanism (stable per object, dicts work) is correct.
@@ -206,7 +220,11 @@ pass a gate.
   with `TypeError: argument num/types mismatch` — which is the
   vendor's own behaviour (`argcheck.zig:43`, G2 P10, pinned by
   test); a `__getitem__`/`__setitem__` on user instances through
-  the API works (G2 P11, pinned by test); non-UTF-8 exec
+  the API works (G2 P11, pinned by test); `ppy_str`/`ppy_repr`
+  run a FunBc `__str__`/`__repr__` through the VM hook (G4/H10,
+  `tests/embed/api_h10_test.c` — 8 checks); a raising dunder
+  falls back to `<B object at …>` with `PPY_OK` (the reference
+  aborts, rc=134 — not reproduced); non-UTF-8 exec
   filenames are lossy; NULL arguments are handled defensively
   where the Zig would fault; nested `ppy_*` calls from a host
   function re-enter through the raw interp pointer
@@ -215,14 +233,16 @@ pass a gate.
   branch (the vendor checks plain `OR` only — probed identical);
   `real_load_maybe` lacks the `__class__`/`__next__` special cases
   (no caller needs them).
-- **E1/E2 leftovers**: `type(iter(s))` is a bare `TypeError`;
-  a dict-subclass `__missing__` reached through the ctx-only slot
-  seams (`instance_subscr_slot`) still yields a bare `TypeError`
-  instead of `KeyError` — the VM path (`try_instance_subscr`)
-  was fixed by G3/H4; no gate coverage for the slot path; the
-  `petitpy-vm` missing-file error prints only the first line
+- **E1/E2 leftovers**: a dict-subclass `__missing__` reached
+  through ctx-only seams yields a bare `TypeError` instead of
+  `KeyError` — the VM path (`try_instance_subscr`) was fixed by
+  G3/H4; no gate coverage for the slot path; the `petitpy-vm`
+  missing-file error prints only the first line
   (`error: FileNotFound`) — the reference's Zig stack trace after
-  it is runtime noise, not reproduced.
+  it is runtime noise, not reproduced. (`type(iter(s))` was a bare
+  `TypeError` — fixed by G4/H8. `from pkg import sub` with a FunBc
+  `__import__` override failed with a bare `TypeError` — fixed by
+  G4/H9.)
 - **The original's own crashes are not mirrored**: where the
   reference aborts (rc=134, e.g. `str.center` with negative width,
   `(a*)*` in `ure`, `sort(key=len)` on ints), Rust raises or

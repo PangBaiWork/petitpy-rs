@@ -562,10 +562,11 @@ pub fn list_subscr(
 }
 
 /// `mp_obj_list_getiter` (`objlist.zig:382-384`): the
-/// polymorph-iter overlay `(list, cur)`.
+/// polymorph-iter overlay `(list, cur)`. Header is the
+/// `iterator` ROM type (G4/H8 — `mp_type_polymorph_iter`).
 pub fn list_getiter(ctx: &mut CallCtx, self_: Value) -> PyResult<Value> {
     Ok(Value::Heap(ctx.alloc(
-        None,
+        Some(ctx.types.iterator),
         Obj::Iterator(crate::objects::value::IteratorData {
             source: self_,
             index: 0,

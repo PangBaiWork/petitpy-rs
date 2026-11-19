@@ -51,6 +51,7 @@ pub(crate) struct D1Bindings {
     pub repr_builtin: Value,
     pub len_builtin: Value,
     pub hash_builtin: Value,
+    pub repl_print_builtin: Value,
     pub format_builtin: Value,
     pub io_module: Value,
 }
@@ -175,10 +176,11 @@ pub(crate) fn bind_d1_builtins(
     let repr_val = mk_var(ctx, "repr", 1, 1, repr_builtin, pairs);
     let _ = mk_var(ctx, "input", 0, 1, input_builtin, pairs);
     // `__repl_print__` (E1): the REPL echo builtin
-    // (`modbuiltins.zig:355`, sig (1, 1)) — a plain
-    // `BuiltinFn`, no interception; the compiler's REPL branch
-    // resolves it on demand.
-    let _ = mk_var(ctx, "__repl_print__", 1, 1, repl_print_builtin, pairs);
+    // (`modbuiltins.zig:355`, sig (1, 1)) — G4/H7 captures the
+    // value so `VmState.repl_print_builtin` can intercept it
+    // by GcRef identity (the hook-aware echo); the compiler's
+    // REPL branch resolves it on demand.
+    let repl_print_val = mk_var(ctx, "__repl_print__", 1, 1, repl_print_builtin, pairs);
     let _ = mk_kw(ctx, "pow", 2, 3, pow_builtin, pow_builtin_kw, pairs);
     let _ = mk_kw(ctx, "round", 1, 2, round_builtin, round_builtin_kw, pairs);
     let open_val = mk_kw(ctx, "open", 1, 255, open_builtin, open_builtin_kw, pairs);
@@ -230,6 +232,7 @@ pub(crate) fn bind_d1_builtins(
         repr_builtin: repr_val,
         len_builtin: len_val,
         hash_builtin: hash_val,
+        repl_print_builtin: repl_print_val,
         format_builtin: format_val,
         io_module,
     }
@@ -563,6 +566,7 @@ impl Vm {
             }
         }
         state.hash_builtin = d1.hash_builtin;
+        state.repl_print_builtin = d1.repl_print_builtin;
         state.format_builtin = d1.format_builtin;
         // F3: the `str.format` method builtin (one `FunBuiltin`
         // object in the str type dict). Looked up by name; a miss

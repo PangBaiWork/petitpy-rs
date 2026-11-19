@@ -100,6 +100,20 @@ pub struct BuiltinTypes {
     /// `iterator`, `FLAG_ITER_IS_ITERNEXT`; `make_view_it`
     /// allocates with this header).
     pub dict_view_it: GcRef,
+    /// `iterator` (G4/H8: the `mp_type_polymorph_iter` ROM type,
+    /// name `iterator`, `FLAG_ITER_IS_ITERNEXT`; the sequence
+    /// iterators — list/tuple/str/bytes/set/frozenset/array/
+    /// deque/getitem — allocate with this header, as the Zig's
+    /// `objlist.zig:572` / `objtuple.zig:296` / `objset.zig:169` /
+    /// `objarray.zig:743` / `objdeque.zig:272` do. Distinct from
+    /// `dict_view_it` and `range_it`: the reference reports
+    /// `type(iter([1])) is type(iter({'a': 1}))` False and
+    /// `type(iter(range(3))) is type(iter([1]))` False.)
+    pub iterator: GcRef,
+    /// `range_it` (G4/H8: the `mp_type_range_it` ROM type, name
+    /// `iterator`, `FLAG_ITER_IS_ITERNEXT`; range iterators
+    /// allocate with this header — `objrange.zig:217`).
+    pub range_it: GcRef,
     /// `socket` (D3: the `socket` module's type object, built by
     /// `build_socket_module` — not by the VM bootstrap, so the
     /// module entry is a plain constructor function per

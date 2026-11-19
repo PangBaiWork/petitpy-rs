@@ -1,0 +1,170 @@
+Lane G4 — VM/dispatch hook family (H1/H7/H8/H10 + H9 stretch)
+Base: master a4f1041 (G0+G2 merged). Worktree: ~/workspace/petitpy-rs-g4-vm-hooks, branch lane/g4-vm-hooks.
+Executor completed 2026-11-19 ~15:3x CST. NOT merged (main agent verifies + merges).
+
+§1 — Acceptance numbers
+----------------------
+Rust-side (cargo test --release --lib --tests / --bins / --test entry_cli):
+- lib 1712 passed / 0 failed / 3 ignored, default (base 1703 + 9 new G4 tests in src/runtime/vm_tests_g4.rs)
+- lib 1720 passed / 0 failed / 3 ignored with --features unsafe-ffi
+- bins 9 passed; entry_cli 45 passed
+- 0 warnings (forced recompile: touch src/lib.rs && cargo build --release, default and feature-ON)
+- 0 unsafe in the lane diff (git diff a4f1041 | grep -c unsafe == 0); largest touched file src/entry/api.rs 1906 lines (< 2500)
+- scripts/check_compile_mpy.py PASS (byte mismatches: 0)
+- scripts/check_frozen.py PASS (23/23, 38,141 bytes)
+
+Six gates (runners with defaults, no --bin except full_gate; outputs in ~/workspace/g4_verify/):
+- full corpus 545/552 — "Full gate: GREEN (matches known-fails baseline exactly)"
+- integration 200/202 default — fail set exactly {select_readable_fd_is_ready, select_timeout_zero_returns_promptly}; 202/202 with --features unsafe-ffi
+- golden 585/585 (works 584/584 + works-native-only 1/1; rust==cpython 576/585)
+- capability 67/67 — "GATE: GREEN (matches the baseline exactly)"
+- stdlib 8/8
+- nano 454/541 (report-only invariant)
+
+C acceptance (F1 commands; the original's api_test.c + host.c UNMODIFIED, linked against the built library):
+- api_test.c vs staticlib: 61/61 PASS, normal + NPY_GC_STRESS=10
+- api_test.c vs cdylib (-Ltarget/release -lpetitpy_rs, LD_LIBRARY_PATH): 61/61 PASS, normal + stress
+- host.c prints exactly "41", rc 0, staticlib + cdylib
+- NEW tests/embed/api_h10_test.c (8 checks): "all passed", staticlib + cdylib x normal/stress
+- 39 ppy_ exports (unchanged; not re-counted this lane — api.rs gained no exports)
+
+Probes (all byte-identical REF vs Rust, in ~/workspace/g4_probe/):
+- h1_float.py PASS (ref rc=1 rust rc=1 — the probe's last case is a TypeError case)
+- h7_keyerr.py, h7b_print.py, h7c_uncaught.py, h7d_uncaught_sub.py: all PASS
+- h7e_repl (REPL echo, h7e_repl.sh + h7e_repl_input.txt): PASS
+- h8_itertype.py, h8b_identity.py: PASS
+- h9_importfrom.py (+ h9pkg/pkg/{__init__,sub}.py fixture): PASS
+- h10_probe.c (4 cases: working / str-raise / repr-raise / nested-raise): ALL PASS on the Rust lib;
+  on the ORIGINAL lib: working ALL PASS, str-raise ABORTS rc=134 (see §4)
+
+§2 — What was built
+-------------------
+H1 — float() runs __float__ (commit 6131427):
+- NEW call_float_ctx in src/runtime/builtin_str.rs: intercepts the float TYPE object by GcRef identity in
+  src/runtime/vm_call_intercept.rs (before the bool_ branch — the str/bool shape, NOT the hash FunBuiltin
+  branch: float is a type object, vm_builtins_bind.rs:262). Runs __float__ through try_instance_unary_op
+  (UnaryOp::FloatMaybe) with the real hook; the result must BE a float (mp_obj_get_float_maybe,
+  obj.zig:662-690) and is re-wrapped with new_float; a non-float return / no dunder / raising __float__
+  falls through to call_type_ctx on ctx.types.float, which raises exactly TypeError: can't convert to
+  float (the raise is drained by try_instance_unary_op/drain_hook_raise, no stale pending raise).
+  Refined probes (REF only): __float__ returning 5 / "x" / None -> TypeError; __float__ raising
+  ValueError("boom") -> TypeError (the raise is SWALLOWED by the conversion — the unary op returns NULL);
+  float subclass without __float__ -> native value; float(1, 2) -> arg mismatch; float([1]) -> TypeError.
+- Tests: 4 new in src/runtime/vm_tests_g4.rs (dunder runs, non-float return is TypeError, raising dunder
+  is swallowed to TypeError, float subclass without dunder still native).
+
+H8 — type(iter(...)) (commit 8a35c61):
+- NEW ROM types in src/runtime/vm_types.rs (built at bootstrap, added to the header-type / fixed-dict /
+  MRO fix-up loops + the BuiltinTypes literal): `iterator` = mp_type_polymorph_iter
+  (src/objects/iters/iter.rs: poly_iter_type_data — name `iterator`, flags 0x0080 ITER_IS_ITERNEXT,
+  getiter returns self) and `range_it` = mp_type_range_it (src/objects/containers/objrange.rs:
+  range_it_type_data, same shape). New fields in src/objects/builtin_types.rs + 8 fixture literals.
+- Header changes: new_iter (iters/iter.rs) allocates with Some(ctx.types.iterator) — covers the getitem
+  + deque iterators and the map/filter/zip/enumerate/reversed intermediates (their make_new_slot
+  wrappers re-stamp, all 5 verified); list_getiter / tuple_getiter / set_getiter / array_getiter
+  allocate with the iterator header; range_getiter with the range_it header.
+- Identity table probed on REF and pinned by test: list/tuple/str/set iterators share ONE type object;
+  range and dict iterators are DIFFERENT type objects with the same name; iter(d) IS iter(d.keys())
+  (both mp_type_dict_view_it — objdict.zig:527, :602; my first test draft wrongly asserted False and
+  was corrected after the probe); iter(it) is it holds; repr(iter([1, 2])) is `<iterator>`.
+- Tests: 2 new in vm_tests_g4.rs (sequence-iterator names/identities/repr, getitem iterator).
+
+H7 — exception args render through the hook (commit d678914):
+- NEW exception_print_hook + exception_print_payload_hook + print_exception_hook (+ chain) in
+  src/runtime/builtin_str.rs: mirrors of exception_print_inner / print_exception_chain (objexcept.rs,
+  obj_ops.rs) with the three arg renders routed through print_helper_hook (single-arg Str, OSError
+  second arg, tuple form). A user __str__/__repr__ on the exception class itself still wins
+  (render_instance first, objtype.zig:1638-1687); with no dunder, the exception-subclass branch writes
+  the subclass name for non-STR kinds and renders the native subobj with PRINT_EXC_SUBCLASS; a raising
+  dunder falls through to the ctx-only slot path (the vendor's print_fallback).
+- print_helper_hook checks is_exception_instance FIRST (before the instance check) — containers holding
+  exceptions render hook-aware too.
+- Wired at every VM-level entry point with state: call_str_ctx / call_repr_ctx (exception branch),
+  render_print_arg + call_print_ctx has_hook_arg (print), print_traceback (src/entry/embed_exec.rs),
+  print_exception_ctx (src/runtime/modsys.rs), and __repl_print__ (NEW call_repl_print_ctx in
+  builtin_str.rs + NEW VmState.repl_print_builtin field in src/runtime/vm.rs, captured in
+  D1Bindings in src/runtime/vm_builtins_bind.rs, intercepted by GcRef identity in
+  src/runtime/vm_call_intercept.rs).
+- Tests: 3 new in vm_tests_g4.rs (str/repr of KeyError/ValueError/user-subclass with instance args,
+  subclass dunder wins, raising dunder propagates via str()).
+- Raising-dunder finding (probed on REF): the reference ABORTS (rc=134, null-pointer panic at
+  mp_mirrors.zig:745 via instance_print, objtype.zig:1679) on str() AND print() of an exception
+  instance whose __str__ raises. Rust keeps the fallback / propagate behavior instead — the documented
+  abort-vs-fallback divergence class (same as a raising __repr__ inside a container); do NOT reproduce.
+
+H10 — ppy_str / ppy_repr with raising __str__ (commit 9a69a25):
+- printed_body in src/entry/api.rs: obj_print_helper -> print_helper_hook (ctx + state were already
+  split there). A working FunBc __str__/__repr__ now runs; nested containers and exception args render
+  through the hook; a raising dunder falls back to `<B object at …>` with PPY_OK (slot semantics).
+- Original behavior pinned EMPIRICALLY: built the original's libpetitpy.a (zig build lib) and probed it
+  with ~/workspace/g4_probe/h10_probe.c — working cases ALL PASS on the original; str(B()) with a
+  raising __str__ ABORTS rc=134 (mp_call_function_1 returns NULL + pending_exc; instance_print blindly
+  prints the NULL result — null-pointer panic at mp_mirrors.zig:745). Documented abort-vs-fallback
+  divergence; do NOT reproduce.
+- NEW tests/embed/api_h10_test.c (8 checks: working dunders, nested container, exception args, three
+  raising-fallback pins). The original's api_test.c runs UNMODIFIED (61/61, see §1). Note: the brief
+  said "extend tests/embed/api_test.c", but that file lives in the ORIGINAL repo (read-only) — the H10
+  checks went into a new file in this repo instead.
+- Probe: ~/workspace/g4_probe/h10_probe.c takes a case arg (working / str-raise / repr-raise /
+  nested-raise; one case per process because the original aborts on the raising cases).
+
+H9 — import_from FunBc fallback (stretch, commit 8db41e1; done after all six gates were green):
+- import_from_ctx in src/runtime/vm_rt_iter.rs: the import_name fallback inside import_from calls a
+  FunBc __import__ override through the ctx-only call_function_n_kw (runtime_import.rs), which cannot
+  run it — `from pkg import sub` failed with a bare TypeError (probed: REF runs the override for
+  `pkg.sub`, Rust rc=1). The override check now lives here (the import_name_ctx precedent): peek the
+  attribute + package (NEW import_from_fallback_dot: attribute miss + __path__ present + __name__ as a
+  string + dotted name fits the 512-byte buffer — import_from's own fallback conditions), and if the
+  fallback will run and an override exists, call it through call_function_ctx with (dot_name, globals,
+  None, True, 0); the ctx-only path below passes override_dict: None. A peek error returns None and
+  the import_from call below reproduces the exact error.
+- str_bytes in src/runtime/runtime_import.rs is now pub(crate) (reused by the peek).
+- No new unit test: the import needs a file package on sys.path; the dual probe is the acceptance.
+
+README.md: Known divergences updated for H1/H7/H8/H9/H10 (fixed bullets rewritten, status-table lib
+counts 1712 default / 1720 feature-ON at lane tip 8db41e1).
+
+§3 — Changed tracked files (28, +1206/-60, including this result file)
+-------------------------------------------
+src/runtime/builtin_str.rs (H1 call_float_ctx; H7 exception_print_hook/print_exception_hook/
+  call_repl_print_ctx + str/repr/print wiring), src/runtime/vm_call_intercept.rs (float + __repl_print__
+  interception), src/runtime/vm.rs (VmState.repl_print_builtin), src/runtime/vm_builtins_bind.rs
+  (D1Bindings.repl_print_builtin), src/runtime/vm_types.rs (iterator + range_it ROM types),
+  src/objects/builtin_types.rs (iterator/range_it fields), src/objects/iters/iter.rs
+  (poly_iter_type_data, new_iter header, doc update), src/objects/containers/objrange.rs
+  (range_it_type_data, range_getiter header), src/objects/containers/objlist.rs,
+  src/objects/containers/objtuple.rs, src/objects/containers/objset.rs,
+  src/objects/containers/objarray_methods.rs (getiter headers), src/runtime/vm_rt_iter.rs (H9
+  import_from_ctx), src/runtime/runtime_import.rs (str_bytes pub(crate)), src/entry/api.rs
+  (printed_body hook), src/entry/embed_exec.rs (print_traceback hook),
+  src/runtime/modsys.rs (print_exception_ctx hook), src/runtime/vm_tests_g4.rs (NEW, 9 tests),
+  tests/embed/api_h10_test.c (NEW, 8 C checks), README.md (divergences + lib counts),
+  + 8 fixture literals (vm.rs, containers/tests.rs, obj_tests.rs, objtype_tests.rs,
+  primitives/tests.rs, primitives/tests_dispatch.rs, objstr_tests.rs, bc_tests.rs).
+NOT touched: docs/任务书.md, docs/agent-rules.md, Cargo.toml/features, src/modules/modselect.rs,
+G3's files (map.rs/objdict.rs/objlist.rs/set paths — objlist.rs was touched ONLY at the list_getiter
+header line, which is H8's own site, not a G3 map path; no G3 conflicts observed).
+
+§4 — Leftovers / notes for the merger
+--------------------------------------
+- All five items (H1/H7/H8/H10 + H9 stretch) are done and green; nothing in the G4 scope remains open.
+- Two corrected premises (both caught by probing, not by review): (1) my first H8 test draft asserted
+  `type(iter(d)) is type(iter(d.keys()))` False — the reference says True (both mp_type_dict_view_it);
+  the test asserts the probed behavior. (2) The H10 brief premise ("ppy_str with raising __str__")
+  implied a PPY_ERROR on the original — the original ABORTS (rc=134) instead; Rust keeps the fallback
+  with PPY_OK (documented divergence class).
+- The `write!` macro on a `&mut dyn ByteSink` needs no `use std::fmt::Write` (it resolves through the
+  ByteSink: fmt::Write supertrait) — two such imports added in the H7 commit were removed again
+  (folded into the H10 commit).
+- My getitem-iterator unit test first used a `__getitem__` that never raises IndexError, so
+  `list(it_g)` was infinite and OOM-killed a test run (6 GiB VM). Fixed in the test (raise at i >= 2);
+  not a code bug.
+- One service restart killed the first six-gate script after stdlib (nano.txt was left empty); the
+  missing nano + feature-ON runs were rerun afterwards — all numbers above are from the reruns on the
+  final tree (final default-gate rerun after H9: lib 1712, full GREEN, integration select x2, golden
+  585/585, capability GREEN, stdlib 8/8, nano 454/541; feature-ON lib 1720, integration 202/202).
+- The `run_integration.py --bin <relative>` form is broken (the runner chdirs to the orig repo, so a
+  relative path resolves there: "interpreter not found"). Always run gate runners with NO args.
+- G3 was still running when this lane finished; the H8 objlist.rs touch is a single header line in
+  list_getiter — rebase carefully at merge time. The lane base is a4f1041 (pre-G3-merge); rebase onto
+  current master, full test in the rebased tree, then merge --no-ff per the lane discipline.

@@ -331,9 +331,32 @@ os.rmdir(d)
     );
     assert_eq!(name, "OSError");
     assert_eq!(value, "22");
-    let (name, value) = fx.run_err("import os\nos.lseek(1, 0, 0)\n");
-    assert_eq!(name, "OSError");
-    assert_eq!(value, "29");
+    // `os.lseek(1, 0, 0)` on stdio: on the default build this
+    // is always ESPIPE(29) (no `Seek` on stdio). Under
+    // `--features unsafe-ffi` (G6a) the real `lseek(2)` runs,
+    // so the outcome depends on what fd 1 is in the test
+    // process — libtest's output capture makes it a regular
+    // temp file (seek succeeds, returns 0), while a pipe/tty
+    // gives ESPIPE. Both are correct kernel answers; the
+    // piped case is pinned by the subprocess test
+    // `g6a_lseek_stdio_file`/`lseek_stdio_pipe` probe instead.
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        let (name, value) = fx.run_err("import os\nos.lseek(1, 0, 0)\n");
+        assert_eq!(name, "OSError");
+        assert_eq!(value, "29");
+    }
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        match fx.run("import os\nx = os.lseek(1, 0, 0)\n") {
+            Ok(_) => {}
+            Err(VmError::Raised(exc)) => {
+                assert_eq!(fx.exc_name(exc), "OSError");
+                assert_eq!(fx.exc_value(exc), "29");
+            }
+            Err(e) => panic!("module failed without raising: {e:?}"),
+        }
+    }
 }
 
 #[test]

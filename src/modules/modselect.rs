@@ -26,9 +26,10 @@
 //!   `/proc/self/fd` re-open is Linux-only and wrong for
 //!   regular files — a separate offset);
 //! - a socket fd (see `modsocket::socket_probe`) is
-//!   `Unprobable` (stream / listener / unbound / foreign)
-//!   or `Bare` (a `fromfd` fd with no owned object —
-//!   `EBADF`, the existing I/O-on-foreign-fd rule);
+//!   `Unprobable` (any socket in the table — stream /
+//!   listener / unbound / datagram, INET or UNIX);
+//!   `Bare` is gone with H-socket's `fromfd` cut, so an
+//!   unknown fd falls through to the os fd table / `EBADF`;
 //! - otherwise the fd must be in `state.os_fds` (a cloned
 //!   `File` is taken for the monitor); unknown → `EBADF`.
 //!
@@ -182,7 +183,6 @@ fn resolve_fd_number(ctx: &mut CallCtx, state: &mut VmState, fd: i64) -> Result<
         use crate::modules::modsocket::{socket_probe, SocketProbe};
         if let Some(p) = socket_probe(fd) {
             return match p {
-                SocketProbe::Bare => Err(errno_exc(ctx, state, EBADF)),
                 SocketProbe::Unprobable => Ok(ResolvedFd::Socket),
             };
         }

@@ -518,14 +518,21 @@ pub struct FileData {
 /// `File` in an `Rc<RefCell<..>>` because `Obj` derives
 /// `Clone` (a plain `File` is not `Clone`); cloning shares
 /// the handle, exactly like aliasing the same file object in
-/// Python. Stdio variants are markers: the handles are the
-/// process-global `std::io::{stdin,stdout,stderr}`, borrowed
-/// per operation — there is no safe `std` API to build an
-/// owned `File` from a raw fd (`from_raw_fd` is `unsafe`,
-/// and the tree is `unsafe`-free).
+/// Python. The `File` is wrapped in a `BufWriter` (capacity
+/// 4096 — glibc's default buffer size for files, `st_blksize`)
+/// because the original writes through libc `fwrite` on a
+/// `FILE*` (`file_io.zig:172`): small writes sit in the buffer
+/// and only surface errors at flush/close. A `BufWriter`
+/// flushes on `seek` and on drop (drop ignores flush errors,
+/// like the original's `_ = fclose(fp)`). Stdio variants are
+/// markers: the handles are the process-global
+/// `std::io::{stdin,stdout,stderr}`, borrowed per operation —
+/// there is no safe `std` API to build an owned `File` from a
+/// raw fd (`from_raw_fd` is `unsafe`, and the tree is
+/// `unsafe`-free).
 #[derive(Clone, Debug)]
 pub enum FileHandle {
-    Owned(std::rc::Rc<std::cell::RefCell<std::fs::File>>),
+    Owned(std::rc::Rc<std::cell::RefCell<std::io::BufWriter<std::fs::File>>>),
     Stdin,
     Stdout,
     Stderr,

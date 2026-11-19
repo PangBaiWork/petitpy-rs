@@ -6,3 +6,11 @@
 # fallback path inside the script).
 [target.aarch64-unknown-linux-gnu]
 linker = "scripts/zig-cc-aarch64.sh"
+
+# Windows port: cross-compile target x86_64-pc-windows-gnu, same
+# Zig-wrapper pattern as aarch64 above. Local cross-check only —
+# CI builds the Windows artifact with the MSVC target
+# (x86_64-pc-windows-msvc) on windows-latest; the gnu target is
+# the compile proxy here (both targets lack `std::os::unix`).
+[target.x86_64-pc-windows-gnu]
+linker = "scripts/zig-cc-windows.sh"

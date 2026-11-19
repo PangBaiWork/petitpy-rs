@@ -63,7 +63,7 @@ use crate::objects::slots::{BuiltinFn, BuiltinKwFn};
 use crate::runtime::raise::raise_os_error;
 use crate::runtime::runtime_call::call_function_1;
 use crate::runtime::vm::VmState;
-use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 pub const EINVAL: i32 = 22;
@@ -211,6 +211,7 @@ fn store(ctx: &mut CallCtx, dict: Value, name: &str, value: Value) {
 
 /// `os.urandom(n)` (`modos.zig:271-290`).
 pub fn os_urandom_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    #[cfg(unix)]
     use std::io::Read;
     let n = arg_int(ctx, args[0])?;
     if n < 0 {
@@ -222,29 +223,66 @@ pub fn os_urandom_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
     if n > 4096 {
         return Err(raise_os_error(ctx, EFBIG));
     }
-    let mut f = std::fs::File::open("/dev/urandom").map_err(|e| os_err(ctx, &e))?;
-    let mut buf = vec![0u8; n as usize];
-    let mut off = 0usize;
-    while off < buf.len() {
-        match f.read(&mut buf[off..]) {
-            Ok(0) => return Err(raise_os_error(ctx, EIO)),
-            Ok(got) => off += got,
-            Err(e) => return Err(os_err(ctx, &e)),
+    #[cfg(unix)]
+    let buf = {
+        let mut f = std::fs::File::open("/dev/urandom").map_err(|e| os_err(ctx, &e))?;
+        let mut buf = vec![0u8; n as usize];
+        let mut off = 0usize;
+        while off < buf.len() {
+            match f.read(&mut buf[off..]) {
+                Ok(0) => return Err(raise_os_error(ctx, EIO)),
+                Ok(got) => off += got,
+                Err(e) => return Err(os_err(ctx, &e)),
+            }
         }
-    }
+        buf
+    };
+    #[cfg(not(unix))]
+    let buf = {
+        // No `/dev/urandom` and no OS-entropy API in pure
+        // std: a xorshift seeded from the wall clock, the
+        // process id and a per-call counter. This is NOT
+        // cryptographic randomness — a documented Windows
+        // limitation (the original has no Windows build to
+        // match against).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static SEED: AtomicU64 = AtomicU64::new(0);
+        let mut x = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9e3779b97f4a7c15)
+            ^ ((std::process::id() as u64) << 32)
+            ^ SEED.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
+        if x == 0 {
+            x = 0x2545F4914F6CDD1D;
+        }
+        let mut buf = vec![0u8; n as usize];
+        for b in buf.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x >> 32) as u8;
+        }
+        buf
+    };
     Ok(new_bytes(ctx, ctx.types, &buf))
 }
 
 /// `os.getcwd()` (`modos.zig:398-402`).
 pub fn os_getcwd_builtin(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> {
     let cwd = std::env::current_dir().map_err(|e| os_err(ctx, &e))?;
-    Ok(new_str(ctx, ctx.types, cwd.as_os_str().as_bytes()))
+    Ok(new_str(
+        ctx,
+        ctx.types,
+        &crate::support::os_str::os_str_as_bytes(cwd.as_os_str()),
+    ))
 }
 
 /// `os.chdir(path)` (`modos.zig:404-408`).
 pub fn os_chdir_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let path = path_arg(ctx, args[0])?;
-    std::env::set_current_dir(std::ffi::OsStr::from_bytes(&path))
+    std::env::set_current_dir(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| os_err(ctx, &e))?;
     Ok(Value::None)
 }
@@ -255,8 +293,12 @@ fn getenv_impl(
     default: Option<Value>,
 ) -> PyResult<Value> {
     let name = path_arg(ctx, name)?;
-    match std::env::var_os(std::ffi::OsStr::from_bytes(&name)) {
-        Some(v) => Ok(new_str(ctx, ctx.types, v.as_bytes())),
+    match std::env::var_os(crate::support::os_str::os_string_from_bytes(&name)) {
+        Some(v) => Ok(new_str(
+            ctx,
+            ctx.types,
+            &crate::support::os_str::os_str_as_bytes(&v),
+        )),
         None => Ok(default.unwrap_or(Value::None)),
     }
 }
@@ -299,8 +341,16 @@ pub fn os_environ_builtin(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value>
     let dict_v = dict_new(ctx, vars.len());
     let types: &BuiltinTypes = ctx.types;
     for (k, v) in vars {
-        let key = new_str(ctx, types, k.as_bytes());
-        let val = new_str(ctx, types, v.as_bytes());
+        let key = new_str(
+            ctx,
+            types,
+            &crate::support::os_str::os_str_as_bytes(&k),
+        );
+        let val = new_str(
+            ctx,
+            types,
+            &crate::support::os_str::os_str_as_bytes(&v),
+        );
         dict_store(ctx, dict_v, key, val).map_err(|e| ctx.record_typed(e))?;
     }
     Ok(dict_v)
@@ -314,8 +364,8 @@ pub fn os_putenv_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         return Err(raise_os_error(ctx, EINVAL));
     }
     std::env::set_var(
-        std::ffi::OsStr::from_bytes(&name),
-        std::ffi::OsStr::from_bytes(&value),
+        crate::support::os_str::os_string_from_bytes(&name),
+        crate::support::os_str::os_string_from_bytes(&value),
     );
     Ok(Value::None)
 }
@@ -326,7 +376,7 @@ pub fn os_unsetenv_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value>
     if name.is_empty() || name.contains(&b'=') {
         return Err(raise_os_error(ctx, EINVAL));
     }
-    std::env::remove_var(std::ffi::OsStr::from_bytes(&name));
+    std::env::remove_var(crate::support::os_str::os_string_from_bytes(&name));
     Ok(Value::None)
 }
 
@@ -334,7 +384,7 @@ pub fn os_unsetenv_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value>
 /// object for both names (`modos.zig:431-435`).
 pub fn os_unlink_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let path = path_arg(ctx, args[0])?;
-    std::fs::remove_file(std::ffi::OsStr::from_bytes(&path))
+    std::fs::remove_file(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| os_err(ctx, &e))?;
     Ok(Value::None)
 }
@@ -344,8 +394,8 @@ pub fn os_rename_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let src = path_arg(ctx, args[0])?;
     let dst = path_arg(ctx, args[1])?;
     std::fs::rename(
-        std::ffi::OsStr::from_bytes(&src),
-        std::ffi::OsStr::from_bytes(&dst),
+        crate::support::os_str::os_string_from_bytes(&src),
+        crate::support::os_str::os_string_from_bytes(&dst),
     )
     .map_err(|e| os_err(ctx, &e))?;
     Ok(Value::None)
@@ -353,15 +403,23 @@ pub fn os_rename_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 
 /// `os.mkdir(path[, mode])` (`modos.zig:444-449`).
 pub fn os_mkdir_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    // Windows has no per-create permission bits: the mode
+    // argument is parsed (and validated) but ignored there.
+    #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt;
     let path = path_arg(ctx, args[0])?;
     let mode: u32 = match args.get(1) {
         Some(v) => arg_int(ctx, *v)? as u32,
         None => 0o777,
     };
-    std::fs::DirBuilder::new()
-        .mode(mode)
-        .create(std::ffi::OsStr::from_bytes(&path))
+    #[cfg(not(unix))]
+    let _ = mode;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let _ = builder.mode(mode);
+    builder
+        .create(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| os_err(ctx, &e))?;
     Ok(Value::None)
 }
@@ -369,7 +427,7 @@ pub fn os_mkdir_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// `os.rmdir(path)` (`modos.zig:451-455`).
 pub fn os_rmdir_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let path = path_arg(ctx, args[0])?;
-    std::fs::remove_dir(std::ffi::OsStr::from_bytes(&path))
+    std::fs::remove_dir(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| os_err(ctx, &e))?;
     Ok(Value::None)
 }
@@ -392,20 +450,71 @@ fn stat_fields() -> Vec<u32> {
 /// Zig's `@intCast`); out-of-window values allocate a heap
 /// int (the Zig tag-wraps instead — unobservable for real
 /// files; see §4).
+/// Synthetic `st_mode`-style permission bits for Windows:
+/// `0o666` for files, `0o777` for directories, write bits
+/// cleared when read-only. (Unix uses the real `mode()`.)
+#[cfg(not(unix))]
+fn win_perm_bits(md: &std::fs::Metadata) -> u32 {
+    let mut m: u32 = if md.is_dir() { 0o777 } else { 0o666 };
+    if md.permissions().readonly() {
+        m &= !0o222;
+    }
+    m
+}
+
 fn stat_result(ctx: &mut CallCtx, md: &std::fs::Metadata) -> Value {
     let types: &BuiltinTypes = ctx.types;
     let int = |ctx: &mut CallCtx, n: i64| Value::int(ctx.arena, Some(types.int), ctx.roots, n);
+    // `MetadataExt` (`mode`/`ino`/`dev`/`nlink`/`uid`/`gid`/
+    // `atime`/`mtime`/`ctime`) is Unix-only. On Windows the
+    // mode is synthetic (file-type bits + `win_perm_bits`),
+    // there is no inode/device/uid/gid (0, 0, 1, 0, 0), and
+    // the times come from accessed/modified/created.
+    #[cfg(unix)]
+    let (mode, ino, dev, nlink, uid, gid, atime, mtime, ctime) = (
+        md.mode() as i64,
+        md.ino() as i64,
+        md.dev() as i64,
+        md.nlink() as i64,
+        md.uid() as i64,
+        md.gid() as i64,
+        md.atime(),
+        md.mtime(),
+        md.ctime(),
+    );
+    #[cfg(not(unix))]
+    let (mode, ino, dev, nlink, uid, gid, atime, mtime, ctime) = {
+        use std::time::UNIX_EPOCH;
+        let secs = |t: std::io::Result<std::time::SystemTime>| {
+            t.ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        };
+        let mode: u32 = if md.is_dir() { 0o040000 } else { 0o100000 } | win_perm_bits(md);
+        (
+            mode as i64,
+            0,
+            0,
+            1,
+            0,
+            0,
+            secs(md.accessed()),
+            secs(md.modified()),
+            secs(md.created()),
+        )
+    };
     let items = vec![
-        int(ctx, md.mode() as i64),
-        int(ctx, md.ino() as i64),
-        int(ctx, md.dev() as i64),
-        int(ctx, md.nlink() as i64),
-        int(ctx, md.uid() as i64),
-        int(ctx, md.gid() as i64),
-        int(ctx, md.size() as i64),
-        int(ctx, md.atime()),
-        int(ctx, md.mtime()),
-        int(ctx, md.ctime()),
+        int(ctx, mode),
+        int(ctx, ino),
+        int(ctx, dev),
+        int(ctx, nlink),
+        int(ctx, uid),
+        int(ctx, gid),
+        int(ctx, md.len() as i64),
+        int(ctx, atime),
+        int(ctx, mtime),
+        int(ctx, ctime),
     ];
     attrtuple_new(ctx, types.attrtuple, stat_fields(), items)
 }
@@ -413,7 +522,7 @@ fn stat_result(ctx: &mut CallCtx, md: &std::fs::Metadata) -> Value {
 /// `os.stat(path)` (`modos.zig:514-519`).
 pub fn os_stat_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let path = path_arg(ctx, args[0])?;
-    let md = std::fs::metadata(std::ffi::OsStr::from_bytes(&path))
+    let md = std::fs::metadata(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| os_err(ctx, &e))?;
     Ok(stat_result(ctx, &md))
 }
@@ -421,7 +530,7 @@ pub fn os_stat_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// `os.lstat(path)` (`modos.zig:521-526`).
 pub fn os_lstat_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let path = path_arg(ctx, args[0])?;
-    let md = std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(&path))
+    let md = std::fs::symlink_metadata(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| os_err(ctx, &e))?;
     Ok(stat_result(ctx, &md))
 }
@@ -429,7 +538,7 @@ pub fn os_lstat_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// `os.listdir(path)` (`modos.zig:530-551`).
 pub fn os_listdir_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let path = path_arg(ctx, args[0])?;
-    let rd = std::fs::read_dir(std::ffi::OsStr::from_bytes(&path))
+    let rd = std::fs::read_dir(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| os_err(ctx, &e))?;
     let mut items = Vec::new();
     for entry in rd {
@@ -437,7 +546,7 @@ pub fn os_listdir_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
         items.push(new_str(
             ctx,
             ctx.types,
-            entry.file_name().as_bytes(),
+            &crate::support::os_str::os_str_as_bytes(&entry.file_name()),
         ));
     }
     Ok(Value::Heap(new_list(ctx, ctx.types.list, &items)))
@@ -447,9 +556,9 @@ pub fn os_listdir_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
 /// truncated to 4095 bytes (the Zig's `buf.len - 1`).
 pub fn os_readlink_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let path = path_arg(ctx, args[0])?;
-    let target = std::fs::read_link(std::ffi::OsStr::from_bytes(&path))
+    let target = std::fs::read_link(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| os_err(ctx, &e))?;
-    let mut bytes = target.as_os_str().as_bytes().to_vec();
+    let mut bytes = crate::support::os_str::os_str_as_bytes(target.as_os_str());
     bytes.truncate(4095);
     Ok(new_str(ctx, ctx.types, &bytes))
 }
@@ -458,11 +567,31 @@ pub fn os_readlink_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value>
 pub fn os_symlink_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let target = path_arg(ctx, args[0])?;
     let linkpath = path_arg(ctx, args[1])?;
+    #[cfg(unix)]
     std::os::unix::fs::symlink(
-        std::ffi::OsStr::from_bytes(&target),
-        std::ffi::OsStr::from_bytes(&linkpath),
+        crate::support::os_str::os_string_from_bytes(&target),
+        crate::support::os_str::os_string_from_bytes(&linkpath),
     )
     .map_err(|e| os_err(ctx, &e))?;
+    #[cfg(not(unix))]
+    {
+        // Windows needs to know the target kind up front
+        // (`symlink_file` vs `symlink_dir`); a dangling
+        // target reads as a file. Creating a symlink also
+        // needs Developer Mode or elevation — otherwise this
+        // raises EPERM, as the OS reports it.
+        let target_os = crate::support::os_str::os_string_from_bytes(&target);
+        let link_os = crate::support::os_str::os_string_from_bytes(&linkpath);
+        let r = if std::fs::metadata(&target_os)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            std::os::windows::fs::symlink_dir(&target_os, &link_os)
+        } else {
+            std::os::windows::fs::symlink_file(&target_os, &link_os)
+        };
+        r.map_err(|e| os_err(ctx, &e))?;
+    }
     Ok(Value::None)
 }
 
@@ -480,8 +609,8 @@ pub fn os_symlink_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
 pub fn os_access_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let path = path_arg(ctx, args[0])?;
     let mode = arg_int(ctx, args[1])?;
-    let path = std::ffi::OsStr::from_bytes(&path);
-    let ok = access_impl(path, mode);
+    let path = crate::support::os_str::os_string_from_bytes(&path);
+    let ok = access_impl(&path, mode);
     Ok(Value::Bool(ok))
 }
 
@@ -498,7 +627,10 @@ fn access_impl(path: &std::ffi::OsStr, mode: i64) -> bool {
     if mode == 0 {
         return true;
     }
+    #[cfg(unix)]
     let mode_bits = md.mode();
+    #[cfg(not(unix))]
+    let mode_bits = win_perm_bits(&md);
     let is_dir = md.is_dir();
     if mode & 4 != 0 {
         let readable = if is_dir {
@@ -528,14 +660,28 @@ fn access_impl(path: &std::ffi::OsStr, mode: i64) -> bool {
 
 /// `os.chmod(path, mode)` (`modos.zig:357-362`).
 pub fn os_chmod_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let path = path_arg(ctx, args[0])?;
     let mode = arg_int(ctx, args[1])? as u32;
+    #[cfg(unix)]
     std::fs::set_permissions(
-        std::ffi::OsStr::from_bytes(&path),
+        crate::support::os_str::os_string_from_bytes(&path),
         std::fs::Permissions::from_mode(mode),
     )
     .map_err(|e| os_err(ctx, &e))?;
+    #[cfg(not(unix))]
+    {
+        // Windows has no Unix permission bits: only the
+        // read-only flag exists, so `chmod` sets or clears
+        // it from the write bits.
+        let path_os = crate::support::os_str::os_string_from_bytes(&path);
+        let mut perm = std::fs::metadata(&path_os)
+            .map_err(|e| os_err(ctx, &e))?
+            .permissions();
+        perm.set_readonly(mode & 0o222 == 0);
+        std::fs::set_permissions(&path_os, perm).map_err(|e| os_err(ctx, &e))?;
+    }
     Ok(Value::None)
 }
 
@@ -560,10 +706,11 @@ pub fn os_chown_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         (false, true) => format!("{uid}"),
         (false, false) => format!("{uid}:{gid}"),
     };
+    let path_os = crate::support::os_str::os_string_from_bytes(&path);
     run_bin(
         ctx,
         "chown",
-        &[std::ffi::OsStr::new(&spec), std::ffi::OsStr::from_bytes(&path)],
+        &[std::ffi::OsStr::new(&spec), &path_os],
     )?;
     Ok(Value::None)
 }

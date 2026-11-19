@@ -39,8 +39,10 @@
 //! process stdout/stderr directly, as `print()` does today.
 
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(not(unix))]
+use crate::runtime::modos_fd::alloc_win_fd;
 
 use crate::memory::gc::CallCtx;
 use crate::objects::obj::FLAG_ITER_IS_STREAM;
@@ -717,12 +719,20 @@ fn open_impl(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         Ok(parsed) => parsed,
         Err(errno) => return Err(raise_os_error(ctx, errno)),
     };
-    let path_os = std::ffi::OsStr::from_bytes(&path);
+    let path_os = crate::support::os_str::os_string_from_bytes(&path);
     let file = match opts.open(path_os) {
         Ok(f) => f,
         Err(e) => return Err(io_err(ctx, e)),
     };
+    // The fd stored on the file object (`fileno()`): the real
+    // kernel fd on Unix, a synthetic id on Windows (see
+    // `alloc_win_fd` — the object is not registered in the
+    // `os.open` table, exactly as on Unix, where `os.close`
+    // of a file's fd is EBADF on the default build, U3).
+    #[cfg(unix)]
     let fd = file.as_raw_fd();
+    #[cfg(not(unix))]
+    let fd = alloc_win_fd();
     let type_ = if binary {
         ctx.types.fileio
     } else {

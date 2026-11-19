@@ -30,7 +30,10 @@ use crate::modules::modpwd::build_pwd_module;
 use crate::modules::modre::build_re_module;
 use crate::modules::modselect::build_select_module;
 use crate::modules::modsignal::build_signal_module;
+#[cfg(unix)]
 use crate::modules::modsocket::build_socket_module;
+#[cfg(windows)]
+use crate::modules::modsocket_win::build_socket_module;
 use crate::modules::modstruct::build_struct_module;
 use crate::modules::modsubprocess::build_subprocess_module;
 use crate::modules::modtime::build_time_module;

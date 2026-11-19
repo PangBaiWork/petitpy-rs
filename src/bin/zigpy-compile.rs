@@ -72,16 +72,14 @@
 //!   code path that can print them.
 
 use std::env;
-use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
 use std::process;
 
 use petitpy_rs::compiler::bridge::compile_to_mpy_named_debug;
 use petitpy_rs::compiler::compile::CompileError;
 use petitpy_rs::compiler::parser::InputKind;
+use petitpy_rs::support::os_str::{os_str_as_bytes, os_string_from_bytes};
 
 // NOTE: deliberately NOT read from build_options (main.zig header
 // comment). The version string is small enough to inline; refresh it
@@ -276,8 +274,8 @@ fn default_output_path(input: &[u8]) -> Vec<u8> {
 // File I/O (mirrors main.zig read_file_libc / write_file_libc).
 // ---------------------------------------------------------------------------
 
-fn path_from_bytes(bytes: &[u8]) -> &Path {
-    Path::new(OsStr::from_bytes(bytes))
+fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
+    std::path::PathBuf::from(os_string_from_bytes(bytes))
 }
 
 fn read_err_line(path: &[u8], err: &[u8]) -> Vec<u8> {
@@ -436,7 +434,7 @@ fn compile_one(input_path: &[u8], output_path: &[u8], source_name: &str) -> bool
 fn main() {
     // argv as raw bytes (Zig `[:0]const u8` argv, argv[0] = program name).
     let argv: Vec<Vec<u8>> = env::args_os()
-        .map(|a| a.as_bytes().to_vec())
+        .map(|a| os_str_as_bytes(&a))
         .collect();
 
     let args = match parse_args(&argv) {

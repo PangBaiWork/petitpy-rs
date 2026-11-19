@@ -17,6 +17,7 @@
 
 pub mod errno;
 pub mod ffi;
+pub mod os_str;
 pub mod output;
 pub mod readline;
 pub mod smallint;

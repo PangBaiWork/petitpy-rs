@@ -586,12 +586,15 @@ impl Vm {
         // `std.fs.path.dirname` returns "" for a bare filename).
         // Byte-exact: `Path::parent` on the raw `OsStr`, no
         // lossy conversion (a non-UTF-8 directory must land in
-        // `sys.path[0]` as-is, as on the reference).
-        use std::os::unix::ffi::OsStrExt;
-        let dir: Vec<u8> = std::path::Path::new(std::ffi::OsStr::from_bytes(script))
-            .parent()
-            .map(|p| p.as_os_str().as_bytes().to_vec())
-            .unwrap_or_default();
+        // `sys.path[0]` as-is, as on the reference) — on
+        // Windows the path is the lossy UTF-8 rendering (see
+        // `support::os_str`).
+        let dir: Vec<u8> = std::path::Path::new(
+            &crate::support::os_str::os_string_from_bytes(script),
+        )
+        .parent()
+        .map(|p| crate::support::os_str::os_str_as_bytes(p.as_os_str()))
+        .unwrap_or_default();
         let mut paths = self.state.sys_path.clone();
         if !paths.is_empty() {
             paths[0] = dir;

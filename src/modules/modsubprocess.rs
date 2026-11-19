@@ -58,8 +58,11 @@
 //!   string through to `execvpe`.
 
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::io::{AsFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(feature = "unsafe-ffi")]
 use std::os::unix::process::CommandExt;
@@ -236,13 +239,26 @@ fn stdio_for(ctx: &mut CallCtx, mode: i64, role: usize) -> PyResult<Stdio> {
             if role == 1 {
                 Ok(Stdio::inherit())
             } else {
-                // A dup of the parent's stdout (fd 1), via
-                // `as_fd` + `try_clone_to_owned` (safe).
-                let owned = std::io::stdout()
-                    .as_fd()
-                    .try_clone_to_owned()
-                    .map_err(|e| io_os_error(ctx, e))?;
-                Ok(Stdio::from(owned))
+                // A dup of the parent's stdout (fd 1 / handle),
+                // via `as_fd` / `as_handle` + `try_clone_to_owned`
+                // (safe).
+                #[cfg(unix)]
+                {
+                    let owned = std::io::stdout()
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .map_err(|e| io_os_error(ctx, e))?;
+                    Ok(Stdio::from(owned))
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::os::windows::io::AsHandle;
+                    let owned = std::io::stdout()
+                        .as_handle()
+                        .try_clone_to_owned()
+                        .map_err(|e| io_os_error(ctx, e))?;
+                    Ok(Stdio::from(owned))
+                }
             }
         }
         DEVNULL => Ok(Stdio::null()),
@@ -462,6 +478,17 @@ fn spawn_and_wait(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         int_arg(ctx, args[6])?,
         int_arg(ctx, args[7])?,
     ];
+    // Windows has no shared fd to dup2 onto stderr (no
+    // `pre_exec`, no Unix socket pair): `stderr=STDOUT` over
+    // a piped stdout gets its own pipe instead, drained
+    // separately below — the two streams are not interleaved
+    // as on Unix, but no output is lost.
+    #[cfg(windows)]
+    let modes = if modes[1] == PIPE && modes[2] == STDOUT {
+        [modes[0], modes[1], PIPE]
+    } else {
+        modes
+    };
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     if let Some(env) = &env {
@@ -491,8 +518,12 @@ fn spawn_and_wait(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     // writable fd the child sees as both 1 and 2; the parent
     // drains the other end. (A socket is not a pipe, but the
     // child only writes bytes to it; ordering is preserved.)
+    // Unix-only: on Windows the modes were remapped above so
+    // this arm never runs (see the `shared_read` match).
+    #[cfg(unix)]
     let mut shared_read: Option<UnixStream> = None;
     match (modes[1], modes[2]) {
+        #[cfg(unix)]
         (PIPE, STDOUT) => {
             let (w, r) = UnixStream::pair().map_err(|e| io_os_error(ctx, e))?;
             // `Stdio` has no `From<UnixStream>` — dup the
@@ -585,16 +616,27 @@ fn spawn_and_wait(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         }
         _ => None,
     };
-    let stdout_rx: Option<mpsc::Receiver<Vec<u8>>> = match (modes[1] == PIPE, shared_read) {
+    let stdout_rx: Option<mpsc::Receiver<Vec<u8>>> = {
         // The shared pair (stderr=STDOUT over a piped
         // stdout): drain the pair's read end — it carries
         // both streams, merged in write order.
-        (true, Some(r)) => Some(drain_thread(r)),
-        (true, None) => match child.stdout.take() {
-            Some(out) => Some(drain_thread(out)),
+        #[cfg(unix)]
+        let rx = match (modes[1] == PIPE, shared_read) {
+            (true, Some(r)) => Some(drain_thread(r)),
+            (true, None) => match child.stdout.take() {
+                Some(out) => Some(drain_thread(out)),
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
+        };
+        // Windows has no shared pair (see the modes remap
+        // above): stdout is always its own pipe.
+        #[cfg(not(unix))]
+        let rx = match (modes[1] == PIPE, child.stdout.take()) {
+            (true, Some(out)) => Some(drain_thread(out)),
+            _ => None,
+        };
+        rx
     };
     let stderr_rx: Option<mpsc::Receiver<Vec<u8>>> = match (modes[2] == PIPE, child.stderr.take())
     {
@@ -686,7 +728,13 @@ fn finish(
     }
     let returncode: i64 = match status.code() {
         Some(code) => code as i64,
+        // Unix: a signal death has no exit code — the negated
+        // signal number. Windows processes always have an exit
+        // code, so this arm is unreachable there.
+        #[cfg(unix)]
         None => -(status.signal().unwrap_or(0) as i64),
+        #[cfg(not(unix))]
+        None => -1,
     };
     let types = ctx.types;
     let out = match (modes[1] == PIPE, stdout_rx) {

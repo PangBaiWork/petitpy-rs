@@ -69,9 +69,30 @@ use crate::runtime::modos::{arg_int, os_err, path_arg, EINVAL, EBADF, EFBIG};
 use crate::runtime::raise::raise_os_error;
 use crate::runtime::vm::VmState;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+
+/// Synthetic fd allocator for Windows: the VM's fd table
+/// (`VmState.os_fds`) is keyed by the real fd on Unix
+/// (`File::as_raw_fd`); Windows has no small-int fds (a
+/// `File` exposes a `HANDLE`), so Windows files get a
+/// monotonically increasing synthetic id instead. The
+/// counter is process-global (an `AtomicI32`) because the
+/// file-object constructor (`objfileio`) has no `VmState`
+/// handle — only `CallCtx` — while `os.open` registers
+/// into the same table; ids never repeat within a process,
+/// so a `fileno()` can never collide with a live entry.
+/// (On Unix this is unused: fds come from the kernel.)
+#[cfg(not(unix))]
+static NEXT_WIN_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
+
+/// Allocate the next synthetic Windows fd (see `NEXT_WIN_FD`).
+#[cfg(not(unix))]
+pub(crate) fn alloc_win_fd() -> i32 {
+    NEXT_WIN_FD.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Allocate one of the six fd builtins in the os dict — the
 /// `func` is a stub (intercepted in `call_function_ctx`).
@@ -145,6 +166,11 @@ pub fn os_open_ctx(
         Some(v) => arg_int(ctx, *v).map_err(|e| exc(ctx, state, e))? as u32,
         None => 0o777,
     };
+    // The mode is parsed (and validated) on every platform,
+    // but only applied on Unix — Windows has no per-create
+    // permission bits.
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut opts = std::fs::OpenOptions::new();
     match flags & 0b11 {
         0 => {
@@ -157,12 +183,26 @@ pub fn os_open_ctx(
             opts.read(true).write(true);
         }
     }
+    // `O_CLOEXEC` / `O_NONBLOCK` / `O_DIRECTORY` have no std
+    // equivalent; on Windows the raw-flags call does not exist
+    // at all (no `OpenOptionsExt`), so the flags beyond r/w/a
+    // are ignored there.
+    #[cfg(unix)]
     opts.custom_flags(flags as i32);
+    #[cfg(unix)]
     opts.mode(mode);
     let file = opts
-        .open(std::ffi::OsStr::from_bytes(&path))
+        .open(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| io_exc(ctx, state, e))?;
+    // The fd is the real kernel fd on Unix; on Windows it is
+    // a synthetic id from the process-global counter (see
+    // `alloc_win_fd`) — `os.close`/`read`/`write`/`lseek`/
+    // `fsync` all go through the same table, so the key kind
+    // is invisible to them.
+    #[cfg(unix)]
     let fd = file.as_raw_fd();
+    #[cfg(not(unix))]
+    let fd = alloc_win_fd();
     state.os_fds.insert(fd, file);
     Ok(Value::SmallInt(i64::from(fd)))
 }

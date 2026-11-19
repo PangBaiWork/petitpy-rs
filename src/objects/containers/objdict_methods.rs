@@ -12,7 +12,7 @@
 
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::containers::map::{
-    map_lookup, map_of, map_of_mut, map_set_value, LookupKind, LookupOutcome,
+    map_lookup, map_lookup_hook, map_of, map_of_mut, map_set_value, LookupKind, LookupOutcome,
 };
 use crate::objects::iters::iter::FLAG_ITER_IS_ITERNEXT;
 use crate::objects::obj::{obj_id, obj_len_maybe};
@@ -173,6 +173,75 @@ pub(crate) fn dict_get_helper(
             _ => Ok(Value::None),
         },
     }
+}
+
+/// `dict_get_helper` with a VM hook (G3/H3): the hook threads
+/// into `map_lookup_hook`, so an instance key's FunBc `__eq__`
+/// runs during `.get` / `.pop` / `.setdefault` — without it
+/// those raised `TypeError: unsupported type for operator` on
+/// instance keys (the H2 gap one level up, in the FunBuiltin
+/// method slots). Same body as `dict_get_helper` otherwise.
+pub(crate) fn dict_get_helper_hook(
+    ctx: &mut CallCtx,
+    dict: Value,
+    key: Value,
+    kind: LookupKind,
+    default: Option<Value>,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, DictError> {
+    let r = dict_ref_of(ctx.arena, dict);
+    if kind != LookupKind::Lookup {
+        ensure_not_fixed(ctx.arena, r)?;
+    }
+    match map_lookup_hook(ctx, ctx.types, r, key, kind, hook)? {
+        LookupOutcome::Found(i) => Ok(entry_value(ctx, r, i)),
+        LookupOutcome::Added(i) => {
+            // `.setdefault` on a missing key: store the default.
+            let v = default.unwrap_or(Value::None);
+            map_set_value(ctx.arena, r, i, v);
+            Ok(v)
+        }
+        LookupOutcome::Removed((_, v)) => Ok(v),
+        LookupOutcome::NotFound => match (kind, default) {
+            // `.pop(k, default)` returns the default when missing.
+            (_, Some(d)) => Ok(d),
+            (LookupKind::Remove, None) => Err(DictError::KeyError(key)),
+            _ => Ok(Value::None),
+        },
+    }
+}
+
+/// `d.get(key[, default])` with a hook (G3/H3).
+pub fn dict_get_hook(
+    ctx: &mut CallCtx,
+    dict: Value,
+    key: Value,
+    default: Option<Value>,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, DictError> {
+    dict_get_helper_hook(ctx, dict, key, LookupKind::Lookup, default, hook)
+}
+
+/// `d.pop(key[, default])` with a hook (G3/H3).
+pub fn dict_pop_hook(
+    ctx: &mut CallCtx,
+    dict: Value,
+    key: Value,
+    default: Option<Value>,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, DictError> {
+    dict_get_helper_hook(ctx, dict, key, LookupKind::Remove, default, hook)
+}
+
+/// `d.setdefault(key[, default])` with a hook (G3/H3).
+pub fn dict_setdefault_hook(
+    ctx: &mut CallCtx,
+    dict: Value,
+    key: Value,
+    default: Option<Value>,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, DictError> {
+    dict_get_helper_hook(ctx, dict, key, LookupKind::Add, default, hook)
 }
 
 /// `d.get(key[, default])`.

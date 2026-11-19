@@ -161,3 +161,42 @@ fn g3_h2_dict_eq_raise_reads_not_equal() {
     );
     assert!(fx.gb("ok"));
 }
+
+// ── H3: dict.get / .pop / .setdefault run FunBc `__eq__` ──────────
+
+#[test]
+fn g3_h3_dict_get_instance_key() {
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "{A_DEF}class B:\n    def __hash__(self):\n        return 7\n    def __eq__(self, o):\n        return isinstance(o, B)\nd = {{}}\nd[A()] = 'x'\nok1 = (d.get(A()) == 'x')\nok2 = (d.get(A(), 'dflt') == 'x')\nok3 = (d.get(B()) is None)\nok4 = (d.get(B(), 'dflt') == 'dflt')\n"
+    ));
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+    assert!(fx.gb("ok3"));
+    assert!(fx.gb("ok4"));
+}
+
+#[test]
+fn g3_h3_dict_pop_instance_key() {
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "{A_DEF}d = {{}}\nd[A()] = 'x'\nv = d.pop(A())\nok1 = (v == 'x')\nok2 = (len(d) == 0)\nok3 = (d.pop(A(), 'dflt') == 'dflt')\nok4 = False\ntry:\n    d.pop(A())\nexcept KeyError:\n    ok4 = True\n"
+    ));
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+    assert!(fx.gb("ok3"));
+    assert!(fx.gb("ok4"));
+}
+
+#[test]
+fn g3_h3_dict_setdefault_instance_key() {
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "{A_DEF}d = {{}}\nd[A()] = 'x'\nok1 = (d.setdefault(A()) == 'x')\nok2 = (len(d) == 1)\nd2 = {{}}\nok3 = (d2.setdefault(A(), 'y') == 'y')\nok4 = (d2[A()] == 'y')\nok5 = (d2.setdefault(A()) == 'y')\n"
+    ));
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+    assert!(fx.gb("ok3"));
+    assert!(fx.gb("ok4"));
+    assert!(fx.gb("ok5"));
+}

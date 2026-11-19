@@ -32,6 +32,7 @@ use crate::memory::gc::CallCtx;
 use crate::objects::callables::objboundmeth::new_bound_meth;
 use crate::objects::containers::map::{hash_of_hook, map_of, MapError};
 use crate::objects::containers::objarray_methods::array_extend;
+use crate::objects::containers::objdict_methods::{dict_get_hook, dict_pop_hook, dict_setdefault_hook};
 use crate::objects::containers::objdict_collect::collect_iterable;
 use crate::objects::containers::objlist::new_list;
 use crate::objects::strings::objstr_methods_c::KwArg;
@@ -371,6 +372,81 @@ pub fn call_array_extend_ctx(
     }
     let mut hook = crate::runtime::vm_seams::make_hook(state);
     array_extend(ctx, args[0], args[1], Some(&mut hook)).map_err(|e| {
+        if let Some(exc) = state.pending_exc.take() {
+            return exc;
+        }
+        let pe = ctx.record_typed(e);
+        exc_from_pyerror(ctx, state, pe)
+    })
+}
+
+/// `dict.get` (G3/H3): intercepted by GcRef identity (see
+/// `dict_get_builtin`) so an instance key runs its FunBc
+/// `__eq__` through the VM's real call hook. Arity is
+/// re-checked by hand (interception bypasses
+/// `call_fun_builtin`'s sig check): self + key [+ default],
+/// no kwargs. A probe `__eq__` raise reads as not-equal
+/// inside `probe_equal` and is discarded there, so no stash
+/// is expected on the error path — but the drain-first shape
+/// is kept (same as `call_array_extend_ctx`) in case a probe
+/// path ever leaves one.
+pub fn call_dict_get_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    call_dict_method_ctx(ctx, state, n_args, n_kw, args, dict_get_hook)
+}
+
+/// `dict.pop` (G3/H3): same interception as `dict.get`.
+pub fn call_dict_pop_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    call_dict_method_ctx(ctx, state, n_args, n_kw, args, dict_pop_hook)
+}
+
+/// `dict.setdefault` (G3/H3): same interception as `dict.get`.
+pub fn call_dict_setdefault_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    call_dict_method_ctx(ctx, state, n_args, n_kw, args, dict_setdefault_hook)
+}
+
+/// Shared core of the three `dict.get` / `.pop` /
+/// `.setdefault` intercepts (G3/H3): arity (2..=3, 0 kwargs),
+/// then the hook-aware helper with the default (or `None`
+/// when the caller passed no default — `.get` → `None`,
+/// `.pop` → `KeyError`, `.setdefault` → insert `None`).
+fn call_dict_method_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+    f: fn(
+        &mut CallCtx,
+        Value,
+        Value,
+        Option<Value>,
+        Option<crate::objects::slots::CallHook<'_, '_>>,
+    ) -> Result<Value, crate::objects::containers::objdict::DictError>,
+) -> Result<Value, Value> {
+    if !(2..=3).contains(&n_args) || n_kw != 0 {
+        return Err(mismatch(ctx, state));
+    }
+    let default = if n_args == 3 { Some(args[2]) } else { None };
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
+    f(ctx, args[0], args[1], default, Some(&mut hook)).map_err(|e| {
         if let Some(exc) = state.pending_exc.take() {
             return exc;
         }

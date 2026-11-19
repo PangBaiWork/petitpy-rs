@@ -568,6 +568,30 @@ impl Vm {
                 *slot = v;
             }
         }
+        // G3/H3: the `dict.get` / `dict.pop` / `dict.setdefault`
+        // method builtins (three `FunBuiltin` objects in the
+        // dict type dict). Looked up by name; a miss leaves the
+        // handle unset and the method keeps its old ctx-only
+        // behavior (an instance key raises "unsupported type
+        // for operator").
+        let dict_dict = match ctx.arena.get(ctx.types.dict) {
+            Obj::Type(d) => d.dict,
+            _ => ctx.types.dict,
+        };
+        for (name, slot) in [
+            (&b"get"[..], &mut state.dict_get_builtin),
+            (&b"pop"[..], &mut state.dict_pop_builtin),
+            (&b"setdefault"[..], &mut state.dict_setdefault_builtin),
+        ] {
+            let q = static_qstr_id(name).expect("dict method is a static qstr");
+            if let Ok(v) = crate::objects::containers::objdict::dict_get_value(
+                &mut ctx,
+                Value::Heap(dict_dict),
+                Value::Qstr(q),
+            ) {
+                *slot = v;
+            }
+        }
         state.min_builtin = d1.min_builtin;
         state.max_builtin = d1.max_builtin;
         state.getattr_builtin = d1.getattr_builtin;

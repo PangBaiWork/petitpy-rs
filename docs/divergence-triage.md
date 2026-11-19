@@ -1,6 +1,7 @@
 # petitpy-rs 已知分歧 Triage 表
 
-> 只读梳理（2026-11-19，主线 master `8f9aafa`，F2 已合并）。
+> 只读梳理（2026-11-19，主线 master `8f9aafa`，F2 已合并；
+> 2026-11-19 更新：G0（本表称 G1）已合并，主线 `f8ccf00`）。
 > 来源：`README.md` "Known divergences" 一节、`scripts/*_result.txt` §4、
 > `docs/任务书.md` §3.5。探针用原版二进制
 > `~/workspace/petitpy-orig/zig-out/bin/petitpy`（REF）和
@@ -13,9 +14,10 @@
 > 规模：S <100 行 / M 100–400 行 / L >400 行或跨多个子系统。
 > "gate" 指现有测试覆盖；"无覆盖" 的项修完必须补探针/测试，不许只凭感觉合。
 >
-> 基线状态（master 8f9aafa）：full 545/552 GREEN、integration 200/202
-> （仅 select ×2）、golden 585/585、capability 67/67、stdlib 8/8、
-> nano 454/541 report-only、lib 1700 + 3 ignored。3 个 ignored 是：
+> 基线状态（master f8ccf00，G0 已合并）：full 545/552 GREEN、integration
+> 202/202（feature `unsafe-ffi` 开）/ 200/202（默认关，仅 select ×2）、
+> golden 585/585、capability 67/67、stdlib 8/8、
+> nano 454/541 report-only、lib 1708（feature 开）/ 1700（默认关）+ 3 ignored。3 个 ignored 是：
 > parser smoke、`makenew_class_attr_on_class`（C.x）、
 > `int_from_bytes_e2e_after_classmethod_wrap`（后两者都是 P5）。
 
@@ -33,7 +35,7 @@
 | H8 | `type(iter(...))` 裸 TypeError | 可修 | M | 迭代器类型头 | 无，需新探针 |
 | H9 | `import_from` 的 FunBc 回退 | 可修 | M | hook 缝合（import） | 无，低价值 |
 | H10 | API `ppy_str`/`ppy_repr` 遇 raising `__str__` | 可修 | M | 打印 hook | 需扩展 api_test |
-| U1 | select ×2 | 修理中 | — | unsafe-ffi（G1 lane 在跑） | integration select ×2 |
+| U1 | select ×2 | 已修（feature 开时 202/202；默认关仍 200/202） | — | unsafe-ffi（G0 lane，已合并 f8ccf00） | integration select ×2 |
 | U2 | `os.umask` 仍是 stub | 可修 | S | unsafe-ffi | integration（现有 stub 断言需改） |
 | U3 | `os.close` 只关 os.open 登记的 fd（含 stdio 复用） | 可修 | S | unsafe-ffi | 无，需新探针 |
 | U4 | `socket.fromfd` 的 close 不关 OS fd | 可修 | S | unsafe-ffi | integration（只断言 fileno） |
@@ -56,6 +58,7 @@
 | P11 | API 上用户实例 `__getitem__` 未测试 | 待探针 | S? | 先写 C 测试定性 | 需扩展 api_test |
 | P12 | DUP_TOP_TWO 潜在 NULL bug | 可修 | S | 无 | 无（编译器不发该 opcode） |
 | P13 | 直接调 `str_join` 短调用 panic | 可修 | S | 无 | 无（用户代码到不了） |
+| P14 | 管道 stdout 时原版缓冲输出、Rust 直写 | 可修 | M 待定 | 输出缓冲机制待定位 | 无，需时间戳探针 |
 | N1 | 原版崩溃（rc=134）系列 | 不修 | — | — | — |
 | N2 | subprocess `input=123` 原版挂起 | 不修 | — | — | — |
 | N3 | identity-hash / 地址值 | 不修（设计如此） | — | — | — |
@@ -247,6 +250,11 @@
 - 行为：不经 VM 拦截直接调 `str_join` 会 SIGABRT；用户代码到不了（VM 调用都过 `call_join_ctx` 的 arity 检查），只有 Rust 侧直接调用方能触发。
 - 证据 **(b)**：E2f §4(e)。机制：在 slot 路径补 arity 检查。规模 S。价值低。
 
+### P14 — 管道 stdout 时原版缓冲输出、Rust 直写（G0 验收新发现）
+- 行为：`print('hello'); time.sleep(2); print('bye')`，stdout 接管道时 REF 的 `hello` 在 2.02s 后才到达（与 `bye` 同时），Rust 的 `hello` 在 0.00s 即到。两者最终输出字节相同，只差到达时间。
+- 证据 **(a)**：主 agent 2026-11-19 双二进制时间戳探针（G0 验收 §8，`~/workspace/g0_verify_main.log`）。与 C8a “`mp_plat_print` 是 plain `write(1, ...)`”表面冲突——缓冲应在 Zig std io 层或 embed 层，需源码对照定位。
+- 机制：待定。先读 `main.zig` / `embed_exec.zig` 的打印路径 + Zig std io writer 是否带缓冲；再决定是给 Rust 输出加缓冲（flush 点：换行？退出？）还是只在 print 路径。规模 M 待定。gate：无覆盖，需新探针（时间戳读管道）。建议并入 G5（P3 文件缓冲同属输出缓冲族）或单独小 lane。
+
 ---
 
 ## N — 不修 / 不是分歧
@@ -357,7 +365,7 @@ D2 的实现是 open/mode 位检查；本次探针 `/dev/null` 可读、不存�
 
 ## 建议 lane 切分
 
-分组原则：同组内的项尽量不碰同一文件（可并行）；同文件族的项收进同一 lane（串行做，避免 rebase 冲突）。G1（unsafe-ffi feature + select）在跑，以下分组假定 G1 已合。
+分组原则：同组内的项尽量不碰同一文件（可并行）；同文件族的项收进同一 lane（串行做，避免 rebase 冲突）。G0（本表称 G1；unsafe-ffi feature + select）已合并（f8ccf00）。
 
 - **G2 — 纯 std 快胜（S 为主）**：P1（`typecreate.rs`）、P2（`vm.rs` 或 CLI 入口）、P7a（`main.rs`）、P10（`api.rs`）、P12（`vm_dispatch.rs`）、P13（`objstr` join 路径）。文件基本不重叠；P11（先写 api_test 探针）可顺带放在本组。验收：各探针 + 全门。
 - **G3 — 容器 hook 族（H2/H3/H4/H5/H6）**：`map.rs`、`objdict.rs`、`objlist.rs`、set 路径。同一文件族，**必须一个 lane 串行做**，不可拆并行。验收：H2–H6 探针 + 全门（`map.rs` 是热路径，全门必重跑）。
@@ -367,4 +375,4 @@ D2 的实现是 open/mode 位检查；本次探针 `/dev/null` 可读、不存�
 - **G6b — unsafe-ffi 之 socket/subprocess（U4/U5/U6/U7/U8）**：`modsocket.rs` + `modsubprocess.rs`。依赖 G1 合并；与 G6a 文件不重叠，可与 G6a 并行。
 - **H9（import_from）与 P7b（API 文件名）**：价值低/改动面大，排最后；H9 可并入 G4（同 import 区），P7b 并入 G2 的 api 侧或单独留待。
 
-顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 待 G1 合并后再排。H9、P7b、U8、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。
+顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 可排（G0 已合）。H9、P7b、U8、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。P14（stdout 缓冲）建议并入 G5 或单独小 lane。

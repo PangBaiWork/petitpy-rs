@@ -137,8 +137,12 @@ pub fn build_d4_modules(vm: &mut Vm) {
     let module_type = state.vm_types.module;
     let time = build_time_module(&mut ctx, fun_builtin_var, module_type)
         .expect("D4 time module build cannot fail");
-    let select = build_select_module(&mut ctx, fun_builtin_var, module_type)
+    let (select, select_fn) = build_select_module(&mut ctx, fun_builtin_var, module_type)
         .expect("D4 select module build cannot fail");
+    // H-select: `select.select` is intercepted by GcRef
+    // identity so it can see `state.os_fds` (see
+    // `call_select_ctx`).
+    state.select_builtin = select_fn;
     let (gc, gc_collect) = build_gc_module(&mut ctx, fun_builtin_var, module_type)
         .expect("D4 gc module build cannot fail");
     // F6: `gc.collect` is intercepted by GcRef identity so the

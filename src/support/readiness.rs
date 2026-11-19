@@ -56,20 +56,20 @@
 //! read-only files. Do not `select` on a read-write FIFO
 //! object that you also write through.
 //!
-//! What feeds a monitor: only a `File` the caller already
-//! holds. A monitor is started from a file *object* (the
-//! arena's `Obj::File` carries its own `Rc<File>`). Bare fd
-//! ints (`os.pipe`, `os.open`) and socket objects cannot be
-//! resolved to a handle from a plain `BuiltinFn` — the os
-//! fd table lives in `VmState` (reachable only through the
-//! `call_function_ctx` interception) and the socket table
-//! is private to `modsocket` — so `select` cannot start a
-//! monitor for them; see `scripts/h_select_result.txt` §4
-//! for the exact unblock proposal. There is no safe `std`
-//! API for an arbitrary fd (`BorrowedFd::borrow_raw` is
-//! `unsafe`, and `UnixStream::peek` is unstable), and
-//! `/proc/self/fd` is Linux-only and refuses sockets, so
-//! no workaround exists within pure `std`.
+//! What feeds a monitor: a `File` the caller already holds.
+//! A monitor is started from a file *object* (the arena's
+//! `Obj::File` carries its own `Rc<File>`) or from a bare
+//! fd int (the intercept in `call_function_ctx` resolves
+//! it through `VmState.os_fds` — a plain `BuiltinFn` could
+//! not see that table). Socket objects are NOT monitored:
+//! pure `std` cannot probe a socket (`UnixStream::peek` is
+//! unstable, and a monitor `recv` would consume bytes the
+//! socket `recv` path does not drain) — see `modselect.rs`
+//! and `scripts/h_select_result.txt` §4. There is no safe
+//! `std` API for an arbitrary fd (`BorrowedFd::borrow_raw`
+//! is `unsafe`), and `/proc/self/fd` is Linux-only and
+//! refuses sockets, so no workaround exists within pure
+//! `std`.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -83,6 +83,16 @@ const BUFFER_CAP: usize = 64 * 1024;
 
 /// Bytes per monitor `read` call.
 const CHUNK: usize = 8 * 1024;
+
+/// How long `ensure_monitor` waits for a fresh monitor's
+/// first read to settle (see `wait_settled`): a thread
+/// spawn + one immediately-returning read is microseconds,
+/// so 10ms is generous even on a loaded 1.5-core VM — and
+/// it is paid only once per fd (a reused monitor is already
+/// settled). A select on an empty pipe with timeout 0 takes
+/// up to this long instead of ~0; that is the price of a
+/// correct first probe.
+const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// One fd's shared monitor state (see the module docs).
 pub struct Monitor {
@@ -226,6 +236,36 @@ fn file_identity(file: &File) -> Option<(u64, u64)> {
     }
 }
 
+/// Wait (bounded) for a fresh monitor's first read to
+/// settle: the monitor thread notifies `data` whenever a
+/// read completes (bytes pushed, EOF, or an error — see
+/// `monitor_loop`), so this returns as soon as the first
+/// read has returned. A blocking read on an empty pipe
+/// never settles — the deadline bounds the wait. Without
+/// this, a `select` with timeout 0 would race the monitor
+/// thread and miss an fd that is already at EOF (its first
+/// probe runs before the monitor's first read). Only called
+/// for a freshly spawned monitor (a reused one is already
+/// settled — its first read happened long ago).
+fn wait_settled(mon: &Monitor, deadline: std::time::Duration) {
+    let mut buf = mon.buffer.lock().unwrap_or_else(|e| e.into_inner());
+    let start = std::time::Instant::now();
+    while buf.is_empty() && !mon.is_eof() && !mon.is_dead() {
+        let remaining = deadline.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let (b, r) = mon
+            .data
+            .wait_timeout(buf, remaining)
+            .unwrap_or_else(|e| e.into_inner());
+        buf = b;
+        if r.timed_out() {
+            break;
+        }
+    }
+}
+
 /// Start (or reuse) the monitor for `fd`, reading ahead
 /// from `file` (`File::try_clone`, safe — the clone shares
 /// the description, so the monitor's reads advance the same
@@ -284,6 +324,10 @@ pub fn ensure_monitor(fd: i32, file: &File) -> io::Result<Arc<Monitor>> {
         remove_if_same(fd, &mon);
         return Err(e);
     }
+    // A fresh monitor's first read is awaited (bounded) so
+    // the caller sees an accurate first probe — see
+    // `wait_settled`. Paid once per fd (reuse returns above).
+    wait_settled(&mon, SETTLE_DEADLINE);
     Ok(mon)
 }
 
@@ -608,6 +652,22 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b));
         assert!(poll_until(2000, || a.is_eof()));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fresh_monitor_settled_on_eof() {
+        // `/dev/null` is at EOF at once: `ensure_monitor`
+        // must not return before the monitor's first read
+        // has settled, or a timeout-0 `select` would miss
+        // it (its first probe runs before the monitor
+        // thread's first read). This is the regression test
+        // for the `wait_settled` handshake.
+        let file = File::open("/dev/null").unwrap();
+        let fd = fd_of(&file);
+        let mon = ensure_monitor(fd, &file).unwrap();
+        assert!(mon.is_eof() || mon.is_dead());
+        assert_eq!(mon.buffered_len(), 0);
     }
 
     #[test]

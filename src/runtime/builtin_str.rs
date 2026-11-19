@@ -34,12 +34,13 @@ use crate::objects::containers::objdict::is_ordered_dict_value;
 use crate::objects::containers::objlist::list_items_vec;
 use crate::objects::containers::objset::is_frozenset;
 use crate::objects::containers::objtuple::tuple_items;
-use crate::objects::obj::obj_is_true;
+use crate::objects::obj::{is_float, obj_is_true};
+use crate::objects::primitives::objfloat::new_float;
 use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::objtype::lookup::{class_lookup, LookupHit, SlotKind};
 use crate::objects::objtype::seams::with_stub_seams;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::{ByteBuf, ByteSink, PrintKind};
+use crate::objects::slots::{ByteBuf, ByteSink, PrintKind, UnaryOp};
 use crate::objects::value::{Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::vm::VmState;
@@ -355,6 +356,68 @@ pub(crate) fn call_bool_ctx(
         }
     }
     let r = ctx.types.bool_;
+    call_type_ctx(ctx, state, r, n_args, n_kw, args)
+}
+
+/// `float(x)` through the VM (G4/H1): a 1-arg instance call runs
+/// `__float__` with the real hook; anything else delegates to the
+/// type-call path (`float()`, `float(1.5)`, arg errors).
+/// The original's `mp_obj_get_float_maybe` (`obj.zig:662-690`)
+/// requires the `__float__` result to BE a float object — a
+/// non-float return falls through to the native-base step and
+/// then to `TypeError: can't convert to float`. A raising
+/// `__float__` is swallowed the same way: the unary op returns
+/// NULL, so the conversion fails with TypeError (probed on the
+/// reference: `float(GR())` with a ValueError-raising `__float__`
+/// is `TypeError: can't convert to float`). Both cases fall
+/// through to the type-call path, whose stub-seam slot cannot
+/// run the FunBc dunder and therefore raises exactly that
+/// TypeError. A float-subclass instance WITHOUT `__float__`
+/// falls through the same way (the native-base step in
+/// `obj_get_float_maybe` answers it — F3).
+pub(crate) fn call_float_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if n_args == 1 && n_kw == 0 {
+        if let Some(arg) = args.first().copied() {
+            if is_instance(ctx.arena, arg) {
+                match try_instance_unary_op(ctx, state, UnaryOp::FloatMaybe, arg) {
+                    Ok(Some(v)) => {
+                        if is_float(ctx.arena, ctx.types, v) {
+                            if let Value::Heap(r) = v {
+                                if let Obj::Float(f) = ctx.arena.get(r) {
+                                    return Ok(new_float(ctx, ctx.types, *f));
+                                }
+                            }
+                        }
+                        // A non-float return: fall through to
+                        // the type-call path (TypeError, like
+                        // the original).
+                    }
+                    Ok(None) => {
+                        // No `__float__`: fall through (the
+                        // native-base step answers float
+                        // subclasses).
+                    }
+                    Err(_) => {
+                        // A raising `__float__` is swallowed by
+                        // the original's conversion (see the docs
+                        // above): fall through to the type-call
+                        // path, which raises TypeError. The raise
+                        // was already drained by
+                        // `try_instance_unary_op` /
+                        // `drain_hook_raise`, so no stale pending
+                        // raise survives into the fall-through.
+                    }
+                }
+            }
+        }
+    }
+    let r = ctx.types.float;
     call_type_ctx(ctx, state, r, n_args, n_kw, args)
 }
 

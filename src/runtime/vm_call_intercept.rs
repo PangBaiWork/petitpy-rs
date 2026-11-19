@@ -248,6 +248,16 @@ pub(crate) fn intercept_builtin_call(
     if fun == Value::Heap(ctx.types.str_) {
         return Some(crate::runtime::builtin_str::call_str_ctx(ctx, state, n_args, n_kw, args));
     }
+    // `float` is the TYPE object itself (G4/H1): a 1-arg
+    // instance call runs the instance's `__float__` through
+    // the VM's real call hook (see `call_float_ctx`); anything
+    // else delegates to the type-call path inside that fn —
+    // the same shape as `str` / `bool` above.
+    if fun == Value::Heap(ctx.types.float) {
+        return Some(crate::runtime::builtin_str::call_float_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     if fun == Value::Heap(ctx.types.bool_) {
         return Some(crate::runtime::builtin_str::call_bool_ctx(ctx, state, n_args, n_kw, args));
     }

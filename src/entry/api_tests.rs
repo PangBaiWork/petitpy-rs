@@ -16,9 +16,9 @@ use std::ffi::c_char;
 use std::ptr::null_mut;
 
 use super::api::{
-    ppy_define_function, ppy_eval, ppy_exec, ppy_free, ppy_get_global, ppy_new, ppy_new_int,
-    ppy_release, ppy_set_global, ppy_to_int, ppy_type_name, Interp, PpyFunction, PpyHandle,
-    PPY_ERROR, PPY_OK,
+    ppy_define_function, ppy_eval, ppy_exec, ppy_free, ppy_get_global, ppy_getitem, ppy_new,
+    ppy_new_int, ppy_raise, ppy_release, ppy_set_global, ppy_setitem, ppy_to_int, ppy_type_name,
+    Interp, PpyFunction, PpyHandle, PPY_ERROR, PPY_OK,
 };
 
 fn new_interp() -> *mut Interp {
@@ -199,5 +199,82 @@ fn handles_survive_gc_stress() {
             "handle {h} lost its value under GC stress"
         );
     }
+    unsafe { ppy_free(py) };
+}
+
+/// G2 (P10): a host function called with kwargs. The vendor's
+/// `argcheck` rejects kwargs before `hostCall` ever runs
+/// (`argcheck.zig:43` — the host builtin's sig is
+/// `makeFunSig(1, maxInt(u16), false)`, takes_kw=false; every
+/// host call goes through `fun_builtin_var_call`'s
+/// `mp_arg_check_num_sig`, `objfun.zig:103`), so the reference
+/// raises `TypeError: argument num/types mismatch` — it does
+/// NOT ignore kwargs. The Rust side matches (the interception
+/// in `vm_call_intercept.rs` routes to `call_host_ctx`, which
+/// rejects `n_kw > 0` with the same message). This test pins
+/// that agreement; there is no kwargs entry in `petitpy.h`
+/// (`ppy_function` takes positional `argc`/`argv` only), so no
+/// C entry is invented.
+unsafe extern "C" fn twice_host(
+    py: *mut Interp,
+    _userdata: *mut std::ffi::c_void,
+    argc: usize,
+    argv: *const PpyHandle,
+    result: *mut PpyHandle,
+) -> i32 {
+    if argc != 1 {
+        return unsafe { ppy_raise(py, c"TypeError".as_ptr(), c"twice() takes one argument".as_ptr()) };
+    }
+    let mut n: i64 = 0;
+    if unsafe { ppy_to_int(py, *argv, &mut n) } != PPY_OK {
+        return PPY_ERROR;
+    }
+    unsafe { ppy_new_int(py, 2 * n, result) }
+}
+
+#[test]
+fn host_call_with_kwargs_is_mismatch() {
+    let py = new_interp();
+    assert_eq!(
+        unsafe {
+            ppy_define_function(py, c"host".as_ptr(), c"twice".as_ptr(), twice_host, null_mut())
+        },
+        PPY_OK
+    );
+    // Positional call still works.
+    exec_ok(py, b"import host\nassert host.twice(21) == 42");
+    // Kwargs are rejected with the terse message, on the
+    // reference and here alike.
+    exec_ok(
+        py,
+        b"try:\n    host.twice(x=1)\n    assert False, 'kwargs must be rejected'\nexcept TypeError as e:\n    assert str(e) == 'argument num/types mismatch', str(e)\n",
+    );
+    unsafe { ppy_free(py) };
+}
+
+/// G2 (P11 probe): `ppy_getitem` / `ppy_setitem` on a user
+/// instance defining `__getitem__` / `__setitem__`. The route
+/// exists (`subscr_body` tries `try_instance_subscr` first);
+/// this test checks it actually works end to end.
+#[test]
+fn ppy_getitem_setitem_user_dunders() {
+    let py = new_interp();
+    exec_ok(
+        py,
+        b"class C:\n    def __init__(self):\n        self.d = {}\n    def __getitem__(self, k):\n        return k * 10\n    def __setitem__(self, k, v):\n        self.d[k] = v\nc = C()\n",
+    );
+    let mut c: PpyHandle = 0;
+    assert_eq!(
+        unsafe { ppy_get_global(py, c"c".as_ptr(), &mut c) },
+        PPY_OK
+    );
+    let key = new_int(py, 4);
+    let mut r: PpyHandle = 0;
+    assert_eq!(unsafe { ppy_getitem(py, c, key, &mut r) }, PPY_OK);
+    assert_eq!(to_int(py, r), 40);
+    let key2 = new_int(py, 3);
+    let val = new_int(py, 30);
+    assert_eq!(unsafe { ppy_setitem(py, c, key2, val) }, PPY_OK);
+    exec_ok(py, b"assert c.d[3] == 30");
     unsafe { ppy_free(py) };
 }

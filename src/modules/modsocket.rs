@@ -71,11 +71,14 @@
 //!   `unsafe-ffi` the real `getsockopt(2)` runs (U7).
 //! - Integer arguments are truncated to `i32` (`as` cast);
 //!   the Zig's `@intCast` would abort on overflow.
-//! - `bind("")` returns `ENOENT` (`UnixListener::bind` on an
-//!   empty path); the reference binds an abstract-named
-//!   socket (it passes the full `sockaddr_un` size with an
-//!   all-zero path). Under `unsafe-ffi` `bind("")` binds
-//!   the abstract socket (U6).
+//! - `bind("")` on the default build binds an UNNAMED
+//!   socket (`UnixListener::bind` passes addrlen 2 for
+//!   the empty path): it listens, but no client can
+//!   connect to it by name; the reference binds an
+//!   abstract-named socket (it passes the full
+//!   `sockaddr_un` size with an all-zero path). Under
+//!   `unsafe-ffi` `bind("")` binds the abstract socket
+//!   (U6).
 //! - `sendall` on a listener is `EINVAL` (the `is_stream`
 //!   gate); the reference's `send(2)` there is `ENOTCONN`
 //!   (107, probed). Out of scope for G6b (the brief leaves
@@ -467,7 +470,9 @@ fn socket_fromfd(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// socket is bound but NOT listening until `listen()`.
 /// On the default build `UnixListener::bind` swaps the
 /// placeholder for a real listener (already listening),
-/// so the fd number changes and `bind("")` is `ENOENT`.
+/// so the fd number changes and `bind("")` binds an
+/// unnamed socket (it listens, but no client can connect
+/// to it by name).
 fn sock_bind(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (r, fd, fields) = self_socket(ctx, args)?;
     let family = fields[0];

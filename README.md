@@ -185,7 +185,8 @@ pass a gate.
   matches abstract names by full length). On the default
   build the old shape stays: a `/dev/null` placeholder fd,
   `bind()` swaps in an already-listening `UnixListener`
-  (fd number changes, `bind("")` is `ENOENT`).
+  (fd number changes, `bind("")` binds an unnamed socket
+  that listens but is unreachable by name).
 - **Real `getsockopt` under `--features unsafe-ffi`** (G6b
   U7): `SO_PEERCRED` returns the real 12-byte `ucred`
   (unconnected: pid 0 / uid -1 / gid -1; connected: the

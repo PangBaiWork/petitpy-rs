@@ -286,12 +286,19 @@ pub fn super_make_new(
         );
         Ok(Value::Heap(r))
     })();
+    // G2 (P1): record the typed error, not just the bare
+    // `PyRaise` signal — `super(1, 2)` must surface
+    // `issubclass() arg 2 must be a class or a tuple of
+    // classes` (the `is_subclass` raise), and a body that
+    // succeeds with a bad arity must surface `argument
+    // num/types mismatch` (the polled sig error). Same
+    // shape as the F4 pattern above in `type_new`.
     match result {
         Ok(v) => match sig_err {
-            Some(e) => Err(e.to_pyerror()),
+            Some(e) => Err(ctx.record_typed(e)),
             None => Ok(v),
         },
-        Err(e) => Err(e.to_pyerror()),
+        Err(e) => Err(ctx.record_typed(e)),
     }
 }
 
@@ -430,7 +437,7 @@ pub fn super_print(
     ctx: &mut CallCtx,
     self_in: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let (t, obj) = match self_in {
         Value::Heap(r) => match ctx.arena.get(r) {
@@ -454,7 +461,7 @@ pub fn type_print(
     ctx: &mut CallCtx,
     self_in: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let Value::Heap(r) = self_in else {
         return;

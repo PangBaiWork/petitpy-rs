@@ -64,7 +64,7 @@ pub fn bool_print(
     _ctx: &mut CallCtx<'_>,
     v: Value,
     _kind: PrintKind,
-    w: &mut dyn std::fmt::Write,
+    w: &mut dyn crate::objects::slots::ByteSink,
 ) {
     if let Value::Bool(b) = v {
         let _ = w.write_str(bool_to_string(b));

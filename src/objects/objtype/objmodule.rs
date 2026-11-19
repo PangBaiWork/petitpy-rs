@@ -395,7 +395,7 @@ pub fn module_store_attr(
 /// so the file entry is found by scanning the dict for a key
 /// whose string is `"__file__"` (see `dict_lookup_by_str`),
 /// not by id lookup.
-pub fn module_print(ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+pub fn module_print(ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     let Some(dict) = module_dict(ctx, value) else {
         return;
     };

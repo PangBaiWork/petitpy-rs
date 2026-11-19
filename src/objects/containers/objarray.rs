@@ -467,7 +467,7 @@ pub fn array_print(
     ctx: &mut CallCtx,
     value: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let Some(a) = array_data(ctx, value) else {
         return;
@@ -544,7 +544,7 @@ fn array_type_data_inner(
         ),
         print: if print {
             Some(
-                |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn std::fmt::Write| {
+                |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink| {
                     array_print(ctx, value, kind, sink)
                 },
             )

@@ -266,9 +266,10 @@ pub struct VmState {
     /// empty qstr (the current directory); the entry point
     /// overwrites `[0]` with the script dir and appends
     /// `PETITPY_LIB` (`main.zig:244-248`, Phase E). Added by
-    /// C15b. A `Vec<String>` (not a Python list object — the
-    /// `sys` module that exposes it is D's `modsys`).
-    pub sys_path: Vec<String>,
+    /// C15b. A `Vec<Vec<u8>>` (not a Python list object — the
+    /// `sys` module that exposes it is D's `modsys`); raw
+    /// bytes, G2 (P7a) — entries may be non-UTF-8.
+    pub sys_path: Vec<Vec<u8>>,
     /// The `sys.path` list OBJECT (`sys_mutable[0]`'s value,
     /// `modsys.zig`): the same list `sys_path` is built from.
     /// Python `sys.path.append(x)` mutates this object, and
@@ -517,7 +518,7 @@ impl Vm {
                 not_implemented: Value::None,
                 pending_sched: None,
                 compiler_linked: true,
-                sys_path: vec![String::new()],
+                sys_path: vec![Vec::new()],
                 sys_path_list: None,
                 sys_modules_dict: None,
                 sys_argv_list: None,
@@ -551,6 +552,15 @@ impl Vm {
         crate::runtime::vm_modules::build_d3_modules(&mut vm);
         crate::runtime::vm_modules::build_d4_modules(&mut vm);
         crate::runtime::vm_modules::build_d5_modules(&mut vm);
+        // G2 (P2): the CLI path never called `gc_init`, so
+        // `NPY_GC_STRESS` was dead there (F1 only fixed the
+        // `ppy_new` path). `gc_init` is idempotent — it only
+        // re-asserts `auto_collect_enabled` and re-reads the
+        // env var into `threshold` (unset → 0 = off) — so
+        // calling it here is safe for every `Vm::new` caller
+        // (CLI, tests, embedding; `ppy_new`'s own call stays
+        // as a harmless second read).
+        vm.arena.gc_init();
         vm
     }
 

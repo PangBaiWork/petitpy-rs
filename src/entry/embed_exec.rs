@@ -24,10 +24,12 @@ use crate::runtime::vm::Vm;
 /// SystemExit NEVER prints a traceback (suppressed on both
 /// nano and full — CPython convention).
 ///
-/// `file` is the script path (`Some` for a script file —
-/// sets `__main__.__file__` + `sys.path[0]`; `None` for `-c`
-/// and the `--emit-mpy` diagnostic re-run).
-pub fn run_source(vm: &mut Vm, src: &[u8], file: Option<&str>) -> i32 {
+/// `file` is the script path as raw bytes (`Some` for a script
+/// file — sets `__main__.__file__` + `sys.path[0]`; `None` for
+/// `-c` and the `--emit-mpy` diagnostic re-run). G2 (P7a):
+/// bytes, not `&str` — a non-UTF-8 script name must reach
+/// `__file__` byte-exact.
+pub fn run_source(vm: &mut Vm, src: &[u8], file: Option<&[u8]>) -> i32 {
     match vm.run_main_source(src, "<stdin>", file) {
         Ok(_) => 0,
         Err(exc) => exit_status_for(vm, exc, true),
@@ -89,6 +91,11 @@ pub(crate) fn print_traceback(vm: &mut Vm, exc: Value, to_stderr: bool) {
 /// Appends to the VM's `sys.path` (whose `[0]` is `""`).
 /// Runs for script, `-c`, and REPL alike, before argv/file
 /// wiring.
+///
+/// G2 (P7a): paths are raw bytes (`Vec<Vec<u8>>`) — an env
+/// entry is UTF-8 here (`std::env::var`), but the stored form
+/// is bytes so a non-UTF-8 script dirname can overwrite
+/// `[0]` without a lossy round-trip.
 pub fn wire_env_sys_path(vm: &mut Vm) {
     let mut paths = vm.state.sys_path.clone();
     if let Ok(pp) = std::env::var("PYTHONPATH") {
@@ -108,7 +115,7 @@ pub fn wire_env_sys_path(vm: &mut Vm) {
         if let Some(dir) = exe.parent() {
             let lib = format!("{}/../share/petitpy/lib", dir.display());
             if std::path::Path::new(&lib).is_dir() {
-                paths.push(lib);
+                paths.push(lib.into_bytes());
             }
         }
     }
@@ -119,10 +126,10 @@ pub fn wire_env_sys_path(vm: &mut Vm) {
 /// colon-separated entry, skipping empties (CPython behavior
 /// — an empty entry would mean CWD, which `sys.path[0]`
 /// already covers).
-fn append_path_entries(paths: &mut Vec<String>, value: &str) {
+fn append_path_entries(paths: &mut Vec<Vec<u8>>, value: &str) {
     for entry in value.split(':') {
         if !entry.is_empty() {
-            paths.push(entry.to_string());
+            paths.push(entry.as_bytes().to_vec());
         }
     }
 }
@@ -130,8 +137,8 @@ fn append_path_entries(paths: &mut Vec<String>, value: &str) {
 /// `wireSysArgv` (`main.zig`): populate `sys.argv` with the
 /// given args (the script path + script args, or `['-c',
 /// ARG...]` — the caller builds the list; argv[0], the
-/// interpreter name, is NOT included).
-pub fn wire_sys_argv(vm: &mut Vm, argv: &[String]) {
+/// interpreter name, is NOT included). Raw bytes, G2 (P7a).
+pub fn wire_sys_argv(vm: &mut Vm, argv: &[Vec<u8>]) {
     vm.set_sys_argv(argv.to_vec());
 }
 

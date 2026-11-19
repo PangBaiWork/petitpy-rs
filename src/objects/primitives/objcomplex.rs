@@ -316,7 +316,7 @@ pub fn complex_print(
     ctx: &mut CallCtx<'_>,
     v: Value,
     _kind: PrintKind,
-    w: &mut dyn std::fmt::Write,
+    w: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let (re, im) = match v {
         Value::Heap(r) => match ctx.arena.get(r) {
@@ -338,10 +338,10 @@ pub fn complex_print(
     }
 }
 
-/// A `fmt::Write` → `PrintSink` bridge — same shape as the one in
+/// A `ByteSink` → `PrintSink` bridge — same shape as the one in
 /// `objfloat.rs` (a local copy: the two modules do not share a
 /// helper, and the bridge is four lines).
-struct WriteSink<'a>(&'a mut dyn std::fmt::Write);
+struct WriteSink<'a>(&'a mut dyn crate::objects::slots::ByteSink);
 
 impl PrintSink for WriteSink<'_> {
     fn emit(&mut self, bytes: &[u8]) -> Result<(), crate::objects::strings::objstr_a::StrError> {

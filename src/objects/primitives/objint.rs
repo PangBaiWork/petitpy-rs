@@ -768,7 +768,7 @@ pub fn int_print(
     ctx: &mut CallCtx<'_>,
     v: Value,
     _kind: PrintKind,
-    w: &mut dyn std::fmt::Write,
+    w: &mut dyn crate::objects::slots::ByteSink,
 ) {
     if let Some(s) = int_to_string(v, ctx.arena) {
         let _ = w.write_str(&s);

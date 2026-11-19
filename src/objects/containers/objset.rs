@@ -622,7 +622,7 @@ pub fn set_binary_op(ctx: &mut CallCtx, op: BinaryOp, lhs: Value, rhs: Value) ->
 /// `frozenset()`; otherwise `{a, b}` / `frozenset({a, b})`,
 /// elements in PRINT_REPR, table order. The `kind` is ignored —
 /// the Zig always prints REPR here.
-pub fn set_print(ctx: &mut CallCtx, v: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+pub fn set_print(ctx: &mut CallCtx, v: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     let frozen = is_frozenset(ctx.arena, ctx.types, v);
     let items = match v {
         Value::Heap(r) => match ctx.arena.get(r) {

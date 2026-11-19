@@ -48,7 +48,7 @@ pub fn instance_print(
     ctx: &mut CallCtx,
     value: Value,
     kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let types = ctx.types;
     let Some(type_) = instance_type_of(ctx, value) else {
@@ -199,7 +199,7 @@ fn lookup_print_method(
 
 /// The `<%s object at %p>` fallback (objtype.zig:1680-1687).
 /// The address is the arena index (the Zig prints a pointer).
-fn print_fallback(ctx: &CallCtx, value: Value, type_: GcRef, sink: &mut dyn std::fmt::Write) {
+fn print_fallback(ctx: &CallCtx, value: Value, type_: GcRef, sink: &mut dyn crate::objects::slots::ByteSink) {
     let name = match type_data(ctx.arena, type_) {
         Some(t) => {
             let bytes = ctx.pool.qstr_str(t.name as u16);
@@ -219,7 +219,7 @@ pub fn instance_print_slot(
     ctx: &mut CallCtx,
     value: Value,
     kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     instance_print(ctx, value, kind, sink)
 }

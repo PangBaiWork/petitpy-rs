@@ -618,7 +618,7 @@ pub fn tuple_print(
     ctx: &mut CallCtx,
     value: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let types = ctx.types;
     let items: Vec<Value> = tuple_items(ctx, value).unwrap_or(&[]).to_vec();
@@ -655,7 +655,7 @@ pub fn tuple_type_data(dict: GcRef) -> TypeData {
         subscr: Some(tuple_subscr),
         buffer: None,
         print: Some(
-            |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn std::fmt::Write| {
+            |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink| {
                 tuple_print(ctx, value, kind, sink)
             },
         ),

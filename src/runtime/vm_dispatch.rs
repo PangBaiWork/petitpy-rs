@@ -65,8 +65,8 @@ pub use crate::runtime::vm_dispatch_util::DispatchOutcome;
 use crate::runtime::vm_dispatch_util::{
     bc_byte, binary_op_from_ordinal, decode_int, decode_qstr, decode_slabel, decode_uint,
     decode_ulabel, fast_local, jump_by, list_slot, list_slot_mut, new_name_error_local,
-    new_no_active_exc, new_not_impl_opcode, scan_prev_exc, spop, spush, spush_null, sset, sget,
-    stop, store_fast_local, unary_op_from_ordinal, unwind_jump, unwind_return, Flow,
+    new_no_active_exc, new_not_impl_opcode, scan_prev_exc, spop, spush, spush_null, spush_opt,
+    sset, sget, stop, store_fast_local, unary_op_from_ordinal, unwind_jump, unwind_return, Flow,
 };
 use crate::runtime::vm_ops::{exc_from_obj_error, type_error};
 use crate::runtime::vm_seams::{drain_hook_raise, make_hook};
@@ -609,18 +609,12 @@ pub(crate) fn dispatch_loop(
                 }
             }
             MP_BC_DUP_TOP_TWO => {
+                // Copy the raw slots (NULL survives — see
+                // `sset`'s doc; vendor `vm.zig:703-708`).
                 let a = sget(frame, 1);
-                let b = stop(frame);
-                match (a, b) {
-                    (Some(a), Some(b)) => {
-                        spush(frame, a);
-                        spush(frame, b);
-                    }
-                    _ => {
-                        spush_null(frame);
-                        spush_null(frame);
-                    }
-                }
+                let b = sget(frame, 0);
+                spush_opt(frame, a);
+                spush_opt(frame, b);
             }
             MP_BC_POP_TOP => {
                 spop(frame);

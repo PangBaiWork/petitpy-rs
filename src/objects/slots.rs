@@ -440,11 +440,56 @@ pub enum PrintKind {
     Raw = 4,
 }
 
-/// `fn(&mut CallCtx, Value, PrintKind, &mut dyn Write)` — print slot
-/// (`mp_print_t` in vendor `py/mpprint.h`). Returns `()` like the
-/// original (void): sink errors are ignored, as the original ignores
-/// `mp_printf`'s return.
-pub type PrintFn = for<'a> fn(&mut CallCtx<'a>, Value, PrintKind, &mut dyn fmt::Write);
+/// A byte-capable print sink (G2, P7a): the object print slots
+/// take `&mut dyn ByteSink` instead of `&mut dyn crate::objects::slots::ByteSink`.
+/// The vendor's print sink is byte-based (`mp_print_strn` writes
+/// raw bytes to fd 1); the Rust text sink degraded non-UTF-8
+/// bytes to U+FFFD, so `print(__file__)` of a `0xff` script name
+/// printed the replacement character instead of the raw byte.
+/// `write_bytes` defaults to the old lossy behaviour (so
+/// `String`-backed sinks — `str()`/`repr()` construction, help
+/// text — are unchanged); byte-backed sinks override it with a
+/// raw write. `ByteBuf` is the raw one, used by the `print`
+/// stdout/file paths and `obj_print`.
+pub trait ByteSink: fmt::Write {
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        let _ = self.write_str(&String::from_utf8_lossy(bytes));
+    }
+}
+
+impl ByteSink for String {}
+
+/// A `Vec<u8>`-backed `ByteSink`: `write_bytes` stores the bytes
+/// exactly; `write_str` stores the string's bytes (also exact —
+/// a `&str` is valid UTF-8 by construction).
+pub struct ByteBuf(pub Vec<u8>);
+
+impl ByteBuf {
+    pub fn new() -> Self {
+        ByteBuf(Vec::new())
+    }
+}
+
+impl fmt::Write for ByteBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+}
+
+impl ByteSink for ByteBuf {
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+}
+
+/// `fn(&mut CallCtx, Value, PrintKind, &mut dyn ByteSink)` —
+/// print slot (`mp_print_t` in vendor `py/mpprint.h`). Returns
+/// `()` like the original (void): sink errors are ignored, as
+/// the original ignores `mp_printf`'s return. G2 (P7a): the
+/// sink is byte-capable (see `ByteSink`) — a `fmt::Write` sink
+/// cannot carry non-UTF-8 `str` bytes.
+pub type PrintFn = for<'a> fn(&mut CallCtx<'a>, Value, PrintKind, &mut dyn ByteSink);
 
 // ── Stream protocol (`mp_stream_p_t`, vendor `py/stream.h`) ─────────────
 // Ported by Lane C16 (`support/stream.zig`). The vtable lives on

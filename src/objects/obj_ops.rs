@@ -6,8 +6,6 @@
 //! (`call_binary`, `call_subscr`, `obj_get_type`, …); the dependency
 //! is one-way (`obj_ops` → `obj`).
 
-use std::fmt;
-
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::obj::{
     buffer_slot, call_binary, call_subscr, call_unary, is_bytes, is_str, obj_get_int_maybe,
@@ -342,7 +340,7 @@ pub fn obj_print_helper(
     types: &BuiltinTypes,
     value: Value,
     kind: PrintKind,
-    sink: &mut dyn fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let t = obj_get_type(ctx.arena, types, value);
     if let Some(f) = print_slot(ctx.arena, t) {
@@ -355,15 +353,15 @@ pub fn obj_print_helper(
 
 /// `mp_obj_print` (`obj.zig:464-466`): print to the Python printer
 /// (stdout under full config — `MP_PYTHON_PRINTER` resolves to
-/// `mp_sys_stdout_print`). `StdoutLock` does not implement
-/// `fmt::Write`, so the text is collected first and written to
-/// stdout with errors ignored, as the original ignores
-/// `mp_printf`'s return.
+/// `mp_sys_stdout_print`). The bytes are collected in a `ByteBuf`
+/// first and written to stdout with errors ignored, as the
+/// original ignores `mp_printf`'s return. G2 (P7a): a `ByteBuf`,
+/// not a `String` — a non-UTF-8 `str` prints byte-exact.
 pub fn obj_print(ctx: &mut CallCtx, types: &BuiltinTypes, value: Value, kind: PrintKind) {
-    let mut s = String::new();
+    let mut s = crate::objects::slots::ByteBuf::new();
     obj_print_helper(ctx, types, value, kind, &mut s);
     use std::io::Write as _;
-    let _ = std::io::stdout().write_all(s.as_bytes());
+    let _ = std::io::stdout().write_all(&s.0);
 }
 
 // ── array access / index / subscript / buffer ─────────────────────────
@@ -556,7 +554,7 @@ pub fn obj_print_exception<'r>(
     types: &BuiltinTypes,
     exc: Value,
     resolve: &'r dyn Fn(u32) -> &'r [u8],
-    sink: &mut dyn fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     print_exception_chain(ctx, types, exc, resolve, 16, sink);
 }
@@ -570,7 +568,7 @@ fn print_exception_chain<'r>(
     exc: Value,
     resolve: &'r dyn Fn(u32) -> &'r [u8],
     depth: u8,
-    sink: &mut dyn fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     if depth > 0 && is_exception_instance(ctx.arena, exc) {
         if let Some(cause) = exception_cause(ctx.arena, exc) {

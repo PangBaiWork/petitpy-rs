@@ -1,0 +1,107 @@
+# Lane G2 — 纯 std 快胜（P1/P2/P7a/P10/P11/P12/P13）
+
+基线 master 4712f27；分支 lane/g2-quickwins；提交 5143d36（P1）、
+bbfae96（P2）、6f6e6e7（P7a）、a8b9a35（P12）、067fcd2（P10/P11）。
+P13 无需改动（见 §1）。README.md 的 Known divergences 已同步更新。
+
+## §1 每项做了什么（文件:行）
+
+- **P1**（已修）：`src/objects/objtype/typecreate.rs`（super_make_new）
+  — 失败分支改走 F4 的 `TypedRaise for ObjTypeError` + `record_typed`，
+  不再返回裸 TypeError。探针覆盖 `super(1,2)` / `super(int,"x")` /
+  `super("x",1)` 等 14 条，全部与 REF byte-identical。
+- **P2**（已修）：`src/runtime/vm.rs`（`Vm::new` 调 `arena.gc_init()`）
+  — CLI 路径 `NPY_GC_STRESS` 正式生效（F1 只在 `ppy_new` 补过）。
+  `ppy_new` 里的调用保留（同值二次读取，无副作用）。
+- **P7a**（已修，分两段）：(a) argv 贯通：`src/main.rs` /
+  `src/bin/petitpy-vm.rs` 改 `args_os()`；`sys.path` / `sys.argv` /
+  `__file__` / `sys.path[0]` 全程存原始字节（`Vec<Vec<u8>>`）：
+  `src/runtime/vm.rs`、`src/runtime/vm_eval.rs`、`src/entry/embed_exec.rs`、
+  `src/runtime/modsys.rs`、`src/runtime/import_search.rs`（+ 两处测试
+  同步）及 `src/entry/api.rs` 的 `set_sys_path` / `set_sys_argv` 调用。
+  (b) 打印出口：前任只做了 (a)，探针仍 FAIL——`print(__file__)`
+  印出 U+FFFD。根因是 C6 的 text-sink 设计：`str_print` 的 raw 分支
+  和 quoted flush 都经 `String::from_utf8_lossy`。修复：新增
+  `ByteSink` trait（`src/objects/slots.rs`，`fmt::Write` 子 trait，
+  `write_bytes` 默认 lossy；`ByteBuf` 原样写字节；`String` /
+  `VstrSink` 实现它）+ `PrintFn` 改走 `&mut dyn ByteSink`（全树
+  34 个文件机械替换签名，行为不变）；`str_print` raw 分支与
+  `str_print_quoted` 的 flush 改走 `write_bytes`；`print` /
+  `obj_print` / `__repl_print__` / `print(file=)` 的 render 改走
+  `ByteBuf`。`str()` / `repr()` 构造仍走 `String`（lossy 默认），
+  属已知局限，见 §4。
+- **P10**（无需修，简报前提错了）：`petitpy.h` 无 kwargs 调用入口
+  （`ppy_function` 只有 positional argc/argv）。原版也**不**忽略
+  kwargs：`argcheck.zig:43`（n_kw>0 且 takes_kw=false → terse），
+  host sig 为 `(1, maxInt(u16), false)`（`api.zig:713`），每次 host
+  调用都过 `fun_builtin_var_call` 的 `mp_arg_check_num_sig`
+  （`objfun.zig:103`）——REF 同样报 `TypeError: argument num/types
+  mismatch`。Rust 侧拦截进 `call_host_ctx` 后报同一错误，行为已
+  一致。新增测试 `src/entry/api_tests.rs::host_call_with_kwargs_is_mismatch`
+  钉住该一致；未编造 C 入口，`api_test.c`（原项目）未动。
+- **P11**（探针通，无需修）：`ppy_getitem` / `ppy_setitem` 已走
+  `try_instance_subscr`（`src/entry/api.rs:708` `subscr_body`）。
+  新增测试 `src/entry/api_tests.rs::ppy_getitem_setitem_user_dunders`
+  （用户 `__getitem__` 返回 k*10、`__setitem__` 写 dict）通过。
+- **P12**（已修）：`src/runtime/vm_dispatch.rs:611`（DUP_TOP_TWO）
+  + 新 `spush_opt`（`src/runtime/vm_dispatch_util.rs`）——原样复制
+  两个 raw slot（NULL 保留），照 `ROT_TWO` / 原版 `vm.zig:703-708`。
+  旧代码任一 slot 为 NULL 即推两个 NULL。新增 dispatch 层测试
+  `src/runtime/vm_dispatch_tests.rs::dup_top_two_copies_raw_slots`
+  （手造 .mpy：`LOAD_CONST 7, LOAD_NULL, DUP_TOP_TWO, POP_TOP,
+  STORE_NAME q`，断言全局 q==7；已反证：修复 stash 后测试 FAIL）。
+  简报“编译器无调用方”前提错了：`src/compiler/compile/assign.rs:211`
+  对 `a[i] += x` 发 `dup_top_two`；NULL 情形仍只对手造 .mpy 可达。
+- **P13**（无需修，已由 E2c 修掉）：`str_join_builtin` 走
+  `builtin_method!` 宏（`src/objects/strings/objstr_methods_b.rs:468`），
+  `args.len() < 2` 即 Err；现存测试
+  `e2c_short_direct_calls_error_not_panic`（0/1 参数 → Err，不 panic）
+  已通过。`str_join` 本体的直接调用方只有 `call_join_ctx`（自带
+  arity 检查），无其它短调用路径。
+
+## §2 实测数字（feature 默认关，与 master 同条件）
+
+- `cargo test --release --lib --tests`：lib **1703 passed / 0 failed /
+  3 ignored**（1700 + P12 1 个 + P10/P11 2 个），bins **9**，
+  entry_cli **45**。强制重编（`touch src/lib.rs && cargo build
+  --release`）：rc=0，**0 warnings**。
+- 全树 0 新增 unsafe：`src/entry/api.rs` 的 unsafe 计数基线 = 当前 =
+  87（全是 F1 既有）；新增 `unsafe` 只出现在 `api_tests.rs` 的
+  FFI 调用点（与既有 6 个测试同一写法）。文件均 <2500 行。
+- `scripts/check_compile_mpy.py` PASS（byte mismatches: 0）；
+  `scripts/check_frozen.py` PASS（38141 bytes / 23 .mpy）。
+- 六门（脚本默认路径）：full **545/552 GREEN**（失败集恰为 7 个
+  known-fails）；integration **200/202**（失败集恰为 select ×2，
+  G0 未合并）；golden **585/585**；capability **GREEN**；stdlib
+  **8/8**；nano **454/541** report-only。
+- C 验收（原版 `api_test.c` 未改动，host.c 未改动）：staticlib
+  61/61（`all passed`），staticlib + `NPY_GC_STRESS=10` 同样；
+  cdylib 61/61，cdylib + stress 同样；host.c 输出 `41`，rc 0。
+
+## §3 探针清单（`~/workspace/g2_probe/`，REF vs 本 worktree 二进制）
+
+- `probe_p1.py`：14/14 byte-identical（super() 各形报错）。
+- `probe_p2.py`：PASS（NPY_GC_STRESS=1 下循环慢 4.9x；`__del__`
+  程序在 stress=None/1/10 下与 REF byte-identical）。
+- `probe_p7a.py`：8/8 PASS（0xff 脚本名、`__file__` / `sys.argv` /
+  `-c` 参数 / `sys.path[0]` 非 UTF-8 目录 / petitpy-vm 非 UTF-8
+  .mpy / 缺失文件；其中 petitpy-vm 缺失文件一例只比 rc + stderr
+  首行——REF 追加的 Zig 栈跟踪是地址噪声，不可复现，见 §4）。
+- `probe_p12.py`：6/6 PASS（`a[i] += x` list/dict/嵌套、for step
+  两种、`del o.x` 的 NULL 回归 guard）。
+
+## §4 遗留 / 未修原因
+
+- `str()` / `repr()` 构造仍走 `String` sink（`ByteSink` 默认
+  lossy）：`repr('…\xff…')` 得到的 str 值仍含 U+FFFD，`print()`
+  输出已是字节精确。修它需把 `str`/`repr` 内置的渲染也改成
+  `ByteBuf`，属同一机制的延伸，未在 G2 范围内做。
+- petitpy-vm 缺失文件时 REF 打印 Zig 栈跟踪，Rust 只印首行
+  `error: FileNotFound`——地址噪声，不可复现，不修（triage 已定）。
+- `ppy_exec` 非 UTF-8 文件名仍 lossy（F1 在 `read_config` 层的
+  `from_utf8_lossy`；P7a 修的是 CLI argv 路径，不是 API 路径）。
+- 一次瞬态：`cargo test` 曾报 `panic strategy abort vs unwind`
+  不兼容（增量指纹混合），重跑即好，未复现；非代码问题。
+- 本 lane 基线 4712f27；合并时需 rebase 到当前 master（G0 已合
+  并，见 parent 侧；G0 的 `modselect.rs` / feature 与本 lane 文件
+  无交集）。

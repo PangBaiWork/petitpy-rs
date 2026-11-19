@@ -441,7 +441,7 @@ pub fn fun_bc_call_slot(
 /// index (see the module docs); the name resolves through the
 /// qstr pool. Prints nothing when the value is not a heap `FunBc`
 /// (unreachable via the slot dispatcher).
-pub fn fun_bc_print(ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+pub fn fun_bc_print(ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     let (name, addr) = match value {
         Value::Heap(r) => match ctx.arena.get(r) {
             Obj::FunBc(d) => (d.name, r.0),
@@ -590,7 +590,7 @@ pub fn fun_bc_type_data(dict: GcRef) -> TypeData {
         subscr: None,
         buffer: None,
         print: Some(
-            |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn std::fmt::Write| {
+            |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink| {
                 fun_bc_print(ctx, value, kind, sink)
             },
         ),

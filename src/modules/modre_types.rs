@@ -13,7 +13,7 @@ use crate::objects::value::{GcRef, Obj, TypeData, Value};
 /// pointer; Rust prints the arena slot index instead (the
 /// pointer is ASLR-random, no test can pin it — see the
 /// module docs).
-pub(crate) fn re_print(ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+pub(crate) fn re_print(ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     let _ = ctx;
     let slot = match value {
         Value::Heap(r) => r.0,
@@ -27,7 +27,7 @@ pub(crate) fn match_print(
     ctx: &mut CallCtx,
     value: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let _ = ctx;
     let num = match value {
@@ -62,7 +62,7 @@ pub(crate) fn re_type_data(dict: GcRef) -> TypeData {
             |ctx: &mut CallCtx,
              value: Value,
              kind: PrintKind,
-             sink: &mut dyn std::fmt::Write| {
+             sink: &mut dyn crate::objects::slots::ByteSink| {
                 re_print(ctx, value, kind, sink)
             },
         ),
@@ -94,7 +94,7 @@ pub(crate) fn match_type_data(dict: GcRef) -> TypeData {
             |ctx: &mut CallCtx,
              value: Value,
              kind: PrintKind,
-             sink: &mut dyn std::fmt::Write| {
+             sink: &mut dyn crate::objects::slots::ByteSink| {
                 match_print(ctx, value, kind, sink)
             },
         ),

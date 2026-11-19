@@ -307,7 +307,7 @@ pub fn range_subscr(
 /// `step == 1`, else `, %ld)`. `%ld` prints the full decimal; Rust
 /// `{}` does the same (no 32-char truncation applies — base-10
 /// `i64` is at most 20 digits).
-pub fn range_print(ctx: &mut CallCtx, v: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+pub fn range_print(ctx: &mut CallCtx, v: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     let (start, stop, step) = range_data_of(ctx.arena, v);
     let _ = write!(sink, "range({start}, {stop}");
     if step == 1 {

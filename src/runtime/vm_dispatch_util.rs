@@ -42,6 +42,14 @@ pub(crate) fn spush_null(frame: &mut CodeState) {
     frame.stack.push(None);
 }
 
+/// PUSH(v) — keeps `None` (NULL) when `v` is `None` (`DUP_TOP_TWO`
+/// must copy the raw slots, like `ROT_TWO`'s `sset` — G2 (P12);
+/// the vendor's `sp[0] = (sp-2)[0]; (sp-1)[0] = (sp-3)[0]`
+/// (`vm.zig:703-708`) copies NULLs verbatim).
+pub(crate) fn spush_opt(frame: &mut CodeState, v: Option<Value>) {
+    frame.stack.push(v);
+}
+
 /// POP() — `None` when the slot held NULL or the stack is empty.
 pub(crate) fn spop(frame: &mut CodeState) -> Option<Value> {
     frame.stack.pop().flatten()

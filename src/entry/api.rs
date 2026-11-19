@@ -1048,10 +1048,9 @@ pub unsafe extern "C" fn ppy_new(config: *const PpyConfig) -> *mut Interp {
     // stress threshold — the original calls it from
     // `mp_embed_init` for every entry point, and the
     // embedding stress run (`NPY_GC_STRESS=10`) only catches
-    // unrooted handles when it takes effect. `Vm::new`
-    // does not call it (the CLI path never does — a
-    // pre-existing tree gap, out of this lane's scope), so
-    // the embedding layer calls it here.
+    // unrooted handles when it takes effect. G2 (P2) made
+    // `Vm::new` call it; the call here stays as a harmless
+    // second read (same env value).
     vm.arena.gc_init();
     // Register `__main__` (an empty run creates the module +
     // its dict and records `d4.main_module`); the globals
@@ -1071,8 +1070,13 @@ pub unsafe extern "C" fn ppy_new(config: *const PpyConfig) -> *mut Interp {
             return std::ptr::null_mut();
         }
     };
-    vm.set_sys_path(paths);
-    vm.set_sys_argv(argv);
+    // G2 (P7a): `set_sys_path` / `set_sys_argv` take raw
+    // bytes now. The config strings are already lossy at the
+    // `read_config` level (F1's documented caveat — C strings
+    // arrive via `from_utf8_lossy`); the conversion here adds
+    // no further loss.
+    vm.set_sys_path(paths.into_iter().map(|s| s.into_bytes()).collect());
+    vm.set_sys_argv(argv.into_iter().map(|s| s.into_bytes()).collect());
     let interp = Box::new(Interp {
         vm,
         index,

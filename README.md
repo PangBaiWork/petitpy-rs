@@ -179,10 +179,9 @@ pass a gate.
 - **GC finaliser is drained only at an explicit `gc.collect()`**
   (F6): a stress collection inside `alloc()` defers the `__del__`
   calls to the next explicit collect (objects are seed-marked to
-  survive meanwhile). The CLI never stress-collects — `Vm::new`
-  never calls `gc_init()` (pre-existing gap; F1 calls it in
-  `ppy_new` only). Finaliser tracebacks go to std stderr, not
-  through the embedding API's print sink.
+  survive meanwhile). The CLI path now stress-collects too (G2:
+  `Vm::new` calls `gc_init()`). Finaliser tracebacks go to std
+  stderr, not through the embedding API's print sink.
 - **`float()` of a class defining `__float__` falls through to
   the native value** (F3): `float(G(1.5))` with `G.__float__`
   returning 9.9 is 9.9 on the reference, 1.5 on Rust.
@@ -196,20 +195,21 @@ pass a gate.
 - **Identity-hash values differ by design** (F3): the reference
   prints raw ASLR addresses, Rust prints arena indices. The
   mechanism (stable per object, dicts work) is correct.
-- **Embedding API edges** (F1): host-function kwargs are rejected;
-  a `__getitem__` on user instances through the API is untested;
-  non-UTF-8 exec filenames are lossy; NULL arguments are handled
-  defensively where the Zig would fault; nested `ppy_*` calls from
-  a host function re-enter through the raw interp pointer
+- **Embedding API edges** (F1): host-function kwargs are rejected
+  with `TypeError: argument num/types mismatch` — which is the
+  vendor's own behaviour (`argcheck.zig:43`, G2 P10, pinned by
+  test); a `__getitem__`/`__setitem__` on user instances through
+  the API works (G2 P11, pinned by test); non-UTF-8 exec
+  filenames are lossy; NULL arguments are handled defensively
+  where the Zig would fault; nested `ppy_*` calls from a host
+  function re-enter through the raw interp pointer
   (lock-serialized, same guarantee the Zig relies on).
 - **Typing edges** (F5a): `|=` on types does not take the union
   branch (the vendor checks plain `OR` only — probed identical);
   `real_load_maybe` lacks the `__class__`/`__next__` special cases
   (no caller needs them).
 - **E1/E2 leftovers**: `type(iter(s))` is a bare `TypeError`;
-  `super()`-construction errors lose their messages
-  (`super_make_new` still returns the bare signal, F4); a
-  dict-subclass `__missing__` reached through ctx-only seams
+  a dict-subclass `__missing__` reached through ctx-only seams
   yields a bare `TypeError` instead of `KeyError` (no gate
   coverage); the `petitpy-vm` missing-file error prints only the
   first line (`error: FileNotFound`) — the reference's Zig stack

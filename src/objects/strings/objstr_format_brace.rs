@@ -75,7 +75,7 @@ fn print_conversion(
     types: &BuiltinTypes,
     arg: Value,
     kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
     mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<(), StrError> {
     if let Some(h) = hook.as_deref_mut() {

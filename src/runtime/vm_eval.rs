@@ -419,15 +419,16 @@ impl Vm {
     /// module that exposes it is D's `modsys`; the default is
     /// `[""]`, the current directory — `runtime.zig:276-279`).
     /// Added by C15b for the import tests (and D1's `modsys`).
-    /// D2: the `sys.path` list OBJECT is synced in place
-    /// (clear + extend, keeping its identity — the delegation
-    /// slot and the import search both point at it).
-    pub fn set_sys_path(&mut self, paths: Vec<String>) {
+    /// G2 (P7a): paths are raw bytes — `sys.path` entries
+    /// come from argv / the environment / a script's dirname,
+    /// all of which may be non-UTF-8 (the reference keeps the
+    /// raw bytes; `new_str` is byte-based).
+    pub fn set_sys_path(&mut self, paths: Vec<Vec<u8>>) {
         let (mut ctx, state) = self.split();
         let types = ctx.types;
         let items: Vec<Value> = paths
             .iter()
-            .map(|p| crate::objects::strings::objstr_a::new_str(&mut ctx, types, p.as_bytes()))
+            .map(|p| crate::objects::strings::objstr_a::new_str(&mut ctx, types, p))
             .collect();
         state.sys_path = paths;
         if let Some(list_ref) = state.sys_path_list {
@@ -441,12 +442,14 @@ impl Vm {
     /// object). Added by E1 for the entry point (`wireSysArgv`,
     /// `main.zig`): `['-c', ARG...]` or `[script, ARG...]`.
     /// Like `set_sys_path`, syncs the list object in place.
-    pub fn set_sys_argv(&mut self, args: Vec<String>) {
+    ///
+    /// G2 (P7a): args are raw bytes (see `set_sys_path`).
+    pub fn set_sys_argv(&mut self, args: Vec<Vec<u8>>) {
         let (mut ctx, state) = self.split();
         let types = ctx.types;
         let items: Vec<Value> = args
             .iter()
-            .map(|a| crate::objects::strings::objstr_a::new_str(&mut ctx, types, a.as_bytes()))
+            .map(|a| crate::objects::strings::objstr_a::new_str(&mut ctx, types, a))
             .collect();
         if let Some(list_ref) = state.sys_argv_list {
             if let Obj::List(l) = ctx.arena.get_mut(list_ref) {
@@ -547,7 +550,12 @@ impl Vm {
     /// `__main__.__file__` = the script path in the module's
     /// dict, and replace `sys.path[0]` with `dirname(script)`.
     /// Runs after registration, BEFORE the body runs.
-    fn wire_script_file_and_path(&mut self, module_val: Value, script: &str) {
+    ///
+    /// G2 (P7a): `script` is raw bytes, not `&str` — a
+    /// non-UTF-8 script name must reach `__file__` and
+    /// `sys.path[0]` byte-exact (the reference prints the raw
+    /// bytes; `new_str` is byte-based so nothing is lost).
+    fn wire_script_file_and_path(&mut self, module_val: Value, script: &[u8]) {
         {
             let (mut ctx, _state) = self.split();
             if let Value::Heap(module_ref) = module_val {
@@ -562,7 +570,7 @@ impl Vm {
                     let file_val = crate::objects::strings::objstr_a::new_str(
                         &mut ctx,
                         types,
-                        script.as_bytes(),
+                        script,
                     );
                     let _ = crate::objects::containers::objdict::dict_store(
                         &mut ctx,
@@ -576,9 +584,13 @@ impl Vm {
         // `sys.path[0] := dirname(script)` — the placeholder
         // empty-qstr entry gets overwritten in place (the Zig's
         // `std.fs.path.dirname` returns "" for a bare filename).
-        let dir = std::path::Path::new(script)
+        // Byte-exact: `Path::parent` on the raw `OsStr`, no
+        // lossy conversion (a non-UTF-8 directory must land in
+        // `sys.path[0]` as-is, as on the reference).
+        use std::os::unix::ffi::OsStrExt;
+        let dir: Vec<u8> = std::path::Path::new(std::ffi::OsStr::from_bytes(script))
             .parent()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| p.as_os_str().as_bytes().to_vec())
             .unwrap_or_default();
         let mut paths = self.state.sys_path.clone();
         if !paths.is_empty() {
@@ -597,11 +609,14 @@ impl Vm {
     /// `sys.path[0]` BEFORE the body runs when `file` is
     /// given, then run the body. Returns the module value, or
     /// the raised exception object.
+    ///
+    /// G2 (P7a): `file` is raw bytes — a non-UTF-8 script
+    /// name must reach `__file__` byte-exact.
     pub fn run_main_source(
         &mut self,
         src: &[u8],
         source_name: &str,
-        file: Option<&str>,
+        file: Option<&[u8]>,
     ) -> Result<Value, Value> {
         let src_str = match std::str::from_utf8(src) {
             Ok(s) => s,

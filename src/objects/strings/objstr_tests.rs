@@ -57,19 +57,19 @@ pub(crate) fn qid(name: &[u8]) -> u32 {
 
 /// Test-only print stubs standing in for C7/C12's real print slots
 /// (int/bool/none). Only the `PRINT_STR` spelling is needed here.
-fn int_print_stub(_ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+fn int_print_stub(_ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     if let Value::SmallInt(n) = value {
         let _ = write!(sink, "{}", n);
     }
 }
 
-fn bool_print_stub(_ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+fn bool_print_stub(_ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     if let Value::Bool(b) = value {
         let _ = sink.write_str(if b { "True" } else { "False" });
     }
 }
 
-fn none_print_stub(_ctx: &mut CallCtx, _value: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+fn none_print_stub(_ctx: &mut CallCtx, _value: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     let _ = sink.write_str("None");
 }
 
@@ -79,7 +79,7 @@ fn none_print_stub(_ctx: &mut CallCtx, _value: Value, _kind: PrintKind, sink: &m
 /// print's format). This stands in for C18's float print slot
 /// (registration only); the `{}`-format conversion path that calls
 /// it is C8b's and is tested here.
-fn float_print_stub(ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+fn float_print_stub(ctx: &mut CallCtx, value: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     if let Value::Heap(r) = value {
         if let Obj::Float(f) = ctx.arena.get(r) {
             let _ = sink.write_str(&crate::vendor::formatfloat::format_float(*f, b'g', -1, 0));

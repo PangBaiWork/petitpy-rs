@@ -43,7 +43,10 @@ const USAGE: &str = "petitpy — a small Python runtime, MicroPython-compatible,
 /// refused (re-run through the exec path for the diagnostic).
 /// The VM is initialised first (the compiler interns qstrs
 /// into the VM's pool).
-fn emit_mpy(vm: &mut Vm, in_path: &str) -> u8 {
+///
+/// G2 (P7a): `in_path` is an `OsStr` — a non-UTF-8 file name
+/// must open, not panic in `std::env::args()`.
+fn emit_mpy(vm: &mut Vm, in_path: &std::ffi::OsStr) -> u8 {
     let src = match std::fs::read(in_path) {
         Ok(s) => s,
         Err(_) => {
@@ -92,29 +95,37 @@ fn emit_mpy(vm: &mut Vm, in_path: &str) -> u8 {
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().collect();
-    let arg1 = argv.get(1).map(String::as_str);
+    // G2 (P7a): `args_os`, not `args` — `std::env::args()`
+    // PANICS (unwrap in env.rs) on a non-UTF-8 argument,
+    // while the reference runs a `0xff` script name fine.
+    // Everything downstream is byte-based (`OsStr` /
+    // `as_encoded_bytes`), so no lossy conversion happens
+    // anywhere on the path from argv to `__file__` /
+    // `sys.argv` / `sys.path[0]`.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let arg1 = argv.get(1).map(|s| s.as_os_str());
+    let is = |s: &str| arg1 == Some(std::ffi::OsStr::new(s));
 
-    if matches!(arg1, Some("--version") | Some("-V")) {
+    if is("--version") || is("-V") {
         let _ = std::io::stdout()
             .write_all(format!("petitpy {VERSION}\n").as_bytes());
         return ExitCode::from(0);
     }
-    if matches!(arg1, Some("--help") | Some("-h")) {
+    if is("--help") || is("-h") {
         let _ = std::io::stderr().write_all(USAGE.as_bytes());
         return ExitCode::from(0);
     }
 
     // `--emit-mpy IN.py` — compile and print the `.mpy` as
     // base64, without running the program.
-    if arg1 == Some("--emit-mpy") {
+    if is("--emit-mpy") {
         let Some(in_path) = argv.get(2) else {
             let _ = std::io::stderr()
                 .write_all(b"usage: petitpy --emit-mpy IN.py\n");
             return ExitCode::from(2);
         };
         let mut vm = Vm::new();
-        return ExitCode::from(emit_mpy(&mut vm, in_path));
+        return ExitCode::from(emit_mpy(&mut vm, in_path.as_os_str()));
     }
 
     // No args → interactive REPL.
@@ -125,7 +136,7 @@ fn main() -> ExitCode {
     }
 
     // `-c CODE [ARG...]`: sys.argv is ['-c', ARG...].
-    if arg1 == Some("-c") {
+    if is("-c") {
         let Some(code) = argv.get(2) else {
             let _ = std::io::stderr().write_all(
                 b"petitpy: argument expected for the -c option\n",
@@ -134,11 +145,15 @@ fn main() -> ExitCode {
         };
         let mut vm = Vm::new();
         wire_env_sys_path(&mut vm);
-        let sys_argv: Vec<String> = std::iter::once("-c".to_string())
-            .chain(argv.iter().skip(3).cloned())
+        let sys_argv: Vec<Vec<u8>> = std::iter::once(b"-c".to_vec())
+            .chain(
+                argv.iter()
+                    .skip(3)
+                    .map(|a| a.as_encoded_bytes().to_vec()),
+            )
             .collect();
         wire_sys_argv(&mut vm, &sys_argv);
-        return ExitCode::from(run_source(&mut vm, code.as_bytes(), None) as u8);
+        return ExitCode::from(run_source(&mut vm, code.as_encoded_bytes(), None) as u8);
     }
 
     // Read the script as a buffer and run it as `__main__`.
@@ -146,16 +161,24 @@ fn main() -> ExitCode {
     let src = match std::fs::read(script) {
         Ok(s) => s,
         Err(e) => {
-            let _ = std::io::stderr().write_all(
-                format!("petitpy: can't open file '{script}': {}\n", io_error_name(&e))
-                    .as_bytes(),
-            );
+            // Byte-exact error line: the file name is raw
+            // argv bytes (the reference prints them as-is).
+            let mut msg = b"petitpy: can't open file '".to_vec();
+            msg.extend_from_slice(script.as_encoded_bytes());
+            msg.extend_from_slice(b"': ");
+            msg.extend_from_slice(io_error_name(&e).as_bytes());
+            msg.push(b'\n');
+            let _ = std::io::stderr().write_all(&msg);
             return ExitCode::from(2);
         }
     };
     let mut vm = Vm::new();
     wire_env_sys_path(&mut vm);
-    let sys_argv: Vec<String> = argv.iter().skip(1).cloned().collect();
+    let sys_argv: Vec<Vec<u8>> = argv
+        .iter()
+        .skip(1)
+        .map(|a| a.as_encoded_bytes().to_vec())
+        .collect();
     wire_sys_argv(&mut vm, &sys_argv);
-    ExitCode::from(run_source(&mut vm, &src, Some(script)) as u8)
+    ExitCode::from(run_source(&mut vm, &src, Some(script.as_encoded_bytes())) as u8)
 }

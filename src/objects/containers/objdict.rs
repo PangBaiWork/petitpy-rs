@@ -635,7 +635,7 @@ pub fn dict_print(
     ctx: &mut CallCtx,
     self_v: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let ordered = is_ordered_dict_value(ctx, self_v);
     if ordered {

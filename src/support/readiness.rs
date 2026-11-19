@@ -91,6 +91,12 @@ pub struct Monitor {
     /// Signalled when `take_buffered` frees room (the
     /// monitor waits here while the buffer is full).
     space: Condvar,
+    /// Signalled when the monitor pushes bytes or reaches a
+    /// terminal state (EOF / read error / stale exit): a
+    /// `fileio_read` blocked in `wait_buffered` wakes here.
+    /// (`space` is the monitor's own wait channel; `data` is
+    /// the readers'.)
+    data: Condvar,
     /// The read side hit EOF (`read` returned 0). EOF is
     /// readable, so `select` reports the fd ready even with
     /// an empty buffer.
@@ -117,6 +123,7 @@ impl Monitor {
         Monitor {
             buffer: Mutex::new(VecDeque::new()),
             space: Condvar::new(),
+            data: Condvar::new(),
             eof: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             stale: AtomicBool::new(false),
@@ -147,6 +154,41 @@ impl Monitor {
 fn table() -> &'static Mutex<HashMap<i32, Arc<Monitor>>> {
     static TABLE: OnceLock<Mutex<HashMap<i32, Arc<Monitor>>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether `mon` may be reused for a file with
+/// `identity`: same description (when both identities are
+/// known), not stale, and either live or dead-with-bytes.
+/// A stale monitor is never reused (its fd was closed or
+/// seeked); a live monitor for a DIFFERENT description
+/// (the fd number was reused after `close`) is never
+/// reused either — the kernel reuses the lowest free fd
+/// number, so a lingering live monitor for a closed fd is
+/// the common case, not a corner. When either identity is
+/// unknown the check cannot run and the old behaviour
+/// (reuse a live monitor) stands.
+fn reusable(mon: &Monitor, identity: Option<(u64, u64)>) -> bool {
+    if mon.stale.load(Ordering::Acquire) {
+        return false;
+    }
+    if let (Some(a), Some(b)) = (mon.identity, identity) {
+        if a != b {
+            return false;
+        }
+    }
+    if !mon.is_dead() {
+        return true;
+    }
+    mon.buffered_len() > 0
+}
+
+/// Mark `mon` stale and wake it if it is parked on a full
+/// buffer (it exits after its next read event; a monitor
+/// blocked in `read` cannot be woken — see the module docs).
+fn mark_stale(mon: &Monitor) {
+    mon.stale.store(true, Ordering::Release);
+    mon.space.notify_all();
+    mon.data.notify_all();
 }
 
 /// Remove `fd`'s entry, but only if it is still `mon` (a
@@ -195,21 +237,23 @@ fn file_identity(file: &File) -> Option<(u64, u64)> {
 /// the fd number still refers to the same description
 /// (identity check — an fd number reused for another file
 /// gets a fresh monitor, never the old bytes); otherwise a
-/// fresh monitor replaces it.
+/// fresh monitor replaces it. The identity check also
+/// applies to LIVE monitors: an fd number reused after
+/// `close` (the kernel reuses the lowest free number) must
+/// not inherit the old monitor — the old one is marked
+/// stale and replaced.
 pub fn ensure_monitor(fd: i32, file: &File) -> io::Result<Arc<Monitor>> {
     let identity = file_identity(file);
     {
         let t = table().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mon) = t.get(&fd) {
-            if !mon.is_dead() {
+            if reusable(mon, identity) {
                 return Ok(mon.clone());
             }
-            if mon.buffered_len() > 0
-                && mon.identity.is_some()
-                && mon.identity == identity
-            {
-                return Ok(mon.clone());
-            }
+            // Not reusable (stale, or the fd number was
+            // reused for another description): mark it so it
+            // exits, and fall through to a fresh monitor.
+            mark_stale(mon);
         }
     }
     let dup = file.try_clone()?;
@@ -222,15 +266,10 @@ pub fn ensure_monitor(fd: i32, file: &File) -> io::Result<Arc<Monitor>> {
         // entry with bytes for the SAME description is also
         // kept (its bytes are still drainable).
         if let Some(cur) = t.get(&fd) {
-            if !cur.is_dead() {
+            if reusable(cur, identity) {
                 return Ok(cur.clone());
             }
-            if cur.buffered_len() > 0
-                && cur.identity.is_some()
-                && cur.identity == identity
-            {
-                return Ok(cur.clone());
-            }
+            mark_stale(cur);
         }
         t.insert(fd, mon.clone());
     }
@@ -281,12 +320,28 @@ fn monitor_loop(fd: i32, mut file: File, mon: Arc<Monitor>) {
                     break;
                 }
                 buf.extend(chunk[..n].iter().copied());
+                // Wake a `fileio_read` waiting for data.
+                mon.data.notify_all();
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // The fd is nonblocking (opened with
+                // `O_NONBLOCK` — file status flags live on the
+                // shared description, so the monitor's dup
+                // inherits them): no data right now, not an
+                // error. Poll again after a short sleep — there
+                // is no blocking read to wait on. A writer
+                // arriving later is picked up within ~2ms.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            }
             Err(_) => break,
         }
     }
     mon.dead.store(true, Ordering::Release);
+    // Wake any `wait_buffered` waiter: the monitor reached a
+    // terminal state (EOF / read error / stale exit).
+    mon.data.notify_all();
     // The entry stays while the buffer still holds bytes:
     // removing it would strand them (`take_buffered`
     // looks the monitor up by fd). It is removed by
@@ -336,6 +391,31 @@ pub fn take_buffered(fd: i32, out: &mut [u8]) -> usize {
     n
 }
 
+/// Block until `fd`'s monitor has buffered bytes, hit EOF,
+/// or died. Returns `false` when there is no monitor
+/// (nothing to wait for — the caller does a plain OS read).
+/// A `fileio_read` with a live monitor must wait here when
+/// the buffer is empty: returning 0 would be read as EOF by
+/// the `stream_rw_loop` (`out_sz == 0` means EOF), while a
+/// live monitor may still deliver bytes.
+pub fn wait_buffered(fd: i32) -> bool {
+    let mon = {
+        let t = table().lock().unwrap_or_else(|e| e.into_inner());
+        match t.get(&fd) {
+            Some(mon) => mon.clone(),
+            None => return false,
+        }
+    };
+    let mut buf = mon.buffer.lock().unwrap_or_else(|e| e.into_inner());
+    while buf.is_empty() && !mon.is_eof() && !mon.is_dead() {
+        buf = mon
+            .data
+            .wait(buf)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    true
+}
+
 /// The monitor for `fd`, if one is live (dead entries are
 /// still returned — the caller checks `is_dead` — so a
 /// just-finished monitor's buffered bytes are not lost).
@@ -346,9 +426,15 @@ pub fn monitor_for(fd: i32) -> Option<Arc<Monitor>> {
 
 /// Mark `fd`'s monitor stale (the file was closed): it
 /// exits after its next read event, or at once when parked
-/// on a full buffer. No-op when there is no monitor.
-/// A monitor blocked in `read` cannot be woken — see the
-/// module docs.
+/// on a full buffer. The buffer is cleared: its bytes were
+/// read ahead from a description that is now closed, and
+/// the file object's read path raises `EBADF` once closed,
+/// so no reader can ever drain them — leaving them would
+/// let a later file reusing this fd number inherit stale
+/// bytes (the `ensure_monitor` identity check cannot tell
+/// two opens of the SAME file apart). No-op when there is
+/// no monitor. A monitor blocked in `read` cannot be woken
+/// — see the module docs.
 pub fn note_closed(fd: i32) {
     let mon = {
         let t = table().lock().unwrap_or_else(|e| e.into_inner());
@@ -358,7 +444,39 @@ pub fn note_closed(fd: i32) {
         }
     };
     mon.stale.store(true, Ordering::Release);
+    {
+        let mut buf = mon.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.clear();
+    }
     mon.space.notify_all();
+    mon.data.notify_all();
+}
+
+/// Invalidate `fd`'s monitor after a seek: the buffered
+/// bytes were read ahead from the OLD offset and are stale
+/// now (a seek discards read-ahead). The buffer is cleared
+/// under its lock and the monitor is marked stale, so it
+/// exits and a later `select` starts a fresh monitor from
+/// the new offset. The clear and the stale mark are ordered
+/// against the monitor's push (both under the buffer lock,
+/// and the monitor re-checks `stale` after acquiring the
+/// lock and before extending), so no stale byte can survive
+/// the seek. No-op when there is no monitor.
+pub fn note_seek(fd: i32) {
+    let mon = {
+        let t = table().lock().unwrap_or_else(|e| e.into_inner());
+        match t.get(&fd) {
+            Some(mon) => mon.clone(),
+            None => return,
+        }
+    };
+    mon.stale.store(true, Ordering::Release);
+    {
+        let mut buf = mon.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.clear();
+    }
+    mon.space.notify_all();
+    mon.data.notify_all();
 }
 
 #[cfg(test)]
@@ -502,5 +620,89 @@ mod tests {
         note_closed(-12345);
         assert!(monitor_for(-12345).is_none());
         assert_eq!(take_buffered(-12345, &mut [0u8; 4]), 0);
+    }
+
+    #[test]
+    fn wait_buffered_returns_when_data_arrives() {
+        let (path, file) = temp_file(b"wait for me");
+        let fd = fd_of(&file);
+        let mon = ensure_monitor(fd, &file).unwrap();
+        // Blocks until the monitor buffers (or EOFs), then
+        // returns true — never a false EOF.
+        assert!(wait_buffered(fd));
+        assert!(mon.buffered_len() > 0 || mon.is_eof());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn note_seek_clears_buffer_and_stales_monitor() {
+        let (path, file) = temp_file(b"0123456789");
+        let fd = fd_of(&file);
+        let mon = ensure_monitor(fd, &file).unwrap();
+        assert!(poll_until(2000, || mon.buffered_len() == 10));
+        note_seek(fd);
+        // Bytes read ahead from the old offset are stale.
+        assert_eq!(mon.buffered_len(), 0);
+        assert_eq!(take_buffered(fd, &mut [0u8; 10]), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `wait_buffered` blocks until a FIFO writer arrives
+    /// (the blocking-read case): a `fileio_read` with a live
+    /// monitor and an empty buffer must wait, not report EOF.
+    /// Unix-only (needs `mkfifo`). The FIFO is opened
+    /// `O_RDWR` — a read-only open would block until a writer
+    /// appears, and a nonblocking read-only open reads EOF
+    /// while there is no writer at all, so neither exercises
+    /// the wait; `O_RDWR` never blocks on open and the pipe
+    /// always has a writer (itself), so the monitor's read
+    /// genuinely blocks until the writer thread writes.
+    #[test]
+    #[cfg(unix)]
+    fn wait_buffered_blocks_until_fifo_writer() {
+        let dir = std::env::temp_dir().join(format!(
+            "h-select-fifo-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let fifo = dir.join("fifo");
+        let _ = std::fs::remove_file(&fifo);
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "mkfifo failed");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let fd = fd_of(&file);
+        let _mon = ensure_monitor(fd, &file).unwrap();
+        // The writer arrives after 50ms.
+        let writer = file.try_clone().unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut w = writer;
+            use std::io::Write;
+            let _ = w.write_all(b"fifo-data");
+        });
+        // Bound the wait: a broken `data` signal would hang
+        // the test forever, so wait on a channel with a 2s
+        // deadline instead of calling `wait_buffered` inline.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(wait_buffered(fd));
+        });
+        let waited = rx
+            .recv_timeout(std::time::Duration::from_millis(2000))
+            .expect("wait_buffered hung: no data signal");
+        assert!(waited);
+        let mut out = [0u8; 9];
+        assert!(poll_until(2000, || take_buffered(fd, &mut out) == 9));
+        assert_eq!(&out, b"fifo-data");
+        let _ = std::fs::remove_file(&fifo);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

@@ -41,22 +41,22 @@
 | H9 | `import_from` 的 FunBc 回退 | **已修（G4，7e0cb16，stretch）** | M | hook 缝合（import） | 探针全同 |
 | H10 | API `ppy_str`/`ppy_repr` 遇 raising `__str__` | **已修（G4，7e0cb16）** | M | 打印 hook | 新 api_h10_test.c 8/8 ×4 |
 | U1 | select ×2 | 已修（feature 开时 202/202；默认关仍 200/202） | — | unsafe-ffi（G0 lane，已合并 f8ccf00） | integration select ×2 |
-| U2 | `os.umask` 仍是 stub | 可修 | S | unsafe-ffi | integration（现有 stub 断言需改） |
-| U3 | `os.close` 只关 os.open 登记的 fd（含 stdio 复用） | 可修 | S | unsafe-ffi | 无，需新探针 |
+| U2 | `os.umask` 仍是 stub | **已修（G6a，6dec501）** | S | unsafe-ffi | g6a_os 8/8（feature 开） |
+| U3 | `os.close` 只关 os.open 登记的 fd（含 stdio 复用） | **已修（G6a，6dec501）** | S | unsafe-ffi | g6a_os 8/8（feature 开） |
 | U4 | `socket.fromfd` 的 close 不关 OS fd | **已修（G6b，a037716）** | S | unsafe-ffi | integration（只断言 fileno） |
 | U5 | subprocess 超时 kill 用 SIGKILL 而非 SIGTERM | **已修（G6b，a037716）** | S–M | unsafe-ffi | integration（断言 returncode） |
 | U6 | socket 构造器是 /dev/null 占位 fd（bind 换 fd 号等） | **已修（G6b，a037716）** | M | unsafe-ffi | integration（socket 相关） |
 | U7 | `getsockopt` 一律 ENOPROTOOPT | **已修（G6b，a037716）** | S–M | unsafe-ffi | 无，需新探针 |
 | U8 | subprocess fd 流模式不共享 offset/append，socket fd 失败 | **已修（G6b，a037716）** | M | unsafe-ffi（dup2） | 无，低价值 |
-| U9 | stdio 上 `os.fsync`/`os.lseek`（重定向到常规文件时） | 可修 | S | unsafe-ffi | 无，需新探针 |
-| P1 | `super()` 构造错误丢 message | 可修 | S | 无（one-line） | 无，需新探针 |
-| P2 | CLI 路径 `NPY_GC_STRESS` 失效（`Vm::new` 不调 `gc_init`） | 可修 | S | 无（one-line） | 无，需环境变量探针 |
+| U9 | stdio 上 `os.fsync`/`os.lseek`（重定向到常规文件时） | **已修（G6a，6dec501）** | S | unsafe-ffi | g6a_os 8/8（feature 开） |
+| P1 | `super()` 构造错误丢 message | **已修（G2，d6c9e98）** | S | 无（one-line） | 探针 14/14 |
+| P2 | CLI 路径 `NPY_GC_STRESS` 失效（`Vm::new` 不调 `gc_init`） | **已修（G2，d6c9e98）** | S | 无（one-line） | 探针全同 |
 | P3 | 文件写无缓冲（`/dev/full` 写时即报） | **已修（G5，ab81588）** | M | 无，纯 std | 9 探针全同 |
 | P4 | `import os.path` 报错名是 `os.path` 而非 `os_path` | **已修（G5，ab81588）；机制纠正：PEP 562 `__getattr__`，不是名字拼接** | S–M | import loader | 探针全同 |
 | P5 | 类型对象属性查找缺口（`C.x`、`int.from_bytes`） | **已修（G5，ab81588）；机制早已落地，0 代码改动，2 ignored 测试去 ignore** | M | 类型 attr slot + loader 切换 | 2 个 ignored 测试 → 0 |
 | P6 | str_data 动态 qstr 残留站点 | **已审计+修（G5，ab81588）；1 真修：`type_name_qstr` 改 `from_strn`** | M | 先审计再定 | 57+42 探针全同 |
-| P7a | CLI 非 UTF-8 文件名直接 panic（rc=-6） | 可修 | S | 无，纯 std | 无，需新探针 |
-| P7b | API `ppy_exec` 非 UTF-8 文件名 lossy | 可修 | M | 编译器需走字节名 | 需扩展 api_test |
+| P7a | CLI 非 UTF-8 文件名直接 panic（rc=-6） | **已修（G2，d6c9e98）** | S | 无，纯 std | 探针全同 |
+| P7b | API `ppy_exec` 非 UTF-8 文件名 lossy | **已修（P7b lane，合并 d1770f2，2026-11-20）** | M | 编译器需走字节名 | 探针 4/4（三边逐字节） |
 | P8 | finaliser 回调走 std stderr，不走 SinkGuard | **已修（G5，ab81588）；纠正：走 fd 1 经 sink，不是 fd 2** | M | F1 的 sink | 新 Rust 测试 `f6_raising_del_goes_to_sink_as_fd1` |
 | P9 | stress 路径 finaliser 延迟 | **不修（G5 评估，低价值）** | M | GC/VM 边界 | 无，低价值 |
 | P10 | host 函数 kwargs 被拒 | 不是分歧（原版同样拒） | — | 无 | G2 已验证，测试钉住 |
@@ -148,15 +148,17 @@
 > 前提：`unsafe-ffi` feature 默认关闭时，以下全部保持现状（纯 std、0 unsafe）；
 > 开启后才走 FFI 路径。U1（select）已由 G1 lane 在修，本表只记状态，不再拆。
 
-### U2 — `os.umask` 仍是 stub
+### U2 — `os.umask` 仍是 stub（已修：G6a，6dec501）
 - 行为：`os.umask(0o022)` → REF 返回旧 mask（实测 `7`），Rust `NotImplementedError: os.umask is not implemented (no std umask API)`。
 - 证据 **(a)**：`probe_all.py` `umask`。出处：D2 §4、F5b §4(d)。
 - 机制：`umask(2)` extern "C"，返回旧值。规模 S。gate：现有测试断言 stub 抛错，修完需改测试。
+- **已修（2026-11-19，G6a 合并 6dec501）**：feature 开时调真 `umask(2)`，默认仍 stub；新 `tests/g6a_os.rs` 8 测试全过（feature 开），探针 14/14。
 
-### U3 — `os.close` 只关 os.open 登记的 fd
+### U3 — `os.close` 只关 os.open 登记的 fd（已修：G6a，6dec501）
 - 行为：`open('/dev/null')` 后 `os.close(f.fileno())` → REF `os.close done`，Rust `OSError: [Errno 9] EBADF`；且 `os.close(1)` 后 REF 的 `os.open` 复用 fd 1（print 写入 /dev/null，无输出），Rust 返回 fd 3。
 - 证据 **(a)**：`probe_all.py` `os_close_openfd`、`os_close_stdio`。出处：F6 §4(a)、D2 §4。
 - 机制：`close(2)` extern "C"，对未登记 fd 直接调；`os_fds` 表仍保留（已登记 fd 的行为不变）。规模 S。gate：无覆盖，需新探针。
+- **已修（2026-11-19，G6a 合并 6dec501）**：每个 fd 先调真 `close(2)` 再落表；stdio 分支（fd 0–2，未登记关闭）feature 开时调真 syscall。探针 14/14。
 
 ### U4 — `socket.fromfd` 的 close 不关 OS fd（已修：G6b lane 合并 a037716，2026-11-20）
 - 行为：`fileno() == fd` 成立，但 `close()` 后原 fd 仍可用；REF 关闭底层 fd。
@@ -181,24 +183,27 @@
 - 行为：fd 流模式是重开 `/proc/self/fd/<fd>`，不共享原 offset/append；socket fd 直接 ENXIO。
 - 证据 **(b)**：D3 §4 源码对照。机制：`pre_exec` + `dup2`（unsafe FFI），子进程继承真 fd。规模 M。价值低（冷门路径），排最后。gate：无。
 
-### U9 — stdio 上 `os.fsync` / `os.lseek`（重定向到常规文件时）
+### U9 — stdio 上 `os.fsync` / `os.lseek`（重定向到常规文件时）（已修：G6a，6dec501）
 - 行为：stdout/stdin 重定向到常规文件时，`os.fsync(1)` → REF ok，Rust `OSError EINVAL`；`os.lseek(0, 0, 0)` → REF `0`，Rust `OSError 29`（ESPIPE）。
 - 证据 **(a)**：`r8.py`（stdio 重定向实测；管道 stdout 时双边一致 EINVAL，故只在常规文件时分歧）。出处：D2 §4。
 - 机制：`fsync(2)` / `lseek(2)` extern "C" 直通 fd 0/1/2。规模 S。gate：无覆盖，需新探针（重定向场景）。
+- **已修（2026-11-19，G6a 合并 6dec501）**：feature 开时 stdio 分支调真 syscall。探针 14/14。
 
 ---
 
 ## P — 纯 std 可修族（不需 unsafe）
 
-### P1 — `super()` 构造错误丢 message
+### P1 — `super()` 构造错误丢 message（G2 已修，d6c9e98）
 - 行为：`super(1, 2)` → REF `TypeError: issubclass() arg 2 must be a class or a tuple of classes`，Rust 裸 `TypeError`（空 message）。
 - 证据 **(a)**：`probe_all.py` `super_err1`。出处：F4 §4（`super_make_new` 仍返回裸 `to_pyerror()` 信号，与已修的 MRO bug 同形）。
 - 机制：F4 §4 已写明——`record_typed` 一行，`TypedRaise` 已存在。规模 S。gate：无覆盖，需新探针。
+- **已修（G2，d6c9e98）**：探针 14/14。
 
-### P2 — CLI 路径 `NPY_GC_STRESS` 失效
+### P2 — CLI 路径 `NPY_GC_STRESS` 失效（G2 已修，d6c9e98）
 - 行为：`Vm::new` 从不调 `arena.gc_init()`，`NPY_GC_STRESS` 在 CLI 路径全死；F1 只在 `ppy_new` 里补了。
 - 证据 **(b)**：F1 §4(h) 源码对照（`src/memory/gc.rs:414-418` 读 env var，但无调用方）。
 - 机制：在 `Vm::new` 或 CLI 入口调一次 `gc_init()`。规模 S。注意：`Vm::new` 也被测试用——env 变量控制，默认行为不变；但要确认 `gc_init` 在测试进程里被反复调无副作用。gate：无，需 `NPY_GC_STRESS=10` 跑 CLI 探针。
+- **已修（G2，d6c9e98）**：`Vm::new` 调 `gc_init()`（`vm.rs:614`）。探针全同。
 
 ### P3 — 文件写无缓冲（G5 已修，ab81588）
 - 行为：写 `/dev/full` → REF 写时成功、close 时吞掉 flush 错（`write ok / close ok`），Rust 写时即 `OSError 28`。
@@ -223,14 +228,16 @@
 - 审计结果（G5，57-case + 42-case 动态 qstr 电池，双边全同）：剩余 `str_data(` 站点经查是死路径（`objstr_iters.rs` 的 `str_iter_next`/`bytes_iter_next`/`str_charlen` 无 live 调用方；`methods_c.rs:445` buffer 路径已走 pool；`lookup.rs` 的 `get_qstr` 是另一函数，误报）。
 - **唯一真修（`cbd9d6c`）**：`type('ZqxjDynHeapName', (), {})` 在 Rust 抛 `MemoryError`，REF 正常——`type_name_qstr` 用 `find_strn`（只查不建）；原版 `mp_obj_str_get_qstr` 调 `qstr_from_strn`（`objstr.zig:3297-3305`）新建动态 qstr；改为 `from_strn`（intern）。`type('x'*300, (), {})`：Rust 仍 MemoryError，REF 崩溃 rc=134（N1，不复现）。
 
-### P7a — CLI 非 UTF-8 文件名直接 panic（本次新发现）
+### P7a — CLI 非 UTF-8 文件名直接 panic（G2 已修，d6c9e98）
 - 行为：脚本文件名含 `0xff` 字节时，REF 正常跑（traceback 印 `<stdin>`），Rust `thread 'main' panicked at std/src/env.rs:878`（rc=-6），`std::env::args()` 在非 Unicode 参数上 unwrap。
 - 证据 **(a)**：`r3.py` `nonutf8`。这是比 F1(f) 更严重的一级：API 只是 lossy，CLI 直接崩。
 - 机制：CLI 改 `args_os()` + lossy 转换。规模 S。gate：无覆盖，需新探针（非 UTF-8 文件名脚本）。
+- **已修（G2，d6c9e98）**：`main.rs` 用 `args_os()`；另需 ByteSink 打印路径改动（34 文件）。探针全同。
 
-### P7b — API `ppy_exec` 非 UTF-8 文件名 lossy
+### P7b — API `ppy_exec` 非 UTF-8 文件名 lossy（已修：P7b lane 合并 d1770f2，2026-11-20）
 - 行为：`ppy_exec` 的 filename 经 `from_utf8_lossy`，traceback 里丢字节；Zig 传原始字节当 source 名。
 - 证据 **(b)**：F1 §4(f)。机制：编译器 source 名需走字节（`&[u8]`），改动面到编译器入口。规模 M。gate：需扩展 api_test。
+- **已修（2026-11-20，P7b lane 合并 d1770f2）**：source 名全程 `&[u8]`（`compile_to_mpy_named`/`eval_exec_body`/`eval_exec_named` 等），`ppy_exec` 传原始字节；traceback 帧打印与 `ppy_format_exception` 一并改字节精确（`ByteSink::write_bytes`/`ByteBuf`）。新测试 2 个（`exec_non_utf8_filename_keeps_raw_bytes`、`exec_null_filename_is_string`）。探针 4/4（REF/feature/默认三边逐字节）；验收：默认 lib 1739/0/1、feature 1755/0/1，integration 200/202 / 202/202，full 545/552 GREEN，golden 585/585，C 验收双 staticlib 61/61，0 warnings。范围外未动：CLI 文件名仍 lossy（P7a 已定）、`compile()` 内建仍 lossy、模块加载路径仍 `&str`。
 
 ### P8 — finaliser 回调走 std stderr，不走 SinkGuard（G5 已修，ab81588）
 - 行为：drain 打印 traceback 直接走 std stderr；host 装了 write sink 也收不到。
@@ -384,4 +391,4 @@ D2 的实现是 open/mode 位检查；本次探针 `/dev/null` 可读、不存�
 - **G6b — unsafe-ffi 之 socket/subprocess（U4/U5/U6/U7/U8）**：`modsocket.rs` + `modsubprocess.rs`。依赖 G1 合并；与 G6a 文件不重叠，可与 G6a 并行。
 - **H9（import_from）与 P7b（API 文件名）**：价值低/改动面大，排最后；H9 可并入 G4（同 import 区），P7b 并入 G2 的 api 侧或单独留待。
 
-顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 可排（G0 已合）。H9、P7b、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。P14（stdout 缓冲）已修（P14 lane，合并 6bcdb3b）。U4–U8 已修（G6b lane，合并 a037716，2026-11-20）。
+顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 可排（G0 已合）。H9、P7b、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。P14（stdout 缓冲）已修（P14 lane，合并 6bcdb3b）。U4–U8 已修（G6b lane，合并 a037716，2026-11-20）。P7b 已修（P7b lane，合并 d1770f2，2026-11-20）；P1/P2/P7a 已修（G2，d6c9e98）、U2/U3/U9 已修（G6a，6dec501）——此前 triage 表漏标，本次补标。

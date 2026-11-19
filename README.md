@@ -186,12 +186,11 @@ pass a gate.
   the native value** (F3): `float(G(1.5))` with `G.__float__`
   returning 9.9 is 9.9 on the reference, 1.5 on Rust.
 - **Dict lookup with distinct instances using a FunBc `__eq__`**
-  (F3): the hash half runs through the hook, but the probe-loop
-  comparison is still ctx-only, so `d[A()] = "x"; d[A()]` is a
-  `KeyError` on Rust. Same family: `dict.get`/`.pop`/`.setdefault`
-  with instance keys, dict-subclass instances with instance keys,
-  and `str(KeyError(instance))` (exception-arg printing has no
-  hook — it shows the `<Color object at N>` fallback).
+  (F3, fixed by G3/H2–H4): the probe comparison, `dict.get` /
+  `.pop` / `.setdefault`, and dict-subclass subscripts all run
+  through the VM hook now. Remaining from that family:
+  `str(KeyError(instance))` (exception-arg printing has no hook
+  — it shows the `<Color object at N>` fallback).
 - **Identity-hash values differ by design** (F3): the reference
   prints raw ASLR addresses, Rust prints arena indices. The
   mechanism (stable per object, dicts work) is correct.
@@ -209,11 +208,13 @@ pass a gate.
   `real_load_maybe` lacks the `__class__`/`__next__` special cases
   (no caller needs them).
 - **E1/E2 leftovers**: `type(iter(s))` is a bare `TypeError`;
-  a dict-subclass `__missing__` reached through ctx-only seams
-  yields a bare `TypeError` instead of `KeyError` (no gate
-  coverage); the `petitpy-vm` missing-file error prints only the
-  first line (`error: FileNotFound`) — the reference's Zig stack
-  trace after it is runtime noise, not reproduced.
+  a dict-subclass `__missing__` reached through the ctx-only slot
+  seams (`instance_subscr_slot`) still yields a bare `TypeError`
+  instead of `KeyError` — the VM path (`try_instance_subscr`)
+  was fixed by G3/H4; no gate coverage for the slot path; the
+  `petitpy-vm` missing-file error prints only the first line
+  (`error: FileNotFound`) — the reference's Zig stack trace after
+  it is runtime noise, not reproduced.
 - **The original's own crashes are not mirrored**: where the
   reference aborts (rc=134, e.g. `str.center` with negative width,
   `(a*)*` in `ure`, `sort(key=len)` on ints), Rust raises or

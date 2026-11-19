@@ -33,6 +33,7 @@ use crate::objects::callables::objboundmeth::new_bound_meth;
 use crate::objects::containers::map::{hash_of_hook, map_of, MapError};
 use crate::objects::containers::objarray_methods::array_extend;
 use crate::objects::containers::objdict_methods::{dict_get_hook, dict_pop_hook, dict_setdefault_hook};
+use crate::objects::containers::objlist_methods::list_extend;
 use crate::objects::containers::objdict_collect::collect_iterable;
 use crate::objects::containers::objlist::new_list;
 use crate::objects::strings::objstr_methods_c::KwArg;
@@ -372,6 +373,34 @@ pub fn call_array_extend_ctx(
     }
     let mut hook = crate::runtime::vm_seams::make_hook(state);
     array_extend(ctx, args[0], args[1], Some(&mut hook)).map_err(|e| {
+        if let Some(exc) = state.pending_exc.take() {
+            return exc;
+        }
+        let pe = ctx.record_typed(e);
+        exc_from_pyerror(ctx, state, pe)
+    })
+}
+
+/// `list.extend` (G3/H6): intercepted by GcRef identity (see
+/// `list_extend_builtin`) so a generator / genexpr arg is
+/// collected through the VM's real call hook (the E2i
+/// `array.extend` shape). Arity is re-checked by hand
+/// (interception bypasses `call_fun_builtin`'s sig check):
+/// self + iterable, no kwargs. On error the hook's stashed
+/// raise is drained first (a generator-resume raise), else
+/// the `ListError` is recorded.
+pub fn call_list_extend_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    if n_args != 2 || n_kw != 0 {
+        return Err(mismatch(ctx, state));
+    }
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
+    list_extend(ctx, args[0], args[1], Some(&mut hook)).map_err(|e| {
         if let Some(exc) = state.pending_exc.take() {
             return exc;
         }

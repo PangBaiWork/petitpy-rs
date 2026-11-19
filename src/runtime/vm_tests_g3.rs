@@ -200,3 +200,37 @@ fn g3_h3_dict_setdefault_instance_key() {
     assert!(fx.gb("ok4"));
     assert!(fx.gb("ok5"));
 }
+
+// ── H6: list.extend / `+=` collect a generator ─────────────────────
+
+#[test]
+fn g3_h6_list_extend_genexpr() {
+    let mut fx = Fx::new();
+    fx.run_ok("l = []\nl.extend(x for x in [1, 2, 3])\nok = (l == [1, 2, 3])\n");
+    assert!(fx.gb("ok"));
+}
+
+#[test]
+fn g3_h6_list_extend_genfn() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "def gen():\n    yield 1\n    yield 2\nl = [0]\nl.extend(gen())\nok = (l == [0, 1, 2])\n",
+    );
+    assert!(fx.gb("ok"));
+}
+
+#[test]
+fn g3_h6_list_iadd_genexpr() {
+    let mut fx = Fx::new();
+    fx.run_ok("l = [0]\nl += (x for x in [1, 2])\nok = (l == [0, 1, 2])\n");
+    assert!(fx.gb("ok"));
+}
+
+#[test]
+fn g3_h6_list_extend_list_unchanged() {
+    // The plain-list fast path still works (no hook needed).
+    let mut fx = Fx::new();
+    fx.run_ok("l = [1]\nl.extend([2, 3])\nok1 = (l == [1, 2, 3])\nl += [4]\nok2 = (l == [1, 2, 3, 4])\n");
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+}

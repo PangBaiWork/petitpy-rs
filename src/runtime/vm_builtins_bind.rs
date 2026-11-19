@@ -523,6 +523,22 @@ impl Vm {
                 state.list_sort_builtin = v;
             }
         }
+        // G3/H6: the `list.extend` method builtin (one
+        // `FunBuiltin` object in the list type dict). Looked up
+        // by name; a miss leaves the handle unset and `extend`
+        // keeps its old ctx-only behavior (a generator arg
+        // raises "object not iterable").
+        let extend_q = static_qstr_id(b"extend").expect("extend is a static qstr");
+        if let Obj::Type(d) = ctx.arena.get(ctx.types.list) {
+            let list_dict = d.dict;
+            if let Ok(v) = crate::objects::containers::objdict::dict_get_value(
+                &mut ctx,
+                Value::Heap(list_dict),
+                Value::Qstr(extend_q),
+            ) {
+                state.list_extend_builtin = v;
+            }
+        }
         state.hash_builtin = d1.hash_builtin;
         state.format_builtin = d1.format_builtin;
         // F3: the `str.format` method builtin (one `FunBuiltin`

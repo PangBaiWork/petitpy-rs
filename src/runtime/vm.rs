@@ -219,6 +219,15 @@ pub struct VmState {
     pub dict_get_builtin: Value,
     pub dict_pop_builtin: Value,
     pub dict_setdefault_builtin: Value,
+    /// The `list.extend` method builtin (G3/H6): the
+    /// `FunBuiltin` from the list type dict. Intercepted by
+    /// GcRef identity in `call_function_ctx` (see
+    /// `call_list_extend_ctx` in `builtin_vm.rs`) —
+    /// `list_extend` is ctx-only and its `collect_iterable`
+    /// cannot resume a generator, so `l.extend(gen())`
+    /// needs the VM's real call hook (the E2i array.extend
+    /// shape).
+    pub list_extend_builtin: Value,
     pub min_builtin: Value,
     pub max_builtin: Value,
     pub getattr_builtin: Value,
@@ -516,6 +525,7 @@ impl Vm {
                 dict_get_builtin: Value::None,
                 dict_pop_builtin: Value::None,
                 dict_setdefault_builtin: Value::None,
+                list_extend_builtin: Value::None,
                 min_builtin: Value::None,
                 max_builtin: Value::None,
                 getattr_builtin: Value::None,

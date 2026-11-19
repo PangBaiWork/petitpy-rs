@@ -19,6 +19,7 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objlist::{is_exact_list, list_items_vec};
+use crate::objects::containers::objlist_methods::list_extend;
 use crate::objects::containers::objtuple::{is_exact_tuple, tuple_items};
 use crate::objects::obj::{
     call_binary, call_unary, is_exact_int, is_float, obj_get_type, obj_is_true, SlotOutcome,
@@ -839,6 +840,32 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
             };
         if let Some((l_items, r_items)) = pair {
             return container_compare(ctx, state, op, &l_items, &r_items);
+        }
+    }
+    // G3/H6 — `l += iterable` with an exact-list lhs: the
+    // list slot's INPLACE_ADD arm calls ctx-only
+    // `list_extend`, so a generator rhs raises "object not
+    // iterable". Intercept here with the VM's real call hook
+    // (the E2i array.extend shape): `list_extend` returns
+    // the list on success (discarded — `+=` yields the lhs
+    // itself); a `ListError` is recorded like the slot path
+    // does, after draining a hook-stashed raise first (a
+    // generator-resume raise). Only exact lists — a list
+    // subclass instance takes the `try_instance_binary_op`
+    // dunder path in the loop below (its `__iadd__` runs
+    // through the hook already), and a non-list lhs falls
+    // through to the generic loop.
+    if op == BinaryOp::InplaceAdd && is_exact_list(ctx, ctx.types.list, lhs) {
+        let mut hook = crate::runtime::vm_seams::make_hook(state);
+        match list_extend(ctx, lhs, rhs, Some(&mut hook)) {
+            Ok(_) => return Ok(lhs),
+            Err(e) => {
+                if let Some(exc) = state.pending_exc.take() {
+                    return Err(exc);
+                }
+                let pe = ctx.record_typed(e);
+                return Err(exc_from_pyerror(ctx, state, pe));
+            }
         }
     }
     // Generic loop: lhs slot → inplace→plain → reverse →

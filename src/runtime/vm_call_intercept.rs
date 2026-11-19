@@ -139,6 +139,14 @@ pub(crate) fn intercept_builtin_call(
             ctx, state, n_args, n_kw, args,
         ));
     }
+    // `list.extend` (G3/H6): intercepted by GcRef identity
+    // so a generator / genexpr arg is collected through the
+    // VM's real call hook (see `call_list_extend_ctx`).
+    if fun == state.list_extend_builtin {
+        return Some(crate::runtime::builtin_vm::call_list_extend_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     // `list.sort` (E2c): intercepted by GcRef identity so a
     // non-`None` key runs through the VM's real call hook (see
     // `call_list_sort_ctx`); a `None` key delegates to the

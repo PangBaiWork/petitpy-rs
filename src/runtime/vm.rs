@@ -544,7 +544,6 @@ impl Vm {
                 str_format_builtin: Value::None,
                 format_builtin: Value::None,
                 gc_collect_builtin: Value::None,
-<<<<<<< HEAD
                 dict_get_builtin: Value::None,
                 dict_pop_builtin: Value::None,
                 dict_setdefault_builtin: Value::None,

@@ -551,6 +551,15 @@ impl Vm {
         crate::runtime::vm_modules::build_d3_modules(&mut vm);
         crate::runtime::vm_modules::build_d4_modules(&mut vm);
         crate::runtime::vm_modules::build_d5_modules(&mut vm);
+        // G2 (P2): the CLI path never called `gc_init`, so
+        // `NPY_GC_STRESS` was dead there (F1 only fixed the
+        // `ppy_new` path). `gc_init` is idempotent — it only
+        // re-asserts `auto_collect_enabled` and re-reads the
+        // env var into `threshold` (unset → 0 = off) — so
+        // calling it here is safe for every `Vm::new` caller
+        // (CLI, tests, embedding; `ppy_new`'s own call stays
+        // as a harmless second read).
+        vm.arena.gc_init();
         vm
     }
 

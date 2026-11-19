@@ -43,11 +43,11 @@
 | U1 | select ×2 | 已修（feature 开时 202/202；默认关仍 200/202） | — | unsafe-ffi（G0 lane，已合并 f8ccf00） | integration select ×2 |
 | U2 | `os.umask` 仍是 stub | 可修 | S | unsafe-ffi | integration（现有 stub 断言需改） |
 | U3 | `os.close` 只关 os.open 登记的 fd（含 stdio 复用） | 可修 | S | unsafe-ffi | 无，需新探针 |
-| U4 | `socket.fromfd` 的 close 不关 OS fd | 可修 | S | unsafe-ffi | integration（只断言 fileno） |
-| U5 | subprocess 超时 kill 用 SIGKILL 而非 SIGTERM | 可修 | S–M | unsafe-ffi | integration（断言 returncode） |
-| U6 | socket 构造器是 /dev/null 占位 fd（bind 换 fd 号等） | 可修 | M | unsafe-ffi | integration（socket 相关） |
-| U7 | `getsockopt` 一律 ENOPROTOOPT | 可修 | S–M | unsafe-ffi | 无，需新探针 |
-| U8 | subprocess fd 流模式不共享 offset/append，socket fd 失败 | 可修 | M | unsafe-ffi（dup2） | 无，低价值 |
+| U4 | `socket.fromfd` 的 close 不关 OS fd | **已修（G6b，a037716）** | S | unsafe-ffi | integration（只断言 fileno） |
+| U5 | subprocess 超时 kill 用 SIGKILL 而非 SIGTERM | **已修（G6b，a037716）** | S–M | unsafe-ffi | integration（断言 returncode） |
+| U6 | socket 构造器是 /dev/null 占位 fd（bind 换 fd 号等） | **已修（G6b，a037716）** | M | unsafe-ffi | integration（socket 相关） |
+| U7 | `getsockopt` 一律 ENOPROTOOPT | **已修（G6b，a037716）** | S–M | unsafe-ffi | 无，需新探针 |
+| U8 | subprocess fd 流模式不共享 offset/append，socket fd 失败 | **已修（G6b，a037716）** | M | unsafe-ffi（dup2） | 无，低价值 |
 | U9 | stdio 上 `os.fsync`/`os.lseek`（重定向到常规文件时） | 可修 | S | unsafe-ffi | 无，需新探针 |
 | P1 | `super()` 构造错误丢 message | 可修 | S | 无（one-line） | 无，需新探针 |
 | P2 | CLI 路径 `NPY_GC_STRESS` 失效（`Vm::new` 不调 `gc_init`） | 可修 | S | 无（one-line） | 无，需环境变量探针 |
@@ -158,26 +158,26 @@
 - 证据 **(a)**：`probe_all.py` `os_close_openfd`、`os_close_stdio`。出处：F6 §4(a)、D2 §4。
 - 机制：`close(2)` extern "C"，对未登记 fd 直接调；`os_fds` 表仍保留（已登记 fd 的行为不变）。规模 S。gate：无覆盖，需新探针。
 
-### U4 — `socket.fromfd` 的 close 不关 OS fd
+### U4 — `socket.fromfd` 的 close 不关 OS fd（已修：G6b lane 合并 a037716，2026-11-20）
 - 行为：`fileno() == fd` 成立，但 `close()` 后原 fd 仍可用；REF 关闭底层 fd。
 - 证据 **(b)**：F5b §4(b)（已探针：REF close 后 fd 真关；Rust 不关）。机制：`from_raw_fd`（unsafe）接管所有权。
 - 规模 S。gate：integration 只断言 fileno，需补 close 语义探针。
 
-### U5 — subprocess 超时 kill 用 SIGKILL 而非 SIGTERM
+### U5 — subprocess 超时 kill 用 SIGKILL 而非 SIGTERM（已修：G6b lane 合并 a037716，2026-11-20）
 - 行为：超时 kill → Rust returncode -9，REF -15；且 REF 有 1s grace 期。
 - 证据 **(b)**：D3 §4 源码对照（std `Command::kill` 只发 SIGKILL）。机制：`kill(2)` 发 SIGTERM，等 1s，仍活着再 SIGKILL。规模 S–M。gate：integration 有超时 case（断言 returncode，需核对）。
 
-### U6 — socket 构造器是 /dev/null 占位 fd
+### U6 — socket 构造器是 /dev/null 占位 fd（已修：G6b lane 合并 a037716，2026-11-20）
 - 行为：构造时调不了 `socket()`，先占 /dev/null fd，`bind()` 时才换真 listener（fd 号会变；bind 到 listen 之间来的连接会被接受；`listen(backlog)` 是验证 no-op；`bind("")` 返回 ENOENT 而 REF 绑抽象 socket；fromfd listener 上 listen 得 EINVAL）。
 - 证据 **(b)**：D3 §4 源码对照。机制：`socket(2)` + 真 bind/listen，一次性修掉上述 5 个子行为。规模 M。gate：integration socket 相关 case。
 - 注意：U6 与 U4/U7 同文件 `modsocket.rs`，同 lane。
 
-### U7 — `getsockopt` 一律 ENOPROTOOPT
+### U7 — `getsockopt` 一律 ENOPROTOOPT（已修：G6b lane 合并 a037716，2026-11-20）
 - 行为：`s.getsockopt(SOL_SOCKET, SO_PEERCRED, 12)` → REF 返回 12 字节 ucred（未连接时 pid 0、uid/gid -1），Rust `OSError 92`。
 - 证据 **(a)**：`r3.py` `getsockopt3`。出处：D3 §4（REF 返回真字节；`peer_cred` 在 stable std 里不稳定）。
 - 机制：`getsockopt(2)` extern "C"，按 buflen 返回 bytes。规模 S–M。gate：无覆盖，需新探针。
 
-### U8 — subprocess fd 流模式不共享 offset/append，socket fd 失败
+### U8 — subprocess fd 流模式不共享 offset/append，socket fd 失败（已修：G6b lane 合并 a037716，2026-11-20）
 - 行为：fd 流模式是重开 `/proc/self/fd/<fd>`，不共享原 offset/append；socket fd 直接 ENXIO。
 - 证据 **(b)**：D3 §4 源码对照。机制：`pre_exec` + `dup2`（unsafe FFI），子进程继承真 fd。规模 M。价值低（冷门路径），排最后。gate：无。
 
@@ -384,4 +384,4 @@ D2 的实现是 open/mode 位检查；本次探针 `/dev/null` 可读、不存�
 - **G6b — unsafe-ffi 之 socket/subprocess（U4/U5/U6/U7/U8）**：`modsocket.rs` + `modsubprocess.rs`。依赖 G1 合并；与 G6a 文件不重叠，可与 G6a 并行。
 - **H9（import_from）与 P7b（API 文件名）**：价值低/改动面大，排最后；H9 可并入 G4（同 import 区），P7b 并入 G2 的 api 侧或单独留待。
 
-顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 可排（G0 已合）。H9、P7b、U8、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。P14（stdout 缓冲）已修（P14 lane，合并 6bcdb3b）。
+顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 可排（G0 已合）。H9、P7b、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。P14（stdout 缓冲）已修（P14 lane，合并 6bcdb3b）。U4–U8 已修（G6b lane，合并 a037716，2026-11-20）。

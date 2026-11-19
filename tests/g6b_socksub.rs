@@ -1,15 +1,12 @@
 //! G6b subprocess tests: `socket`/`subprocess` behaviors
-//! that need the real binary (`--features unsafe-ffi`).
-//! Every test spawns the built `petitpy-rs` binary as a
-//! subprocess — `fromfd` takes ownership of a real fd,
-//! so the close must happen in a child process, not in
-//! the test harness. All tests are feature-gated; on the
-//! default build this file contributes zero tests.
+//! that need the real binary. `fromfd` is CUT in H-socket
+//! (safe Rust cannot take ownership of a raw fd): the name
+//! stays, every call raises `NotImplementedError` on both
+//! builds. This test runs the built `petitpy-rs` binary as
+//! a subprocess and asserts exactly that.
 //!
 //! Binaries are located through the `CARGO_BIN_EXE_*`
 //! variables Cargo sets for integration tests.
-
-#![cfg(feature = "unsafe-ffi")]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -54,20 +51,21 @@ fn run_script(script: &Path) -> Run {
     }
 }
 
-/// `socket.fromfd` takes ownership (G6b U4): after
-/// `s.close()` the fd is really closed, so `os.close(fd)`
-/// is `EBADF` — exactly like the reference (probed).
-/// On the default build the fd survives `s.close()`.
+/// `socket.fromfd` is CUT in H-socket: every call raises
+/// `NotImplementedError`, on both builds (the old G6b U4
+/// behavior — the socket taking ownership of the fd and
+/// `close()` really closing it — is gone with the FFI
+/// implementation).
 #[test]
-fn g6b_fromfd_close_ebadf() {
-    let dir = scratch("fromfd_close");
+fn g6b_fromfd_not_implemented() {
+    let dir = scratch("fromfd_notimpl");
     let script = write_script(
         &dir,
         "t.py",
-        "import socket, os\nfd = os.open('/dev/null', os.O_RDONLY)\ns = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\ns.close()\ntry:\n    os.close(fd)\n    print('os.close after s.close: ok')\nexcept OSError as e:\n    print('os.close after s.close:', e.args[0])\n",
+        "import socket, os\nfd = os.open('/dev/null', os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    print('fromfd: no error')\nexcept NotImplementedError as e:\n    print('fromfd:', e.args[0])\n",
     );
     let r = run_script(&script);
     assert_eq!(r.code, 0, "stderr: {}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(r.stdout, b"os.close after s.close: 9\n");
+    assert_eq!(r.stdout, b"fromfd: socket.fromfd is not implemented\n");
     assert!(r.stderr.is_empty());
 }

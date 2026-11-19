@@ -169,6 +169,7 @@ impl Fixture {
             iterator: GcRef(0),
             range_it: GcRef(0),
             socket: None,
+            socketfile: None,
             deque: None,
             ordereddict: None,
             namedtuple_fn: None,

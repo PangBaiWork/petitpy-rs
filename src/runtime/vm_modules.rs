@@ -30,10 +30,7 @@ use crate::modules::modpwd::build_pwd_module;
 use crate::modules::modre::build_re_module;
 use crate::modules::modselect::build_select_module;
 use crate::modules::modsignal::build_signal_module;
-#[cfg(unix)]
 use crate::modules::modsocket::build_socket_module;
-#[cfg(windows)]
-use crate::modules::modsocket_win::build_socket_module;
 use crate::modules::modstruct::build_struct_module;
 use crate::modules::modsubprocess::build_subprocess_module;
 use crate::modules::modtime::build_time_module;
@@ -92,8 +89,9 @@ pub fn build_d3_modules(vm: &mut Vm) {
     let module_type = state.vm_types.module;
     let math = build_math_module(&mut ctx, fun_builtin_var, module_type)
         .expect("D3 math module build cannot fail");
-    let (socket, socket_type) = build_socket_module(&mut ctx, fun_builtin_var, module_type)
-        .expect("D3 socket module build cannot fail");
+    let (socket, socket_type, socketfile_type) =
+        build_socket_module(&mut ctx, fun_builtin_var, module_type)
+            .expect("D3 socket module build cannot fail");
     let struct_mod = build_struct_module(&mut ctx, fun_builtin_var, module_type)
         .expect("D3 struct module build cannot fail");
     for (name, module) in [("math", math), ("socket", socket)] {
@@ -107,6 +105,7 @@ pub fn build_d3_modules(vm: &mut Vm) {
     // The socket type ref (the D5 `re` precedent — stored
     // after `drop(ctx)` since `ctx.types` borrows `vm.types`).
     vm.types.socket = Some(socket_type);
+    vm.types.socketfile = Some(socketfile_type);
     for module in [math, socket, struct_mod] {
         vm.pin(module);
     }

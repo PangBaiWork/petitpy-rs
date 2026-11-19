@@ -1,13 +1,15 @@
 //! Tests for the `socket` module (`modsocket.rs`).
 //!
-//! The round-trip test drives a real client from a Rust
-//! `std` thread (`UnixStream::connect`) — the reference has
-//! no `connect` method, so the client side is always the
-//! test harness. Socket paths are unique per test and
-//! unlinked before and after.
+//! The round-trip tests drive a real client from a Rust
+//! `std` thread — the reference has no `connect` method,
+//! so the client side is always the test harness. Socket
+//! paths are unique per test and unlinked before and
+//! after. TCP tests use a Rust `TcpListener` on
+//! `127.0.0.1:0` and pass its port into the script (the
+//! module has no `getsockname`).
 
 use std::io::{Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::net::{TcpListener, UdpSocket};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -121,21 +123,38 @@ impl Fx {
 fn setup_socket(vm: &mut Vm) -> GcRef {
     let fun_var = vm.state.vm_types.fun_builtin_var;
     let module_type = vm.state.vm_types.module;
-    let (m, t) = {
+    let (m, t, ft) = {
         let (mut ctx, state) = vm.split();
-        let (m, t) =
+        let (m, t, ft) =
             build_socket_module(&mut ctx, fun_var, module_type).expect("socket builds");
         let id = static_qstr_id(b"socket").expect("socket qstr");
         state.builtin_modules.push((id, m));
-        (m, t)
+        (m, t, ft)
     };
     vm.types.socket = Some(t);
+    vm.types.socketfile = Some(ft);
     vm.pin(m);
     t
 }
 
 fn unlink(path: &str) {
     let _ = std::fs::remove_file(path);
+}
+
+/// Spawn a Rust TCP server on `127.0.0.1:0`; returns
+/// (port, thread handle). The thread accepts one
+/// connection, runs `f` on it, then exits.
+fn tcp_server<F>(f: F) -> (u16, std::thread::JoinHandle<()>)
+where
+    F: FnOnce(std::net::TcpStream) + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").expect("tcp listen");
+    let port = listener.local_addr().expect("local addr").port();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("tcp accept");
+        f(stream);
+    });
+    (port, handle)
 }
 
 /// The `__del__` entry is the SAME `FunBuiltin` object as
@@ -171,6 +190,7 @@ fn socket_constants() {
         r#"
 import socket
 assert socket.__name__ == 'socket'
+assert socket.AF_UNSPEC == 0
 assert socket.AF_UNIX == 1
 assert socket.AF_INET == 2
 assert socket.AF_INET6 == 10
@@ -178,9 +198,23 @@ assert socket.SOCK_STREAM == 1
 assert socket.SOCK_DGRAM == 2
 assert socket.SOL_SOCKET == 1
 assert socket.SO_REUSEADDR == 2
+assert socket.SO_BROADCAST == 6
+assert socket.SO_RCVBUF == 8
+assert socket.SO_SNDBUF == 7
+assert socket.SO_RCVTIMEO == 20
+assert socket.SO_SNDTIMEO == 21
 assert socket.SO_PEERCRED == 17
+assert socket.IPPROTO_IP == 0
+assert socket.IPPROTO_TCP == 6
+assert socket.IPPROTO_UDP == 17
+assert socket.TCP_NODELAY == 1
+assert socket.IP_TTL == 2
+assert socket.SHUT_RD == 0
+assert socket.SHUT_WR == 1
+assert socket.SHUT_RDWR == 2
 assert str(socket.socket) == '<function>'
 assert str(socket.fromfd) == '<function>'
+assert str(socket.getaddrinfo) == '<function>'
 "#,
     );
 }
@@ -202,44 +236,16 @@ assert s.fileno() == -1
     );
 }
 
-/// The not-shipped names are all `AttributeError`
-/// (`modsocket.zig` header: connect, sendto, recvfrom,
-/// setsockopt, makefile, gethostname, gethostbyname).
+/// Only `gethostname` / `gethostbyname` are unshipped now
+/// (brief §4): `connect`, `sendto`, `recvfrom`,
+/// `setsockopt`, `makefile` all ship in H-socket.
 #[test]
 fn socket_no_unshipped() {
     let mut fx = Fx::new();
-    // `getattr` is not bound in this worktree (D1's job), so
-    // probe the names with bare attribute loads instead.
     fx.run_ok(
         r#"
 import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 ok = True
-try:
-    s.connect
-    ok = False
-except AttributeError:
-    pass
-try:
-    s.sendto
-    ok = False
-except AttributeError:
-    pass
-try:
-    s.recvfrom
-    ok = False
-except AttributeError:
-    pass
-try:
-    s.setsockopt
-    ok = False
-except AttributeError:
-    pass
-try:
-    s.makefile
-    ok = False
-except AttributeError:
-    pass
 try:
     socket.gethostname
     ok = False
@@ -251,7 +257,6 @@ try:
 except AttributeError:
     pass
 assert ok
-s.close()
 "#,
     );
 }
@@ -259,13 +264,13 @@ s.close()
 #[test]
 fn socket_bind_listen_errors() {
     let mut fx = Fx::new();
-    // Non-AF_UNIX bind, non-str path, listen/recv before
-    // bind, bad sizes, bad getsockopt buflens.
+    // Non-str path, listen/recv before bind, bad sizes,
+    // bad getsockopt buflens. (The old INET-bind case is
+    // gone: INET bind works now. The old `recv(4097)` →
+    // `EFBIG` case is gone too: the 4096 cap was the Zig's
+    // stack buffer, CPython has none — an unbound stream
+    // `recv` is `EINVAL` at any size.)
     for (src, want) in [
-        (
-            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.bind(('127.0.0.1', 0))",
-            ("OSError", "97"),
-        ),
         (
             "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.bind(123)",
             ("OSError", "22"),
@@ -284,7 +289,7 @@ fn socket_bind_listen_errors() {
         ),
         (
             "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.recv(4097)",
-            ("OSError", "27"),
+            ("OSError", "22"),
         ),
         (
             "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.getsockopt(1, 17, 0)",
@@ -307,23 +312,57 @@ fn socket_bind_listen_errors() {
     }
 }
 
-/// `getsockopt` has no stable-`std` implementation: after
-/// the buflen validation every option is `ENOPROTOOPT`
-/// (the reference returns the real bytes — see the module
-/// docs; this pins the documented limitation). Default
-/// build only — under `unsafe-ffi` the real `getsockopt(2)`
-/// runs (see `socket_getsockopt_real`).
-#[cfg(not(feature = "unsafe-ffi"))]
+/// `getsockopt` / `setsockopt` are shadow state now (see
+/// the module docs): `SO_PEERCRED` and unknown options are
+/// `ENOPROTOOPT`; unset `SO_RCVBUF` / `SO_SNDBUF` are
+/// `ENOPROTOOPT`; the other known options return their
+/// shadow value or their known default.
 #[test]
-fn socket_getsockopt_enoprotoopt() {
+fn socket_getsockopt_shadow() {
     let mut fx = Fx::new();
+    fx.run_ok(
+        r#"
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+assert s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 4) == b'\x00\x00\x00\x00'
+assert s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 4) == b'\x00\x00\x00\x00'
+assert s.getsockopt(socket.IPPROTO_IP, socket.IP_TTL, 4) == b'\x40\x00\x00\x00'
+assert len(s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, 16)) == 16
+assert s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 2) == b'\x00\x00'
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+assert s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 4) == b'\x01\x00\x00\x00'
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+assert s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 4) == b'\x01\x00\x00\x00'
+s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 128)
+assert s.getsockopt(socket.IPPROTO_IP, socket.IP_TTL, 4) == b'\x80\x00\x00\x00'
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+assert s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4) == b'\x00\x10\x00\x00'
+s.close()
+"#,
+    );
     for (src, want) in [
         (
-            "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)",
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)",
             ("OSError", "92"),
         ),
         (
-            "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 4)",
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.getsockopt(socket.SOL_SOCKET, 9999, 4)",
+            ("OSError", "92"),
+        ),
+        (
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4)",
+            ("OSError", "92"),
+        ),
+        (
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4)",
+            ("OSError", "92"),
+        ),
+        (
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 1)",
+            ("OSError", "92"),
+        ),
+        (
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, 9999, 1)",
             ("OSError", "92"),
         ),
     ] {
@@ -335,35 +374,30 @@ fn socket_getsockopt_enoprotoopt() {
     }
 }
 
-/// `getsockopt` under `unsafe-ffi` runs the real
-/// `getsockopt(2)` (U7): `SO_PEERCRED` on an unconnected
-/// socket is the 12-byte `ucred` (pid 0, uid -1, gid -1 —
-/// probed on the reference), `SO_REUSEADDR` is 4 zero
-/// bytes, and an unknown optname is `ENOPROTOOPT`
-/// (probed on the reference).
-#[cfg(feature = "unsafe-ffi")]
+/// `SO_RCVTIMEO` / `SO_SNDTIMEO` take a 16-byte `timeval`
+/// (an int is `EINVAL`); the value round-trips through
+/// `getsockopt`. A raw `setsockopt` timeout does NOT
+/// change `gettimeout()` (CPython: only `settimeout`
+/// updates it).
 #[test]
-fn socket_getsockopt_real() {
+fn socket_sockopt_timeouts() {
     let mut fx = Fx::new();
     fx.run_ok(
         r#"
 import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-peercred = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-reuse = s.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 4)
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+tv = b'\x01\x00\x00\x00\x00\x00\x00\x00\x20\xa1\x07\x00\x00\x00\x00\x00'
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, tv)
+assert s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, 16) == tv
+assert s.gettimeout() is None
 s.close()
 "#,
     );
     assert_eq!(
-        fx.gbytes("peercred"),
-        [0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255]
-    );
-    assert_eq!(fx.gbytes("reuse"), [0, 0, 0, 0]);
-    assert_eq!(
         fx.raised_msg(
-            "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.getsockopt(socket.SOL_SOCKET, 9999, 4)"
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, 1)"
         ),
-        ("OSError".to_string(), "92".to_string())
+        ("OSError".to_string(), "22".to_string())
     );
 }
 
@@ -411,6 +445,48 @@ s.close()
         ),
         ("TypeError".to_string(), "can't convert to int".to_string())
     );
+}
+
+/// `settimeout` / `gettimeout` round-trip exactly through
+/// the shadow state; bad values are `ValueError` /
+/// `TypeError`.
+#[test]
+fn socket_timeout_roundtrip() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        r#"
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+assert s.gettimeout() is None
+s.settimeout(1.5)
+assert s.gettimeout() == 1.5
+s.settimeout(0)
+assert s.gettimeout() == 0.0
+s.setblocking(True)
+assert s.gettimeout() is None
+s.setblocking(False)
+assert s.gettimeout() == 0.0
+s.settimeout(None)
+assert s.gettimeout() is None
+s.close()
+"#,
+    );
+    for (src, want) in [
+        (
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.settimeout(-1)",
+            ("ValueError", "Timeout value must be a non-negative number"),
+        ),
+        (
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.settimeout('x')",
+            ("TypeError", "can't convert to float"),
+        ),
+    ] {
+        assert_eq!(
+            fx.raised_msg(src),
+            (want.0.to_string(), want.1.to_string()),
+            "for {src:?}"
+        );
+    }
 }
 
 #[test]
@@ -504,178 +580,139 @@ fn socket_roundtrip() {
     unlink(path);
 }
 
-/// `fromfd(-1, ...)` behaves like a closed socket (the
-/// Zig wraps the fd directly and fails at use); `fromfd`
-/// on a real fd wraps it as `SocketState::Foreign` (F5b):
-/// `fileno()` returns the fd, `close()` drops the entry
-/// and stores `-1`. Under `unsafe-ffi` the socket OWNS
-/// the fd (U4) and `close()` closes it — the reference
-/// closes it too (probed: `os.close(fd)` after
-/// `s.close()` is EBADF; see the subprocess test
-/// `g6b_fromfd_close_ebadf`). On the default build the
-/// OS fd is NOT closed (the documented divergence, see
-/// the module docs and `scripts/f5b_result.txt` §4).
+/// TCP echo: the VM is the client, a Rust thread the
+/// server. Also pins `recv` returning exactly what the
+/// peer sent.
 #[test]
-fn socket_fromfd() {
-    let mut fx = Fx::new();
-    fx.run_ok(
-        "import socket\ns = socket.fromfd(-1, socket.AF_UNIX, socket.SOCK_STREAM)\nassert s.fileno() == -1\n",
-    );
-    assert_eq!(
-        fx.raised_msg(
-            "import socket\ns = socket.fromfd(-1, socket.AF_UNIX, socket.SOCK_STREAM)\ns.recv(1)"
-        ),
-        ("OSError".to_string(), "9".to_string())
-    );
-    let (a, _b) = UnixStream::pair().expect("pair");
-    let fd = a.as_raw_fd();
-    fx.run_ok(&format!(
-        "import socket\ns = socket.fromfd({fd}, socket.AF_UNIX, socket.SOCK_STREAM)\nassert s.fileno() == {fd}\ns.close()\nassert s.fileno() == -1\n"
-    ));
-    #[cfg(feature = "unsafe-ffi")]
-    {
-        // The socket owns the fd now (U4): `s.close()`
-        // already closed it, so the Rust-side handle must
-        // NOT close it again — forget it instead (the
-        // "fd is really closed" assertion is the
-        // subprocess test `g6b_fromfd_close_ebadf`).
-        std::mem::forget(a);
-    }
-    #[cfg(not(feature = "unsafe-ffi"))]
-    {
-        // The caller's fd is still open (the divergence):
-        // the pair's other end can still send through it.
-        drop(a);
-    }
-}
-
-/// `fileno()` changes across `bind()` (the placeholder fd
-/// is swapped for the listener — the documented pure-`std`
-/// divergence from the reference, which keeps one fd).
-/// Default build only — under `unsafe-ffi` the fd never
-/// changes (see `socket_fileno_stable_on_bind`).
-#[cfg(not(feature = "unsafe-ffi"))]
-#[test]
-fn socket_fileno_changes_on_bind() {
-    let path = "/tmp/petitpy-d3-sock-fdchange.sock";
-    unlink(path);
+fn socket_tcp_echo() {
+    let (port, server) = tcp_server(|mut s| {
+        let mut buf = [0u8; 5];
+        s.read_exact(&mut buf).expect("server reads");
+        assert_eq!(&buf, b"hello");
+        s.write_all(b"world").expect("server writes");
+    });
     let mut fx = Fx::new();
     fx.run_ok(&format!(
-        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\nbefore = s.fileno()\ns.bind('{path}')\nafter = s.fileno()\nassert before >= 0\nassert after >= 0\nassert before != after\ns.close()\n"
+        "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.connect(('127.0.0.1', {port}))\ns.sendall(b'hello')\ndata = s.recv(100)\nassert data == b'world'\ns.close()\n"
     ));
-    unlink(path);
+    assert_eq!(fx.gbytes("data"), b"world");
+    server.join().expect("server thread");
 }
 
-/// `fileno()` is stable across `bind()` under
-/// `unsafe-ffi` (U6): the constructor calls the real
-/// `socket(2)` and `bind()` runs the real `bind(2)` on
-/// the same fd — the reference keeps one fd throughout.
-#[cfg(feature = "unsafe-ffi")]
+/// UDP `sendto` / `recvfrom` over `AF_UNIX` datagrams:
+/// the VM binds a datagram socket, sends to a Rust
+/// `UnixDatagram`, which replies; the reply's address is
+/// the Rust socket's path bytes (the sender's address).
+/// (The `AF_INET` version is
+/// `socket_udp_inet_sendto_recvfrom`, ignored — this VM's
+/// sandbox returns `EPERM` for UDP loopback `sendto`,
+/// verified with a standalone `std` probe; the datagram
+/// state machine and the `sendto` / `recvfrom` path are
+/// the same for both families.)
+#[cfg(unix)]
 #[test]
-fn socket_fileno_stable_on_bind() {
-    let path = "/tmp/petitpy-d3-sock-fdstable.sock";
-    unlink(path);
+fn socket_unix_datagram_sendto_recvfrom() {
+    use std::os::unix::net::UnixDatagram;
+    let server_path = "/tmp/petitpy-h-sock-udp-server.sock";
+    let client_path = "/tmp/petitpy-h-sock-udp-client.sock";
+    unlink(server_path);
+    unlink(client_path);
+    let sock = UnixDatagram::bind(server_path).expect("udp bind");
+    let server = std::thread::spawn(move || {
+        let mut buf = [0u8; 100];
+        let (n, src) = sock.recv_from(&mut buf).expect("udp recv");
+        assert_eq!(&buf[..n], b"ping");
+        sock.send_to(b"pong", src.as_pathname().unwrap())
+            .expect("udp send");
+    });
     let mut fx = Fx::new();
     fx.run_ok(&format!(
-        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\nbefore = s.fileno()\ns.bind('{path}')\nafter = s.fileno()\nassert before >= 0\nassert before == after\ns.close()\n"
+        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\ns.bind(b'{client_path}')\nn = s.sendto(b'ping', b'{server_path}')\nassert n == 4\ndata, addr = s.recvfrom(100)\nassert data == b'pong'\nassert addr == b'{server_path}'\ns.close()\n"
     ));
-    unlink(path);
+    server.join().expect("server thread");
+    unlink(server_path);
+    unlink(client_path);
 }
 
-/// The constructor fails for a bad family/type under
-/// `unsafe-ffi` (U6 — the real `socket(2)` fails
-/// `EAFNOSUPPORT`, probed on the reference); on the
-/// default build it succeeds over the placeholder and
-/// the failure surfaces at `bind()` instead.
+/// `AF_INET` UDP `sendto` / `recvfrom`. IGNORED: this
+/// VM's sandbox returns `EPERM` (os error 1) for UDP
+/// loopback `sendto` — verified with a standalone `std`
+/// probe (`UdpSocket::send_to` to `127.0.0.1` fails the
+/// same way, no petitpy code involved), so the test
+/// cannot pass here. The datagram path is covered by
+/// `socket_unix_datagram_sendto_recvfrom`; run this one
+/// explicitly (`cargo test -- --ignored`) on an
+/// unsandboxed host.
+#[ignore]
 #[test]
-fn socket_ctor_bad_family() {
+fn socket_udp_inet_sendto_recvfrom() {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+    let port = sock.local_addr().expect("local addr").port();
+    let server = std::thread::spawn(move || {
+        let mut buf = [0u8; 100];
+        let (n, src) = sock.recv_from(&mut buf).expect("udp recv");
+        assert_eq!(&buf[..n], b"ping");
+        sock.send_to(b"pong", src).expect("udp send");
+    });
     let mut fx = Fx::new();
-    #[cfg(feature = "unsafe-ffi")]
-    for fam in [0, -1, 999] {
+    fx.run_ok(&format!(
+        "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\nn = s.sendto(b'ping', ('127.0.0.1', {port}))\nassert n == 4\ndata, addr = s.recvfrom(100)\nassert data == b'pong'\nassert addr[0] == '127.0.0.1'\nassert addr[1] == {port}\ns.close()\n"
+    ));
+    server.join().expect("server thread");
+}
+
+/// `send` / `sendall` on a listener is `ENOTCONN` (107,
+/// CPython) — this fixes the G6b §4 leftover, where it
+/// was `EINVAL`. Each case binds its own path: the first
+/// script's listener stays alive (a module global in the
+/// shared `Fx` VM), so a second `bind` on the same path
+/// would be `EADDRINUSE`.
+#[test]
+fn socket_listener_send_enotconn() {
+    let mut fx = Fx::new();
+    for method in ["send", "sendall"] {
+        let path = format!("/tmp/petitpy-h-sock-listenersend-{method}.sock");
+        unlink(&path);
         assert_eq!(
             fx.raised_msg(&format!(
-                "import socket\nsocket.socket({fam}, socket.SOCK_STREAM)"
+                "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.bind('{path}')\ns.listen(1)\ns.{method}(b'x')"
             )),
-            ("OSError".to_string(), "97".to_string()),
-            "for family {fam}"
+            ("OSError".to_string(), "107".to_string()),
+            "for {method}"
         );
+        unlink(&path);
     }
-    #[cfg(not(feature = "unsafe-ffi"))]
-    fx.run_ok(
-        "import socket\ns = socket.socket(0, socket.SOCK_STREAM)\nassert s.fileno() >= 0\ns.close()\n",
-    );
 }
 
-/// `accept()` on a bound-but-not-listening socket is
-/// `EINVAL` under `unsafe-ffi` (U6 — the kernel decides;
-/// probed on the reference). Feature only: on the
-/// default build `bind()` already listens, so the same
-/// program would block in `accept()`.
-#[cfg(feature = "unsafe-ffi")]
+/// `connect` on a listener is `EINVAL`; a second
+/// `connect` on a connected socket is `EISCONN` (106).
 #[test]
-fn socket_accept_on_bound_not_listening() {
-    let path = "/tmp/petitpy-d3-sock-boundaccept.sock";
+fn socket_connect_errors() {
+    let path = "/tmp/petitpy-h-sock-connerr.sock";
     unlink(path);
     let mut fx = Fx::new();
     assert_eq!(
         fx.raised_msg(&format!(
-            "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.bind('{path}')\ns.accept()"
+            "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.bind('{path}')\ns.listen(1)\ns.connect(('127.0.0.1', 9))"
         )),
         ("OSError".to_string(), "22".to_string())
     );
     unlink(path);
-}
-
-/// `bind("")` binds an abstract socket under
-/// `unsafe-ffi` (U6 — the all-zeros address, probed on
-/// the reference): a client connecting to the empty
-/// abstract name is accepted and can send. Feature only:
-/// on the default build `bind("")` is `ENOENT`.
-/// NOTE: the client address must be 107 zero name bytes
-/// (`from_abstract_name(&[0; 107])`, addrlen 110) — the
-/// kernel matches abstract names by full length, so the
-/// 0-byte name does NOT match the server's 110-byte
-/// all-zeros bind (probed: a 1-byte name is refused
-/// with `ECONNREFUSED`, the 108-byte name connects).
-#[cfg(feature = "unsafe-ffi")]
-#[test]
-fn socket_bind_empty_abstract() {
-    use std::os::linux::net::SocketAddrExt;
-    use std::os::unix::net::SocketAddr;
-    let addr = SocketAddr::from_abstract_name(&[0u8; 107]).expect("empty abstract addr");
-    let client = std::thread::spawn(move || {
-        // Retry like `socket_roundtrip`: the VM may not
-        // have bound yet when this thread first runs.
-        let mut stream = None;
-        for _ in 0..200 {
-            match UnixStream::connect_addr(&addr) {
-                Ok(s) => {
-                    stream = Some(s);
-                    break;
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        let mut stream = stream.expect("client connects");
-        stream.write_all(b"hello").expect("client writes");
-    });
-    let mut fx = Fx::new();
-    fx.run_ok(
-        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.bind('')\ns.listen(1)\nclient, addr = s.accept()\nassert addr == b''\ndata = client.recv(100)\nclient.close()\ns.close()\n",
+    let (port, server) = tcp_server(|s| drop(s));
+    assert_eq!(
+        fx.raised_msg(&format!(
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.connect(('127.0.0.1', {port}))\ns.connect(('127.0.0.1', {port}))"
+        )),
+        ("OSError".to_string(), "106".to_string())
     );
-    assert_eq!(fx.gbytes("data"), b"hello");
-    client.join().expect("client thread");
+    server.join().expect("server thread");
 }
 
-/// `recv` works on a `fromfd` socket under `unsafe-ffi`
-/// (U4 — the foreign fd is owned, so it dups): the
-/// server accepts a client, wraps the accepted fd with
-/// `fromfd`, and reads through the wrapper. Feature only:
-/// on the default build I/O on a foreign fd is `EBADF`.
-#[cfg(feature = "unsafe-ffi")]
+/// `dup()` shares the connection (a new fd): the dup
+/// sends, closes, and the original still sends.
 #[test]
-fn socket_fromfd_recv() {
-    let path = "/tmp/petitpy-d3-sock-fromfdrecv.sock";
+fn socket_dup() {
+    let path = "/tmp/petitpy-h-sock-dup.sock";
     unlink(path);
     let path_owned = path.to_string();
     let client = std::thread::spawn(move || {
@@ -690,13 +727,152 @@ fn socket_fromfd_recv() {
             }
         }
         let mut stream = stream.expect("client connects");
-        stream.write_all(b"hello").expect("client writes");
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).expect("client reads 1");
+        assert_eq!(&buf, b"hello");
+        stream.read_exact(&mut buf).expect("client reads 2");
+        assert_eq!(&buf, b"again");
     });
     let mut fx = Fx::new();
     fx.run_ok(&format!(
-        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.bind('{path}')\ns.listen(1)\nclient, addr = s.accept()\nwrapped = socket.fromfd(client.fileno(), socket.AF_UNIX, socket.SOCK_STREAM)\ndata = wrapped.recv(100)\nwrapped.close()\nclient.close()\ns.close()\n"
+        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.bind('{path}')\ns.listen(1)\nclient, addr = s.accept()\nd = client.dup()\nassert d.fileno() != client.fileno()\nd.sendall(b'hello')\nd.close()\nclient.sendall(b'again')\nclient.close()\ns.close()\n"
     ));
-    assert_eq!(fx.gbytes("data"), b"hello");
     client.join().expect("client thread");
     unlink(path);
+}
+
+/// `makefile('rwb')`: the VM reads a line through the
+/// file object and writes a reply through it.
+#[test]
+fn socket_makefile() {
+    let path = "/tmp/petitpy-h-sock-makefile.sock";
+    unlink(path);
+    let path_owned = path.to_string();
+    let client = std::thread::spawn(move || {
+        let mut stream = None;
+        for _ in 0..200 {
+            match UnixStream::connect(&path_owned) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let mut stream = stream.expect("client connects");
+        stream.write_all(b"hello\n").expect("client writes");
+        let mut buf = [0u8; 6];
+        stream.read_exact(&mut buf).expect("client reads");
+        assert_eq!(&buf, b"world\n");
+    });
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.bind('{path}')\ns.listen(1)\nclient, addr = s.accept()\nf = client.makefile('rwb')\nline = f.readline()\nassert line == b'hello\\n'\nf.write(b'world\\n')\nf.flush()\nf.close()\nclient.close()\ns.close()\n"
+    ));
+    assert_eq!(fx.gbytes("line"), b"hello\n");
+    client.join().expect("client thread");
+    unlink(path);
+}
+
+/// `getaddrinfo`: list of 5-tuples, `canonname` is `''`,
+/// int and service-name ports, `None` host, bad family
+/// is `EAFNOSUPPORT`, an unknown service is
+/// `OSError(-2)` (CPython's `gaierror` errno).
+#[test]
+fn socket_getaddrinfo() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        r#"
+import socket
+infos = socket.getaddrinfo('localhost', 80)
+assert len(infos) > 0
+fam, typ, proto, canon, addr = infos[0]
+assert fam == socket.AF_INET or fam == socket.AF_INET6
+assert typ == socket.SOCK_STREAM
+assert proto == 0
+assert canon == ''
+assert addr[1] == 80
+infos = socket.getaddrinfo('127.0.0.1', 'http')
+assert infos[0][0] == socket.AF_INET
+assert infos[0][4] == ('127.0.0.1', 80)
+infos = socket.getaddrinfo(None, 0)
+assert len(infos) > 0
+"#,
+    );
+    assert_eq!(
+        fx.raised_msg("import socket\nsocket.getaddrinfo('localhost', 80, 999)"),
+        ("OSError".to_string(), "97".to_string())
+    );
+    assert_eq!(
+        fx.raised_msg("import socket\nsocket.getaddrinfo('localhost', 'nosuchservice')"),
+        ("OSError".to_string(), "-2".to_string())
+    );
+}
+
+/// `fromfd` is CUT in H-socket: the name stays, every
+/// call raises `NotImplementedError` on both builds
+/// (safe Rust cannot take ownership of a raw fd).
+#[test]
+fn socket_fromfd() {
+    let mut fx = Fx::new();
+    for (src, want) in [
+        (
+            "import socket\nsocket.fromfd(0, socket.AF_UNIX, socket.SOCK_STREAM)",
+            ("NotImplementedError", "socket.fromfd is not implemented"),
+        ),
+        (
+            "import socket\nsocket.fromfd(-1, socket.AF_UNIX, socket.SOCK_STREAM)",
+            ("NotImplementedError", "socket.fromfd is not implemented"),
+        ),
+    ] {
+        assert_eq!(
+            fx.raised_msg(src),
+            (want.0.to_string(), want.1.to_string()),
+            "for {src:?}"
+        );
+    }
+}
+
+/// `fileno()` changes across `bind()` on BOTH builds now
+/// (the placeholder fd is swapped for the listener — the
+/// documented pure-`std` divergence from the reference,
+/// which keeps one fd; the old feature-only
+/// `socket_fileno_stable_on_bind` is gone with the FFI
+/// implementation).
+#[test]
+fn socket_fileno_changes_on_bind() {
+    let path = "/tmp/petitpy-d3-sock-fdchange.sock";
+    unlink(path);
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\nbefore = s.fileno()\ns.bind('{path}')\nafter = s.fileno()\nassert before >= 0\nassert after >= 0\nassert before != after\ns.close()\n"
+    ));
+    unlink(path);
+}
+
+/// The constructor fails at once now, on both builds:
+/// bad family is `EAFNOSUPPORT` (97), bad type is
+/// `EINVAL` (22), bad proto is `EPROTONOSUPPORT` (93).
+#[test]
+fn socket_ctor_bad_family() {
+    let mut fx = Fx::new();
+    for fam in [0, -1, 999] {
+        assert_eq!(
+            fx.raised_msg(&format!(
+                "import socket\nsocket.socket({fam}, socket.SOCK_STREAM)"
+            )),
+            ("OSError".to_string(), "97".to_string()),
+            "for family {fam}"
+        );
+    }
+    assert_eq!(
+        fx.raised_msg("import socket\nsocket.socket(socket.AF_INET, 999)"),
+        ("OSError".to_string(), "22".to_string())
+    );
+    assert_eq!(
+        fx.raised_msg(
+            "import socket\nsocket.socket(socket.AF_INET, socket.SOCK_STREAM, 999)"
+        ),
+        ("OSError".to_string(), "93".to_string())
+    );
 }

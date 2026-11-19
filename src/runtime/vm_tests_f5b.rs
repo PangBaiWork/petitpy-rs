@@ -8,7 +8,9 @@
 //!    resolves NO module globals (`NameError`), even before the
 //!    first yield, while plain functions in the same module work
 //!    (`itertools.zip_longest` calling module-global `repeat`).
-//! 2. `socket.fromfd` registers the given fd in the socket table.
+//! 2. `socket.fromfd` is CUT in H-socket (raises
+//!    `NotImplementedError` — safe Rust cannot take
+//!    ownership of a raw fd).
 //! 3. `subprocess.run` honours `stderr=STDOUT` and text mode.
 //! 4. `os.kill` / `os.chown` raise the reference's errors instead
 //!    of `NotImplementedError`.
@@ -187,14 +189,16 @@ fn f5b_itertools_zip_longest_repeat() {
     assert_eq!(fx.gi("g"), 3);
 }
 
-/// `socket.fromfd` wraps the given fd; `fileno()` returns it.
+/// `socket.fromfd` is CUT in H-socket: every call raises
+/// `NotImplementedError` (safe Rust cannot take ownership
+/// of a raw fd).
 #[test]
-fn f5b_socket_fromfd_fileno() {
+fn f5b_socket_fromfd_not_implemented() {
     let mut fx = Fx::new();
     fx.run_ok(
-        "import socket, os\nfd = os.open('/dev/null', os.O_RDONLY)\ns = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\na = (s.fileno() == fd)\ns.close()\n",
+        "import socket, os\nfd = os.open('/dev/null', os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    ok = False\nexcept NotImplementedError:\n    ok = True\n",
     );
-    assert_eq!(fx.g("a"), Some(Value::Bool(true)));
+    assert_eq!(fx.g("ok"), Some(Value::Bool(true)));
 }
 
 /// `subprocess.run` with `stderr=STDOUT` merges stderr into the

@@ -758,6 +758,7 @@ pub(crate) fn build_vm_types(
         iterator,
         range_it,
         socket: None,
+        socketfile: None,
         deque: None,
         ordereddict: None,
         namedtuple_fn: None,

@@ -84,8 +84,9 @@ seek 测试原断言 `st.offset` 是在钉这个 bug，已改为断言
 - 探针 ~/workspace/g5_probe/probe_p3.py 9 用例全 SAME
 （p3a 小写 /dev/full、p3b 5000 字节写 /dev/full、p3c
 写读往返、p3d flush 到 /dev/full、p3e tell、p4_ospath、
-p5a/b/c）。`os.write` 直接路径 triage 已断言不受影响
-（G5 未重探——主 agent 验收时可顺带确认）。
+p5a/b/c）。`os.write` 直接路径重探：/dev/full 双边
+write 时即报 errno 28，rc=0——P3 未波及（triage 断言证实，
+见 §2）。
 
 ### P6 — str_data 动态 qstr 残留站点审计（DONE，审计 + 1 修，cbd9d6c）
 - 审计方法：D5 清单逐项 grep + 双二进制探针。

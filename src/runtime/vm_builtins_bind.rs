@@ -539,6 +539,29 @@ impl Vm {
                 state.list_extend_builtin = v;
             }
         }
+        // G3/H5: the `set.add` / `set.discard` / `set.remove`
+        // method builtins (three `FunBuiltin` objects in the
+        // set type dict). Looked up by name; a miss leaves the
+        // handle unset and the method keeps its old ctx-only
+        // behavior (an instance element raises "unsupported
+        // type for operator").
+        if let Obj::Type(d) = ctx.arena.get(ctx.types.set) {
+            let set_dict = d.dict;
+            for (name, slot) in [
+                (&b"add"[..], &mut state.set_add_builtin),
+                (&b"discard"[..], &mut state.set_discard_builtin),
+                (&b"remove"[..], &mut state.set_remove_builtin),
+            ] {
+                let q = static_qstr_id(name).expect("set method is a static qstr");
+                if let Ok(v) = crate::objects::containers::objdict::dict_get_value(
+                    &mut ctx,
+                    Value::Heap(set_dict),
+                    Value::Qstr(q),
+                ) {
+                    *slot = v;
+                }
+            }
+        }
         state.hash_builtin = d1.hash_builtin;
         state.format_builtin = d1.format_builtin;
         // F3: the `str.format` method builtin (one `FunBuiltin`

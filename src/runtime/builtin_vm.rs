@@ -34,6 +34,8 @@ use crate::objects::containers::map::{hash_of_hook, map_of, MapError};
 use crate::objects::containers::objarray_methods::array_extend;
 use crate::objects::containers::objdict_methods::{dict_get_hook, dict_pop_hook, dict_setdefault_hook};
 use crate::objects::containers::objlist_methods::list_extend;
+use crate::objects::containers::objset::SetError;
+use crate::objects::containers::objset_methods::{set_add_hook, set_discard_hook, set_remove_hook};
 use crate::objects::containers::objdict_collect::collect_iterable;
 use crate::objects::containers::objlist::new_list;
 use crate::objects::strings::objstr_methods_c::KwArg;
@@ -401,6 +403,75 @@ pub fn call_list_extend_ctx(
     }
     let mut hook = crate::runtime::vm_seams::make_hook(state);
     list_extend(ctx, args[0], args[1], Some(&mut hook)).map_err(|e| {
+        if let Some(exc) = state.pending_exc.take() {
+            return exc;
+        }
+        let pe = ctx.record_typed(e);
+        exc_from_pyerror(ctx, state, pe)
+    })
+}
+
+/// `set.add` (G3/H5): intercepted by GcRef identity (see
+/// `set_add_builtin`) so an instance element runs its FunBc
+/// `__eq__` through the VM's real call hook. Arity is
+/// re-checked by hand (interception bypasses
+/// `call_fun_builtin`'s sig check): self + item, no kwargs.
+/// On error the hook's stashed raise is drained first, else
+/// the `SetError` is recorded (same as
+/// `call_list_extend_ctx`).
+pub fn call_set_add_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    call_set_mutating_ctx(ctx, state, n_args, n_kw, args, set_add_hook)
+}
+
+/// `set.discard` (G3/H5): same interception as `set.add`.
+pub fn call_set_discard_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    call_set_mutating_ctx(ctx, state, n_args, n_kw, args, set_discard_hook)
+}
+
+/// `set.remove` (G3/H5): same interception as `set.add`.
+pub fn call_set_remove_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+) -> Result<Value, Value> {
+    call_set_mutating_ctx(ctx, state, n_args, n_kw, args, set_remove_hook)
+}
+
+/// Shared core of the three `set.add` / `.discard` /
+/// `.remove` intercepts (G3/H5): arity (2,2), 0 kwargs, then
+/// the hook-aware core.
+fn call_set_mutating_ctx(
+    ctx: &mut CallCtx,
+    state: &mut VmState,
+    n_args: usize,
+    n_kw: usize,
+    args: &[Value],
+    f: fn(
+        &mut CallCtx,
+        Value,
+        Value,
+        Option<crate::objects::slots::CallHook<'_, '_>>,
+    ) -> Result<Value, SetError>,
+) -> Result<Value, Value> {
+    if n_args != 2 || n_kw != 0 {
+        return Err(mismatch(ctx, state));
+    }
+    let mut hook = crate::runtime::vm_seams::make_hook(state);
+    f(ctx, args[0], args[1], Some(&mut hook)).map_err(|e| {
         if let Some(exc) = state.pending_exc.take() {
             return exc;
         }

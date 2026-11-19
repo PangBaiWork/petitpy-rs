@@ -158,7 +158,7 @@ impl From<PyError> for MapError {
 // ── sizing tables (map.zig) ─────────────────────────────────────────
 
 /// `hash_allocation_sizes[]` (map.c): growth sizes for the set table
-/// (and the nano map path). Used by `set_rehash`.
+/// (and the nano map path). Used by `set_rehash_inner`.
 pub(crate) const HASH_ALLOCATION_SIZES: [u16; 34] = [
     0, 2, 4, 6, 8, 10, 12, // +2
     17, 23, 29, 37, 47, 59, 73, // *1.25

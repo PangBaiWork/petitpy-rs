@@ -20,7 +20,7 @@ use crate::objects::obj::obj_get_type;
 use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::containers::objlist::new_list;
 use crate::objects::containers::objlist_methods::list_append;
-use crate::objects::containers::objset::{set_new, set_store};
+use crate::objects::containers::objset::{set_new_hook, set_store_hook};
 use crate::objects::containers::objslice::slice_make_new;
 use crate::objects::containers::objtuple::new_tuple;
 use crate::objects::objtype::objexcept::exception_match;
@@ -333,7 +333,7 @@ pub(crate) fn dispatch_exec(
                     .into_iter()
                     .map(|v| v.unwrap_or(Value::None))
                     .collect();
-                match set_new(ctx, ctx.types.set, &items) {
+                match set_new_hook(ctx, ctx.types.set, &items, Some(&mut make_hook(state))) {
                     Ok(v) => spush(frame, v),
                     Err(e) => {
                         return Some(DispatchOutcome::Raised(exc_from_obj_error(
@@ -418,9 +418,15 @@ pub(crate) fn dispatch_exec(
                         }
                     }
                     _ => {
+                        // Set-comprehension append (G3/H5): same
+                        // gap as BUILD_SET — the store's probe runs
+                        // through the hook, so an instance element's
+                        // FunBc `__eq__` runs.
                         let item = spop(frame).unwrap_or(Value::None);
                         let mut pending = None;
-                        if let Err(e) = set_store(ctx, obj, item, &mut pending) {
+                        if let Err(e) =
+                            set_store_hook(ctx, obj, item, &mut pending, Some(&mut make_hook(state)))
+                        {
                             return Some(DispatchOutcome::Raised(exc_from_obj_error(
                                 ctx, state, e,
                             )));

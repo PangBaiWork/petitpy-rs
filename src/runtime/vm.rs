@@ -228,6 +228,18 @@ pub struct VmState {
     /// needs the VM's real call hook (the E2i array.extend
     /// shape).
     pub list_extend_builtin: Value,
+    /// The `set.add` / `set.discard` / `set.remove` method
+    /// builtins (G3/H5): the three `FunBuiltin`s from the set
+    /// type dict. Intercepted by GcRef identity in
+    /// `call_function_ctx` (see `call_set_add_ctx` /
+    /// `call_set_discard_ctx` / `call_set_remove_ctx` in
+    /// `builtin_vm.rs`) — the `set_add` / `set_discard` /
+    /// `set_remove` cores are ctx-only and their lookup
+    /// cannot run a FunBc `__eq__`, so `s.add(A())` on a set
+    /// holding an equal A() needs the VM's real call hook.
+    pub set_add_builtin: Value,
+    pub set_discard_builtin: Value,
+    pub set_remove_builtin: Value,
     pub min_builtin: Value,
     pub max_builtin: Value,
     pub getattr_builtin: Value,
@@ -526,6 +538,9 @@ impl Vm {
                 dict_pop_builtin: Value::None,
                 dict_setdefault_builtin: Value::None,
                 list_extend_builtin: Value::None,
+                set_add_builtin: Value::None,
+                set_discard_builtin: Value::None,
+                set_remove_builtin: Value::None,
                 min_builtin: Value::None,
                 max_builtin: Value::None,
                 getattr_builtin: Value::None,

@@ -18,8 +18,10 @@
 //! precheck.
 
 use crate::memory::gc::CallCtx;
+use crate::objects::containers::objdict::{dict_get_value_hook, DictError};
 use crate::objects::containers::objlist::{is_exact_list, list_items_vec};
 use crate::objects::containers::objlist_methods::list_extend;
+use crate::objects::containers::objset::{is_set_or_frozenset, set_contains_hook};
 use crate::objects::containers::objtuple::{is_exact_tuple, tuple_items};
 use crate::objects::obj::{
     call_binary, call_unary, is_exact_int, is_float, obj_get_type, obj_is_true, SlotOutcome,
@@ -809,6 +811,41 @@ pub fn binary_op_ctx(ctx: &mut CallCtx, state: &mut VmState, op_in: BinaryOp, lh
     if op == BinaryOp::In {
         op = BinaryOp::Contains;
         std::mem::swap(&mut lhs, &mut rhs);
+    }
+    // G3/H5 — `x in d` / `x in s` with the VM hook: the
+    // dict/set slots are ctx-only, so an instance key's FunBc
+    // `__eq__` never ran there. Intercept exact dicts and
+    // sets/frozensets here (the H2/H5 probe paths): a dict
+    // miss is `KeyError` → False, any other `DictError`
+    // propagates; a set miss is False via `set_contains_hook`
+    // (its hash-failure pending still raises). Dict/set
+    // SUBCLASS instances keep the generic loop below — their
+    // `__contains__` dunder runs through
+    // `try_instance_binary_op` with the hook already — and
+    // every other lhs falls through to the loop (whose
+    // `contains_op_ctx` fallback iterates + compares).
+    if op == BinaryOp::Contains {
+        if matches!(lhs, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::Dict(_))) {
+            let mut hook = make_hook(state);
+            match dict_get_value_hook(ctx, lhs, rhs, Some(&mut hook)) {
+                Ok(_) => return Ok(Value::Bool(true)),
+                Err(DictError::KeyError(_)) => return Ok(Value::Bool(false)),
+                Err(e) => {
+                    if let Some(exc) = state.pending_exc.take() {
+                        return Err(exc);
+                    }
+                    let pe = ctx.record_typed(e);
+                    return Err(exc_from_pyerror(ctx, state, pe));
+                }
+            }
+        }
+        if is_set_or_frozenset(ctx.arena, ctx.types, lhs) {
+            let mut hook = make_hook(state);
+            return match set_contains_hook(ctx, lhs, rhs, Some(&mut hook)) {
+                Ok(b) => Ok(Value::Bool(b)),
+                Err(pe) => Err(exc_from_pyerror(ctx, state, pe)),
+            };
+        }
     }
     // E2d — same-kind container ordering with the VM hook:
     // the ctx-only `seq_cmp_objs` cannot run a FunBc `__lt__`

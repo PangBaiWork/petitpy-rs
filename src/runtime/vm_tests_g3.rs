@@ -234,3 +234,66 @@ fn g3_h6_list_extend_list_unchanged() {
     assert!(fx.gb("ok1"));
     assert!(fx.gb("ok2"));
 }
+
+// ── H5: set probe runs FunBc `__eq__` ──────────────────────────────
+
+#[test]
+fn g3_h5_set_literal_instance_key() {
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "{A_DEF}s = {{A()}}\nok1 = (A() in s)\nok2 = (len(s) == 1)\ns2 = {{A(), A()}}\nok3 = (len(s2) == 1)\n"
+    ));
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+    assert!(fx.gb("ok3"));
+}
+
+#[test]
+fn g3_h5_set_methods_instance_key() {
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "{A_DEF}s = set()\ns.add(A())\ns.add(A())\nok1 = (len(s) == 1)\ns.discard(A())\nok2 = (len(s) == 0)\ns.add(A())\ns.remove(A())\nok3 = (len(s) == 0)\nok4 = False\ntry:\n    s.remove(A())\nexcept KeyError:\n    ok4 = True\n"
+    ));
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+    assert!(fx.gb("ok3"));
+    assert!(fx.gb("ok4"));
+}
+
+#[test]
+fn g3_h5_set_ctor_instance_keys() {
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "{A_DEF}s = set([A(), A()])\nok1 = (len(s) == 1)\ns2 = set(A() for _ in range(2))\nok2 = (len(s2) == 1)\ns3 = {{A() for _ in range(2)}}\nok3 = (len(s3) == 1)\n"
+    ));
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+    assert!(fx.gb("ok3"));
+}
+
+#[test]
+fn g3_h5_set_add_unhashable_quirk() {
+    // The quirk must survive the hook threading: `s.add([2])`
+    // raises TypeError AND the element is still in the set
+    // (observable via len / iteration — `s == {[2]}` itself
+    // raises TypeError on the reference too, since the
+    // comparison re-hashes the element).
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "s = set()\nok1 = False\ntry:\n    s.add([2])\nexcept TypeError:\n    ok1 = True\nok2 = (len(s) == 1)\nok3 = (list(s) == [[2]])\n",
+    );
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+    assert!(fx.gb("ok3"));
+}
+
+#[test]
+fn g3_h5_dict_in_instance_key() {
+    // The dict-`in` gap adjacent to H2 (the Contains branch).
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "{A_DEF}class B:\n    def __hash__(self):\n        return 7\n    def __eq__(self, o):\n        return isinstance(o, B)\nd = {{}}\nd[A()] = 'x'\nok1 = (A() in d)\nok2 = (B() not in d)\n"
+    ));
+    assert!(fx.gb("ok1"));
+    assert!(fx.gb("ok2"));
+}

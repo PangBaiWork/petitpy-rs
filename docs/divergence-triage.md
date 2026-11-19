@@ -63,7 +63,7 @@
 | P11 | API 上用户实例 `__getitem__` 未测试 | 已验证，无需修 | — | 无 | G2 探针通 |
 | P12 | DUP_TOP_TWO 潜在 NULL bug | 已修（G2） | — | 无 | 编译器对 `a[i] += x` 发该指令 |
 | P13 | 直接调 `str_join` 短调用 panic | 已由 E2c 修掉 | — | 无 | G2 已验证，无需改动 |
-| P14 | 管道 stdout 时原版缓冲输出、Rust 直写 | **机制已定位（G5）；待修，后续 lane** | M | libc stdio FILE*（`file_io.zig:486`） | 时间戳探针已定位 |
+| P14 | 管道 stdout 时原版缓冲输出、Rust 直写 | **已修（P14 lane，合并 6bcdb3b，2026-11-19）** | M | libc stdio FILE*（`file_io.zig:486`） | 探针 10/10（到达时间逐桶一致） |
 | N1 | 原版崩溃（rc=134）系列 | 不修 | — | — | — |
 | N2 | subprocess `input=123` 原版挂起 | 不修 | — | — | — |
 | N3 | identity-hash / 地址值 | 不修（设计如此） | — | — | — |
@@ -257,11 +257,12 @@
 - 行为：不经 VM 拦截直接调 `str_join` 会 SIGABRT；用户代码到不了（VM 调用都过 `call_join_ctx` 的 arity 检查），只有 Rust 侧直接调用方能触发。
 - 证据 **(b)**：E2f §4(e)。G2 已验证：`str_join_builtin` 走 `builtin_method!` 宏（`args.len() < $min` 即 Err），现存测试 `e2c_short_direct_calls_error_not_panic` 通过，无需改动。
 
-### P14 — 管道 stdout 时原版缓冲输出、Rust 直写（G0 验收新发现；机制 G5 已定位，待修）
+### P14 — 管道 stdout 时原版缓冲输出、Rust 直写（已修：P14 lane 合并 6bcdb3b，2026-11-19）
 - 行为：`print('hello'); time.sleep(2); print('bye')`，stdout 接管道时 REF 的 `hello` 在 2.02s 后才到达（与 `bye` 同时），Rust 的 `hello` 在 0.00s 即到。两者最终输出字节相同，只差到达时间。
 - 证据 **(a)**：主 agent 2026-11-19 双二进制时间戳探针（G0 验收 §8，`~/workspace/g0_verify_main.log`）。与 C8a “`mp_plat_print` 是 plain `write(1, ...)`”表面冲突——缓冲应在 Zig std io 层或 embed 层，需源码对照定位。
 - **机制已定位（主 agent 2026-11-19 读 `file_io.zig:160-176` + `:480-495` 确认）**：REF 的 `mp_sys_stdout_obj.fp` 就是 libc 的 `stdout` FILE*（`file_io.zig:486` `mp_sys_stdout_obj.fp = stdoutFp()`；`mp_sys_stdout_buffer_obj` 同）；`npyFileWrite` 调 `fwrite` → glibc stdio 缓冲（管道全缓冲 4096，tty 行缓冲）；装了 sink 时经 `output.write(1/2, ...)` 直接旁路（`file_io.zig:166-169`）。`print()` 走 `MP_PYTHON_PRINTER` = `mp_sys_stdout_print`（`full_stubs.zig:58-62`）。Rust 的 `FileHandle::Stdout` 用 `std::io::stdout()`（LineWriter——见换行即 flush，所以管道上直写）。
 - 修形（后续 lane 的 brief 用）：给 `FileHandle::Stdout` 加 4096 字节缓冲——满了 flush、`is_terminal()` 时行 flush、装了 sink 时旁路、退出 / `sys.stdout.flush()` / `print(flush=True)` 时 flush。触点：`FileHandle::Stdout` 变体、`fileio_write`/`flush`、退出路径（embed_exec/main/REPL）。注意：P8 之后 finaliser 打印也走 fd 1——P14 lane 须检查管道下 drain 打印的时序。范围探针（`probe_p14.py`）：`-c`、脚本、文件重定向、REPL 在 REF 上都缓冲；stderr 双边都不缓冲。
+- **已修（2026-11-19，合并 6bcdb3b）**：全局 4096 字节 stdout 缓冲（`src/support/output.rs`，tty 行缓冲、管道满 4096 刷、退出时刷一次；`print(flush=True)` 与 `sys.stdout.flush()` 走它；sink 旁路）。两点与 brief 不同，均按 Zig 源码：finaliser drain 打印不刷盘（`printExcAndClear` 无 fflush，CLI 上不可观测）；`os.write(1/2)` 之前走的是 std LineWriter 而非 raw write，已修为写后 flush。探针 10/10（`~/workspace/p14_probe/probe_p14.py`，到达时间逐桶字节一致，默认 + feature 双边）。
 
 ---
 
@@ -383,4 +384,4 @@ D2 的实现是 open/mode 位检查；本次探针 `/dev/null` 可读、不存�
 - **G6b — unsafe-ffi 之 socket/subprocess（U4/U5/U6/U7/U8）**：`modsocket.rs` + `modsubprocess.rs`。依赖 G1 合并；与 G6a 文件不重叠，可与 G6a 并行。
 - **H9（import_from）与 P7b（API 文件名）**：价值低/改动面大，排最后；H9 可并入 G4（同 import 区），P7b 并入 G2 的 api 侧或单独留待。
 
-顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 可排（G0 已合）。H9、P7b、U8、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。P14（stdout 缓冲）G5 已定位机制，未修——单独小 lane（机制见 P14 节）。
+顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 可排（G0 已合）。H9、P7b、U8、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。P14（stdout 缓冲）已修（P14 lane，合并 6bcdb3b）。

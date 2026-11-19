@@ -67,7 +67,7 @@ fn emit_mpy(vm: &mut Vm, in_path: &std::ffi::OsStr) -> u8 {
             }
         },
         petitpy_rs::compiler::parser::InputKind::FileInput,
-        "<emit-mpy>",
+        b"<emit-mpy>",
     ) {
         Ok(mpy) => {
             let b64 = petitpy_rs::entry::base64::encode(&mpy);

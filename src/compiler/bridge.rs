@@ -45,16 +45,17 @@ use crate::compiler::parser::{parse, InputKind};
 /// path string `petitpy --emit-mpy` uses. `compile_to_mpy` uses the
 /// empty name.
 pub fn compile_to_mpy(source: &str, kind: InputKind) -> Result<Vec<u8>, CompileError> {
-    compile_to_mpy_named(source, kind, "")
+    compile_to_mpy_named(source, kind, b"")
 }
 
 /// Like `compile_to_mpy`, but the emitted module records `source_name`
 /// as its source file (qstr index 0). Lexer `debug_mode` is `false`,
-/// matching bridge.zig.
+/// matching bridge.zig. `source_name` is raw bytes — the embedding
+/// API's filename reaches qstr unconverted (P7b: no UTF-8 lossy).
 pub fn compile_to_mpy_named(
     source: &str,
     kind: InputKind,
-    source_name: &str,
+    source_name: &[u8],
 ) -> Result<Vec<u8>, CompileError> {
     compile_to_mpy_named_debug(source, kind, source_name, false)
 }
@@ -64,13 +65,13 @@ pub fn compile_to_mpy_named(
 pub fn compile_to_mpy_named_debug(
     source: &str,
     kind: InputKind,
-    source_name: &str,
+    source_name: &[u8],
     debug_mode: bool,
 ) -> Result<Vec<u8>, CompileError> {
     let mut qctx = crate::compiler::qstr::QstrContext::new();
     // The source name is interned first so it lands at qstr index 0,
     // exactly as the Zig bridge seeds it via `qstr_from_strn`.
-    let source_file_qstr = qctx.from_strn(source_name.as_bytes()).unwrap_or(0);
+    let source_file_qstr = qctx.from_strn(source_name).unwrap_or(0);
 
     let mut lex = match Lexer::new_from_str(source_file_qstr, source.as_bytes(), debug_mode) {
         Ok(lex) => lex,

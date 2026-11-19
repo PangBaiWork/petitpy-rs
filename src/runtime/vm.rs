@@ -681,7 +681,7 @@ impl Vm {
         let mpy = compile_to_mpy_named(
             source,
             crate::compiler::parser::InputKind::FileInput,
-            name,
+            name.as_bytes(),
         )
         .map_err(VmError::Compile)?;
         self.load_module_from_mpy(&mpy, name)

@@ -41,7 +41,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match compile_to_mpy_named(&source, kind, source_name) {
+    match compile_to_mpy_named(&source, kind, source_name.as_bytes()) {
         Ok(mpy) => match fs::write(output, &mpy) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

@@ -39,7 +39,7 @@ impl Fx {
     /// the Phase E entry shape (`load_module_from_mpy` with
     /// name `"__main__"` sets `state.d4.main_module`).
     fn run_main(&mut self, src: &str) -> Result<Value, VmError> {
-        let mpy = compile_to_mpy_named(src, InputKind::FileInput, "__main__")
+        let mpy = compile_to_mpy_named(src, InputKind::FileInput, b"__main__")
             .map_err(VmError::Compile)?;
         self.vm.load_module_from_mpy(&mpy, "__main__")
     }

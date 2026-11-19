@@ -134,7 +134,7 @@ impl Vm {
     pub(crate) fn register_mpy_code(
         &mut self,
         data: &[u8],
-        name: &str,
+        name: &[u8],
         module_dict: Option<GcRef>,
         register: bool,
     ) -> Result<(Value, usize), VmError> {
@@ -144,7 +144,7 @@ impl Vm {
         // since C15b, so either order works.)
         let name_id = self
             .pool
-            .from_strn(name.as_bytes())
+            .from_strn(name)
             .map_err(|_| VmError::OutOfMemory)?;
         let qstr_table =
             resolve_qstr_table(&self.pool, &module.qstrs).map_err(|_| VmError::OutOfMemory)?;
@@ -170,13 +170,13 @@ impl Vm {
         ctx: &mut CallCtx,
         state: &mut VmState,
         data: &[u8],
-        name: &str,
+        name: &[u8],
         module_dict: Option<GcRef>,
     ) -> Result<(Value, usize), VmError> {
         let module = mpy::read(data).map_err(VmError::Mpy)?;
         let name_id = ctx
             .pool
-            .from_strn(name.as_bytes())
+            .from_strn(name)
             .map_err(|_| VmError::OutOfMemory)? as u32;
         let qstr_table =
             resolve_qstr_table(ctx.pool, &module.qstrs).map_err(|_| VmError::OutOfMemory)?;
@@ -217,12 +217,12 @@ impl Vm {
                 ));
             }
         };
-        let mpy = match compile_to_mpy_named(source_str, kind, "<string>") {
+        let mpy = match compile_to_mpy_named(source_str, kind, b"<string>") {
             Ok(m) => m,
             Err(ce) => return Err(Self::compile_error_value_ctx(ctx, state, ce)),
         };
         let (module_val, code_idx) =
-            match Self::register_mpy_code_ctx(ctx, state, &mpy, "<string>", Some(globals)) {
+            match Self::register_mpy_code_ctx(ctx, state, &mpy, b"<string>", Some(globals)) {
                 Ok(v) => v,
                 Err(VmError::OutOfMemory) => {
                     // Register-path allocation failure — NOT a
@@ -331,7 +331,7 @@ impl Vm {
         globals: GcRef,
         locals: GcRef,
     ) -> Result<Value, Value> {
-        self.eval_exec_named(source, kind, "<string>", globals, locals)
+        self.eval_exec_named(source, kind, b"<string>", globals, locals)
     }
 
     /// `eval_exec` with a caller-chosen source name (F1: the
@@ -346,7 +346,7 @@ impl Vm {
         &mut self,
         source: &[u8],
         kind: InputKind,
-        name: &str,
+        name: &[u8],
         globals: GcRef,
         locals: GcRef,
     ) -> Result<Value, Value> {
@@ -481,7 +481,7 @@ impl Vm {
         data: &[u8],
         name: &str,
     ) -> Result<(Value, usize, GcRef), VmError> {
-        let (module_val, code_idx) = self.register_mpy_code(data, name, None, true)?;
+        let (module_val, code_idx) = self.register_mpy_code(data, name.as_bytes(), None, true)?;
         let module_ref = match module_val {
             Value::Heap(r) => r,
             _ => unreachable!("new_module returns a heap module"),
@@ -535,11 +535,11 @@ impl Vm {
     pub(crate) fn compile_error_value_named(
         &mut self,
         e: CompileError,
-        source_name: &str,
+        source_name: &[u8],
     ) -> Value {
         let file = self
             .pool
-            .from_strn(source_name.as_bytes())
+            .from_strn(source_name)
             .map(u32::from)
             .unwrap_or(0);
         let (mut ctx, state) = self.split();
@@ -615,7 +615,7 @@ impl Vm {
     pub fn run_main_source(
         &mut self,
         src: &[u8],
-        source_name: &str,
+        source_name: &[u8],
         file: Option<&[u8]>,
     ) -> Result<Value, Value> {
         let src_str = match std::str::from_utf8(src) {

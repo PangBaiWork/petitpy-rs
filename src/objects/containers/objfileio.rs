@@ -83,6 +83,49 @@ fn io_err(ctx: &mut CallCtx, e: std::io::Error) -> PyError {
     raise_os_error(ctx, e.raw_os_error().unwrap_or(EIO))
 }
 
+/// Drain the readiness monitor's read-ahead bytes for `fd`
+/// into `buf` (H-select: `support::readiness`). Returns
+/// `(n, need_os)`: `n` bytes drained; `need_os` says
+/// whether the caller should read the remainder from the OS
+/// file (true only when no live monitor is left to feed the
+/// buffer: no monitor, or a dead one). When `need_os` is
+/// false the buffer is full or EOF was reached. A live
+/// monitor with an empty buffer BLOCKS here until it
+/// delivers bytes — a blocking read must wait for data,
+/// not report EOF (`stream_rw_loop` reads a 0 return as
+/// EOF), and the monitor is the only reader of the shared
+/// offset while it lives (an OS read now would skip the
+/// bytes it still holds).
+fn drain_buffered(fd: i32, buf: &mut [u8]) -> (usize, bool) {
+    use crate::support::readiness;
+    let Some(mon) = readiness::monitor_for(fd) else {
+        return (0, true);
+    };
+    let mut n = readiness::take_buffered(fd, buf);
+    if n == buf.len() {
+        return (n, false);
+    }
+    loop {
+        // EOF is terminal: no more bytes will ever arrive.
+        if mon.is_eof() {
+            return (n, false);
+        }
+        // Dead (read error / stale): the OS read surfaces
+        // the error, or EOF, for the remainder.
+        if mon.is_dead() {
+            return (n, true);
+        }
+        // Live monitor, empty buffer: wait for data / EOF /
+        // death (blocks — this is a blocking read).
+        readiness::wait_buffered(fd);
+        let m = readiness::take_buffered(fd, &mut buf[n..]);
+        n += m;
+        if n == buf.len() {
+            return (n, false);
+        }
+    }
+}
+
 // ── slot resolution ───────────────────────────────────────────────────
 
 /// Resolve `obj` to its `Obj::File` slot (`stringio_slot`'s
@@ -121,8 +164,8 @@ fn fileio_is_text(ctx: &CallCtx, obj: Value) -> bool {
 /// buffer); reading stdout/stderr is `EBADF`.
 pub fn fileio_read(ctx: &mut CallCtx, obj: Value, buf: &mut [u8]) -> PyResult<usize> {
     let r = fileio_slot(ctx, obj)?;
-    let (closed, handle) = match ctx.arena.get(r) {
-        Obj::File(d) => (d.closed, d.handle.clone()),
+    let (closed, handle, fd) = match ctx.arena.get(r) {
+        Obj::File(d) => (d.closed, d.handle.clone(), d.fd),
         _ => return Err(PyError::PyRaise),
     };
     if closed {
@@ -139,7 +182,20 @@ pub fn fileio_read(ctx: &mut CallCtx, obj: Value, buf: &mut [u8]) -> PyResult<us
             if let Err(e) = std::io::Write::flush(&mut *w) {
                 return Err(io_err(ctx, e));
             }
-            w.get_mut().read(buf)
+            // Drop the borrow before the drain: the drain
+            // may block in `wait_buffered`, and the monitor
+            // never touches this `RefCell`.
+            drop(w);
+            // H-select: drain the monitor's read-ahead first
+            // (it already consumed those bytes from the
+            // shared offset); read the remainder from the OS
+            // only when no live monitor is left.
+            let (n0, need_os) = drain_buffered(fd, buf);
+            if !need_os {
+                return Ok(n0);
+            }
+            let mut w = rc.borrow_mut();
+            w.get_mut().read(&mut buf[n0..]).map(|n1| n0 + n1)
         }
         FileHandle::Stdin => std::io::stdin().read(buf),
         FileHandle::Stdout | FileHandle::Stderr => {
@@ -221,8 +277,8 @@ pub fn fileio_ioctl(
             let IoctlArg::Seek(state) = arg else {
                 return Err(PyError::PyRaise);
             };
-            let (closed, handle) = match ctx.arena.get(r) {
-                Obj::File(d) => (d.closed, d.handle.clone()),
+            let (closed, handle, fd) = match ctx.arena.get(r) {
+                Obj::File(d) => (d.closed, d.handle.clone(), d.fd),
                 _ => return Err(PyError::PyRaise),
             };
             if closed {
@@ -253,6 +309,10 @@ pub fn fileio_ioctl(
                 // make every file `seek`/`tell` return 0.
                 Ok(pos) => {
                     state.result = pos as i64;
+                    // H-select: the offset moved, so the
+                    // monitor's read-ahead bytes (from the old
+                    // offset) are stale — invalidate it.
+                    crate::support::readiness::note_seek(fd);
                     Ok(0)
                 }
                 Err(e) => Err(io_err(ctx, e)),
@@ -300,6 +360,12 @@ pub fn fileio_ioctl(
                 if matches!(data.handle, FileHandle::Owned(_)) {
                     data.handle = FileHandle::Closed;
                 }
+                // H-select: the monitor's read-ahead bytes
+                // belong to a closed description — mark it
+                // stale (and clear the buffer) so a later
+                // file reusing this fd number starts fresh.
+                let fd = data.fd;
+                crate::support::readiness::note_closed(fd);
             }
             Ok(0)
         }

@@ -74,7 +74,7 @@ use std::cell::RefCell;
 
 use crate::memory::gc::{CallCtx, GcArena};
 use crate::objects::obj::{call_unary, is_str, obj_get_type, obj_id, BuiltinTypes, ObjError, SlotOutcome};
-use crate::objects::obj_ops::obj_equal;
+use crate::objects::obj_ops::probe_equal;
 use crate::objects::objtype::instance::instance_unary_op;
 use crate::objects::objtype::seams::with_call_hook_seams;
 use crate::objects::slots::{CallHook, UnaryOp};
@@ -717,7 +717,7 @@ fn map_lookup_inner(
     }
 
     if map_of(ctx.arena, map_ref).is_ordered {
-        ordered_lookup(ctx, types, map_ref, key, kind, compare_only_ptrs)
+        ordered_lookup(ctx, types, map_ref, key, kind, compare_only_ptrs, hook)
     } else {
         // Full config is always compact (`COMPACT`); the nano
         // hash-table path is out of scope for petitpy-rs.
@@ -727,6 +727,9 @@ fn map_lookup_inner(
 }
 
 /// The ordered-array path (fixed maps + OrderedDict, map.zig).
+/// `hook` (G3/H2) threads into the probe comparison, as in
+/// `compact_lookup` below — an instance key's FunBc `__eq__`
+/// runs through the VM's real call hook.
 fn ordered_lookup(
     ctx: &mut CallCtx,
     types: &BuiltinTypes,
@@ -734,6 +737,7 @@ fn ordered_lookup(
     key: Value,
     kind: LookupKind,
     compare_only_ptrs: bool,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<LookupOutcome, MapError> {
     let used = map_of(ctx.arena, map_ref).used;
     let mut i = 0;
@@ -741,7 +745,9 @@ fn ordered_lookup(
         let k = map_of(ctx.arena, map_ref).entries[i].key;
         if let Some(k) = k {
             let found = k == key
-                || (!compare_only_ptrs && obj_equal(ctx, types, k, key).map_err(MapError::from)?);
+                || (!compare_only_ptrs
+                    && probe_equal(ctx, types, k, key, hook.as_deref_mut())
+                        .map_err(MapError::from)?);
             if found {
                 if kind == LookupKind::Remove {
                     // Move the rest of the array down, place the found
@@ -858,7 +864,12 @@ fn compact_lookup(
                 Some(k) => {
                     let mut found = k == key;
                     if !found && !compare_only_ptrs {
-                        found = obj_equal(ctx, types, k, key).map_err(MapError::from)?;
+                        // G3/H2: the probe comparison runs a
+                        // FunBc `__eq__` through the hook
+                        // (`probe_equal` — a raise reads as
+                        // not-equal, stash discarded).
+                        found = probe_equal(ctx, types, k, key, hook.as_deref_mut())
+                            .map_err(MapError::from)?;
                         if found {
                             // Re-validate: a `__eq__` may have mutated
                             // (or rehashed) this map under us — the
@@ -947,10 +958,19 @@ fn compact_rehash(
     }
     for (k, v) in live {
         match compact_lookup(ctx, types, map_ref, k, LookupKind::Add, false, hook.as_deref_mut())? {
-            LookupOutcome::Added(i) => map_set_value(ctx.arena, map_ref, i, v),
-            // Unreachable on a fresh table (no duplicates, room for
-            // `used` entries in `new_alloc >= used + 1` slots).
-            _ => unreachable!("compact rehash replay must add"),
+            // Fresh table: no duplicates, room for `used`
+            // entries in `new_alloc >= used + 1` slots — every
+            // replay inserts. EXCEPT a stateful `__eq__` (G3):
+            // two live keys that were unequal at insert time
+            // can compare equal at replay time, and the probe
+            // then finds the already-replayed one — the Zig
+            // overwrites its value (`compactLookup(...).value
+            // = e.value`, map.zig), dropping the duplicate
+            // entry; mirror it instead of panicking.
+            LookupOutcome::Added(i) | LookupOutcome::Found(i) => {
+                map_set_value(ctx.arena, map_ref, i, v)
+            }
+            _ => unreachable!("compact rehash replay must add or find"),
         }
     }
     Ok(())

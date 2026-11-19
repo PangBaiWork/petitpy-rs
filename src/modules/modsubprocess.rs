@@ -20,12 +20,16 @@
 //! Pure-`std` implementation (`std::process::Command` +
 //! reader/writer threads; no `libc` fork/exec, no `poll`).
 //! Divergences from the Zig, all recorded here (see the
-//! result file §4):
+//! result file §4) — each is fixed under the
+//! `unsafe-ffi` feature (G6b: U5/U8) and keeps the old
+//! shape on the default build:
 //! - Timeout kill: `std`'s `Child::kill` sends `SIGKILL`,
 //!   not `SIGTERM`, so a timed-out child reports
 //!   `returncode -9`, not `-15`, and there is no 1-second
 //!   grace period before the `SIGKILL`. (There is no
-//!   `SIGTERM` in `std`.)
+//!   `SIGTERM` in `std`.) Under `unsafe-ffi` the timeout
+//!   arm sends `SIGTERM`, waits up to 1.0 s, then
+//!   `SIGKILL` (U5).
 //! - Spawn failure (missing executable, bad `cwd`): the
 //!   Zig's child `_exit(127)`s after fork, so the parent
 //!   reports `127` with empty captured output; `Command`
@@ -41,7 +45,8 @@
 //!   freshly-opened files, but the new open does not share
 //!   the original's file offset or append mode (the Zig's
 //!   `dup2` shares both), and a socket fd fails with
-//!   `ENXIO` (`OSError(6)`).
+//!   `ENXIO` (`OSError(6)`). Under `unsafe-ffi` the fd
+//!   modes go through a `pre_exec` `dup2` (U8).
 //! - `argv` must be a list. A str `argv` ABORTS the
 //!   reference (`incorrect alignment` panic,
 //!   `MpObjList.fromObj`); a tuple `argv` ABORTS it too
@@ -56,6 +61,8 @@ use std::io::{Read, Write};
 use std::os::unix::io::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
+#[cfg(feature = "unsafe-ffi")]
+use std::os::unix::process::CommandExt;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -240,19 +247,36 @@ fn stdio_for(ctx: &mut CallCtx, mode: i64, role: usize) -> PyResult<Stdio> {
         }
         DEVNULL => Ok(Stdio::null()),
         fd if fd >= 0 => {
-            // Re-open `/proc/self/fd/<fd>` (see the module
-            // docs): read-only for stdin, write-only for
-            // stdout/stderr. A socket fd fails `ENXIO`.
-            let path = format!("/proc/self/fd/{fd}");
-            if role == 0 {
-                let f = std::fs::File::open(&path).map_err(|e| io_os_error(ctx, e))?;
-                Ok(Stdio::from(f))
-            } else {
-                let f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .map_err(|e| io_os_error(ctx, e))?;
-                Ok(Stdio::from(f))
+            // Under `unsafe-ffi` the fd is dup2'd onto the
+            // stream in the child's `pre_exec` hook (U8) —
+            // the SAME fd number, so offset/append are
+            // shared and socket fds work, as the Zig's
+            // `dup2(m, fd)`. The `Stdio` here is only a
+            // placeholder: `std` dups `/dev/null` onto the
+            // fd first, then `pre_exec` dup2's the real fd
+            // over it (verified: `pre_exec` runs after the
+            // stdio setup). On the default build the
+            // `/proc/self/fd/<fd>` re-open stays (see the
+            // module docs): read-only for stdin, write-only
+            // for stdout/stderr. A socket fd fails `ENXIO`.
+            #[cfg(feature = "unsafe-ffi")]
+            {
+                let _ = fd;
+                Ok(Stdio::null())
+            }
+            #[cfg(not(feature = "unsafe-ffi"))]
+            {
+                let path = format!("/proc/self/fd/{fd}");
+                if role == 0 {
+                    let f = std::fs::File::open(&path).map_err(|e| io_os_error(ctx, e))?;
+                    Ok(Stdio::from(f))
+                } else {
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .map_err(|e| io_os_error(ctx, e))?;
+                    Ok(Stdio::from(f))
+                }
             }
         }
         _ => Err(einval(ctx)),
@@ -274,12 +298,26 @@ fn stderr_stdio_for(ctx: &mut CallCtx, modes: [i64; 3]) -> PyResult<Stdio> {
     match modes[1] {
         DEVNULL => Ok(Stdio::null()),
         fd if fd >= 0 => {
-            let path = format!("/proc/self/fd/{fd}");
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(|e| io_os_error(ctx, e))?;
-            Ok(Stdio::from(f))
+            // Under `unsafe-ffi` this is a placeholder (U8):
+            // the child's `pre_exec` hook dup2's the CHILD's
+            // stdout (already set up) onto stderr, after the
+            // fd dup2's — exactly the Zig's `dup2(1, 2)`.
+            // On the default build stderr re-opens that fd
+            // write-only (the same U8 gap as `stdio_for`).
+            #[cfg(feature = "unsafe-ffi")]
+            {
+                let _ = fd;
+                Ok(Stdio::null())
+            }
+            #[cfg(not(feature = "unsafe-ffi"))]
+            {
+                let path = format!("/proc/self/fd/{fd}");
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| io_os_error(ctx, e))?;
+                Ok(Stdio::from(f))
+            }
         }
         _ => stdio_for(ctx, STDOUT, 2),
     }
@@ -337,24 +375,57 @@ fn is_exec_failure(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(2 | 13 | 20 | 40 | 36 | 26 | 8))
 }
 
-/// Drain a pipe to a `Vec<u8>` on a thread; the receiver
-/// gets the bytes (empty on any read error — the Zig closes
-/// the stream on read failure and keeps what it got).
+/// Drain a pipe to the caller, chunk by chunk, on a
+/// thread; the receiver gets each 16 KiB chunk as it
+/// arrives (the final chunk is followed by the channel
+/// closing when the thread ends on EOF / read error — the
+/// Zig closes the stream on read failure and keeps what
+/// it got). Chunked sends (not one send at EOF) matter
+/// for the timeout path: after a kill the caller takes
+/// what has arrived so far instead of waiting for EOF —
+/// a killed child's grandchild may hold the pipe open
+/// (probed: a `sh -c 'sleep 5'` timeout took 5.0 s with
+/// a single EOF send, the reference takes 1.3 s).
 fn drain_thread<R: Read + Send + 'static>(mut r: R) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
         let mut chunk = [0u8; 16384];
         loop {
             match r.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
-        let _ = tx.send(buf);
     });
     rx
+}
+
+/// Collect a drained stream. Normally block until the
+/// drain thread finishes (EOF) and take everything; on
+/// the timeout path take only what has arrived so far
+/// without blocking — the reference returns what its
+/// poll loop collected before the timeout, it does not
+/// wait for EOF.
+fn collect_stream(rx: mpsc::Receiver<Vec<u8>>, timed_out: bool) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if timed_out {
+        // Let the drain thread flush any chunk it is about
+        // to send, then take what is available.
+        std::thread::sleep(Duration::from_millis(10));
+        while let Ok(chunk) = rx.try_recv() {
+            buf.extend_from_slice(&chunk);
+        }
+    } else {
+        while let Ok(chunk) = rx.recv() {
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    buf
 }
 
 /// Feed `input` to the child's stdin on a thread, then
@@ -446,6 +517,48 @@ fn spawn_and_wait(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
             cmd.stderr(stderr_stdio_for(ctx, modes)?);
         }
     }
+    // Under `unsafe-ffi`, fd stream modes (U8): `pre_exec`
+    // runs in the child between fork and exec — exactly
+    // where the Zig does its `dup2` calls. For each stream
+    // whose mode is a plain fd (m >= 0) the hook dup2's
+    // that fd onto the stream; when `stderr == STDOUT`
+    // with `stdout == fd` it then dup2's the CHILD's
+    // stdout onto stderr. The (PIPE, STDOUT) shared pair
+    // above is untouched (no fd modes there).
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        let need_pre_exec =
+            modes.iter().any(|m| *m >= 0) || (modes[2] == STDOUT && modes[1] >= 0);
+        if need_pre_exec {
+            let modes_copy = modes;
+            // FFI invariant: `CommandExt::pre_exec` runs
+            // the closure in the child after fork and
+            // before exec, after `std` has set up the
+            // `Stdio` fds (verified with a standalone
+            // probe: a `pre_exec` dup2 over a `null()`
+            // placeholder sticks). The closure only calls
+            // `dup2` (async-signal-safe) through the safe
+            // `sys_dup2` wrapper, captures plain `i64` fd
+            // numbers by value (no allocation, no locks,
+            // no borrowed state), and ignores dup2 errors
+            // exactly as the Zig does (`_ = dup2(...)` in
+            // `py_spawn_and_wait`). The parent's fds stay
+            // open — only the child's fds move.
+            unsafe {
+                cmd.pre_exec(move || {
+                    for (i, m) in modes_copy.iter().enumerate() {
+                        if *m >= 0 {
+                            let _ = crate::support::ffi::sys_dup2(*m as i32, i as i32);
+                        }
+                    }
+                    if modes_copy[2] == STDOUT && modes_copy[1] >= 0 {
+                        let _ = crate::support::ffi::sys_dup2(1, 2);
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -515,9 +628,35 @@ fn spawn_and_wait(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         std::thread::sleep(Duration::from_millis(10));
     }
     if timed_out {
-        // `std` only kills with `SIGKILL` (no `SIGTERM`):
-        // the returncode is -9, not the Zig's -15 (see the
-        // module docs). `wait()` reaps after the kill.
+        // Under `unsafe-ffi` the Zig's kill sequence (U5):
+        // `SIGTERM` first (errors ignored, as the Zig
+        // ignores kill errors), then a `waitpid(WNOHANG)`
+        // poll every 10 ms for up to 1.0 s of grace; if the
+        // child is still alive, `SIGKILL` + a blocking
+        // `wait`. The returncode is -15 when TERM kills it,
+        // -9 only when the grace expires (probed on the
+        // reference). On the default build `std` only kills
+        // with `SIGKILL` (no `SIGTERM`): the returncode is
+        // -9 (see the module docs). `wait()` reaps after
+        // the kill.
+        #[cfg(feature = "unsafe-ffi")]
+        {
+            let _ = crate::support::ffi::sys_kill(child.id() as i32, crate::support::ffi::SIGTERM);
+            let grace_deadline = Instant::now() + Duration::from_secs_f64(1.0);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => {
+                        return finish(ctx, modes, s, stdout_rx, stderr_rx, stdin_handle, true);
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(io_os_error(ctx, e)),
+                }
+                if Instant::now() >= grace_deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         let _ = child.kill();
         let status = child.wait().map_err(|e| io_os_error(ctx, e))?;
         return finish(ctx, modes, status, stdout_rx, stderr_rx, stdin_handle, true);
@@ -551,11 +690,11 @@ fn finish(
     };
     let types = ctx.types;
     let out = match (modes[1] == PIPE, stdout_rx) {
-        (true, Some(rx)) => new_bytes(ctx, types, &rx.recv().unwrap_or_default()),
+        (true, Some(rx)) => new_bytes(ctx, types, &collect_stream(rx, timed_out)),
         _ => Value::None,
     };
     let err = match (modes[2] == PIPE, stderr_rx) {
-        (true, Some(rx)) => new_bytes(ctx, types, &rx.recv().unwrap_or_default()),
+        (true, Some(rx)) => new_bytes(ctx, types, &collect_stream(rx, timed_out)),
         _ => Value::None,
     };
     let tuple = new_tuple(

@@ -16,6 +16,13 @@ The project is managed in git; the work is organized as lanes in
 
 ## Status
 
+Continuous integration (`.github/workflows/build.yml`, runs on every
+push): builds `petitpy-rs`, `petitpy-vm` and `zigpy-compile` for
+Linux x86_64 + aarch64, macOS x86_64 + aarch64, Windows x86_64
+(MSVC) and Android aarch64 + x86_64, and uploads them as artifacts
+(`petitpy-rs-<platform>`). The Linux rows also build the
+`--features unsafe-ffi` variant (`petitpy-rs-linux-<arch>-unsafe-ffi`).
+
 Final acceptance (F2, master `bdf3c5b` + this lane):
 
 | Gate | Result |

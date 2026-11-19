@@ -1,0 +1,166 @@
+H-socket lane result (branch lane/h-socket, baseline d316394)
+==========================================================
+
+§1 改了什么
+----------
+socket 模块按 brief 重写为 ONE 跨平台纯 std 实现（CPython
+语义，不再对照 petitpy 原理；无 FFI、无 C、无 unsafe，
+无 feature 分支）：
+
+- src/modules/modsocket.rs：重写，2422 行（原 922 行，<2500 行
+  上限）。AF_INET/6 经 std::net，AF_UNIX 经
+  std::os::unix::net（Windows 上 AF_UNIX 构造直接
+  NotImplementedError）。ctor 先建 placeholder
+  UdpSocket::bind("127.0.0.1:0")，bind/connect 成功后换成
+  真对象（fileno 会变，见 §4）。实现：bind / listen /
+  accept / connect / recv / send / sendall / sendto /
+  recvfrom / setblocking / settimeout / gettimeout /
+  getsockopt / setsockopt / fileno / close / dup / makefile，
+  模块函数 getaddrinfo；常量旧 8 个 + AF_UNSPEC、
+  IPPROTO_TCP、IPPROTO_UDP、IPPROTO_IP、TCP_NODELAY、
+  SO_BROADCAST、IP_TTL、SO_RCVTIMEO、SO_SNDTIMEO、
+  SO_RCVBUF、SO_SNDBUF、SHUT_RD、SHUT_WR、SHUT_RDWR。
+  fromfd 砍掉：名字保留，每次调用 NotImplementedError。
+  gethostname / gethostbyname 未做（brief §4）。
+  关键语义：listener 上 send/sendall 是 OSError(ENOTCONN
+  107)（修复 G6b §4 遗留，原为 EINVAL）；recv 无 4096/EFBIG
+  上限（原上限是 Zig 的栈缓冲，CPython 没有；>64 MiB 是
+  MemoryError，<0 是 EINVAL）；超时用 shadow 状态精确
+  round-trip（settimeout/setblocking 只写 shadow，
+  gettimeout 只读 shadow）；getsockopt/setsockopt 用 shadow
+  表（只 TCP_NODELAY、SO_BROADCAST、IP_TTL 落到 std；
+  SO_RCVTIMEO/SO_SNDTIMEO 落到读写超时；SO_REUSEADDR/
+  SO_RCVBUF/SO_SNDBUF 只 shadow；SO_PEERCRED 与未知选项
+  一律 ENOPROTOOPT；未设置的 SO_RCVBUF/SO_SNDBUF 是
+  ENOPROTOOPT）；makefile 经 try_clone + BufReader/
+  BufWriter，返回本模块 socketfile 包装对象；getaddrinfo
+  经 ToSocketAddrs，canonname 恒 ""，服务名用数字解析 +
+  9 个知名服务小表（http/https/ftp/ssh/telnet/smtp/dns/
+  pop3/imap），未知服务 OSError(-2)；accept 继承
+  listener 的设置；dup 复制设置；close 删表项 + 设置项
+  （复用 fd 不会继承旧设置）；I/O 都在 clone 的句柄上
+  跑，不持表锁做阻塞调用；recv 不碰 select/readiness。
+- src/modules/modsocket_win.rs：删除（124 行）。
+- src/modules/mod.rs：只剩 `pub mod modsocket;`。
+- src/runtime/vm_modules.rs：单 import；build 返回
+  (module, socket, socketfile) 三元组，注册后存
+  vm.types.socket 与 vm.types.socketfile。
+- src/objects/builtin_types.rs：BuiltinTypes 新增
+  `socketfile: Option<GcRef>` 字段，9 处 struct 字面量
+  各加 `socketfile: None`（vm.rs、vm_types.rs + 7 个
+  测试 fixture）。偏离 brief 文件清单的原因：CallCtx.types
+  是 &BuiltinTypes（builder 存不了类型，只能由 vm_modules.rs
+  的注册器存），而进程级 OnceLock<GcRef> 在并行 lib 测试
+  下不 sound（两个活 VM 会串 arena）；沿用 re 模块先例
+  （build_re_module 返回多值、注册器存类型）。
+- src/modules/modsocket_tests.rs：重写。删 6 个 feature-only
+  旧测试（getsockopt_real、fileno_stable_on_bind、
+  accept_on_bound_not_listening、bind_empty_abstract、
+  fromfd_recv、getsockopt_enoprotoopt）；fromfd 改断言
+  NotImplementedError；fileno_changes_on_bind 去门（双构建
+  都变）；ctor 改双构建统一报错（family 97 / type 22 /
+  proto 93）；getsockopt 改 shadow 断言；新增 10 个测试
+  （getsockopt_shadow、sockopt_timeouts、timeout_roundtrip、
+  tcp_echo、unix_datagram_sendto_recvfrom、listener_send_enotconn、
+  connect_errors、dup、makefile、getaddrinfo）。
+- src/runtime/vm_tests_f5b.rs：f5b_socket_fromfd_fileno
+  改名 f5b_socket_fromfd_not_implemented，断言
+  NotImplementedError。
+- tests/g6b_socksub.rs：fromfd 测试改断言
+  NotImplementedError，删除 `#![cfg(feature =
+  "unsafe-ffi")]` 门。
+- tests/h_socket.rs：新增。7 个测试 + 1 个 ignored：
+  tcp_echo_large（10 万字节 sendall）、unix_echo、
+  unix_datagram、getaddrinfo、timeout_sockopt、
+  makefile_dup、fromfd；ignored 的是 h_socket_udp_inet
+  （见 §4 沙箱原因）。
+
+§2 验证数字（最终代码上重跑过，默认构建在后）
+----------------------------------------
+- lib 默认：1748 passed / 0 failed / 2 ignored（基线
+  1739/0/1：+10 新测试，-1 旧 getsockopt_enoprotoopt，
+  +1 ignored 是 socket_udp_inet_sendto_recvfrom）。
+- lib feature：1761 passed / 0 failed / 2 ignored（基线
+  1755/0/1：+10 新测试，-5 feature-only 旧测试，
+  +1 fileno_changes_on_bind 解门，+1 ignored）。
+- bins：9 passed / 0 failed。entry_cli：45 passed。
+- g6b_socksub：1 passed（双构建）。
+- h_socket：7 passed / 1 ignored（双构建）。
+- full gate：545/552 GREEN（双构建，恰为 7 个 known-fails）。
+- integration：默认 199/202，feature 201/202。默认失败
+  = select ×2（已知）+ socket_fromfd_wraps_fd（§4 说明）；
+  feature 失败 = 仅 socket_fromfd_wraps_fd。
+- golden：585/585（双构建）。capability：GREEN（双构建）。
+  stdlib：8/8（双构建）。nano：454/541（双构建，report-only，
+  与基线一致）。
+- 0 warnings：强制重编（touch 全部 src 后 build + test
+  --no-run），双构建各 0。Windows-gnu 交叉编 exit 0，
+  petitpy-rs.exe 已产出；唯一警告是 Zig lld 的 linker
+  stderr（auto-image-base 未实现），与 Rust 代码无关（§4）。
+- `grep -r unsafe src/modules/modsocket.rs`：空（文档注释
+  里的 unsafe 字样已改掉写法）。
+- modsocket.rs 2422 行（<2500）。无新依赖。
+
+§3 探针结果
+----------
+- lib socket 测试（`cargo test --release --lib socket`）：
+  25 passed / 0 failed / 1 ignored。修过 3 个失败：
+  listener 测试两 case 共用同一 path 导致二次 bind
+  EADDRINUSE（改每 case 独立 path）；UDP 测试断言写错
+  （recvfrom 返回发送方地址，应为 server path）；f5b 旧
+  fromfd 测试改断言。
+- 双构建探针（/tmp/h_probe.py，30 行输出：常量、ctor 三
+  类错、timeout round-trip、sockopt shadow 值、bind/
+  listener/close/unbound 各错、getaddrinfo、fromfd、
+  makefile）：默认 binary 与 feature binary（/tmp/
+  petitpy-rs-feature）stdout、stderr diff 均为空，
+  rc 均为 0。关键值：ctor family 97 / type 22 /
+  proto 93；timeout None→1.5→0.0→None；TTL 默认 64、
+  置 128 后读回 128；SO_PEERCRED 92；listener send/
+  sendall 107；close 后 recv 9；未知服务 -2。
+- h_socket 集成测试双构建各 7/7（含 10 万字节 TCP
+  sendall、AF_UNIX echo、AF_UNIX datagram、makefile +
+  dup）。
+- UDP 沙箱证据：纯 std Rust 探针（/tmp/udp.rs）在本 VM
+  上 `UdpSocket::send_to` 到 127.0.0.1 返回 EPERM(1)，
+  与 petitpy 代码无关；AF_UNIX datagram 探针
+  （/tmp/udg.rs）正常。TCP loopback 正常。
+- 中途一次服务重启打断了 feature 警告检查命令，未产生
+  任何输出；重跑后确认 0 警告，无残留影响。
+
+§4 已知遗留
+----------
+- integration 的 socket_fromfd_wraps_fd 在双构建都失败，
+  是 brief 要求的 intentional break：该 case 在只读原仓
+  tests/test_integration_os.py 里断言 fromfd 后
+  fileno()==fd，而 brief §4 砍掉 fromfd；integration
+  runner 无跳过/known-fails 机制，原仓只读改不了。
+  brief 验收行的 "integration 200/202" 写于 fromfd 被砍
+  之前；实际默认 199/202、feature 201/202，新增的唯一
+  失败就是这一个。
+- AF_INET UDP loopback 在本 VM 沙箱被禁（EPERM，见 §3）：
+  socket_udp_inet_sendto_recvfrom（lib）与 h_socket_udp_inet
+  （集成）均为 #[ignore]，附沙箱证据注释；数据报路径改
+  由 AF_UNIX datagram 测试覆盖（同一状态机与同一
+  sendto/recvfrom 代码路径），INET UDP 地址解析由 TCP
+  测试覆盖。无沙箱机器上跑 `cargo test -- --ignored`
+  可验。
+- gethostname / gethostbyname 未实现（brief §4，std 无 API）。
+- 非阻塞 connect() 会阻塞（std 无非阻塞 connect；timeout
+  时用 connect_timeout）。accept() 忽略 listener 的 timeout
+  （无 readiness 接口，brief 要求不建）。
+- 服务名解析只有 9 个知名服务 + 数字；其余服务名按
+  CPython 的 gaierror errno -2 报错。
+- getsockopt 未设置的 SO_RCVBUF/SO_SNDBUF 返回
+  ENOPROTOOPT（内核默认值不可知）；各选项常量取 Linux 值
+  （沿用旧 SO_PEERCRED=17 的做法）。
+- fileno() 在 bind/connect 后变化（placeholder 换真对象，
+  brief 认可的已知限制）；AF_UNIX 在 Windows 上构造即
+  NotImplementedError；makefile 只支持流式 socket；
+  close 后 fd 不会被旧设置污染（设置随 close 删除）。
+- Windows-gnu 交叉编有 1 个 lld linker 警告
+  （auto-image-base 未实现），工具链噪音，任何用该
+  Zig linker 的构建都有，与代码无关；CI 的 MSVC 真机
+  构建不受影响。
+- 本 lane 未碰 modselect.rs、modsubprocess.rs、
+  src/support/readiness.rs（brief 要求）。

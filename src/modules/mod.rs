@@ -23,10 +23,7 @@ pub mod modre_match;
 pub mod modre_types;
 pub mod modselect;
 pub mod modsignal;
-#[cfg(unix)]
 pub mod modsocket;
-#[cfg(windows)]
-pub mod modsocket_win;
 pub mod modstruct;
 pub mod modsubprocess;
 pub mod modtime;

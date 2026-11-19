@@ -122,6 +122,13 @@ pub struct BuiltinTypes {
     /// socket module is built and registered; the registrar
     /// stores `Some(type_ref)` after calling the builder).
     pub socket: Option<GcRef>,
+    /// `socketfile` (H-socket: the `socket.makefile()` wrapper
+    /// type object, built by `build_socket_module` alongside
+    /// the socket type — same shape as `socket`/`match_type`:
+    /// `None` until the socket module is built and
+    /// registered; the registrar stores `Some(type_ref)`
+    /// after calling the builder).
+    pub socketfile: Option<GcRef>,
     /// `deque` (D4: the native deque type object, built by
     /// `build_collections_module` — the `ucollections.deque`
     /// type as well, once Phase E builds that module; the

@@ -39,7 +39,7 @@
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objdict::{dict_get_value, dict_store};
 use crate::objects::obj::obj_get_type;
-use crate::objects::objtype::objexcept::new_exception_msg;
+use crate::objects::objtype::objexcept::{exception_match, new_exception_msg};
 use crate::objects::value::{Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::import_search::{
@@ -48,6 +48,7 @@ use crate::runtime::import_search::{
 use crate::runtime::runtime::dunder;
 use crate::runtime::vm::VmState;
 use crate::runtime::vm_ops::{exc_from_pyerror, type_error};
+use crate::runtime::vm_rt_name::load_method_maybe_ctx;
 
 /// Look a name up in a builtin-module table BYTES (no interning
 /// needed — the dispatch path cannot intern a genuinely-new
@@ -243,8 +244,24 @@ fn process_component(
         }
         // Neither on disk nor frozen: a built-in parent may serve
         // the submodule as an attribute (`import os.path`,
-        // `os.__getattr__`).
-        let (dest, self_) = load_attr_maybe(ctx, state, parent_obj, level_qstr)?;
+        // `os.__getattr__`). The Zig's `loadAttrMaybe` runs
+        // `mp_load_method_maybe`, whose module attr slot calls
+        // the module `__getattr__` inline; the C14
+        // `load_method_maybe` cannot (no VM seam — the AttrFn
+        // adapter passes `None`), so run the VM's loader here
+        // and swallow AttributeError exactly like `loadAttrMaybe`
+        // does (any other raise — e.g. the `os_path` import's
+        // ModuleNotFoundError — propagates).
+        let (dest, self_) = match load_method_maybe_ctx(ctx, state, parent_obj, level_qstr) {
+            Ok(d) => d,
+            Err(e) => {
+                if exception_match(ctx.arena, e, Value::Heap(state.exc.attribute_error)) {
+                    (None, None)
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         if let (Some(v), None) = (dest, self_) {
             if is_exact_module(ctx, state, v) {
                 return Ok(v);

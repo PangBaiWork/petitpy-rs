@@ -127,7 +127,18 @@ pub fn fileio_read(ctx: &mut CallCtx, obj: Value, buf: &mut [u8]) -> PyResult<us
         return Err(raise_os_error(ctx, EBADF));
     }
     let n = match &handle {
-        FileHandle::Owned(rc) => rc.borrow_mut().read(buf),
+        // A read after buffered writes flushes first (the
+        // libc `FILE*` direction switch flushes the write
+        // buffer before reading); a flush failure surfaces
+        // here, as the original's `fread` would report it
+        // via `ferror`.
+        FileHandle::Owned(rc) => {
+            let mut w = rc.borrow_mut();
+            if let Err(e) = std::io::Write::flush(&mut *w) {
+                return Err(io_err(ctx, e));
+            }
+            w.get_mut().read(buf)
+        }
         FileHandle::Stdin => std::io::stdin().read(buf),
         FileHandle::Stdout | FileHandle::Stderr => {
             return Err(raise_os_error(ctx, EBADF));
@@ -143,8 +154,12 @@ pub fn fileio_read(ctx: &mut CallCtx, obj: Value, buf: &mut [u8]) -> PyResult<us
 /// `npyFileWrite` (`file_io.zig:159-176`): `fp == NULL` →
 /// `EBADF`; short `fwrite` → errno. One `write` call per
 /// invocation (the `mp_stream_rw` loop handles partial
-/// writes). Writing stdin is `EBADF`. F1: a stdio stdout/stderr
-/// write with an embedding sink installed on this thread goes
+/// writes). Writing stdin is `EBADF`. The `Owned` handle is
+/// a `BufWriter` (see `FileHandle`): small writes sit in the
+/// 4096-byte buffer and only surface errors at flush/close,
+/// exactly like the original's libc `fwrite`; a write at or
+/// above the capacity bypasses the buffer and writes through.
+/// F1: a stdio stdout/stderr write with an embedding sink installed on this thread goes
 /// to the host's write callback (`output.sink`, `output.zig`)
 /// instead of the process streams — the sink consumes the whole
 /// buffer (it has no return value), so the full length is
@@ -213,6 +228,9 @@ pub fn fileio_ioctl(
                 _ => return Err(raise_os_error(ctx, EINVAL)),
             };
             let pos = match &handle {
+                // `BufWriter::seek` flushes the write buffer
+                // first, like the original's `fseek` on a
+                // buffered `FILE*`.
                 FileHandle::Owned(rc) => rc.borrow_mut().seek(seek),
                 // No safe `std` Seek for stdio handles.
                 FileHandle::Stdin | FileHandle::Stdout | FileHandle::Stderr => {
@@ -221,8 +239,13 @@ pub fn fileio_ioctl(
                 FileHandle::Closed => return Err(raise_os_error(ctx, EBADF)),
             };
             match pos {
+                // The backend writes the new absolute offset
+                // into `SeekState.result` (the field
+                // `stream_seek` reads) — the StringIO backend
+                // does the same; writing `offset` here used to
+                // make every file `seek`/`tell` return 0.
                 Ok(pos) => {
-                    state.offset = pos as i64;
+                    state.result = pos as i64;
                     Ok(0)
                 }
                 Err(e) => Err(io_err(ctx, e)),
@@ -696,7 +719,13 @@ fn open_impl(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     };
     Ok(new_file_object(
         ctx,
-        FileHandle::Owned(std::rc::Rc::new(std::cell::RefCell::new(file))),
+        // BufWriter (capacity 4096 — glibc's default file
+        // buffer size): the original writes through libc
+        // `fwrite`, so small writes buffer and errors surface
+        // at flush/close.
+        FileHandle::Owned(std::rc::Rc::new(std::cell::RefCell::new(
+            std::io::BufWriter::with_capacity(4096, file),
+        ))),
         fd,
         !binary,
         type_,

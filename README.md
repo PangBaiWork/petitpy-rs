@@ -26,7 +26,7 @@ Final acceptance (F2, master `bdf3c5b` + this lane):
 | Capability matrix (`scripts/run_capability.py`) | 67/67 GREEN |
 | Test-stdlib (`scripts/run_stdlib.py`) | 8/8 |
 | Nano config (`scripts/run_nano.py`) | 454/541, report-only (no Rust nano build exists) |
-| `cargo test --release --lib --tests` | 1731 passed, 0 failed, 3 ignored with `--features unsafe-ffi`; 1723 / 0 / 3 default (master `a4f1041` + lane G3) |
+| `cargo test --release --lib --tests` | 1734 passed, 0 failed, 1 ignored with `--features unsafe-ffi`; 1726 / 0 / 1 default (master `12e244e` + lane G5) |
 | `cargo test --release --bins` / `--test entry_cli` | 9 / 45 passed |
 | Benchmark vs reference binary | 0.172x wall-clock (limit ≤ 1.5x; `~/workspace/bench_e3.py`, steady-state run 2) |
 
@@ -169,19 +169,27 @@ pass a gate.
 - **`os.close(fd)` only closes `os.open`-tracked fds** (F6 probe):
   closing an `open()`-created fd raises `EBADF` on Rust while the
   reference's real `close(2)` succeeds.
-- **File writes are unbuffered on Rust** (F6 probe): writing to
-  `/dev/full` raises at `write` on Rust, succeeds on the reference
-  (its buffered close swallows the flush error).
 - **Subprocess timeout kill is SIGKILL (-9), reference SIGTERM
   (-15)** (D3). **`os.umask` is still a `NotImplementedError` stub**
   (D2). **Signal handlers are recorded but never dispatched**
   (D4, the original's own MVP limitation is mirrored in structure).
+- **Piped stdout is unbuffered on Rust** (G0 probe, P14): the
+  reference buffers piped stdout (glibc stdio on the `stdout`
+  `FILE*`, `file_io.zig:486` + `fwrite`; `print` + `sleep` shows
+  both lines only after the sleep), Rust writes through per
+  `print` (Rust `Stdout` is a line writer). Mechanism located
+  by G5; the fix (a 4096-byte stdout buffer, tty line-flush,
+  sink bypass, exit flush) is a follow-up lane, not G5.
 - **GC finaliser is drained only at an explicit `gc.collect()`**
   (F6): a stress collection inside `alloc()` defers the `__del__`
   calls to the next explicit collect (objects are seed-marked to
   survive meanwhile). The CLI path now stress-collects too (G2:
-  `Vm::new` calls `gc_init()`). Finaliser tracebacks go to std
-  stderr, not through the embedding API's print sink.
+  `Vm::new` calls `gc_init()`). Finaliser tracebacks now go to
+  fd 1 through the embedding sink when installed (G5 P8: the
+  original's protected call prints via `mp_plat_print`); file
+  writes are buffered through a 4096-byte `BufWriter` (G5 P3),
+  so `/dev/full` errors now surface at flush/close as on the
+  reference.
 - **`float()` of a class defining `__float__` falls through to
   the native value** (F3): `float(G(1.5))` with `G.__float__`
   returning 9.9 is 9.9 on the reference, 1.5 on Rust.

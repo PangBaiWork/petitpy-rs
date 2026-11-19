@@ -87,7 +87,13 @@ fn open_text_write_read_roundtrip() {
         fileio_ioctl(&mut ctx, f, MP_STREAM_SEEK, IoctlArg::Seek(&mut st)),
         Ok(0)
     );
-    assert_eq!(st.offset, 0);
+    // The backend reports the new absolute offset in
+    // `SeekState.result` (the field `stream_seek` reads —
+    // same as the StringIO backend); the old assertion on
+    // `st.offset` pinned the file backend writing the
+    // result into the input field, which made `tell()`
+    // return 0 on real files (G5/P3).
+    assert_eq!(st.result, 0);
     assert_eq!(fileio_read(&mut ctx, f, &mut buf[..2]), Ok(2));
     assert_eq!(&buf[..2], b"he");
     let mut st = SeekState::new(-1, SEEK_END);
@@ -95,7 +101,7 @@ fn open_text_write_read_roundtrip() {
         fileio_ioctl(&mut ctx, f, MP_STREAM_SEEK, IoctlArg::Seek(&mut st)),
         Ok(0)
     );
-    assert_eq!(st.offset, 4);
+    assert_eq!(st.result, 4);
     assert_eq!(fileio_read(&mut ctx, f, &mut buf[..1]), Ok(1));
     assert_eq!(&buf[..1], b"o");
     assert_eq!(

@@ -118,21 +118,23 @@ pub fn is_fun(ctx: &CallCtx, v: Value) -> bool {
 
 /// The name qstr of a `type()` call's first argument: a `Qstr`
 /// value carries its id; a heap `str` goes through `get_qstr`
-/// (static content) or the pool's `find_strn` (content already
-/// interned). A non-str raises `NotStr` ("can't convert to str
-/// implicitly" — probed: `type(1, (), {})`); a heap str whose
-/// content is neither static nor in the pool is the C13 gap (see
-/// the module docs) and reports `OutOfMemory`.
+/// (static content) or the pool's `from_strn` (interning — the
+/// original's `mp_obj_str_get_qstr` creates a dynamic qstr for
+/// heap content, `objstr.zig:3297-3305`). A non-str raises
+/// `NotStr` ("can't convert to str implicitly" — probed:
+/// `type(1, (), {})`); a name over 255 bytes is `OutOfMemory`
+/// (the pool's u8 length cap — the original ABORTS there,
+/// `qstr_from_strn` panic, an N1 crash we do not reproduce).
 fn type_name_qstr(ctx: &mut CallCtx, name_v: Value) -> Result<u32, ObjTypeError> {
     if let Some(id) = get_qstr(ctx.arena, ctx.types, name_v) {
         return Ok(id);
     }
     if let Some(bytes) = get_str(ctx.arena, name_v) {
-        let id = ctx.pool.find_strn(bytes);
-        if id != 0 {
-            return Ok(id as u32);
-        }
-        return Err(ObjTypeError::OutOfMemory);
+        return ctx
+            .pool
+            .from_strn(bytes)
+            .map(u32::from)
+            .map_err(|_| ObjTypeError::OutOfMemory);
     }
     Err(ObjTypeError::NotStr)
 }

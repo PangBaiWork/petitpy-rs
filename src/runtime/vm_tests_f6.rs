@@ -30,7 +30,7 @@ use crate::objects::containers::objdict::dict_store;
 use crate::objects::objtype::objexcept::exception_get_value;
 use crate::objects::primitives::objint::fun_n_args;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::value::{FunBuiltinData, InstanceData, MapData, Obj, Value};
+use crate::objects::value::{FunBuiltinData, GcRef, InstanceData, MapData, Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::finaliser::drain_pending_finalisers;
 use crate::runtime::vm::{Vm, VmError};
@@ -257,63 +257,68 @@ fn raise_del(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> {
     Err(PyError::PyRaise)
 }
 
-#[test]
-fn f6_raising_del_is_printed_and_swallowed() {
-    // A raising `__del__` is unobservable from Python on the
-    // reference (native `close` never raises; patching or
-    // subclassing `__del__` is blocked identically on both
-    // binaries), so the protected-call path is exercised here
-    // directly: a hand-built type whose `__del__` is a raising
-    // `FunBuiltin`, an instance flagged for finalisation, then
-    // the drain. The raise must be swallowed (no pending raise,
-    // the object freed, the VM still usable) — the traceback
-    // print goes to the test process's stderr (visible with
-    // --nocapture, not asserted: stderr cannot be captured
-    // without unsafe fd redirection).
-    DEL_RAN.store(false, Ordering::SeqCst);
-    let mut fx = Fx::new();
+/// Build a class `P` with a raising `FunBuiltin` `__del__` in
+/// its dict, then allocate one flagged instance of it (unrooted)
+/// and return its `GcRef`. The `__del__` sets `DEL_RAN`.
+/// A raising `__del__` is unobservable from Python on the
+/// reference (native `close` never raises; patching or
+/// subclassing `__del__` is blocked identically on both
+/// binaries), so the protected-call path is exercised here
+/// directly.
+fn install_raising_del_instance(fx: &mut Fx) -> GcRef {
     fx.run_ok("class P:\n    pass\n");
     let p_type = match fx.g("P") {
         Some(Value::Heap(r)) => r,
         other => panic!("P is not a heap value: {other:?}"),
     };
-    let inst = {
-        let (mut ctx, _state) = fx.vm.split();
-        // Install the raising `__del__` in P's dict.
-        let del_q = static_qstr_id(b"__del__").expect("__del__ is a static qstr");
-        // n_args (0, 0): a `FunBuiltin` on a user (instance) type
-        // is a staticmethod by the vendor's payload rule
-        // (`convert_member_lookup`, lookup.rs:149-154 — probed:
-        // a `FunBuiltin` `__init__` on a user type is unbound),
-        // so the drain calls it with 0 args. Production native
-        // `__del__` bodies (file/socket close) live on native
-        // types and are bound (1 arg); the arity here reflects
-        // the lookup result, not the production signature.
-        let fun = Value::Heap(ctx.alloc(
-            None,
-            Obj::FunBuiltin(FunBuiltinData {
-                name: del_q,
-                n_args: fun_n_args(0, 0),
-                func: raise_del,
-                kw_func: None,
-            }),
-        ));
-        let dict = match ctx.arena.get(p_type) {
-            Obj::Type(d) => Value::Heap(d.dict),
-            _ => panic!("P is not a type"),
-        };
-        dict_store(&mut ctx, dict, Value::Qstr(del_q), fun).expect("store __del__");
-        // Allocate a flagged instance; do NOT root it.
-        let roots = &*ctx.roots;
-        ctx.arena.alloc_with_finaliser(
-            Some(p_type),
-            Obj::Instance(InstanceData {
-                members: MapData::new(),
-                subobj: vec![],
-            }),
-            roots,
-        )
+    let (mut ctx, _state) = fx.vm.split();
+    // Install the raising `__del__` in P's dict.
+    let del_q = static_qstr_id(b"__del__").expect("__del__ is a static qstr");
+    // n_args (0, 0): a `FunBuiltin` on a user (instance) type
+    // is a staticmethod by the vendor's payload rule
+    // (`convert_member_lookup`, lookup.rs:149-154 — probed:
+    // a `FunBuiltin` `__init__` on a user type is unbound),
+    // so the drain calls it with 0 args. Production native
+    // `__del__` bodies (file/socket close) live on native
+    // types and are bound (1 arg); the arity here reflects
+    // the lookup result, not the production signature.
+    let fun = Value::Heap(ctx.alloc(
+        None,
+        Obj::FunBuiltin(FunBuiltinData {
+            name: del_q,
+            n_args: fun_n_args(0, 0),
+            func: raise_del,
+            kw_func: None,
+        }),
+    ));
+    let dict = match ctx.arena.get(p_type) {
+        Obj::Type(d) => Value::Heap(d.dict),
+        _ => panic!("P is not a type"),
     };
+    dict_store(&mut ctx, dict, Value::Qstr(del_q), fun).expect("store __del__");
+    // Allocate a flagged instance; do NOT root it.
+    let roots = &*ctx.roots;
+    ctx.arena.alloc_with_finaliser(
+        Some(p_type),
+        Obj::Instance(InstanceData {
+            members: MapData::new(),
+            subobj: vec![],
+        }),
+        roots,
+    )
+}
+
+#[test]
+fn f6_raising_del_is_printed_and_swallowed() {
+    // The raise must be swallowed (no pending raise, the object
+    // freed, the VM still usable) — the traceback print goes to
+    // the test process's stdout as fd 1 (the protected-call
+    // shape; see `print_raised` in `finaliser.rs`), visible
+    // with --nocapture, not asserted here (see the sink test
+    // below for the asserted destination).
+    DEL_RAN.store(false, Ordering::SeqCst);
+    let mut fx = Fx::new();
+    let inst = install_raising_del_instance(&mut fx);
     {
         let (mut ctx, state) = fx.vm.split();
         let _ = ctx.arena.collect(ctx.roots);
@@ -326,5 +331,57 @@ fn f6_raising_del_is_printed_and_swallowed() {
         assert_eq!(ctx.arena.nbytes(inst), 0, "object freed after __del__");
     }
     // The VM keeps working after a swallowed finaliser raise.
+    fx.run_ok("x = 1 + 1\n");
+}
+
+/// P8 (G5): the `__del__` raise print goes through the
+/// embedding sink as fd 1. A recording sink, installed for the
+/// duration of the drain, must receive exactly one write, as
+/// fd 1, carrying the exception type and message.
+static SINK_LOG: std::sync::Mutex<Vec<(i32, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn record_sink(
+    _userdata: *mut std::ffi::c_void,
+    fd: i32,
+    data: *const u8,
+    len: usize,
+) {
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+    SINK_LOG.lock().unwrap().push((fd, bytes));
+}
+
+#[test]
+fn f6_raising_del_goes_to_sink_as_fd1() {
+    use crate::support::output::{CSink, set_thread_sink};
+    SINK_LOG.lock().unwrap().clear();
+    DEL_RAN.store(false, Ordering::SeqCst);
+    let mut fx = Fx::new();
+    let inst = install_raising_del_instance(&mut fx);
+    let prev = set_thread_sink(Some(CSink {
+        write: record_sink,
+        userdata: std::ptr::null_mut(),
+    }));
+    {
+        let (mut ctx, state) = fx.vm.split();
+        let _ = ctx.arena.collect(ctx.roots);
+        drain_pending_finalisers(&mut ctx, state);
+    }
+    set_thread_sink(prev);
+    assert!(DEL_RAN.load(Ordering::SeqCst), "__del__ must have run");
+    let log = SINK_LOG.lock().unwrap();
+    assert_eq!(log.len(), 1, "sink must receive exactly one write, got {log:?}");
+    assert_eq!(log[0].0, 1, "finaliser raise must go to fd 1, got {}", log[0].0);
+    let text = String::from_utf8_lossy(&log[0].1);
+    assert!(
+        text.contains("ValueError"),
+        "sink text must name the exception, got {text}"
+    );
+    assert!(
+        text.contains("boom-del"),
+        "sink text must carry the message, got {text}"
+    );
+    drop(log);
+    let (ctx, _state) = fx.vm.split();
+    assert_eq!(ctx.arena.nbytes(inst), 0, "object freed after __del__");
     fx.run_ok("x = 1 + 1\n");
 }

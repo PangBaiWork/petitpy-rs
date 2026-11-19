@@ -16,8 +16,10 @@
 //! `pending_exc` saved and restored, the finaliser call neither sees
 //! nor clears it): the recorded raise is saved around the drain, a
 //! `__del__` raise is printed with the canonical
-//! `obj_print_exception` (to stderr, stdout flushed first — the
-//! `print_traceback` shape) and swallowed, never raised. A lookup
+//! `obj_print_exception` (to fd 1, through the embedding sink
+//! when installed — the protected-call shape, NOT the
+//! uncaught-traceback fd-2 shape; see `print_raised` below)
+//! and swallowed, never raised. A lookup
 //! failure is skipped silently (the vendor's `dest[0] == 0` case;
 //! its defer restores the saved pending exception, discarding any
 //! lookup raise). Only native types allocate with the flag (files
@@ -45,8 +47,15 @@ fn rt_to_value(ctx: &mut CallCtx, state: &mut VmState, e: RtError) -> Value {
 }
 
 /// Print a `__del__` raise with the canonical exception printer, to
-/// stderr (the `print_traceback` shape in `embed_exec.rs`: stdout
-/// flushed first so piped output stays in order).
+/// fd 1 through the embedding sink when one is installed — the
+/// original's protected call prints via `mp_obj_print_exception`
+/// with `mp_plat_print` (`runtime_utils.zig:41-48`), which routes
+/// to `output.write(1, ...)` (`vendor_stubs.zig:22-24`); the
+/// uncaught-traceback shape (`mp_stderr_print`, fd 2) is a
+/// different path and does NOT apply here. Without a sink, plain
+/// `write(1, ...)` (stdout, flushed first so piped output stays
+/// in order — the `print_traceback` ordering, destination
+/// corrected).
 fn print_raised(ctx: &mut CallCtx, exc: Value) {
     use std::io::Write as _;
     let mut out = String::new();
@@ -54,7 +63,10 @@ fn print_raised(ctx: &mut CallCtx, exc: Value) {
     let types = ctx.types;
     obj_print_exception(ctx, types, exc, &|id| pool.qstr_str(id as u16), &mut out);
     let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().write_all(out.as_bytes());
+    if crate::support::output::write_sink(1, out.as_bytes()) {
+        return;
+    }
+    let _ = std::io::stdout().write_all(out.as_bytes());
 }
 
 /// Drain the arena's pending-finaliser list: run each object's

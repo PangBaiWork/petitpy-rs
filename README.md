@@ -26,7 +26,7 @@ Final acceptance (F2, master `bdf3c5b` + this lane):
 | Capability matrix (`scripts/run_capability.py`) | 67/67 GREEN |
 | Test-stdlib (`scripts/run_stdlib.py`) | 8/8 |
 | Nano config (`scripts/run_nano.py`) | 454/541, report-only (no Rust nano build exists) |
-| `cargo test --release --lib --tests` | 1708 passed, 0 failed, 3 ignored with `--features unsafe-ffi`; 1700 / 0 / 3 default (identical to master `8f9aafa`) |
+| `cargo test --release --lib --tests` | 1711 passed, 0 failed, 3 ignored with `--features unsafe-ffi`; 1703 / 0 / 3 default (master `d6c9e98`) |
 | `cargo test --release --bins` / `--test entry_cli` | 9 / 45 passed |
 | Benchmark vs reference binary | 0.172x wall-clock (limit ≤ 1.5x; `~/workspace/bench_e3.py`, steady-state run 2) |
 

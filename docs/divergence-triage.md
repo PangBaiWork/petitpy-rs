@@ -54,10 +54,10 @@
 | P7b | API `ppy_exec` 非 UTF-8 文件名 lossy | 可修 | M | 编译器需走字节名 | 需扩展 api_test |
 | P8 | finaliser 回调走 std stderr，不走 SinkGuard | 可修 | M | F1 的 sink | 无，需 API 探针 |
 | P9 | stress 路径 finaliser 延迟 | 可修 | M | GC/VM 边界 | 无，低价值 |
-| P10 | host 函数 kwargs 被拒 | 可修 | S | 无 | 需扩展 api_test |
-| P11 | API 上用户实例 `__getitem__` 未测试 | 待探针 | S? | 先写 C 测试定性 | 需扩展 api_test |
-| P12 | DUP_TOP_TWO 潜在 NULL bug | 可修 | S | 无 | 无（编译器不发该 opcode） |
-| P13 | 直接调 `str_join` 短调用 panic | 可修 | S | 无 | 无（用户代码到不了） |
+| P10 | host 函数 kwargs 被拒 | 不是分歧（原版同样拒） | — | 无 | G2 已验证，测试钉住 |
+| P11 | API 上用户实例 `__getitem__` 未测试 | 已验证，无需修 | — | 无 | G2 探针通 |
+| P12 | DUP_TOP_TWO 潜在 NULL bug | 已修（G2） | — | 无 | 编译器对 `a[i] += x` 发该指令 |
+| P13 | 直接调 `str_join` 短调用 panic | 已由 E2c 修掉 | — | 无 | G2 已验证，无需改动 |
 | P14 | 管道 stdout 时原版缓冲输出、Rust 直写 | 可修 | M 待定 | 输出缓冲机制待定位 | 无，需时间戳探针 |
 | N1 | 原版崩溃（rc=134）系列 | 不修 | — | — | — |
 | N2 | subprocess `input=123` 原版挂起 | 不修 | — | — | — |
@@ -231,24 +231,21 @@
 - 行为：`alloc()` 内的 stress 收集只攒 `pending_finalisers`，无 CallCtx 可跑 `__del__`，拖到下次显式 `gc.collect()`（对象 seed-marked 保活）。
 - 证据 **(b)**：F6 §4 源码对照。机制：在 VM 顶层调用返回处等安全点补 drain。规模 M。价值低（只在 `NPY_GC_STRESS` 下可观测，且 CLI 从不 stress 收集——见 P2）。gate：无。
 
-### P10 — host 函数 kwargs 被拒
-- 行为：Python 侧带 kwargs 调 host 函数 → Rust `argument num/types mismatch`；Zig 的 hostCall 取 `argc = n_args - 1`，忽略 kwargs。
-- 证据 **(b)**：F1 §4(a)（api.zig hostCall 对照；api_test 无 kwargs 用例）。
-- 机制：`call_host_ctx` 按 Zig 算 argc，忽略 kwargs。规模 S。gate：需扩展 api_test。
+### P10 — host 函数 kwargs 被拒（不是分歧，G2 已验证关闭）
+- 行为：Python 侧带 kwargs 调 host 函数 → Rust `argument num/types mismatch`；**原版同样拒**：`mp_arg_check_num_sig`（`argcheck.zig:43`，`n_kw != 0 and !takes_kw` → terse）在 hostCall 之前就拒掉，host sig 为 `(1, maxInt(u16), false)`（`api.zig:713`）。F1 §4(a) “Zig 忽略 kwargs”的说法是错的。
+- 证据 **(a)**：G2 探针 + 新增 Rust 测试 `host_call_with_kwargs_is_mismatch` 钉住该一致；未编造 C 入口，`api_test.c` 未动。
 
-### P11 — API 上用户实例 `__getitem__` 未测试
-- 现状：`ppy_getitem` / `ppy_setitem` 走 `try_instance_subscr` 的路径存在，但 api_test 只用 dict/list，未覆盖用户 `__getitem__`。
-- 证据 **(c)**：F1 §4(e)——“路径是 dispatch 的形状，但无 C 或 Rust 测试跑过”，修不修先得定性。
-- 任务：先给 api_test 加一个用户 `__getitem__` 用例，看通不通；通则关闭，不通再按结果定机制。规模 S（探针先行）。
+### P11 — API 上用户实例 `__getitem__` 未测试（G2 已验证，无需修）
+- 现状：`ppy_getitem` / `ppy_setitem` 走 `try_instance_subscr` 的路径存在；G2 新增 Rust 测试 `ppy_getitem_setitem_user_dunders`（用户 `__getitem__` 返回 k*10、`__setitem__` 写 dict）**通过**，路径已存在，无需修。关闭。
+- 证据 **(a)**：G2 探针 + 测试。
 
-### P12 — DUP_TOP_TWO 潜在 NULL bug
-- 行为：`vm_dispatch.rs:611`——任一 top slot 为 NULL 时推两个 NULL，而不是像 ROT_TWO 那样原样复制两个 slot。
-- 证据 **(b)**：D2 §4 + 代码对照（ROT_TWO 在 626 行已正确处理 NULL）；且编译器里 `dup_top_two()` 无调用方（grep `src/compiler` 零命中），即 Python 代码到不了，只有手造 .mpy 能触发。
-- 机制：照 ROT_TWO 改成原样复制两个 slot。规模 S。价值低，但改动 2 行、零风险，可顺手做。gate：无（需手造 .mpy 或 dispatch 层单测）。
+### P12 — DUP_TOP_TWO 潜在 NULL bug（G2 已修）
+- 行为：`vm_dispatch.rs:611`——任一 top slot 为 NULL 时推两个 NULL，而不是像 ROT_TWO 那样原样复制两个 slot。G2 已修（新 `spush_opt`，原样复制两 slot；dispatch 层手造 .mpy 测试，反证通过）。
+- 证据 **(b)**：D2 §4 + 代码对照（ROT_TWO 在 626 行已正确处理 NULL）。**纠正**：编译器确实发该指令——`src/compiler/compile/assign.rs:211` 对 `a[i] += x` 发 `dup_top_two`（另 `handlers_control.rs:417`）；NULL 情形仍只对手造 .mpy 可达。原 triage “编译器无调用方”的说法是错的。
 
-### P13 — 直接调 `str_join` 短调用 panic
+### P13 — 直接调 `str_join` 短调用 panic（已由 E2c 修掉，G2 已验证）
 - 行为：不经 VM 拦截直接调 `str_join` 会 SIGABRT；用户代码到不了（VM 调用都过 `call_join_ctx` 的 arity 检查），只有 Rust 侧直接调用方能触发。
-- 证据 **(b)**：E2f §4(e)。机制：在 slot 路径补 arity 检查。规模 S。价值低。
+- 证据 **(b)**：E2f §4(e)。G2 已验证：`str_join_builtin` 走 `builtin_method!` 宏（`args.len() < $min` 即 Err），现存测试 `e2c_short_direct_calls_error_not_panic` 通过，无需改动。
 
 ### P14 — 管道 stdout 时原版缓冲输出、Rust 直写（G0 验收新发现）
 - 行为：`print('hello'); time.sleep(2); print('bye')`，stdout 接管道时 REF 的 `hello` 在 2.02s 后才到达（与 `bye` 同时），Rust 的 `hello` 在 0.00s 即到。两者最终输出字节相同，只差到达时间。

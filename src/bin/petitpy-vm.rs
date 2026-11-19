@@ -33,6 +33,16 @@ use petitpy_rs::runtime::vm::Vm;
 const USAGE: &str = "petitpy-vm — VM-only runtime (loads pre-compiled .mpy files).\n\nUsage:\n  petitpy-vm <script.mpy>   run a compiled bytecode file\n  petitpy-vm --version      print version\n  petitpy-vm --help         this message\n";
 
 fn main() -> ExitCode {
+    // P14: flush the buffered stdout once at process exit
+    // (C's `exit()` flushes stdio automatically; Rust does
+    // not flush a custom buffer). Same shape as `petitpy`'s
+    // `main` — aborts never reach this return.
+    let code = real_main();
+    petitpy_rs::support::output::flush_stdout_buffer();
+    code
+}
+
+fn real_main() -> ExitCode {
     // G2 (P7a): `args_os`, not `args` — same panic as the
     // main binary's on a non-UTF-8 `.mpy` path.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();

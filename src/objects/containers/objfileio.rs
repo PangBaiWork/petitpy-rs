@@ -179,7 +179,12 @@ pub fn fileio_write(ctx: &mut CallCtx, obj: Value, buf: &[u8]) -> PyResult<usize
             if crate::support::output::write_sink(1, buf) {
                 return Ok(buf.len());
             }
-            std::io::stdout().write(buf)
+            // P14: through the buffered stdout (`fwrite` on
+            // the reference's libc `stdout` FILE*). `fwrite`
+            // reports the full length when the bytes are
+            // accepted into the buffer.
+            crate::support::output::buffered_stdout_write(buf);
+            return Ok(buf.len());
         }
         FileHandle::Stderr => {
             if crate::support::output::write_sink(2, buf) {
@@ -261,7 +266,13 @@ pub fn fileio_ioctl(
             }
             let res = match &handle {
                 FileHandle::Owned(rc) => rc.borrow_mut().flush(),
-                FileHandle::Stdout => std::io::stdout().flush(),
+                // P14: flush the buffered stdout (this is what
+                // `sys.stdout.flush()` must do — the bytes sit
+                // in the process-global buffer until flushed).
+                FileHandle::Stdout => {
+                    crate::support::output::flush_stdout_buffer();
+                    Ok(())
+                }
                 FileHandle::Stderr => std::io::stderr().flush(),
                 // glibc `fflush(stdin)` discards buffered input;
                 // safe `std` cannot express it — no-op.

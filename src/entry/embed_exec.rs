@@ -79,9 +79,19 @@ pub(crate) fn print_traceback(vm: &mut Vm, exc: Value, to_stderr: bool) {
         out
     };
     if to_stderr {
-        let _ = std::io::stdout().flush();
+        // P14: flush the buffered stdout (the Zig's `printExc`
+        // does `fflush(null)` before the stderr traceback).
+        crate::support::output::flush_stdout_buffer();
         let _ = std::io::stderr().write_all(out.as_bytes());
     } else {
+        // petitpy-vm: the traceback goes to stdout via a plain
+        // write, BYPASSING the buffer with no flush first —
+        // the Zig's `embed_run_mpy` calls
+        // `mp_obj_print_exception(&mp_plat_print, raw)` with
+        // no `fflush` (probed: REF prints the traceback
+        // BEFORE earlier buffered `print()` output, which
+        // surfaces at exit). The exit flush in `main` emits
+        // the buffered output after the traceback.
         let _ = std::io::stdout().write_all(out.as_bytes());
         let _ = std::io::stdout().flush();
     }

@@ -662,7 +662,12 @@ pub static MP_PLAT_PRINT: PrintT = PrintT {
 };
 
 fn plat_print_strn(bytes: &[u8]) {
-    let _ = std::io::stdout().write_all(bytes);
+    // P14: through the buffered stdout — the reference's
+    // stdout is libc's `stdout` FILE* (`fwrite`, glibc stdio
+    // buffering), not a per-`\n` write-through. The embedding
+    // sink (when installed) still bypasses the buffer, via
+    // `plat_print_sink_aware` above.
+    crate::support::output::buffered_stdout_write(bytes);
 }
 
 /// `mp_stderr_print` routes to fd 2 (`write(2, ...)`), used by

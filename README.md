@@ -166,12 +166,27 @@ pass a gate.
 - **`socket.fromfd` doesn't own the OS fd** (F5b): `fileno() == fd`
   holds, but `close()` does not close the underlying fd — pure std
   has no `from_raw_fd`. The integration case only asserts `fileno`.
-- **`os.close(fd)` only closes `os.open`-tracked fds** (F6 probe):
-  closing an `open()`-created fd raises `EBADF` on Rust while the
-  reference's real `close(2)` succeeds.
+- **`os.close(fd)` closes any fd under `--features unsafe-ffi`**
+  (G6a U3): the real `close(2)` runs for every fd — an
+  `open()` file's fd, stdio 0–2 (the number is freed for reuse),
+  and registered fds go through the syscall first (a stale
+  number fails `EBADF`, like the reference). On the default
+  build the old shape stays: only `os.open`-tracked fds close,
+  unregistered fds are `EBADF`, stdio is only recorded.
+- **`os.umask` is implemented under `--features unsafe-ffi`**
+  (G6a U2): the real `umask(2)` runs and returns the previous
+  mask. On the default build it is still a
+  `NotImplementedError` stub (no std API). `os.umask(-1)`
+  wraps on Rust (kernel masks to 0777); the reference aborts
+  (Zig `@intCast` panic, rc=134) — N1, not reproduced.
+- **`os.fsync` / `os.lseek` on stdio work under
+  `--features unsafe-ffi`** (G6a U9): the real `fsync(2)` /
+  `lseek(2)` run, so a stdio fd redirected to a regular file
+  syncs/seeks; on pipes/ttys the kernel returns `EINVAL` /
+  `ESPIPE`, as before. On the default build stdio `fsync` is
+  always `EINVAL` and stdio `lseek` is always `ESPIPE`.
 - **Subprocess timeout kill is SIGKILL (-9), reference SIGTERM
-  (-15)** (D3). **`os.umask` is still a `NotImplementedError` stub**
-  (D2). **Signal handlers are recorded but never dispatched**
+  (-15)** (D3). **Signal handlers are recorded but never dispatched**
   (D4, the original's own MVP limitation is mirrored in structure).
 - **Piped stdout is unbuffered on Rust** (G0 probe, P14): the
   reference buffers piped stdout (glibc stdio on the `stdout`

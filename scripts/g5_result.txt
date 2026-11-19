@@ -148,9 +148,33 @@ helper。双二进制探针 ~/workspace/g5_probe/probe_p8.py
 ### P9 — stress 路径 finaliser 延迟（未做，见 §4）
 ### P14 — 管道 stdout 缓冲（未做，见 §4；机制已定位）
 
-## §2 验收（默认构建）
+## §2 验收（默认构建；门输出 ~/workspace/g5_verify/acceptance.log，
+lib_default2.txt、integration_default.txt、nano_default.txt）
 
-
+- lib：**1706 通过 / 0 失败 / 1 ignored**（基线 1703/0/3；
+  P5 解 ignore +2，P8 新测试 +1，ignored 3→1）。
+  注：`cargo test --release --lib --tests` 在本 lane 两次撞上
+  已知的瞬时 panic-strategy（abort vs unwind）增量指纹问题
+  （G2 §4 同款），重跑即净；计数以 `cargo test --release
+  --lib`（重定向到文件后 grep）为准。
+- bins：**9**；entry_cli：**45**；强制重编译 **0 warnings**。
+- check_compile_mpy：PASS（0 mismatches）；
+  check_frozen：PASS（38,141 bytes / 23 .mpy）。
+- 六门：full **545/552 GREEN**（恰好 7 known-fails）；
+  integration **200/202**（失败集恰好 select ×2：
+  `select_timeout_zero_returns_promptly`、
+  `select_readable_fd_is_ready`）；golden **585/585**
+  （rust==cpython 576/585）；capability **GREEN**；
+  stdlib **8/8**；nano **454/541** report-only（未变）。
+- feature-ON（`--features unsafe-ffi`）：lib **1714/0/1**，
+  integration **202/202**。验收后已重建默认构建，工作树
+  处于默认状态。
+- 0 新 unsafe：lane diff 内 `unsafe` 命中只有文档注释中
+  的 prose 与 G0 的 `#[cfg(feature = "unsafe-ffi")]` 属性；
+  无 `unsafe {}` 新增。改动文件均 <2500 行（最大
+  typecreate.rs 813 行）。
+- `os.write` 直接路径重探：/dev/full 双边 write 时即报
+  errno 28，rc=0——P3 未波及（triage 断言证实）。
 
 ## §3 改动文件
 

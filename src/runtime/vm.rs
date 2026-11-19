@@ -486,6 +486,8 @@ impl Vm {
             property: GcRef(0),
             dict_view: GcRef(0),
             dict_view_it: GcRef(0),
+            iterator: GcRef(0),
+            range_it: GcRef(0),
             socket: None,
             deque: None,
             ordereddict: None,

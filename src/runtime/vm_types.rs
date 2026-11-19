@@ -20,12 +20,13 @@ use crate::objects::containers::objattrtuple::attrtuple_type_data;
 use crate::objects::containers::objfileio::build_fileio_types;
 use crate::objects::containers::objlist::list_type_data;
 use crate::objects::containers::objlist_methods::LIST_METHODS;
-use crate::objects::containers::objrange::range_type_data;
+use crate::objects::containers::objrange::{range_it_type_data, range_type_data};
 use crate::objects::containers::objset::{frozenset_type_data, set_type_data};
 use crate::objects::containers::objset_methods::{FROZENSET_METHODS, SET_METHODS};
 use crate::objects::containers::objslice::{slice_type_data, SLICE_METHODS};
 use crate::objects::containers::objtuple::{tuple_type_data, TUPLE_METHODS};
 use crate::objects::containers::objproperty::PROPERTY_METHODS;
+use crate::objects::iters::iter::poly_iter_type_data;
 use crate::objects::iters::objenumerate::enumerate_type_data;
 use crate::objects::iters::objfilter::filter_type_data;
 use crate::objects::iters::objmap::map_type_data;
@@ -493,6 +494,15 @@ pub(crate) fn build_vm_types(
     let dict_view = ctx.alloc(None, Obj::Type(dict_view_type_data(dict_view_dict)));
     let dict_view_it_dict = empty_dict(ctx);
     let dict_view_it = ctx.alloc(None, Obj::Type(dict_view_it_type_data(dict_view_it_dict)));
+    // `iterator` + `range_it` (G4/H8): the `mp_type_polymorph_iter`
+    // and `mp_type_range_it` ROM types (both named `iterator`,
+    // distinct objects — the reference reports `type(iter([1])) is
+    // type(iter(range(3)))` False). Built here (not lazily) so the
+    // getiter paths can read them from `ctx.types`.
+    let iterator_dict = empty_dict(ctx);
+    let iterator = ctx.alloc(None, Obj::Type(poly_iter_type_data(iterator_dict)));
+    let range_it_dict = empty_dict(ctx);
+    let range_it = ctx.alloc(None, Obj::Type(range_it_type_data(range_it_dict)));
     // `code` (E1): the ROM type from `objcode.c` (BASIC level).
     // The name `"code"` IS a static qstr (in the generated
     // table — `from_strn` finds it there); the type has no slots.
@@ -646,7 +656,7 @@ pub(crate) fn build_vm_types(
         tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
         filter, zip, enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
         property, ellipsis, type_, super_, staticmethod, classmethod,
-        fileio, textio, attrtuple, code, dict_view, dict_view_it,
+        fileio, textio, attrtuple, code, dict_view, dict_view_it, iterator, range_it,
     ] {
         ctx.arena.set_header_type(t, Some(type_));
     }
@@ -666,7 +676,7 @@ pub(crate) fn build_vm_types(
         tuple, list, dict, set, frozenset, range, slice, array, bytearray, memoryview, map,
         filter, zip, enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module,
         property, ellipsis, type_, super_, staticmethod, classmethod,
-        fileio, textio, attrtuple, code, dict_view, dict_view_it,
+        fileio, textio, attrtuple, code, dict_view, dict_view_it, iterator, range_it,
     ] {
         let dict_ref = match ctx.arena.get(t) {
             Obj::Type(d) => d.dict,
@@ -700,7 +710,7 @@ pub(crate) fn build_vm_types(
         dict, set, frozenset, range, slice, array, bytearray, memoryview, map, filter, zip,
         enumerate, reversed, fun_bc, gen_wrap, gen_instance, closure, bound_meth, module, property,
         ellipsis, type_, super_, staticmethod, classmethod, code,
-        dict_view, dict_view_it,
+        dict_view, dict_view_it, iterator, range_it,
     ] {
         if let Obj::Type(d) = ctx.arena.get_mut(t) {
             if d.mro.is_empty() {
@@ -745,6 +755,8 @@ pub(crate) fn build_vm_types(
         property,
         dict_view,
         dict_view_it,
+        iterator,
+        range_it,
         socket: None,
         deque: None,
         ordereddict: None,

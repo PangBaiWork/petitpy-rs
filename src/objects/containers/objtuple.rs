@@ -571,10 +571,11 @@ pub fn tuple_index(
 }
 
 /// `mp_obj_tuple_getiter` (`objtuple.zig:292-294`): the
-/// polymorph-iter overlay `(tuple, cur)`.
+/// polymorph-iter overlay `(tuple, cur)`. Header is the
+/// `iterator` ROM type (G4/H8 — `mp_type_polymorph_iter`).
 pub fn tuple_getiter(ctx: &mut CallCtx, self_: Value) -> PyResult<Value> {
     Ok(Value::Heap(ctx.alloc(
-        None,
+        Some(ctx.types.iterator),
         Obj::Iterator(crate::objects::value::IteratorData {
             source: self_,
             index: 0,

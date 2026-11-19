@@ -8,9 +8,13 @@
 //! # The iterator convention (C0 `IteratorData`, formalised here)
 //!
 //! Every iterator is an `Obj::Iterator(IteratorData { source, index,
-//! extra })` allocated with header type `None` (the overlay pattern
-//! C9b/C9c established: `tuple_getiter`, `list_getiter`,
-//! `range_getiter`, `dict_view_it_next`). The kind is the
+//! extra })`. The sequence iterators (list/tuple/str/bytes/set/
+//! frozenset/array/deque/getitem) allocate with the `iterator`
+//! header (`mp_type_polymorph_iter`, G4/H8 — `new_iter` below);
+//! `map` / `filter` / `zip` / `enumerate` / `reversed` allocate
+//! the same way and are re-stamped with their own type by their
+//! `make_new` slots (`make_new.rs`); dict views carry the
+//! `dict_view` / `dict_view_it` headers instead. The kind is the
 //! `SmallInt` tag in `extra[0]`:
 //!
 //! | tag | kind | `extra` layout |
@@ -103,7 +107,8 @@ use crate::objects::containers::objrange::range_it_next;
 use crate::objects::containers::objtuple::tuple_iternext;
 use crate::objects::containers::sequence::{ARRAY_ITER_TAG, LIST_ITER_TAG, TUPLE_ITER_TAG};
 use crate::objects::obj::{obj_get_type, ObjError};
-use crate::objects::value::{IteratorData, Obj, Value};
+use crate::objects::primitives::ops::static_qstr_id;
+use crate::objects::value::{GcRef, IteratorData, Obj, TypeData, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::qstr::RuntimeQstr;
 
@@ -119,6 +124,39 @@ use super::objzip::zip_iternext;
 /// `mp_mirrors.zig` — the polymorph-iterator flag;
 /// objpolyiter.zig sets it on the `iterator` type).
 pub const FLAG_ITER_IS_ITERNEXT: u16 = 0x0080;
+
+/// `mp_type_polymorph_iter` ROM (`objpolyiter.zig:28-51`):
+/// name `iterator`, flags `0x0080`
+/// (`MP_TYPE_FLAG_ITER_IS_ITERNEXT` — the object is its own
+/// iterator, so `getiter` returns it unchanged), iter slot
+/// only, no locals dict. (G4/H8: the header for the sequence
+/// iterators — list/tuple/str/bytes/set/frozenset/array/
+/// deque/getitem. Distinct from `dict_view_it` and
+/// `range_it`: the reference reports `type(iter([1])) is
+/// type(iter({'a': 1}))` False and `type(iter(range(3))) is
+/// type(iter([1]))` False, although all three are named
+/// `iterator`.)
+pub fn poly_iter_type_data(dict: GcRef) -> TypeData {
+    TypeData {
+        name: static_qstr_id(b"iterator").expect("iterator is a static qstr"),
+        flags: FLAG_ITER_IS_ITERNEXT,
+        base: None,
+        mro: Vec::new(),
+        dict,
+        attr: None,
+        make_new: None,
+        bases: None,
+        unary_op: None,
+        binary_op: None,
+        call: None,
+        getiter: Some(|_ctx: &mut CallCtx, self_: Value| Ok(self_)),
+        subscr: None,
+        buffer: None,
+        print: None,
+        namedtuple_fields: None,
+        protocol: None,
+    }
+}
 
 /// `map` iterator tag (`extra[0]`).
 pub const MAP_ITER_TAG: i64 = 110;
@@ -372,7 +410,7 @@ pub fn value_to_qstr(
 /// Build a C11 iterator overlay: `Obj::Iterator` with header
 /// type `None`, rooted across the allocation (D6).
 pub fn new_iter(ctx: &mut CallCtx, data: IteratorData) -> Value {
-    Value::Heap(ctx.alloc(None, Obj::Iterator(data)))
+    Value::Heap(ctx.alloc(Some(ctx.types.iterator), Obj::Iterator(data)))
 }
 
 /// `mp_getiter` (`runtime.zig:1277-1300`, `mpGetiterImpl`):

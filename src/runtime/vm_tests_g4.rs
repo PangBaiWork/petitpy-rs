@@ -55,6 +55,26 @@ impl Fx {
         self.vm.load_module_from_source(src, "<test>")
     }
 
+    fn gs(&mut self, name: &str) -> String {
+        match self.g(name) {
+            Some(Value::Qstr(q)) => {
+                String::from_utf8_lossy(self.vm.pool.qstr_str(q as u16)).into_owned()
+            }
+            Some(Value::Heap(r)) => match self.vm.arena.get(r) {
+                Obj::Str(s) => String::from_utf8_lossy(&s.bytes).into_owned(),
+                other => panic!("global {name} is not a str: {other:?}"),
+            },
+            other => panic!("global {name} is not a str: {other:?}"),
+        }
+    }
+
+    fn gb(&mut self, name: &str) -> bool {
+        match self.g(name) {
+            Some(Value::Bool(b)) => b,
+            other => panic!("global {name} is not a bool: {other:?}"),
+        }
+    }
+
     fn run_ok(&mut self, src: &str) -> Value {
         match self.run(src) {
             Ok(v) => v,
@@ -200,4 +220,92 @@ a = float(F(2.5))
 "#,
     );
     assert_eq!(fx.gf("a"), 2.5);
+}
+
+// ── G4/H8: `type(iter(...))` ────────────────────────────────────────
+// Probed on the reference: every sequence iterator reports
+// `<class 'iterator'>` and `repr(iter([1, 2]))` is `<iterator>`;
+// the list/tuple/str/set iterators share ONE type object, but
+// the range and dict iterators are DIFFERENT type objects with
+// the same name (`type(iter([1])) is type(iter(range(3)))`
+// False, `type(iter([1])) is type(iter({'a': 1}))` False);
+// `iter(it) is it` holds.
+
+#[test]
+fn g4_type_of_sequence_iterators() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        r#"
+it_l = iter([1, 2])
+it_t = iter((1, 2))
+it_s = iter('ab')
+it_set = iter({1, 2})
+it_r = iter(range(3))
+it_d = iter({'a': 1})
+it_k = iter({'a': 1}.keys())
+n_l = type(it_l).__name__
+n_t = type(it_t).__name__
+n_s = type(it_s).__name__
+n_set = type(it_set).__name__
+n_r = type(it_r).__name__
+n_d = type(it_d).__name__
+n_k = type(it_k).__name__
+r_l = repr(it_l)
+i_lt = type(it_l) is type(it_t)
+i_ls = type(it_l) is type(it_s)
+i_lset = type(it_l) is type(it_set)
+i_lr = type(it_l) is type(it_r)
+i_ld = type(it_l) is type(it_d)
+i_lk = type(it_l) is type(it_k)
+i_dk = type(it_d) is type(it_k)
+i_rk = type(it_r) is type(it_k)
+s_l = iter(it_l) is it_l
+s_r = iter(it_r) is it_r
+s_d = iter(it_d) is it_d
+"#,
+    );
+    for n in ["n_l", "n_t", "n_s", "n_set", "n_r", "n_d", "n_k"] {
+        assert_eq!(fx.gs(n), "iterator", "{n}");
+    }
+    assert_eq!(fx.gs("r_l"), "<iterator>");
+    // The polymorph family shares ONE type object ...
+    assert!(fx.gb("i_lt"));
+    assert!(fx.gb("i_ls"));
+    assert!(fx.gb("i_lset"));
+    // ... but range and dict iterators are DIFFERENT type objects
+    // with the same name (probed on REF). The dict family shares
+    // ONE type object: `iter(d)`, `iter(d.keys())`,
+    // `iter(d.values())`, `iter(d.items())` are all
+    // `mp_type_dict_view_it` (objdict.zig:527, :602 — probed on REF).
+    assert!(!fx.gb("i_lr"));
+    assert!(!fx.gb("i_ld"));
+    assert!(!fx.gb("i_lk"));
+    assert!(fx.gb("i_dk"));
+    assert!(!fx.gb("i_rk"));
+    // iter(it) is it.
+    assert!(fx.gb("s_l"));
+    assert!(fx.gb("s_r"));
+    assert!(fx.gb("s_d"));
+}
+
+#[test]
+fn g4_type_of_getitem_iterator() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        r#"
+class A:
+    def __getitem__(self, i):
+        if i >= 2:
+            raise IndexError(i)
+        return i * 10
+it_g = iter(A())
+n_g = type(it_g).__name__
+i_g = type(it_g) is type(iter([1]))
+xs = list(it_g)
+r_xs = repr(xs)
+"#,
+    );
+    assert_eq!(fx.gs("n_g"), "iterator");
+    assert!(fx.gb("i_g"));
+    assert_eq!(fx.gs("r_xs"), "[0, 10]");
 }

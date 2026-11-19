@@ -1,0 +1,194 @@
+Lane G3 — container hook family H2/H3/H4/H5/H6 (serial lane)
+Worktree ~/workspace/petitpy-rs-g3-container-hooks, branch
+lane/g3-container-hooks, rebased onto master a4f1041 (G0 + G2
+merged while the lane ran; rebase clean except the README
+commit, resolved by hand — G2's super() fix kept, G3's
+__missing__ update kept). Gate outputs ~/workspace/g3_verify/
+(full_final.txt, integration_final.txt, golden_final.txt,
+capability_final.txt, stdlib_final.txt, nano_final.txt,
+test_rebased2.txt, test_feat_on2.txt), probes
+~/workspace/g3_probe/probe_g3.py (12/12 PASS).
+
+§1 — what was built (per item)
+H2 — dict lookup FunBc __eq__ (commit 58ca61e):
+  src/objects/obj_ops.rs:294 obj_equal_hook (EQUAL dispatch with
+    an optional hook); :333 probe_equal (the probe comparison).
+  src/objects/containers/map.rs:733 ordered_lookup (hook param),
+    :827 compact_lookup (probe via probe_equal), :936
+    compact_rehash (replay through the probe; a Found(i) now
+    overwrites the value — mirrors the Zig's
+    compactLookup(...).value = e.value — instead of unreachable!()).
+  probe_equal implements the vendor mp_obj_is_true pending guard
+  (obj.zig:470): a raise from __eq__ reads as not-equal and the
+  stashed raise is DISCARDED on both channels (hook take_pending
+  + ctx record) — in BOTH arms, because the 2-pass loop swallows
+  a slot raise as NULL and falls through to the pointer
+  comparison, so a raising __eq__ returns Ok(false) with the
+  raise still stashed; without the Ok-arm drain it surfaced later
+  at the next drain_hook_raise as the WRONG exception (traced
+  2026-11-19: a load after a raising __eq__ raised the stashed
+  ValueError past `except KeyError`, the real KeyError only
+  surfacing on the handler's re-raise). When a stash was present
+  the answer is forced false.
+H3 — dict.get/.pop/.setdefault (commit 5c48b7e):
+  src/objects/containers/objdict_methods.rs:184
+    dict_get_helper_hook (map_lookup_hook core), :215 dict_get_hook,
+    :226 dict_pop_hook, :237 dict_setdefault_hook.
+  src/runtime/vm.rs: dict_get/pop/setdefault_builtin fields.
+  src/runtime/vm_builtins_bind.rs: captured by name from the dict
+    type dict. src/runtime/vm_call_intercept.rs: 3 arms.
+  src/runtime/builtin_vm.rs:493 call_dict_get_ctx, :504
+    call_dict_pop_ctx, :515 call_dict_setdefault_ctx (shared
+    call_dict_method_ctx core: arity 2..=3, 0 kwargs else
+    mismatch; drains state.pending_exc first on error).
+H6 — list.extend(gen) + l += gen (commit d3b77c8):
+  src/runtime/vm.rs + vm_builtins_bind.rs: list_extend_builtin
+    field, captured by name from the list type dict.
+  src/runtime/builtin_vm.rs:394 call_list_extend_ctx (arity
+    (2,2), 0 kwargs; list_extend with the hook; drains the stash
+    first on error). src/runtime/vm_call_intercept.rs: arm.
+  src/runtime/vm_rt.rs:882 binary_op_ctx exact-list InplaceAdd
+    branch before the generic loop (hook-aware list_extend,
+    returns the lhs; subclass instances keep the
+    try_instance_binary_op dunder path).
+H5 — set probe FunBc __eq__ (commit 6e3d324):
+  src/objects/containers/map_set.rs: set_lookup/set_lookup_hashed/
+    set_rehash restructured into *_inner fns taking an optional
+    hook (the H2 map.rs shape): hash via hash_of_hook, probe via
+    probe_equal. :184 set_lookup_hook, :231 set_lookup_hashed_hook.
+    The now-dead set_rehash wrappers were removed (the hook
+    reaches the replay via set_lookup_hashed_hook); map.rs:161
+    comment updated (set_rehash_inner).
+  src/objects/containers/objset.rs:412 set_lookup_quirk_hook,
+    :463 set_store_hook, :498 set_new_hook, :648
+    set_contains_hook; set_make_new threads its call hook into
+    the store loop.
+  src/objects/containers/objset_methods.rs:326 set_add_hook,
+    :369 set_discard_hook, :413 set_remove_hook.
+  src/runtime/vm_dispatch_exec.rs:336 BUILD_SET -> set_new_hook,
+    :428 set-comprehension append arm -> set_store_hook.
+  src/runtime/vm_rt.rs:815 binary_op_ctx Contains branch —
+    exact-dict lhs via dict_get_value_hook (KeyError -> False,
+    closing the dict-in gap), set/frozenset lhs via
+    set_contains_hook; subclass instances keep the dunder path.
+  src/runtime/vm.rs + vm_builtins_bind.rs: set_add/discard/
+    remove_builtin fields, captured by name from the set type
+    dict. src/runtime/builtin_vm.rs:422/433/444
+    call_set_add/discard/remove_ctx (shared
+    call_set_mutating_ctx core: arity (2,2), 0 kwargs).
+    src/runtime/vm_call_intercept.rs: 3 arms.
+H4 — dict-subclass instance subscripts (commit 8e68ccd):
+  src/objects/objtype/seams.rs:363 with_call_hook_subscr_seams
+    (call + subscr share ONE hook through a RefCell — each
+    borrows mutably at call time, never active simultaneously),
+    :393 hook_subscr (exact-dict base -> dict_get_value_hook /
+    dict_store_hook / dict_delete_hook with the hook; other bases
+    -> stub_subscr; a Get miss records the KeyError on the
+    CallCtx AND reports SubscrError::KeyError, so instance_subscr
+    owns the record's lifecycle for __missing__; Set/Delete
+    return None, matching dict_subscr).
+  src/runtime/vm_seams.rs:346 try_instance_subscr is the ONLY
+    caller of the new shape; every other try_instance_* caller
+    keeps stub_subscr.
+README.md (commit ca01ac0): Known divergences — H2-H6 out
+  (F3 dict-lookup bullet now records H2-H4 fixed, only
+  str(KeyError(instance)) remains; E1/E2 bullet notes the VM
+  __missing__ path fixed by H4, only the ctx-only slot-seam path
+  remains). Status-table lib counts updated to 1731 feature-ON /
+  1723 default (master a4f1041 + lane G3).
+Rebase integration (commit d7134d9): modd4_tests.rs — G0's
+  select test uses UnixStream/Duration only inside a
+  #[cfg(feature = "unsafe-ffi")] test, so the default build
+  warned unused-imports (2 warnings) on the rebased tree; the
+  two imports are now gated on the feature. Default and
+  feature-ON both compile with 0 warnings.
+Tests: NEW src/runtime/vm_tests_g3.rs (334 lines, 20 tests:
+  5 H2, 3 H3, 4 H6, 5 H5, 3 H4), registered in
+  src/runtime/mod.rs.
+
+§2 — measured numbers (rebased tree, default feature OFF,
+unless noted; baseline master a4f1041: lib 1703/0/3)
+  cargo test --release --lib --tests: lib 1723 passed, 0 failed,
+    3 ignored (1703 + 20 new); bins 9; entry_cli 45.
+  cargo test --release --lib --tests --features unsafe-ffi:
+    lib 1731 passed, 0 failed, 3 ignored; bins 9; entry_cli 45.
+  0 rustc warnings (forced recompile: touch src/lib.rs &&
+    cargo build --release; test runs clean too — the only
+    warnings ever seen are cargo's pre-existing output-filename
+    collision notes).
+  scripts/check_compile_mpy.py: PASS (0 failures, 0 mismatches).
+  scripts/check_frozen.py: PASS (23/23 identical, 38141 bytes).
+  Full gate (scripts/run_full_gate.py): GREEN, 545/552 (fail set
+    exactly the 7 known-fails).
+  Integration (scripts/run_integration.py): 200/202, fail set
+    exactly {select_readable_fd_is_ready,
+    select_timeout_zero_returns_promptly} (feature OFF — G0's
+    select needs --features unsafe-ffi, where it is 202/202).
+  Golden (scripts/run_golden.py): 585/585 (rust==cpython 576/585).
+  Capability (scripts/run_capability.py): GREEN (67/67).
+  Stdlib (scripts/run_stdlib.py): 8/8.
+  Nano (scripts/run_nano.py): 454/541, report-only.
+  File sizes: all touched files < 2500 lines (largest
+    objset_methods.rs ~590, vm_rt.rs ~900). 0 unsafe in the
+    lane diff (G3 introduces no unsafe).
+
+§3 — dual-binary probes (REF vs worktree binary, stdout+stderr+rc
+byte-compare; scripts in ~/workspace/g3_probe/probe_g3.py)
+  12/12 PASS on the rebased tree:
+  h2_dict_subscr, h2_dict_rehash (30 inserts), h2_dict_del,
+  h3_dict_methods (get/pop/setdefault),
+  h4_dict_subclass (subscript + .get), h4_dict_subclass_missing
+  (__missing__ control), h5_set_literal, h5_set_methods
+  (add/discard/remove), h5_set_ctor (set from genexpr),
+  h6_list_extend_gen, h6_list_iadd_gen (l += gen),
+  h6_list_extend_genfn.
+
+§4 — leftovers / known deviations (all probed on REF 2026-11-19)
+  (a) Raising __eq__ is state-dependent on REF and has no uniform
+  rule; the probe-level discard (probe_equal) matches REF exactly
+  on the load case (KeyError) and on all well-behaved acceptance
+  probes, and deviates only in the raising corner:
+    - `A() in d` / `d.get(A())` with a raising __eq__: REF
+      propagates the ValueError; Rust returns False / the
+      default (discarded in the probe).
+    - Second store `d[A()] = 'y'` (dict already holds an A key)
+      with a raising __eq__: REF raises TypeError
+      "unsupported type for operator"; Rust stores silently
+      (probe reads not-equal, inserts a second entry).
+    - `s.add(A())` (set already holds A) with a raising __eq__:
+      REF raises TypeError; Rust inserts silently.
+    - `A() == A()` with a raising __eq__: REF propagates the
+      ValueError (the VM polls the pending raise after the op);
+      Rust returns False with a stale stash — the same swallow
+      shape lives in E2d's `==` path (obj_equal_not_equal's
+      in-loop `Err(PyError::PyRaise) => {}`), OUT of G3 scope.
+      A follow-up lane could surface it by draining the hook
+      stash after a successful `==`/`!=` and re-raising — the
+      probe_equal fix shows the shape.
+  (b) Pre-existing module-doc inaccuracy found while testing H5:
+  objset.rs claims `s.add([2])` raises "but `s == {[2]}`" — as
+  a runnable program that equality itself raises TypeError on
+  REF too (the comparison re-hashes the element; even two
+  quirk-built sets can't compare). The quirk IS observable via
+  len(s)==1 / list(s)==[[2]] / repr(s)=='{[2]}' (all probed on
+  REF, all asserted by g3_h5_set_add_unhashable_quirk). The
+  module doc should be corrected to the len/list/repr wording.
+  (c) `str(KeyError(instance))` still shows the ctx-only
+  `<Color object at N>` fallback (exception print slot has no
+  hook) — H10/G4's item, untouched here.
+  (d) Dict-subclass `__missing__` through the ctx-only slot
+  seams (instance_subscr_slot) still yields a bare TypeError
+  instead of KeyError — only the VM path (try_instance_subscr)
+  was fixed by H4; no gate coverage for the slot path.
+  (e) H9 (import_from FunBc fallback) low value, G4 to decide.
+  (f) Tooling notes (recurring, for the next lanes): the
+  panic-strategy `abort` vs `unwind` mismatch on bin-test
+  compiles and the stale-rlib link failure (undefined symbols
+  e.g. Vm::new) are the same pre-existing cargo artifact
+  race (cdylib/staticlib/rlib output-filename collision);
+  every occurrence in this lane was fixed by a plain rerun
+  (6+ times). `cargo clean -p petitpy-rs` removes 0 files and
+  does not help. A `///` doc-comment line inside a `//`
+  comment block warns `unused doc comment` (caught once in
+  vm_rt.rs). Commit messages with backticks get shell-mangled
+  — write them to a file and use `git commit -F`.

@@ -672,16 +672,22 @@ fn print_exception_chain<'r>(
         if !tb.is_empty() {
             let _ = sink.write_str("Traceback (most recent call last):\n");
             for frame in tb.iter().rev() {
+                // P7b: file/block names are raw qstr bytes — write
+                // them through `write_bytes`, not `from_utf8_lossy`
+                // (a non-UTF-8 filename must print byte-exact, as
+                // the original's `mp_obj_print_exception` prints
+                // qstr bytes raw; a `String` sink keeps the old
+                // lossy default, a byte sink is exact).
                 let file = resolve(frame.name);
-                let _ = write!(sink, "  File \"{}\"", String::from_utf8_lossy(file));
+                let _ = sink.write_str("  File \"");
+                sink.write_bytes(file);
+                let _ = sink.write_str("\"");
                 match frame.block {
                     Some(b) => {
                         let name = resolve(b);
-                        let _ = write!(
-                            sink,
-                            ", in {}\n",
-                            String::from_utf8_lossy(name)
-                        );
+                        let _ = sink.write_str(", in ");
+                        sink.write_bytes(name);
+                        let _ = sink.write_str("\n");
                     }
                     None => {
                         let _ = sink.write_str("\n");

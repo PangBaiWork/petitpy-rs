@@ -82,7 +82,7 @@ use crate::objects::objtype::objmodule::new_module;
 use crate::objects::objtype::subclass::is_subclass_fast;
 use crate::objects::primitives::objfloat::new_float;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::{PrintKind, SubscrArg};
+use crate::objects::slots::{ByteBuf, PrintKind, SubscrArg};
 use crate::objects::strings::objstr_a::{new_bytes, new_str};
 use crate::objects::value::{DictData, MapData, Obj, Value};
 use crate::runtime::builtinimport::import_impl;
@@ -853,9 +853,14 @@ fn format_exception_body(interp: &mut Interp, h: PpyHandle) -> Result<Value, Val
     let exc = obj_or_invalid(&mut ctx, state, exc)?;
     let types = ctx.types;
     let pool = ctx.pool;
-    let mut out = String::new();
+    // P7b: a `ByteBuf` sink, not `String` — the formatted
+    // traceback must keep non-UTF-8 filename bytes exact
+    // (a `String` sink lossies them via the `ByteSink`
+    // default); `new_str` is byte-based so the result holds
+    // the raw bytes.
+    let mut out = ByteBuf::new();
     obj_print_exception(&mut ctx, types, exc, &|id| pool.qstr_str(id as u16), &mut out);
-    let v = new_str(&mut ctx, types, out.as_bytes());
+    let v = new_str(&mut ctx, types, &out.0);
     Ok(v)
 }
 

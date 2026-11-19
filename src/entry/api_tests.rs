@@ -16,9 +16,10 @@ use std::ffi::c_char;
 use std::ptr::null_mut;
 
 use super::api::{
-    ppy_define_function, ppy_eval, ppy_exec, ppy_free, ppy_get_global, ppy_getitem, ppy_new,
-    ppy_new_int, ppy_raise, ppy_release, ppy_set_global, ppy_setitem, ppy_to_int, ppy_type_name,
-    Interp, PpyFunction, PpyHandle, PPY_ERROR, PPY_OK,
+    ppy_define_function, ppy_eval, ppy_exec, ppy_fetch_error, ppy_format_exception, ppy_free,
+    ppy_get_global, ppy_getitem, ppy_new, ppy_new_int, ppy_raise, ppy_release, ppy_set_global,
+    ppy_setitem, ppy_to_int, ppy_to_str, ppy_type_name, Interp, PpyFunction, PpyHandle, PPY_ERROR,
+    PPY_OK,
 };
 
 fn new_interp() -> *mut Interp {
@@ -276,5 +277,92 @@ fn ppy_getitem_setitem_user_dunders() {
     let val = new_int(py, 30);
     assert_eq!(unsafe { ppy_setitem(py, c, key2, val) }, PPY_OK);
     exec_ok(py, b"assert c.d[3] == 30");
+    unsafe { ppy_free(py) };
+}
+
+/// P7b: `ppy_exec` with a non-UTF-8 filename — the name
+/// travels as raw bytes to qstr (the original's `evalExec`
+/// passes `file` straight to `qstr(file)`), so the
+/// traceback names the file byte-exact: the raw `0xff` is
+/// present and no U+FFFD substitution appears.
+#[test]
+fn exec_non_utf8_filename_keeps_raw_bytes() {
+    let py = new_interp();
+    let src = b"raise ValueError('boom')\n";
+    let mut name_c = b"bad\xffname.py".to_vec();
+    name_c.push(0);
+    let rc = unsafe {
+        ppy_exec(
+            py,
+            src.as_ptr() as *const c_char,
+            src.len(),
+            name_c.as_ptr() as *const c_char,
+        )
+    };
+    assert_eq!(rc, PPY_ERROR, "raising exec must return PPY_ERROR");
+    let mut exc: PpyHandle = 0;
+    assert_eq!(unsafe { ppy_fetch_error(py, &mut exc) }, PPY_OK);
+    assert_ne!(exc, 0, "an exception must be pending");
+    let mut text: PpyHandle = 0;
+    assert_eq!(
+        unsafe { ppy_format_exception(py, exc, &mut text) },
+        PPY_OK
+    );
+    let mut ptr: *const c_char = std::ptr::null();
+    let mut len: usize = 0;
+    assert_eq!(
+        unsafe { ppy_to_str(py, text, &mut ptr, &mut len) },
+        PPY_OK
+    );
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let frame = b"File \"bad\xffname.py\", in <module>";
+    assert!(
+        bytes.windows(frame.len()).any(|w| w == frame),
+        "traceback must name the file byte-exact, got {:?}",
+        String::from_utf8_lossy(bytes)
+    );
+    assert!(
+        !bytes.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]),
+        "traceback must not contain U+FFFD, got {:?}",
+        String::from_utf8_lossy(bytes)
+    );
+    unsafe { ppy_free(py) };
+}
+
+/// P7b: a NULL filename execs as `"<string>"`.
+#[test]
+fn exec_null_filename_is_string() {
+    let py = new_interp();
+    let src = b"raise ValueError('boom')\n";
+    let rc = unsafe {
+        ppy_exec(
+            py,
+            src.as_ptr() as *const c_char,
+            src.len(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, PPY_ERROR, "raising exec must return PPY_ERROR");
+    let mut exc: PpyHandle = 0;
+    assert_eq!(unsafe { ppy_fetch_error(py, &mut exc) }, PPY_OK);
+    let mut text: PpyHandle = 0;
+    assert_eq!(
+        unsafe { ppy_format_exception(py, exc, &mut text) },
+        PPY_OK
+    );
+    let mut ptr: *const c_char = std::ptr::null();
+    let mut len: usize = 0;
+    assert_eq!(
+        unsafe { ppy_to_str(py, text, &mut ptr, &mut len) },
+        PPY_OK
+    );
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    assert!(
+        bytes
+            .windows(b"File \"<string>\", in <module>".len())
+            .any(|w| w == b"File \"<string>\", in <module>"),
+        "NULL filename must exec as \"<string>\", got {:?}",
+        String::from_utf8_lossy(bytes)
+    );
     unsafe { ppy_free(py) };
 }

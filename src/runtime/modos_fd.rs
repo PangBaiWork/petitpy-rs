@@ -223,22 +223,30 @@ pub fn os_close_ctx(
         state.os_closed_stdio.insert(fd);
         return Ok(Value::None);
     }
-    match state.os_fds.remove(&fd) {
-        Some(_) => Ok(Value::None),
-        None => {
-            #[cfg(feature = "unsafe-ffi")]
-            {
-                // FFI invariant: same as above — any i32 is a
-                // valid argument to the kernel.
-                match crate::support::ffi::sys_close(fd) {
-                    Ok(()) => Ok(Value::None),
-                    Err(e) => Err(errno_exc(ctx, state, e)),
-                }
-            }
-            #[cfg(not(feature = "unsafe-ffi"))]
-            {
-                Err(errno_exc(ctx, state, EBADF))
-            }
+    // Feature path (G6a): the reference closes by NUMBER
+    // (`close(fd)`), with no fd table — so a registered fd whose
+    // number was already closed out from under it (e.g. by an
+    // `open()` file's `close()`) fails EBADF there. Table removal
+    // alone would return Ok, so run the real close first: on
+    // failure raise the errno (the dead entry stays in the
+    // table); on success drop the entry (the drop re-closes the
+    // number, EBADF ignored). This covers registered and
+    // unregistered fds uniformly.
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        // FFI invariant: `close` takes any i32 fd number; the
+        // kernel fails EBADF on a bad fd, it cannot fault.
+        if let Err(e) = crate::support::ffi::sys_close(fd) {
+            return Err(errno_exc(ctx, state, e));
+        }
+        state.os_fds.remove(&fd);
+        return Ok(Value::None);
+    }
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        match state.os_fds.remove(&fd) {
+            Some(_) => Ok(Value::None),
+            None => Err(errno_exc(ctx, state, EBADF)),
         }
     }
 }

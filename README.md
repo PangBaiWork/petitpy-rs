@@ -26,7 +26,7 @@ Final acceptance (F2, master `bdf3c5b` + this lane):
 | Capability matrix (`scripts/run_capability.py`) | 67/67 GREEN |
 | Test-stdlib (`scripts/run_stdlib.py`) | 8/8 |
 | Nano config (`scripts/run_nano.py`) | 454/541, report-only (no Rust nano build exists) |
-| `cargo test --release --lib --tests` | 1743 passed, 0 failed, 1 ignored with `--features unsafe-ffi`; 1735 / 0 / 1 default (master `f4210de` + lane G4) |
+| `cargo test --release --lib --tests` | 1753 passed, 0 failed, 1 ignored with `--features unsafe-ffi`; 1737 / 0 / 1 default (master `6dec501` + lane G6b) |
 | `cargo test --release --bins` / `--test entry_cli` | 9 / 45 passed |
 | Benchmark vs reference binary | 0.172x wall-clock (limit ≤ 1.5x; `~/workspace/bench_e3.py`, steady-state run 2) |
 
@@ -163,9 +163,37 @@ pass a gate.
 - **arm64 runtime unverified** — cross-compile to
   `aarch64-unknown-linux-gnu` passes (Zig linker wrapper, committed),
   but no arm64 machine or qemu run was available in this lane.
-- **`socket.fromfd` doesn't own the OS fd** (F5b): `fileno() == fd`
-  holds, but `close()` does not close the underlying fd — pure std
-  has no `from_raw_fd`. The integration case only asserts `fileno`.
+- **`socket.fromfd` doesn't own the OS fd on the default build**
+  (F5b): `fileno() == fd` holds, but `close()` does not close
+  the underlying fd — pure std has no `from_raw_fd`. Under
+  `--features unsafe-ffi` (G6b U4) the socket OWNS the fd
+  (the reference wraps without dup and closes it; CPython
+  dups it): `close()` closes the OS fd (`os.close(fd)` after
+  `s.close()` is `EBADF`, probed), and `recv` / `sendall` /
+  `setblocking` / `accept` work on fromfd sockets. The
+  integration case only asserts `fileno`.
+- **Real socket construction / bind / listen under
+  `--features unsafe-ffi`** (G6b U6): the constructor calls
+  the real `socket(2)` (a bad family/type fails `EAFNOSUPPORT`
+  there, as the reference), `bind()` runs the real `bind(2)`
+  on the same fd (the fd number never changes; a client
+  connecting between `bind()` and `listen()` is refused
+  `ECONNREFUSED`, as the reference), `listen()` runs the real
+  `listen(2)` (an unbound socket is `EINVAL`, probed), and
+  `bind("")` binds an abstract socket (a client connecting
+  to the 108-byte all-NUL name is accepted — the kernel
+  matches abstract names by full length). On the default
+  build the old shape stays: a `/dev/null` placeholder fd,
+  `bind()` swaps in an already-listening `UnixListener`
+  (fd number changes, `bind("")` binds an unnamed socket
+  that listens but is unreachable by name).
+- **Real `getsockopt` under `--features unsafe-ffi`** (G6b
+  U7): `SO_PEERCRED` returns the real 12-byte `ucred`
+  (unconnected: pid 0 / uid -1 / gid -1; connected: the
+  peer's pid/uid/gid), `SO_REUSEADDR` returns 4 bytes, an
+  unknown optname is `ENOPROTOOPT` (all probed on the
+  reference). On the default build it is `ENOPROTOOPT`
+  for every `(level, opt)` (no stable-std `getsockopt`).
 - **`os.close(fd)` closes any fd under `--features unsafe-ffi`**
   (G6a U3): the real `close(2)` runs for every fd — an
   `open()` file's fd, stdio 0–2 (the number is freed for reuse),
@@ -185,9 +213,39 @@ pass a gate.
   syncs/seeks; on pipes/ttys the kernel returns `EINVAL` /
   `ESPIPE`, as before. On the default build stdio `fsync` is
   always `EINVAL` and stdio `lseek` is always `ESPIPE`.
-- **Subprocess timeout kill is SIGKILL (-9), reference SIGTERM
-  (-15)** (D3). **Signal handlers are recorded but never dispatched**
-  (D4, the original's own MVP limitation is mirrored in structure).
+- **Subprocess timeout kill is SIGKILL (-9) on the default
+  build, reference SIGTERM (-15)** (D3, fixed under
+  `--features unsafe-ffi` by G6b U5): the timeout arm sends
+  `SIGTERM`, waits up to 1.0 s of grace, then `SIGKILL` — a
+  plain `sleep` dies on `SIGTERM` (-15, fast), a child that
+  ignores `SIGTERM` is killed after the grace (-9 after
+  ~1.2 s), a child that traps `SIGTERM` and exits 0 returns
+  0 (all probed on the reference; the brief's "trap-exit-0
+  → -15" premise was wrong — -15 is the DEFAULT disposition).
+  The timeout path no longer waits for pipe EOF either: a
+  killed child's grandchild may hold the pipe open (the old
+  code took 5.0 s on a `sh -c 'sleep 5'` timeout, the
+  reference 1.3 s) — the drain now streams chunks and the
+  timeout path takes what has arrived so far. **Signal
+  handlers are recorded but never dispatched** (D4, the
+  original's own MVP limitation is mirrored in structure).
+- **Subprocess fd stream modes share offset/append under
+  `--features unsafe-ffi`** (G6b U8): a plain-fd stdin /
+  stdout / stderr goes through a `pre_exec` `dup2` in the
+  child — the SAME fd number, so the file offset and
+  `O_APPEND` are shared and socket fds work (a socketpair
+  fd as stdout delivers to the peer; `stderr=STDOUT` with
+  `stdout=fd` dup2's the child's stdout onto stderr, so
+  both streams land in the same file in write order). On
+  the default build the modes re-open `/proc/self/fd/<fd>`
+  (a new open: no shared offset/append, socket fds fail
+  `ENXIO`).
+- **`sendall` on a listener is `EINVAL`, reference
+  `ENOTCONN`** (107, probed while working G6b): the
+  `is_stream` gate rejects non-stream sockets before the
+  syscall; the reference's `send(2)` there is `ENOTCONN`.
+  Out of scope for G6b (the brief leaves `sendall`
+  unchanged).
 - **Piped stdout is buffered on Rust, like the reference** (G0
   probe, P14 — fixed by lane P14): the reference buffers piped
   stdout (glibc stdio on the `stdout` `FILE*`, `file_io.zig:486`

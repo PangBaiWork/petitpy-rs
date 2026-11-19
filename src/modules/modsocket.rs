@@ -38,7 +38,9 @@
 //! so the table lock is never held across I/O.
 //!
 //! Pure-`std` divergences from the Zig (all recorded here,
-//! see the result file §4):
+//! see the result file §4) — each is fixed under the
+//! `unsafe-ffi` feature (G6b: U4/U6/U7) and keeps the
+//! old shape on the default build:
 //! - The constructor cannot call `socket()`: `std` has no
 //!   unbound stream-socket constructor (`UnixListener::bind`
 //!   creates, binds AND listens). The instance is created
@@ -48,35 +50,53 @@
 //!   client connecting between `bind()` and `listen()` is
 //!   accepted (the reference refuses it — `bind()` already
 //!   listens, backlog 128, and `listen(backlog)` is a
-//!   validation no-op after `bind()`).
+//!   validation no-op after `bind()`). Under `unsafe-ffi`
+//!   the constructor calls the real `socket(2)`, `bind()`
+//!   runs the real `bind(2)` on the same fd, and `listen()`
+//!   runs the real `listen(2)` (U6).
 //! - `fromfd` does NOT take ownership of the fd: closing the
 //!   socket drops the table entry but leaves the caller's fd
 //!   open (the Zig wraps without dup and closes it; CPython
-//!   dups it). Taking ownership needs `from_raw_fd` /
-//!   `borrow_raw`, both `unsafe`, and this tree is pure-`std`.
-//!   `fromfd(-1, ...)` creates an instance with fd -1 and no
-//!   table entry, which behaves exactly like a closed socket.
-//!   I/O on a foreign fd is EBADF (no dup-able object).
+//!   dups it). Under `unsafe-ffi` the socket owns the fd
+//!   (U4). `fromfd(-1, ...)` creates an instance with fd -1
+//!   and no table entry, which behaves exactly like a closed
+//!   socket. I/O on a foreign fd without an owned object is
+//!   EBADF (no dup-able object).
 //! - `getsockopt` has no stable-`std` implementation
 //!   (`UnixStream::peer_cred` is unstable
 //!   `peer_credentials_unix_socket`): after the `buflen`
 //!   validation it raises `OSError(ENOPROTOOPT)` for every
 //!   `(level, opt)`. The reference returns the real bytes
-//!   (e.g. the 12-byte `ucred` for `SO_PEERCRED`).
+//!   (e.g. the 12-byte `ucred` for `SO_PEERCRED`). Under
+//!   `unsafe-ffi` the real `getsockopt(2)` runs (U7).
 //! - Integer arguments are truncated to `i32` (`as` cast);
 //!   the Zig's `@intCast` would abort on overflow.
-//! - `bind("")` returns `ENOENT` (`UnixListener::bind` on an
-//!   empty path); the reference binds an abstract-named
-//!   socket (it passes the full `sockaddr_un` size with an
-//!   all-zero path).
+//! - `bind("")` on the default build binds an UNNAMED
+//!   socket (`UnixListener::bind` passes addrlen 2 for
+//!   the empty path): it listens, but no client can
+//!   connect to it by name; the reference binds an
+//!   abstract-named socket (it passes the full
+//!   `sockaddr_un` size with an all-zero path). Under
+//!   `unsafe-ffi` `bind("")` binds the abstract socket
+//!   (U6).
+//! - `sendall` on a listener is `EINVAL` (the `is_stream`
+//!   gate); the reference's `send(2)` there is `ENOTCONN`
+//!   (107, probed). Out of scope for G6b (the brief leaves
+//!   `sendall` unchanged).
 
 use std::collections::HashMap;
+#[cfg(not(feature = "unsafe-ffi"))]
 use std::ffi::OsStr;
+#[cfg(not(feature = "unsafe-ffi"))]
 use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(not(feature = "unsafe-ffi"))]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsFd, AsRawFd, OwnedFd, RawFd};
+#[cfg(feature = "unsafe-ffi")]
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(not(feature = "unsafe-ffi"))]
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -104,6 +124,9 @@ const EAFNOSUPPORT: i32 = 97;
 const EFBIG: i32 = 27;
 const EPIPE: i32 = 32;
 const EBADF: i32 = 9;
+/// Only the default build raises this (the feature build
+/// runs the real `getsockopt(2)` instead).
+#[cfg(not(feature = "unsafe-ffi"))]
 const ENOPROTOOPT: i32 = 92;
 
 /// `sockaddr_un.sun_path` length (the Zig's
@@ -123,25 +146,31 @@ fn sockets_table() -> &'static Mutex<HashMap<RawFd, SocketState>> {
 
 /// The owned OS side of one socket instance.
 enum SocketState {
-    /// Not yet bound: a `/dev/null` placeholder fd, replaced
-    /// by a real listener at `bind()`.
-    Unbound(File),
-    /// Bound (and, under `std`, already listening).
+    /// Not yet bound: under `unsafe-ffi` the real socket
+    /// fd from `socket(2)` (U6); on the default build a
+    /// `/dev/null` placeholder fd, replaced by a real
+    /// listener at `bind()`.
+    Unbound(OwnedFd),
+    /// Bound (and, under `std`, already listening). Under
+    /// `unsafe-ffi` this also holds a merely-bound socket:
+    /// the fd is wrapped as a `UnixListener` but the
+    /// kernel has not been asked to listen yet, so
+    /// `accept()` fails `EINVAL` there (the kernel
+    /// decides) until `listen()` runs the real `listen(2)`.
     Listener(UnixListener),
     /// Connected (accepted).
     Stream(UnixStream),
-    /// A foreign fd wrapped by `fromfd` (F5b): NO owned object
-    /// — the fd is only a table key. `fileno()` returns it and
-    /// `close()` drops the entry and stores `-1`, but the OS fd
-    /// itself is NOT closed: taking ownership needs
-    /// `from_raw_fd`, which is `unsafe`, and this tree is
-    /// pure-`std`. The reference wraps the fd directly and DOES
-    /// close it on `close()` (probed: `os.close(fd)` after
-    /// `s.close()` is EBADF) — documented divergence, see
-    /// `scripts/f5b_result.txt` §4. I/O on a foreign fd
-    /// (`recv`/`sendall`/`setblocking`) is EBADF: there is no
-    /// dup-able object to work through.
-    Foreign,
+    /// A foreign fd wrapped by `fromfd` (F5b). Under
+    /// `unsafe-ffi` the socket OWNS the fd (U4 — the
+    /// reference wraps without dup and closes it, unlike
+    /// CPython which dups it); `close()` drops the entry
+    /// and the OS fd closes. On the default build there is
+    /// no owned object — the fd is only a table key, and
+    /// `close()` drops the entry but leaves the caller's
+    /// fd open (the documented divergence, see
+    /// `scripts/f5b_result.txt` §4). I/O on a foreign fd
+    /// without an owned object is EBADF.
+    Foreign(Option<OwnedFd>),
 }
 
 fn sockets() -> std::sync::MutexGuard<'static, HashMap<RawFd, SocketState>> {
@@ -149,17 +178,31 @@ fn sockets() -> std::sync::MutexGuard<'static, HashMap<RawFd, SocketState>> {
 }
 
 /// Is the fd's entry a stream-like one (`recv`/`sendall`
-/// may use it)? The lock is released before the result is
+/// may use it)? A `Foreign` entry counts only when it owns
+/// its fd (U4): the kernel then decides the real error
+/// (a fromfd listener reads `EINVAL`, a fromfd stream
+/// reads). The lock is released before the result is
 /// used.
 fn is_stream(fd: RawFd) -> bool {
-    matches!(sockets().get(&fd), Some(SocketState::Stream(_)))
+    matches!(
+        sockets().get(&fd),
+        Some(SocketState::Stream(_)) | Some(SocketState::Foreign(Some(_)))
+    )
 }
 
 /// Is the fd's entry one `accept` may use (a listener, or
-/// a foreign fd that might be one)? The lock is released
-/// before the result is used.
+/// a foreign fd that might be one)? A `Foreign` entry
+/// counts only when it owns its fd (U4 — a fromfd listener
+/// may accept, probed on the reference); the kernel
+/// decides whether the fd is actually listening
+/// (`accept` on a bound-but-not-listening socket is
+/// `EINVAL`). The lock is released before the result is
+/// used.
 fn is_listener(fd: RawFd) -> bool {
-    matches!(sockets().get(&fd), Some(SocketState::Listener(_)))
+    matches!(
+        sockets().get(&fd),
+        Some(SocketState::Listener(_)) | Some(SocketState::Foreign(Some(_)))
+    )
 }
 
 /// Duplicate the fd (safe: `as_fd` + `try_clone_to_owned`
@@ -172,8 +215,10 @@ fn dup_fd(ctx: &mut CallCtx, fd: RawFd) -> PyResult<OwnedFd> {
         Some(SocketState::Unbound(f)) => f.as_fd().try_clone_to_owned(),
         Some(SocketState::Listener(l)) => l.as_fd().try_clone_to_owned(),
         Some(SocketState::Stream(s)) => s.as_fd().try_clone_to_owned(),
-        // A foreign fd has no owned object to dup (F5b).
-        Some(SocketState::Foreign) => return Err(raise_os_error(ctx, EBADF)),
+        // A foreign fd dups only when it owns its fd (U4);
+        // without an owned object there is nothing to dup.
+        Some(SocketState::Foreign(Some(f))) => f.as_fd().try_clone_to_owned(),
+        Some(SocketState::Foreign(None)) => return Err(raise_os_error(ctx, EBADF)),
         None => return Err(raise_os_error(ctx, EBADF)),
     };
     owned.map_err(|e| io_os_error(ctx, e))
@@ -317,14 +362,19 @@ fn alloc_socket(ctx: &mut CallCtx, fd: i32, family: i32, type_: i32, proto: i32)
 // ── Module-level constructors ───────────────────────────────────────
 
 /// `socket.socket(family, type[, proto=0])` (`modsocket.zig`
-/// `py_socket_ctor`, variadic 2..3). The OS socket cannot be
-/// created yet in pure `std` (no unbound stream-socket
-/// constructor), so the instance is created over a
-/// `/dev/null` placeholder fd; `bind()` swaps in the real
-/// listener. The constructor therefore never fails for a bad
-/// family/type (the reference's `socket()` would raise
-/// there); the failure surfaces at `bind()` as
-/// `EAFNOSUPPORT` for a non-`AF_UNIX` family.
+/// `py_socket_ctor`, variadic 2..3). Under `unsafe-ffi`
+/// the constructor calls the real `socket(2)` (U6), so it
+/// FAILS for a bad family/type — `EAFNOSUPPORT`, as the
+/// reference does — and the instance holds the real fd
+/// throughout (`bind()` never changes the fd number). On
+/// the default build the OS socket cannot be created yet
+/// in pure `std` (no unbound stream-socket constructor),
+/// so the instance is created over a `/dev/null`
+/// placeholder fd; `bind()` swaps in the real listener.
+/// The constructor therefore never fails for a bad
+/// family/type on the default build; the failure surfaces
+/// at `bind()` as `EAFNOSUPPORT` for a non-`AF_UNIX`
+/// family.
 fn socket_ctor(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let family = int_arg(ctx, args[0])? as i32;
     let type_ = int_arg(ctx, args[1])? as i32;
@@ -332,9 +382,24 @@ fn socket_ctor(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         Some(v) => int_arg(ctx, *v)? as i32,
         None => 0,
     };
-    let placeholder = File::open("/dev/null").map_err(|e| io_os_error(ctx, e))?;
-    let fd = placeholder.as_raw_fd();
-    sockets().insert(fd, SocketState::Unbound(placeholder));
+    #[cfg(feature = "unsafe-ffi")]
+    let (fd, owned) = {
+        let fd = crate::support::ffi::sys_socket(family, type_, proto)
+            .map_err(|e| raise_os_error(ctx, e))?;
+        // FFI invariant: the fd came back from the kernel's
+        // `socket(2)` just above, so it is open and owned
+        // by this process; taking ownership transfers it to
+        // the socket table (exactly one owner).
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        (fd, owned)
+    };
+    #[cfg(not(feature = "unsafe-ffi"))]
+    let (fd, owned) = {
+        let placeholder = File::open("/dev/null").map_err(|e| io_os_error(ctx, e))?;
+        let fd = placeholder.as_raw_fd();
+        (fd, OwnedFd::from(placeholder))
+    };
+    sockets().insert(fd, SocketState::Unbound(owned));
     alloc_socket(ctx, fd, family, type_, proto)
 }
 
@@ -342,13 +407,23 @@ fn socket_ctor(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// (`modsocket.zig` `py_socket_fromfd`, variadic 3..4).
 /// A negative fd creates an instance with no table entry,
 /// behaving exactly like a closed socket (the Zig wraps it
-/// directly and fails at use). A non-negative fd registers a
-/// `SocketState::Foreign` entry (F5b): `fileno()` returns the
-/// fd and `close()` drops the entry, but the OS fd is NOT
-/// closed — taking ownership needs `from_raw_fd` / `borrow_raw`
-/// (both `unsafe`; this lane is pure-`std`, no `unsafe`).
-/// The Zig wraps it directly and DOES close it (probed);
-/// CPython dups it. The difference is documented in
+/// directly and fails at use). Under `unsafe-ffi` a
+/// non-negative fd is stored as an OWNED `OwnedFd` (U4):
+/// the socket takes ownership exactly as the reference
+/// does (it wraps without dup and closes it; CPython dups
+/// it). `close()` then drops the entry and the OS fd
+/// closes (`os.close(fd)` after `s.close()` is EBADF,
+/// probed). When the fd is ALREADY in the socket table
+/// (e.g. `fromfd` of a live listener's fd) the existing
+/// entry is kept — the fd is already owned exactly once,
+/// and both instances share it (the Zig has two objects
+/// for one fd there too; the table makes the double
+/// `close()` safe: the first removes the entry and closes
+/// the fd, the second is a no-op remove). On the default
+/// build a non-negative fd registers a `Foreign` entry
+/// with no owned object: `fileno()` returns the fd and
+/// `close()` drops the entry, but the OS fd is NOT closed
+/// — the documented divergence, see
 /// `scripts/f5b_result.txt` §4.
 fn socket_fromfd(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let fd = int_arg(ctx, args[0])? as i32;
@@ -361,7 +436,23 @@ fn socket_fromfd(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     if fd < 0 {
         return alloc_socket(ctx, fd, family, type_, proto);
     }
-    sockets().insert(fd, SocketState::Foreign);
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        if !sockets().contains_key(&fd) {
+            // FFI invariant: the fd came from the caller,
+            // who hands over ownership exactly as the
+            // reference does (`fromfd` wraps without dup);
+            // taking ownership transfers it to the socket
+            // table (exactly one owner — the caller must
+            // not close it afterwards).
+            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            sockets().insert(fd, SocketState::Foreign(Some(owned)));
+        }
+    }
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        sockets().insert(fd, SocketState::Foreign(None));
+    }
     alloc_socket(ctx, fd, family, type_, proto)
 }
 
@@ -373,7 +464,17 @@ fn socket_fromfd(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// `mp_obj_str_get_str` returns NULL); `plen >= 108` is
 /// `ENAMETOOLONG`; the path is the bytes up to the first
 /// NUL. `AF_INET` tuples are not supported (same branch as
-/// the Zig's).
+/// the Zig's). Under `unsafe-ffi` the bind runs the real
+/// `bind(2)` on the SAME fd (U6 — the fd number never
+/// changes, and a client connecting between `bind()` and
+/// `listen()` is refused, as the reference); `bind("")`
+/// binds an abstract socket (the all-zeros address). The
+/// socket is bound but NOT listening until `listen()`.
+/// On the default build `UnixListener::bind` swaps the
+/// placeholder for a real listener (already listening),
+/// so the fd number changes and `bind("")` binds an
+/// unnamed socket (it listens, but no client can connect
+/// to it by name).
 fn sock_bind(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (r, fd, fields) = self_socket(ctx, args)?;
     let family = fields[0];
@@ -404,32 +505,82 @@ fn sock_bind(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     if plen >= SUN_PATH_LEN {
         return Err(raise_os_error(ctx, ENAMETOOLONG));
     }
-    let path = Path::new(OsStr::from_bytes(&path_bytes[..plen]));
-    let listener = UnixListener::bind(path).map_err(|e| io_os_error(ctx, e))?;
-    let new_fd = listener.as_raw_fd();
-    // Drop the placeholder (closing its fd) and install the
-    // listener under its own fd.
-    sockets().remove(&fd);
-    sockets().insert(new_fd, SocketState::Listener(listener));
-    set_fd(ctx, r, new_fd);
-    Ok(Value::None)
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        let addr = crate::support::ffi::SockaddrUn::new_unix(&path_bytes, plen);
+        crate::support::ffi::sys_bind(fd, &addr).map_err(|e| raise_os_error(ctx, e))?;
+        // On success the fd is bound (but not listening).
+        // Move the real fd out of the Unbound entry and
+        // wrap it as a listener — the fd number NEVER
+        // changes. (A second bind fails EINVAL in the
+        // kernel, so only the Unbound entry can reach
+        // here; any other entry is put back unchanged.)
+        // The table lock is released between the remove
+        // and the insert (no lock is held across either).
+        let prev = sockets().remove(&fd);
+        match prev {
+            Some(SocketState::Unbound(owned)) => {
+                sockets().insert(fd, SocketState::Listener(UnixListener::from(owned)));
+            }
+            Some(other) => {
+                sockets().insert(fd, other);
+            }
+            None => {}
+        }
+        let _ = r;
+        return Ok(Value::None);
+    }
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        let path = Path::new(OsStr::from_bytes(&path_bytes[..plen]));
+        let listener = UnixListener::bind(path).map_err(|e| io_os_error(ctx, e))?;
+        let new_fd = listener.as_raw_fd();
+        // Drop the placeholder (closing its fd) and install the
+        // listener under its own fd.
+        sockets().remove(&fd);
+        sockets().insert(new_fd, SocketState::Listener(listener));
+        set_fd(ctx, r, new_fd);
+        Ok(Value::None)
+    }
 }
 
 /// `sock.listen(backlog)` (`modsocket.zig`
-/// `py_sock_listen`): `UnixListener::bind` already listens,
-/// so this only validates — a listener succeeds, anything
-/// else (unbound, connected, closed) is `EINVAL`.
-/// The backlog value is still converted (a non-int is
-/// TypeError, as the Zig's `mp_obj_get_int`).
+/// `py_sock_listen`): under `unsafe-ffi` the real
+/// `listen(2)` runs on the stored fd (U6) — for Unbound,
+/// Bound (the `Listener` entry wrapping a merely-bound
+/// fd), Listener AND Foreign states; the kernel is the
+/// authority (an unbound socket fails `EINVAL` there,
+/// probed on the reference; a bound one succeeds; a
+/// listening one succeeds again). On success the state
+/// becomes Listener (it already is — the entry is a
+/// `UnixListener` wrapper either way). A closed socket
+/// is `EBADF`. On the default build `UnixListener::bind`
+/// already listens, so this only validates — a listener
+/// succeeds, anything else (unbound, connected, closed)
+/// is `EINVAL`.
+/// The backlog value is still converted first (a non-int
+/// is TypeError, as the Zig's `mp_obj_get_int`).
 fn sock_listen(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, _fields) = self_socket(ctx, args)?;
-    let _backlog = int_arg(ctx, args[1])?;
+    let _backlog = int_arg(ctx, args[1])? as i32;
     if fd < 0 {
         return Err(raise_os_error(ctx, EBADF));
     }
-    match sockets().get(&fd) {
-        Some(SocketState::Listener(_)) => Ok(Value::None),
-        _ => Err(raise_os_error(ctx, EINVAL)),
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        if !sockets().contains_key(&fd) {
+            return Err(raise_os_error(ctx, EINVAL));
+        }
+        return crate::support::ffi::sys_listen(fd, _backlog)
+            .map(|()| Value::None)
+            .map_err(|e| raise_os_error(ctx, e));
+    }
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        match sockets().get(&fd) {
+            Some(SocketState::Listener(_)) => Ok(Value::None),
+            _ => Err(raise_os_error(ctx, EINVAL)),
+        }
     }
 }
 
@@ -523,9 +674,11 @@ fn sock_setblocking(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     match sockets().get(&fd) {
         Some(SocketState::Unbound(_))
         | Some(SocketState::Listener(_))
-        | Some(SocketState::Stream(_)) => {}
-        // A foreign fd has no dup-able object (F5b).
-        Some(SocketState::Foreign) => return Err(raise_os_error(ctx, EBADF)),
+        | Some(SocketState::Stream(_))
+        | Some(SocketState::Foreign(Some(_))) => {}
+        // A foreign fd without an owned object has no
+        // dup-able object (F5b).
+        Some(SocketState::Foreign(None)) => return Err(raise_os_error(ctx, EBADF)),
         None => return Err(raise_os_error(ctx, EBADF)),
     }
     let dup = dup_fd(ctx, fd)?;
@@ -542,14 +695,17 @@ fn sock_setblocking(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// `sock.getsockopt(level, opt, buflen) -> bytes`
 /// (`modsocket.zig` `py_sock_getsockopt`, sig (4, 4)):
 /// `buflen <= 0` or `> 4096` is `EINVAL`; a closed socket
-/// is `EBADF`; otherwise `ENOPROTOOPT` — there is no
+/// is `EBADF`; under `unsafe-ffi` the real `getsockopt(2)`
+/// runs (U7) and returns the bytes of the RETURNED buflen
+/// (e.g. the 12-byte `ucred` for `SO_PEERCRED`, probed on
+/// the reference). On the default build there is no
 /// stable-`std` `getsockopt` (`peer_cred` is unstable), so
-/// even `SO_PEERCRED` cannot be served (see the module
-/// docs).
+/// it is `ENOPROTOOPT` for every `(level, opt)` (see the
+/// module docs).
 fn sock_getsockopt(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, _fields) = self_socket(ctx, args)?;
-    let _level = int_arg(ctx, args[1])?;
-    let _opt = int_arg(ctx, args[2])?;
+    let _level = int_arg(ctx, args[1])? as i32;
+    let _opt = int_arg(ctx, args[2])? as i32;
     let buflen = int_arg(ctx, args[3])?;
     if buflen <= 0 || buflen > 4096 {
         return Err(raise_os_error(ctx, EINVAL));
@@ -557,7 +713,16 @@ fn sock_getsockopt(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     if fd < 0 {
         return Err(raise_os_error(ctx, EBADF));
     }
-    Err(raise_os_error(ctx, ENOPROTOOPT))
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        let bytes = crate::support::ffi::sys_getsockopt(fd, _level, _opt, buflen as i32)
+            .map_err(|e| raise_os_error(ctx, e))?;
+        return Ok(new_bytes(ctx, ctx.types, &bytes));
+    }
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        Err(raise_os_error(ctx, ENOPROTOOPT))
+    }
 }
 
 /// `sock.fileno() -> int` (`modsocket.zig`

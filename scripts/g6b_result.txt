@@ -1,0 +1,196 @@
+G6b — unsafe-ffi socket/subprocess (U4/U5/U6/U7/U8)
+=======================================================
+Lane: lane/g6b-ffi-socket, base master 6dec501 (G6a merge)
+Head: d0f26a3 (lane commits ae7ac43, 731bca2, 62801b4, b063d5b,
+      214b00f, d0f26a3; result file + README count row committed
+      after the gates — see git log)
+Date: 2026-11-19
+
+§1 — What was built
+--------------------
+FFI + module work, all under `--features unsafe-ffi`, pure Rust
+std otherwise, 0 dependencies, 0 new warnings:
+
+- src/support/ffi.rs (commit ae7ac43): private `mod ffi_b` with
+  externs `socket`, `bind`, `listen`, `getsockopt`, `kill`,
+  `dup2`; safe wrappers `sys_socket`, `sys_bind`, `sys_listen`,
+  `sys_getsockopt` (returns Vec<u8> of the RETURNED buflen),
+  `sys_kill`, `sys_dup2`; `#[repr(C)] SockaddrUn { sun_family:
+  u16, sun_path: [u8; 108] }` (110 bytes) with
+  `new_unix(path, plen)`; consts `AF_UNIX=1`, `SIGTERM=15`,
+  `SIGKILL=9`. G6a pattern (errno read immediately after the
+  failed call).
+- src/modules/modsocket.rs (731bca2): U6 — real `socket(2)` fd
+  for every socket (default: `OwnedFd::from(File::open(
+  "/dev/null"))` placeholder; feature: `OwnedFd::from_raw_fd`
+  of the `socket(2)` fd); `bind()` runs the real `bind(2)`
+  (same fd — fileno stable), `listen()` runs the real
+  `listen(2)` (bound-not-listening until then; `accept()` on
+  it is the kernel's EINVAL 22); `Foreign(Option<OwnedFd>)`
+  (default None, feature Some(owned)). U4 — `socket_fromfd`
+  wraps the LIVE fd (feature) instead of an anonymous pair:
+  the fd is closed when the socket closes (os.close(fd)
+  afterwards is EBADF 9), `recv` on it goes to the kernel
+  (fromfd listener recv is EINVAL 22; fromfd /dev/null fd
+  recv is ENOTSOCK 88); if the fd is already in the socket
+  table the existing entry is kept (fd owned exactly once).
+  U7 — `getsockopt` runs the real `getsockopt(2)` under the
+  feature (level/optname/buflen passed through, unknown
+  optname is ENOPROTOOPT 92; `SO_PEERCRED` unconnected is
+  12 bytes [0,0,0,0,255x8] — pid 0, uid -1, gid -1).
+  No new `SocketState` variant: the feature's `bind()` wraps
+  the same fd as `UnixListener::from(owned)`; the entry stays
+  `Listener` and the kernel decides.
+- src/modules/modsubprocess.rs (62801b4): U5 — the timeout arm
+  sends `SIGTERM`, polls `waitpid(WNOHANG)` every 10 ms for
+  up to 1.0 s of grace, then `SIGKILL` + blocking `waitpid`
+  (feature only; default still SIGKILL immediately).
+  Returncode is -signum when signaled. U8 — plain-fd stdin /
+  stdout / stderr go through a `pre_exec` `dup2` in the child
+  (feature only; default still re-opens `/proc/self/fd/<fd>`):
+  same fd number, so file offset and O_APPEND are shared and
+  socket fds work; `stderr=STDOUT` with `stdout=fd` dup2's
+  the child's stdout onto stderr. `pre_exec` ignores dup2
+  errors, matching the Zig's `_ = dup2(...)`; verified
+  empirically that pre_exec runs AFTER stdio setup, so a
+  `Stdio::null()` placeholder is safely overwritten.
+  ALSO FIXED (not feature-gated — a bug fix to the shared
+  collection path): the old single-`recv()` in `finish`
+  waited for pipe EOF after a timeout kill; a killed child's
+  grandchild (`sh -c 'sleep 5'`) holds the pipe open, so the
+  timeout path took 5.0 s on the reference's 1.3 s (confirmed
+  on the master default binary, no G6b). The drain now
+  streams chunks and the timeout path takes what has arrived
+  so far (10 ms settle first).
+- Tests (b063d5b): modsocket_tests.rs — feature-only
+  `socket_getsockopt_real`, `socket_fileno_stable_on_bind`,
+  `socket_accept_on_bound_not_listening` (EINVAL 22),
+  `socket_bind_empty_abstract` (client uses
+  `SocketAddr::from_abstract_name(&[0u8; 107])` + retry loop),
+  `socket_fromfd_recv`; cfg-split `socket_ctor_bad_family`
+  (feature: OSError 97 for 0/-1/999; default: success),
+  `socket_fileno_changes_on_bind` (default only),
+  `socket_getsockopt_enoprotoopt` (default only).
+  modsubprocess_tests.rs — cfg-split `subprocess_timeout`
+  (-15 feature / -9 default); feature-only
+  `subprocess_timeout_sigterm_grace` (-9 after grace),
+  `subprocess_fd_shared_offset`, `subprocess_fd_append`,
+  `subprocess_fd_socket` (UnixStream::pair),
+  `subprocess_fd_stderr_stdout`.
+  New tests/g6b_socksub.rs (whole file
+  `#![cfg(feature = "unsafe-ffi")]`, G6a g6a_os.rs pattern):
+  `g6b_fromfd_close_ebadf` (os.close(fd) after s.close()
+  is 9).
+- README.md (214b00f + doc-fix commit): divergence bullets
+  for U4/U6/U7, subprocess-timeout rewritten (U5), new
+  U8 fd-mode bullet, sendall-on-listener note; status-table
+  lib counts updated to the verified numbers (see §2).
+
+§2 — Acceptance numbers
+------------------------
+All verified 2026-11-19 on HEAD d0f26a3 (gates log
+~/workspace/g6b_gates.log, lib-test log
+~/workspace/g6b_libtest.log, probe log
+~/workspace/g6b_probe/run2.log).
+- lib (cargo test --release --lib): default 1737 passed, 0
+  failed, 1 ignored; feature-ON 1753 passed, 0 failed, 1
+  ignored. Bins 9, entry_cli 45 (both builds); g6a_os 8/8
+  and g6b_socksub 1/1 under --features unsafe-ffi.
+- integration: default 200/202 (only the 2 select cases —
+  the known pre-existing fails), feature-ON 202/202.
+- full corpus: 545/552, GREEN (matches the known-fails
+  baseline exactly).
+- golden: 585/585 passed (rust==cpython on 576/585).
+  capability: GREEN (matches the baseline exactly).
+  stdlib: 8/8 passed.
+- nano: 454/541 passing (byte-identical to the frozen
+  reference) — report-only.
+- check_compile_mpy.py: PASS (both builds).
+  check_frozen.py: PASS (both builds).
+- C acceptance (staticlib-only, api_test.c UNMODIFIED):
+  61/61 checks PASS, "all passed", rc 0
+  (/tmp/g6b_api_static; 61 lines starting "PASS").
+- nm -D target/release/libpetitpy_rs.so | grep -c " ppy_" = 39
+  (the header's 39 exports).
+
+§3 — Probes (~/workspace/g6b_probe/, 22 cases, drivers in
+      Python + petitpy server programs)
+----------------------------------------------------------
+REF (~/workspace/petitpy-orig/zig-out/bin/petitpy): 22/22 PASS
+Rust --features unsafe-ffi (/tmp/g6b_feat_bin):    22/22 PASS
+Rust default (/tmp/g6b_def_bin):                    4/22 PASS
+
+Probe files: probe_u6.py (8 cases), probe_u4.py (2),
+probe_u7.py (4), probe_u5.py (4), probe_u8.py (4).
+run_all.sh builds both binaries and runs all five probes
+against REF / feature / default (log run.log);
+run_probes.sh re-runs probes only against already-built
+binaries (log run2.log).
+
+- u6 (8): (a) fileno stable across bind; (e) listen() on a
+  fresh unbound socket is EINVAL 22 (NOT kernel auto-bind —
+  the brief's "probe first" note resolved against auto-bind);
+  (f) accept() on bound-not-listening is EINVAL 22;
+  (g) bad family at construction (0, -1, 999) is EAFNOSUPPORT
+  97 for all; (c-pure) bind("") ok; (b) connect between
+  bind and listen is ECONNREFUSED 111; (c) abstract connect
+  with '\0'*108 (the kernel matches abstract names by FULL
+  length — the 1-byte '\0' gives ECONNREFUSED 111, verified
+  with CPython clients against the REF server); (d) fromfd
+  listener accept.
+- u4 (2): fromfd close is EBADF 9 on os.close afterwards;
+  fromfd recv on an accepted stream returns the data.
+- u7 (4): SO_PEERCRED unconnected is 12 bytes [0,0,0,0,
+  255x8]; SO_REUSEADDR buflen 4 is [0,0,0,0]; buflen 0/4097
+  + unknown optname (level 1, opt 9999) is ENOPROTOOPT 92;
+  SO_PEERCRED connected matches the driver's own pid/uid/gid.
+- u5 (4, driver-measured elapsed buckets): plain sleep -15
+  <0.6 s; term-ignoring child -9 in [1.0,1.6) s; trap-exit-0
+  child 0 <0.6 s; clean exit 3 <0.6 s. NOTE: the U5 brief
+  premise was WRONG — a child that traps SIGTERM and exits 0
+  returns 0, not -15; -15 is the DEFAULT disposition. The
+  probes assert the REF-verified values.
+- u8 (4): stdin from fd at offset 3 — child sees b'3456789'
+  (shared offset); stdout to O_APPEND fd — file b'AAABBB\n'
+  (append shared); stderr=STDOUT with stdout=fd — both
+  streams in the same file in write order; socketpair fd as
+  stdout delivers to the peer.
+- Default build fails exactly the old gaps (18 fails): u6a
+  fileno changes (3 -> 4); u6f accept blocks (bind already
+  listens); u6g ctor ok for 0/-1/999; u6b connect ok; u6c
+  abstract connect 111 (bind("") binds an UNNAMED socket on
+  the default build — addrlen 2 — it listens but is
+  unreachable by name; NOT ENOENT as the module docs used to
+  claim, corrected in this lane); u6d fromfd listen EINVAL;
+  u4 fd survives + recv EBADF; u7 peercred/reuseaddr OSError
+  92; u5 -9 everywhere, no grace; u8 offset 0 / overwrite /
+  err-only / ENXIO 6.
+- Probe-harness bug found and fixed during the run: the
+  driver cases read `_, srv_out = srv.communicate(...)`,
+  i.e. they compared STDERR (empty on success) against the
+  expected stdout. Fixed to `srv_out, _ = ...` plus a
+  `drain()` helper that kills a hung server and prefixes
+  its output with b"TIMEOUT:" instead of crashing the probe.
+
+§4 — Leftovers (for the main agent)
+------------------------------------
+1. `sendall` on a listener is EINVAL on Rust, ENOTCONN 107
+   on the reference (probed while working G6b): the
+   `is_stream` gate rejects non-stream sockets before the
+   syscall. Out of scope — the brief leaves `sendall`
+   unchanged. README + module docs note it.
+2. A drain thread blocked on read may outlive a timed-out
+   spawn (leaked thread per call when a grandchild holds the
+   pipe) — a consequence of the chunked-drain fix; the
+   reference does not have this shape (it uses a different
+   collection path). No test covers it; worth a note in the
+   triage doc if the main agent wants it tracked.
+3. Default build `bind("")` binds an UNNAMED socket (see
+   §3) — the old module-docs claim (ENOENT) was wrong and
+   is corrected in this lane. No lib test asserts either
+   behaviour on default; the probe is the only coverage.
+4. The P14 lane ran in parallel in the same VM; its
+   compiles slowed G6b builds (release builds ~1m20s each
+   under contention).
+5. Nano 541/541 is the original's own gate; Rust has no
+   nano build — report-only, not targeted.

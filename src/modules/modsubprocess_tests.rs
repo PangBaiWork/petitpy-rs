@@ -4,8 +4,9 @@
 //! `/bin/cat`, `/bin/echo`, `/bin/sh`, `/usr/bin/env`,
 //! `/bin/pwd`, `/usr/bin/head`) — the same surface the
 //! reference probes used. The timeout test pins
-//! `returncode -9` (`SIGKILL` — the documented divergence
-//! from the reference's `-15` `SIGTERM`).
+//! `returncode -15` (`SIGTERM`) under `unsafe-ffi` and
+//! `-9` (`SIGKILL` — the documented divergence from the
+//! reference) on the default build.
 
 use std::os::unix::io::AsRawFd;
 
@@ -261,9 +262,33 @@ import _subprocess
 r = _subprocess._spawn_and_wait(["/bin/sleep", "5"], None, 0.2, None, None, -4, -4, -4)
 "#,
     );
-    // `std` kills with SIGKILL, so the returncode is -9,
-    // not the reference's -15 (SIGTERM) — see the module
-    // docs.
+    // Under `unsafe-ffi` the timeout arm sends `SIGTERM`
+    // (U5): a plain `sleep` dies on it, returncode -15.
+    // On the default build `std` kills with `SIGKILL`,
+    // so the returncode is -9 — the documented
+    // divergence (see the module docs).
+    #[cfg(feature = "unsafe-ffi")]
+    assert_eq!(fx.g_result("r"), (-15, None, None, true));
+    #[cfg(not(feature = "unsafe-ffi"))]
+    assert_eq!(fx.g_result("r"), (-9, None, None, true));
+}
+
+/// A child that IGNORES `SIGTERM` is `SIGKILL`ed after
+/// the 1.0 s grace (U5): returncode -9, timed out. (A
+/// plain `/bin/sleep` dies on `SIGTERM` itself: -15 —
+/// see `subprocess_timeout`.) Feature only: on the
+/// default build there is no grace, the kill is
+/// `SIGKILL` at once.
+#[cfg(feature = "unsafe-ffi")]
+#[test]
+fn subprocess_timeout_sigterm_grace() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        r#"
+import _subprocess
+r = _subprocess._spawn_and_wait(["/bin/sh", "-c", "trap \"\" TERM; sleep 5"], None, 0.2, None, None, -4, -4, -4)
+"#,
+    );
     assert_eq!(fx.g_result("r"), (-9, None, None, true));
 }
 
@@ -395,8 +420,12 @@ r = _subprocess._spawn_and_wait(["/bin/sh", "-c", "head -c 200000 /dev/zero"], N
     assert!(!timed_out);
 }
 
-/// File-descriptor stream modes (`/proc/self/fd`
-/// re-open): stdin from a file, stdout to a file.
+/// File-descriptor stream modes: stdin from a file,
+/// stdout to a file. On the default build the modes are
+/// served by the `/proc/self/fd` re-open (see the module
+/// docs); under `unsafe-ffi` they go through the
+/// `pre_exec` `dup2` (U8) — same result for plain files
+/// at offset 0, so this test runs on both builds.
 #[test]
 fn subprocess_fd_modes() {
     let in_path = "/tmp/petitpy-d3-sub-in.txt";
@@ -431,5 +460,108 @@ fn subprocess_fd_modes() {
     drop(in_file);
     drop(out_file);
     let _ = std::fs::remove_file(in_path);
+    let _ = std::fs::remove_file(out_path);
+}
+
+/// The child reads from the SHARED offset (U8): the
+/// parent seeks to 3 first, the child gets the rest —
+/// the `dup2` shares the file offset. Feature only: the
+/// default build's `/proc` re-open starts at offset 0,
+/// so the child would see all bytes.
+#[cfg(feature = "unsafe-ffi")]
+#[test]
+fn subprocess_fd_shared_offset() {
+    use std::io::Seek;
+    let in_path = "/tmp/petitpy-d3-sub-off-in.txt";
+    std::fs::write(in_path, b"0123456789").expect("write input file");
+    let mut in_file = std::fs::File::open(in_path).expect("open input");
+    in_file
+        .seek(std::io::SeekFrom::Start(3))
+        .expect("seek");
+    let in_fd = in_file.as_raw_fd();
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "import _subprocess\nr = _subprocess._spawn_and_wait([\"/bin/cat\"], None, -1.0, None, None, {in_fd}, -1, -4)\n"
+    ));
+    assert_eq!(fx.g_result("r"), (0, Some(b"3456789".to_vec()), None, false));
+    drop(in_file);
+    let _ = std::fs::remove_file(in_path);
+}
+
+/// The child appends after existing content (U8): the
+/// fd was opened `O_APPEND` and the `dup2` shares the
+/// append mode. Feature only: the default build's
+/// `/proc` re-open has no `O_APPEND` and starts at
+/// offset 0, so the child would overwrite.
+#[cfg(feature = "unsafe-ffi")]
+#[test]
+fn subprocess_fd_append() {
+    use std::io::Write;
+    let out_path = "/tmp/petitpy-d3-sub-append-out.txt";
+    let mut out_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(true)
+        .open(out_path)
+        .expect("open output");
+    out_file.write_all(b"AAA").expect("write AAA");
+    let out_fd = out_file.as_raw_fd();
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "import _subprocess\nr = _subprocess._spawn_and_wait([\"/bin/sh\", \"-c\", \"echo BBB\"], None, -1.0, None, None, -4, {out_fd}, -4)\n"
+    ));
+    assert_eq!(fx.g_result("r"), (0, None, None, false));
+    drop(out_file);
+    assert_eq!(std::fs::read(out_path).expect("read output"), b"AAABBB\n");
+    let _ = std::fs::remove_file(out_path);
+}
+
+/// stdout to a SOCKET fd (U8): the child output arrives
+/// on the pair's peer. Feature only: the default build's
+/// `/proc` re-open fails `ENXIO` on a socket fd.
+#[cfg(feature = "unsafe-ffi")]
+#[test]
+fn subprocess_fd_socket() {
+    use std::io::Read;
+    let (mut peer, child_end) = std::os::unix::net::UnixStream::pair().expect("pair");
+    let fd = child_end.as_raw_fd();
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "import _subprocess\nr = _subprocess._spawn_and_wait([\"/bin/echo\", \"hi\"], None, -1.0, None, None, -4, {fd}, -4)\n"
+    ));
+    assert_eq!(fx.g_result("r"), (0, None, None, false));
+    drop(child_end);
+    let mut buf = Vec::new();
+    peer.read_to_end(&mut buf).expect("read peer");
+    assert_eq!(buf, b"hi\n");
+}
+
+/// `stderr=STDOUT` with `stdout=fd` (U8): both streams
+/// land in the same file, in write order — the Zig's
+/// `dup2(1, 2)` of the CHILD's stdout. Feature only:
+/// the default build's stderr re-open has its own
+/// offset, so the two writes would not interleave in
+/// order.
+#[cfg(feature = "unsafe-ffi")]
+#[test]
+fn subprocess_fd_stderr_stdout() {
+    let out_path = "/tmp/petitpy-d3-sub-merge-out.txt";
+    let out_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out_path)
+        .expect("open output");
+    let out_fd = out_file.as_raw_fd();
+    let mut fx = Fx::new();
+    fx.run_ok(&format!(
+        "import _subprocess\nr = _subprocess._spawn_and_wait([\"/bin/sh\", \"-c\", \"echo out; echo err >&2\"], None, -1.0, None, None, -4, {out_fd}, -2)\n"
+    ));
+    assert_eq!(fx.g_result("r"), (0, None, None, false));
+    drop(out_file);
+    assert_eq!(
+        std::fs::read(out_path).expect("read output"),
+        b"out\nerr\n"
+    );
     let _ = std::fs::remove_file(out_path);
 }

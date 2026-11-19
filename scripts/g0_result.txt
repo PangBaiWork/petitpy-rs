@@ -1,0 +1,184 @@
+# Lane G0 — `unsafe-ffi` feature + real select(2) + arm64/x64 cross-compile
+
+Base: master `8f9aafa`. Worktree `~/workspace/petitpy-rs-g0-unsafe`,
+branch `lane/g0-unsafe-ffi`. Gate outputs `~/workspace/g0_verify/`
+(`feat_on/` and `feat_off/` subdirs), probes `~/workspace/g0_probe/`
+(`select_probe.py`, output `~/workspace/g0_verify/probes.txt`).
+
+## §1 Acceptance (all measured in the worktree)
+
+### cargo test (release)
+- feature ON: `cargo test --release --lib --tests` → **1708 passed,
+  0 failed, 3 ignored** (1700 master + 9 new − 1: the 2 `modselect`
+  unit tests + 7 `g0_select` VM tests; `d4_select_nonempty_not_implemented`
+  is compiled out under the feature). `cargo test --release --bins` →
+  **9 passed**; `cargo test --release --test entry_cli` → **45 passed**.
+- feature OFF: `cargo test --release --lib` → **1700 passed, 0 failed,
+  3 ignored** — identical to master `8f9aafa` exactly.
+- Warnings (forced recompile, `touch src/lib.rs && cargo build
+  --release`): feature ON **0**, feature OFF **0**.
+- `scripts/check_compile_mpy.py` PASS (0 byte mismatches),
+  `scripts/check_frozen.py` PASS (38,141 bytes, 23 files).
+
+### Six gates, feature ON (x86_64, default --bin)
+- full: **GREEN** (matches known-fails baseline exactly)
+- integration: **202/202** — fail set EMPTY; the two select cases flip
+- golden: **585/585** (rust==cpython 576/585)
+- capability: **GREEN**
+- stdlib: **8/8**
+- nano: **454/541** (report-only, unchanged)
+
+### Six gates, feature OFF (x86_64)
+- Identical to master `8f9aafa`: full GREEN; integration **200/202**,
+  fail set exactly {`select_readable_fd_is_ready`,
+  `select_timeout_zero_returns_promptly`}; golden 585/585; capability
+  GREEN; stdlib 8/8; nano 454/541. Default build behaviour unchanged
+  by one word.
+
+### arm64
+- `cargo build --target aarch64-unknown-linux-gnu --release
+  --features unsafe-ffi` → **rc=0, 0 warnings**. `file` →
+  `ELF 64-bit LSB pie executable, ARM aarch64, ... dynamically
+  linked, interpreter /lib/ld-linux-aarch64.so.1, ... stripped`.
+  `libpetitpy_rs.so` (1,886,968 bytes) and `libpetitpy_rs.a`
+  (34,509,364 bytes) both link for aarch64.
+- `cargo check --target aarch64-unknown-linux-gnu` (no feature) →
+  **rc=0**.
+- Linker config is committed with the repo: `.cargo/config.toml`
+  (relative path) + `scripts/zig-cc-aarch64.sh` (in-repo, +x).
+- Runtime on arm64 is UNVERIFIED (see §4).
+
+### Unsafe audit
+- `unsafe` in the diff appears ONLY in `src/modules/modselect.rs`:
+  2 `unsafe` blocks (the `ffi::select` call, the errno read) + 2
+  `extern "C"` blocks, each carrying an FFI-invariant comment
+  immediately above it (the F1 rule). 0 `unsafe` in any other file.
+- No new dependencies: `[dependencies]` stays empty.
+- Largest touched file `modselect.rs` ≈ 360 lines (< 2500).
+- x86_64 feature-on binary `target/release/petitpy-rs`: 1,956,336 bytes.
+
+### Verification-order note
+The six gates were run before the final cfg-gating cleanup of
+`modselect.rs` (see §2). That cleanup only added `#[cfg]`
+attributes to feature-only helpers/imports/tests — no runtime code
+changed — and the lib tests + warning counts were re-run after it
+in both configs (1708/1700, 0/0). The gate binaries were rebuilt
+from the same runtime code.
+
+## §2 Mechanisms (对照 original locations)
+
+- `Cargo.toml`: `[features] unsafe-ffi = []` (default OFF).
+- `src/modules/modselect.rs` — two paths, shared pre-checks unchanged
+  (non-list → TypeError; negative/NaN timeout → OSError(22)):
+  - ON: hand-written `extern "C" { fn select(...); fn
+    __errno_location(); }` (no libc crate); `FdSet = [u64; 16]`
+    (c_long is 8 bytes on both x86_64 and aarch64 — same as
+    `modselect.zig`'s `bits_per_long`); `Timeval { tv_sec: i64,
+    tv_usec: i64 }`; `timeval_from_secs` (trunc + clamp [0, 999999],
+    saturating `as`); `select_real` follows `modselect.zig::py_select`:
+    populate skips fd < 0 / >= 1024, `nfds` = max fd + 1, all lists
+    empty → nfds 0 + all three sets NULL (`select(0, NULL, NULL,
+    NULL, tv)` just sleeps), `n < 0` → read `*__errno_location()`
+    immediately, raise OSError, NO EINTR retry (the Zig doesn't
+    retry either); results keep input order + the original fd
+    objects (`filterReady` appends `list.items[i]`).
+  - OFF: existing implementation untouched (sleep + NotImplementedError).
+  - Feature-only helpers/imports/tests are `#[cfg(feature =
+    "unsafe-ffi")]`-gated so the default build has 0 warnings and
+    exactly 1700 lib tests (found by the forced-rebuild warning
+    check: 9 dead-code warnings before gating).
+- `src/modules/modd4_tests.rs`: `d4_select_nonempty_not_implemented`
+  now `#[cfg(not(feature = "unsafe-ffi"))]`; added 7 feature-gated
+  tests (`g0_select_devnull_readable`,
+  `g0_select_listener_readable_then_drained`,
+  `g0_select_write_ready`, `g0_select_ebadf`,
+  `g0_select_fd_over_1024_skipped`, `g0_select_dup_fd`,
+  `g0_select_xlist_not_ready`).
+- `.cargo/config.toml` (NEW) + `scripts/zig-cc-aarch64.sh` (NEW):
+  `[target.aarch64-unknown-linux-gnu] linker =
+  "scripts/zig-cc-aarch64.sh"`; the script resolves `zig` from PATH
+  (fallback `/home/hatch/zig-x86_64-linux-0.16.0/zig`), calls
+  `zig cc -target aarch64-linux-gnu`, strips
+  `-Wl,--fix-cortex-a53-*` (GNU-ld only; lld handles the erratum)
+  and `-Wl,-O1` (a GNU-ld hint that lld only warns about — the
+  arm64 build initially showed 5 warning lines, all that one
+  linker-message warning; after the strip it is 0).
+- `README.md`: status table now 202/202 with the feature, 200/202
+  default; divergence list updated (ceiling claim removed, arm64
+  cross-compile verified / runtime unverified noted).
+
+## §3 Probes (release binary, `~/workspace/g0_probe/select_probe.py`;
+REF = `~/workspace/petitpy-orig/zig-out/bin/petitpy`, RUST = worktree
+`target/release/petitpy-rs` with the feature on; all byte-compare
+stdout+stderr+rc unless noted)
+
+- `int_case_devnull`: `select([fd_of_/dev/null], [], [], 0)` → True.
+  IDENTICAL.
+- `int_case_listener`: fresh AF_UNIX listener, `select([fileno],
+  [], [], 0)` → empty. IDENTICAL.
+- `devnull_write_ready`: `select([], [w_of_/dev/null], [], 0)` →
+  1 ready. IDENTICAL.
+- `ebadf`: closed fd into select → `OSError: [Errno 9] EBADF`,
+  traceback byte-identical, rc=1 both. IDENTICAL.
+- `fd_over_1024`: fd 2000 into select → `[] [] []`, rc=0.
+  IDENTICAL (silent skip, as the Zig's `populateSet`).
+- `dup_fd`: same fd twice in rlist → result count 2.
+  IDENTICAL (reference keeps duplicates).
+- `xlist_not_ready`: `/dev/null` O_RDONLY fd in xlist, timeout 0 →
+  0 ready. IDENTICAL.
+- `neg_fd_skipped`: fd −1 into select → `[] [] []`, rc=0.
+  IDENTICAL.
+- `listener_readable`: Unix listener + CPython client connects while
+  the binary is blocked in `select(..., 5)` → `ready\n1\n0\n`,
+  rc=0 both. IDENTICAL. (First run showed a DIFF: the reference
+  buffers stdout when piped, so a `readline()` "ready" sync only
+  returns after the process exits — the client then connected after
+  select had already timed out. Fixed by sleeping 1 s before
+  connecting; a direct manual run with the same timing gives 1 on
+  both binaries. See §4 for the buffering finding.)
+- `timeout_0.2`: timed INSIDE the script (`time.time()` around the
+  call): REF 0.200 s, RUST 0.200 s. OK. (First version timed the
+  whole subprocess including startup: REF 0.310 s — the 27 MB Debug
+  reference takes ~0.1 s to start; the script-internal timing is
+  the honest measure.)
+
+## §4 Left-open
+
+- **arm64 runtime unverified.** `apt-get install -y qemu-user`
+  succeeded (qemu-aarch64 1:8.2.2 present), and a qemu run was
+  attempted, but this VM has no aarch64 glibc sysroot — no
+  `/lib/ld-linux-aarch64.so.1` anywhere (Zig's bundled glibc dir
+  holds headers/stubs only) — so `qemu-aarch64` fails with
+  "Could not open '/lib/ld-linux-aarch64.so.1'". Cross-compile
+  passes; runtime needs a real arm64 machine or a sysroot.
+- **Huge/infinite timeout**: the original aborts (`@intFromFloat`
+  panic); Rust saturates `tv_sec` to `i64::MAX` (feature path) or
+  sleeps `Duration::MAX` (default path) — the pre-G0 divergence,
+  kept as-is per the brief.
+- **`os.pipe` does not exist on either binary**: the first probe
+  draft used `os.pipe()`; both REF and Rust raise AttributeError
+  (`hasattr(os, 'pipe')` is False on the reference too — the D2 os
+  module never exposed it). Not a select gap; probes and tests were
+  rewritten to use Unix listeners / `/dev/null` instead.
+- **Reference buffers stdout when piped** (probed 2026-11-19 while
+  fixing the listener probe): with `print('hello'); time.sleep(2)`,
+  the first line arrives after 2.11 s on the reference, 0.00 s on
+  Rust (write-through). Pre-existing print-flushing divergence,
+  unrelated to select, out of G0 scope; recorded here because it
+  bit the probe sync.
+- No other divergences found in this lane. Nothing else was touched.
+
+## §5 Files changed
+
+- `Cargo.toml` — `[features] unsafe-ffi = []`.
+- `src/modules/modselect.rs` — two-path select (real `select(2)`
+  under the feature, default path untouched); feature-only items
+  cfg-gated.
+- `src/modules/modd4_tests.rs` — `d4_select_nonempty_not_implemented`
+  gated off under the feature; 7 new `g0_select_*` tests.
+- `.cargo/config.toml` — NEW, aarch64 linker = in-repo script.
+- `scripts/zig-cc-aarch64.sh` — NEW (+x), Zig-based aarch64 linker
+  wrapper (strips `-Wl,--fix-cortex-a53-*` and `-Wl,-O1`).
+- `README.md` — status table + divergence list updated.
+- `scripts/g0_result.txt` — this file.
+- NOT touched: `docs/任务书.md`, any other module, test expectations.

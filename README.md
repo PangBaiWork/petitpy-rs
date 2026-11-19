@@ -21,12 +21,12 @@ Final acceptance (F2, master `bdf3c5b` + this lane):
 | Gate | Result |
 | --- | --- |
 | Corpus, full config (`scripts/run_full_gate.py`) | 545/552 — GREEN, exactly the 7 documented known-fails |
-| Integration smoke (`scripts/run_integration.py`) | 200/202 — the honest ceiling (see below) |
+| Integration smoke (`scripts/run_integration.py`) | 202/202 with `--features unsafe-ffi`; 200/202 default (see below) |
 | Golden programs (`scripts/run_golden.py`) | 585/585 (rust==cpython on 576/585) |
 | Capability matrix (`scripts/run_capability.py`) | 67/67 GREEN |
 | Test-stdlib (`scripts/run_stdlib.py`) | 8/8 |
 | Nano config (`scripts/run_nano.py`) | 454/541, report-only (no Rust nano build exists) |
-| `cargo test --release --lib --tests` | 1700 passed, 0 failed, 3 ignored (pre-existing) |
+| `cargo test --release --lib --tests` | 1708 passed, 0 failed, 3 ignored with `--features unsafe-ffi`; 1700 / 0 / 3 default (identical to master `8f9aafa`) |
 | `cargo test --release --bins` / `--test entry_cli` | 9 / 45 passed |
 | Benchmark vs reference binary | 0.172x wall-clock (limit ≤ 1.5x; `~/workspace/bench_e3.py`, steady-state run 2) |
 
@@ -34,12 +34,27 @@ The reference binary on hand is the 27 MB Debug build, so the
 benchmark bar is lenient — but the 5.8x margin leaves large headroom,
 and no further optimization was needed.
 
-Integration tops out at 200/202: the two `select` cases
-(`select_readable_fd_is_ready`, `select_timeout_zero_returns_promptly`)
-have no safe implementation in pure Rust std — there is no
+Integration is 202/202 with `--features unsafe-ffi` (cargo feature
+`unsafe-ffi`, default OFF): that feature adds a real POSIX
+`select(2)` call (hand-written `extern "C"`, zero dependencies —
+see `src/modules/modselect.rs`), which flips the two `select` cases
+(`select_readable_fd_is_ready`, `select_timeout_zero_returns_promptly`).
+The default build is still 200/202: pure Rust std has no
 `select(2)`/`poll(2)`, a helper process cannot inherit the fds, and
 reading a byte to stash it would corrupt later `os.read` semantics —
-so they are recorded as a documented divergence, not faked.
+so without the feature the two cases remain a documented divergence,
+not faked.
+
+Cross-compile for arm64 (Linux glibc, `aarch64-unknown-linux-gnu`)
+works via the committed Zig-based linker wrapper
+(`scripts/zig-cc-aarch64.sh`, `.cargo/config.toml`):
+`cargo build --target aarch64-unknown-linux-gnu --release
+--features unsafe-ffi` produces a real ARM aarch64 ELF (including
+`libpetitpy_rs.so` / `.a`). Runtime on arm64 is unverified — this VM
+has no arm64 machine; qemu-user was installed and a qemu run was
+attempted, but the host has no aarch64 glibc sysroot (no
+`ld-linux-aarch64.so.1`), so the dynamic loader cannot be found
+and the binary cannot start under qemu here.
 
 ## Build
 
@@ -141,9 +156,13 @@ These are deliberate, probed, and recorded in the per-lane result
 files (`scripts/<lane>_result.txt` §4); nothing here is faked to
 pass a gate.
 
-- **Integration ceiling 200/202** — the two `select` cases (see
-  above). Nano 454/541 is report-only: the original's nano gate is
+- **Integration 200/202 on the default build** — the two `select`
+  cases (see above); with `--features unsafe-ffi` it is 202/202.
+  Nano 454/541 is report-only: the original's nano gate is
   541/541, but Rust has no nano build.
+- **arm64 runtime unverified** — cross-compile to
+  `aarch64-unknown-linux-gnu` passes (Zig linker wrapper, committed),
+  but no arm64 machine or qemu run was available in this lane.
 - **`socket.fromfd` doesn't own the OS fd** (F5b): `fileno() == fd`
   holds, but `close()` does not close the underlying fd — pure std
   has no `from_raw_fd`. The integration case only asserts `fileno`.

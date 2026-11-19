@@ -1,0 +1,8 @@
+# G0: cross-compile target aarch64-unknown-linux-gnu. The linker is the
+# in-repo wrapper script (relative to the workspace root), which drives
+# Zig's bundled clang/lld — no aarch64-linux-gnu-gcc needed. Requires
+# the aarch64 std component (`rustup target add
+# aarch64-unknown-linux-gnu`) and Zig 0.16.0+ on PATH (or at the
+# fallback path inside the script).
+[target.aarch64-unknown-linux-gnu]
+linker = "scripts/zig-cc-aarch64.sh"

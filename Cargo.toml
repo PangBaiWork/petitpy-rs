@@ -18,4 +18,12 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# G0: opt-in unsafe FFI. Default OFF — the default build stays pure
+# std with zero unsafe in the VM core. With `unsafe-ffi` enabled,
+# `select` uses the real POSIX select(2) via extern "C" (no libc
+# crate, zero new dependencies) and the crate builds for
+# aarch64-unknown-linux-gnu as well as x86_64-unknown-linux-gnu.
+[features]
+unsafe-ffi = []
+
 [dependencies]

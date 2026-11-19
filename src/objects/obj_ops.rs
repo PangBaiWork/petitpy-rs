@@ -285,6 +285,80 @@ pub fn obj_equal(
     obj_is_true(ctx, types, r)
 }
 
+/// `mp_obj_equal` with an optional VM hook (G3/H2): the hook
+/// threads into `obj_equal_not_equal`, so an instance's FunBc
+/// `__eq__` actually runs (the `instance_binary_op` path);
+/// without a hook this is exactly `obj_equal`. A raise from the
+/// hook propagates as `Err(PyError::PyRaise)` — the probe
+/// callers below decide what it means.
+pub fn obj_equal_hook(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    o1: Value,
+    o2: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> PyResult<bool> {
+    let r = obj_equal_not_equal(ctx, types, BinaryOp::Equal, o1, o2, hook)?;
+    obj_is_true(ctx, types, r)
+}
+
+/// The hash-table probe comparison (G3/H2, H5): `obj_equal_hook`
+/// with the vendor's `mp_obj_is_true` pending guard
+/// (`obj.zig:470` — while a raise is pending, equality reads
+/// false). A raise from `__eq__` therefore reads as "not
+/// equal" and the probe continues; the stashed raise is
+/// DISCARDED here (both the hook's side channel and the
+/// `CallCtx` record), never drained — the same convention as
+/// `hash_of_hook`'s swallowed `__hash__` raise.
+///
+/// The discard is needed in BOTH arms: the generic 2-pass
+/// loop swallows a slot raise as NULL (`Err(PyError::PyRaise)
+/// => {} // NULL → keep looking`) and falls through to the
+/// pointer comparison, so a raising `__eq__` comes back as
+/// `Ok(b)` with the raise still stashed on the hook — without
+/// the Ok-arm drain it would surface later at the next
+/// `drain_hook_raise` as the WRONG exception (probed
+/// 2026-11-19: a load after a raising `__eq__` raised the
+/// stashed `ValueError` past `except KeyError`, and the real
+/// `KeyError` only surfaced on the handler's re-raise). When
+/// a stash was present the answer is forced `false`, which is
+/// the vendor guard exactly. `OutOfMemory` still propagates.
+/// (REF note, probed 2026-11-19: a raising `__eq__` is
+/// state-dependent on the reference — a load reports `KeyError`
+/// (this rule, exactly), while `in` / `.get` surface the
+/// `ValueError` and a store surfaces `TypeError` or nothing
+/// depending on the table state — no uniform rule reproduces
+/// that; the probe-level discard is the documented vendor
+/// guard.)
+pub fn probe_equal(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    o1: Value,
+    o2: Value,
+    mut hook: Option<CallHook<'_, '_>>,
+) -> PyResult<bool> {
+    // Drain both raise channels; true iff a raise was stashed.
+    let drain_stash = |hook: &mut Option<CallHook<'_, '_>>, ctx: &mut CallCtx| -> bool {
+        let mut raised = false;
+        if let Some(h) = hook.as_deref_mut() {
+            raised |= h.take_pending().is_some();
+        }
+        raised |= ctx.take_pending_raise().is_some();
+        raised
+    };
+    match obj_equal_hook(ctx, types, o1, o2, hook.as_deref_mut()) {
+        Ok(b) => {
+            let raised = drain_stash(&mut hook, ctx);
+            Ok(b && !raised)
+        }
+        Err(PyError::OutOfMemory) => Err(PyError::OutOfMemory),
+        Err(PyError::PyRaise) => {
+            let _ = drain_stash(&mut hook, ctx);
+            Ok(false)
+        }
+    }
+}
+
 // ── type name / print ─────────────────────────────────────────────────
 
 /// `mp_obj_get_type_str` (`obj.zig:447-450`): the type's name bytes.

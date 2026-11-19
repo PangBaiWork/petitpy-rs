@@ -9,7 +9,9 @@
 //! every assertion was probed on the reference binary
 //! 2026-11-18 (see `scripts/d4_result.txt` §2).
 
+#[cfg(feature = "unsafe-ffi")]
 use std::os::unix::net::UnixStream;
+#[cfg(feature = "unsafe-ffi")]
 use std::time::Duration;
 
 use crate::compiler::bridge::compile_to_mpy_named;

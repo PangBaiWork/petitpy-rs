@@ -46,6 +46,9 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::callables::objboundmeth::new_bound_meth;
+use crate::objects::containers::objdict::{
+    dict_delete_hook, dict_get_value_hook, dict_store_hook, DictError,
+};
 use crate::objects::obj::{call_binary, call_subscr, call_unary, obj_get_type, ObjError, SlotOutcome};
 use crate::objects::objtype::lookup::{class_lookup, LookupHit};
 use crate::objects::slots::{BinaryOp, CallHook, SubscrArg, UnaryOp};
@@ -344,6 +347,82 @@ pub fn with_call_hook_seams<R>(hook: CallHook<'_, '_>, f: impl FnOnce(&mut VmSea
         stub_subscr,
         f,
     )
+}
+
+/// Run `f` with seams whose `call` is the VM's real call hook
+/// AND whose `subscr` is the hook-aware `hook_subscr` below
+/// (G3/H4). The two closures share ONE hook through a `RefCell`:
+/// each borrows it mutably at call time and releases it before
+/// returning, and the two are never active simultaneously — the
+/// subscr closure's `__eq__` runs through the borrowed hook
+/// directly, and any re-entrant subscript goes through a fresh
+/// hook from `make_hook(state)`. Only `try_instance_subscr`
+/// uses this shape; every other `with_call_hook_seams` caller
+/// keeps `stub_subscr` (their behaviour is pinned by their own
+/// lanes' tests).
+pub fn with_call_hook_subscr_seams<R>(hook: CallHook<'_, '_>, f: impl FnOnce(&mut VmSeams) -> R) -> R {
+    use std::cell::RefCell;
+    let cell = RefCell::new(hook);
+    with_custom_seams(
+        |ctx: &mut CallCtx, fun: Value, n: usize, k: usize, a: &[Value]| {
+            cell.borrow_mut().call(ctx, fun, n, k, a)
+        },
+        |_ctx: &mut CallCtx, _obj: Value, _attr: u32| None,
+        |ctx: &mut CallCtx, b: Value, i: Value, a: SubscrArg| {
+            hook_subscr(ctx, b, i, a, &mut **cell.borrow_mut())
+        },
+        f,
+    )
+}
+
+/// The subscr seam for `with_call_hook_subscr_seams` (G3/H4):
+/// when the base is an exact dict (`Obj::Dict` — a dict-subclass
+/// instance's subobj[0]), route Get/Set/Delete through the
+/// hook-aware dict slot functions with the VM's real call hook,
+/// so a dict-subclass instance subscripts instance keys through
+/// a running FunBc `__eq__`. Any other base falls back to
+/// `stub_subscr` (the C6 slot dispatch + the F4 `KeyError`
+/// inspection dance). The Get miss records the `KeyError` on
+/// the `CallCtx` (via `record_typed`) AND reports
+/// `SubscrError::KeyError` — `instance_subscr` owns the
+/// record's lifecycle (it discards the record when
+/// `__missing__` handles the miss and leaves it for the drain
+/// when it doesn't), exactly as `stub_subscr`'s re-record
+/// does. Set/Delete return `None` on success, matching
+/// `dict_subscr` (the hook fns return the dict itself).
+fn hook_subscr(
+    ctx: &mut CallCtx,
+    b: Value,
+    i: Value,
+    a: SubscrArg,
+    hook: CallHook<'_, '_>,
+) -> Result<Value, SubscrError> {
+    let is_dict = matches!(b, Value::Heap(r) if matches!(ctx.arena.get(r), Obj::Dict(_)));
+    if !is_dict {
+        return stub_subscr(ctx, b, i, a);
+    }
+    match a {
+        SubscrArg::Get => match dict_get_value_hook(ctx, b, i, Some(hook)) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let is_key = matches!(e, DictError::KeyError(_));
+                let pe = ctx.record_typed(e);
+                if is_key {
+                    Err(SubscrError::KeyError)
+                } else {
+                    Err(SubscrError::Raise(pe))
+                }
+            }
+        },
+        SubscrArg::Set(v) => match dict_store_hook(ctx, b, i, v, Some(hook)) {
+            Ok(_) => Ok(Value::None),
+            Err(e) => Err(SubscrError::Raise(ctx.record_typed(e))),
+        },
+        SubscrArg::Delete => match dict_delete_hook(ctx, b, i, Some(hook)) {
+            Ok(_) => Ok(Value::None),
+            Err(e) => Err(SubscrError::Raise(ctx.record_typed(e))),
+        },
+    }
 }
 
 /// `mp_load_method_maybe` for the seams (E2f): a REAL `load_maybe`

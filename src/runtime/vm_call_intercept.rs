@@ -119,6 +119,54 @@ pub(crate) fn intercept_builtin_call(
             ctx, state, n_args, n_kw, args,
         ));
     }
+    // `dict.get` / `dict.pop` / `dict.setdefault` (G3/H3):
+    // intercepted by GcRef identity so an instance key runs
+    // its FunBc `__eq__` through the VM's real call hook (see
+    // `call_dict_get_ctx` / `call_dict_pop_ctx` /
+    // `call_dict_setdefault_ctx`).
+    if fun == state.dict_get_builtin {
+        return Some(crate::runtime::builtin_vm::call_dict_get_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
+    if fun == state.dict_pop_builtin {
+        return Some(crate::runtime::builtin_vm::call_dict_pop_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
+    if fun == state.dict_setdefault_builtin {
+        return Some(crate::runtime::builtin_vm::call_dict_setdefault_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
+    // `list.extend` (G3/H6): intercepted by GcRef identity
+    // so a generator / genexpr arg is collected through the
+    // VM's real call hook (see `call_list_extend_ctx`).
+    if fun == state.list_extend_builtin {
+        return Some(crate::runtime::builtin_vm::call_list_extend_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
+    // `set.add` / `set.discard` / `set.remove` (G3/H5):
+    // intercepted by GcRef identity so an instance element
+    // runs its FunBc `__eq__` through the VM's real call
+    // hook (see `call_set_add_ctx` / `call_set_discard_ctx`
+    // / `call_set_remove_ctx`).
+    if fun == state.set_add_builtin {
+        return Some(crate::runtime::builtin_vm::call_set_add_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
+    if fun == state.set_discard_builtin {
+        return Some(crate::runtime::builtin_vm::call_set_discard_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
+    if fun == state.set_remove_builtin {
+        return Some(crate::runtime::builtin_vm::call_set_remove_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     // `list.sort` (E2c): intercepted by GcRef identity so a
     // non-`None` key runs through the VM's real call hook (see
     // `call_list_sort_ctx`); a `None` key delegates to the

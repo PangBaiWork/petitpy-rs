@@ -207,6 +207,39 @@ pub struct VmState {
     /// to materialise a `__del__` raise for the protected print,
     /// which the ctx-only `gc_collect_builtin` cannot do.
     pub gc_collect_builtin: Value,
+    /// The `dict.get` / `dict.pop` / `dict.setdefault` method
+    /// builtins (G3/H3): the three `FunBuiltin`s from the dict
+    /// type dict. Intercepted by GcRef identity in
+    /// `call_function_ctx` (see `call_dict_get_ctx` /
+    /// `call_dict_pop_ctx` / `call_dict_setdefault_ctx` in
+    /// `builtin_vm.rs`) — the `dict_get_helper` core is
+    /// ctx-only and its lookup cannot run a FunBc `__eq__`,
+    /// so `d.get(A())` on an instance key needs the VM's real
+    /// call hook (the H2 gap one level up, in the method slots).
+    pub dict_get_builtin: Value,
+    pub dict_pop_builtin: Value,
+    pub dict_setdefault_builtin: Value,
+    /// The `list.extend` method builtin (G3/H6): the
+    /// `FunBuiltin` from the list type dict. Intercepted by
+    /// GcRef identity in `call_function_ctx` (see
+    /// `call_list_extend_ctx` in `builtin_vm.rs`) —
+    /// `list_extend` is ctx-only and its `collect_iterable`
+    /// cannot resume a generator, so `l.extend(gen())`
+    /// needs the VM's real call hook (the E2i array.extend
+    /// shape).
+    pub list_extend_builtin: Value,
+    /// The `set.add` / `set.discard` / `set.remove` method
+    /// builtins (G3/H5): the three `FunBuiltin`s from the set
+    /// type dict. Intercepted by GcRef identity in
+    /// `call_function_ctx` (see `call_set_add_ctx` /
+    /// `call_set_discard_ctx` / `call_set_remove_ctx` in
+    /// `builtin_vm.rs`) — the `set_add` / `set_discard` /
+    /// `set_remove` cores are ctx-only and their lookup
+    /// cannot run a FunBc `__eq__`, so `s.add(A())` on a set
+    /// holding an equal A() needs the VM's real call hook.
+    pub set_add_builtin: Value,
+    pub set_discard_builtin: Value,
+    pub set_remove_builtin: Value,
     pub min_builtin: Value,
     pub max_builtin: Value,
     pub getattr_builtin: Value,
@@ -501,6 +534,13 @@ impl Vm {
                 str_format_builtin: Value::None,
                 format_builtin: Value::None,
                 gc_collect_builtin: Value::None,
+                dict_get_builtin: Value::None,
+                dict_pop_builtin: Value::None,
+                dict_setdefault_builtin: Value::None,
+                list_extend_builtin: Value::None,
+                set_add_builtin: Value::None,
+                set_discard_builtin: Value::None,
+                set_remove_builtin: Value::None,
                 min_builtin: Value::None,
                 max_builtin: Value::None,
                 getattr_builtin: Value::None,

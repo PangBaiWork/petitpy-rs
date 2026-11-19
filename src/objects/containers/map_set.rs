@@ -9,9 +9,10 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::obj::BuiltinTypes;
-use crate::objects::obj_ops::obj_equal;
+use crate::objects::obj_ops::probe_equal;
+use crate::objects::slots::CallHook;
 use crate::objects::value::Value;
-use crate::objects::containers::map::{get_hash_alloc_geq, hash_of, LookupKind, MapError};
+use crate::objects::containers::map::{get_hash_alloc_geq, hash_of_hook, LookupKind, MapError};
 
 // ── `mp_set_*` (set underlying hash table) ──────────────────────────
 
@@ -92,12 +93,16 @@ impl MpSet {
 /// set, obj.zig:470), so a replayed element is never "found" — the
 /// replay inserts it. A set can hold two equal unhashable elements
 /// that way (both inserted while pending was set); the replay must
-/// keep both, which the guard gives.
-fn set_rehash(
+/// keep both, which the guard gives. G3/H5: the replay hashes
+/// through `hash_of_hook` and probes through
+/// `set_lookup_hashed_hook` when a hook is passed, so an instance
+/// element's FunBc `__hash__` / `__eq__` runs during the replay.
+fn set_rehash_inner(
     ctx: &mut CallCtx,
     types: &BuiltinTypes,
     set: &mut MpSet,
     eq_blocked: bool,
+    mut hook: Option<CallHook<'_, '_>>,
 ) -> Result<(), MapError> {
     let old_table = std::mem::take(&mut set.table);
     let old_alloc = set.alloc;
@@ -106,8 +111,17 @@ fn set_rehash(
     set.table = vec![SetSlot::Empty; set.alloc];
     for slot in old_table.into_iter().take(old_alloc) {
         if let SetSlot::Live(k) = slot {
-            let hash = hash_of(ctx, types, k).unwrap_or(0);
-            let _ = set_lookup_hashed(ctx, types, set, k, LookupKind::Add, hash, eq_blocked)?;
+            let hash = hash_of_hook(ctx, types, k, hook.as_deref_mut()).unwrap_or(0);
+            let _ = set_lookup_hashed_hook(
+                ctx,
+                types,
+                set,
+                k,
+                LookupKind::Add,
+                hash,
+                eq_blocked,
+                hook.as_deref_mut(),
+            )?;
         }
     }
     Ok(())
@@ -141,12 +155,41 @@ pub fn set_lookup(
     index: Value,
     lookup_kind: LookupKind,
 ) -> Result<Option<Value>, MapError> {
+    set_lookup_inner(ctx, types, set, index, lookup_kind, None)
+}
+
+/// `mp_set_lookup` with a VM hook (G3/H5): the hash goes
+/// through `hash_of_hook` and the probe through
+/// `set_lookup_hashed_hook`, so an instance element's FunBc
+/// `__hash__` / `__eq__` runs (`{A()}` then `A() in s`).
+fn set_lookup_inner(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    set: &mut MpSet,
+    index: Value,
+    lookup_kind: LookupKind,
+    mut hook: Option<CallHook<'_, '_>>,
+) -> Result<Option<Value>, MapError> {
     // The hash is computed once, before any mutation (it can raise).
     // NOTE: the Zig hashes here with `mp_unary_op` directly (no qstr
     // fast path in `mp_set_lookup`) — `hash_of` applies the same
     // `qstr_hash` for qstrs, so the values agree.
-    let hash = hash_of(ctx, types, index)?;
-    set_lookup_hashed(ctx, types, set, index, lookup_kind, hash, false)
+    let hash = hash_of_hook(ctx, types, index, hook.as_deref_mut())?;
+    set_lookup_hashed_hook(ctx, types, set, index, lookup_kind, hash, false, hook)
+}
+
+/// `mp_set_lookup` with a VM hook (G3/H5) — the public entry
+/// for callers that already have a hash or a quirk to preserve
+/// (see `set_lookup_quirk_hook` in `objset.rs`).
+pub fn set_lookup_hook(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    set: &mut MpSet,
+    index: Value,
+    lookup_kind: LookupKind,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Option<Value>, MapError> {
+    set_lookup_inner(ctx, types, set, index, lookup_kind, hook)
 }
 
 /// `mp_set_lookup` with a precomputed `hash` (map.zig). The set
@@ -177,12 +220,44 @@ pub fn set_lookup_hashed(
     hash: usize,
     eq_blocked: bool,
 ) -> Result<Option<Value>, MapError> {
+    set_lookup_hashed_inner(ctx, types, set, index, lookup_kind, hash, eq_blocked, None)
+}
+
+/// `set_lookup_hashed` with a VM hook (G3/H5): the probe
+/// comparison runs through `probe_equal`, so an instance
+/// element's FunBc `__eq__` runs (a raising `__eq__` reads
+/// as not-equal there, per the vendor's `mp_obj_is_true`
+/// pending guard — see `probe_equal`).
+pub fn set_lookup_hashed_hook(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    set: &mut MpSet,
+    index: Value,
+    lookup_kind: LookupKind,
+    hash: usize,
+    eq_blocked: bool,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Option<Value>, MapError> {
+    set_lookup_hashed_inner(ctx, types, set, index, lookup_kind, hash, eq_blocked, hook)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_lookup_hashed_inner(
+    ctx: &mut CallCtx,
+    types: &BuiltinTypes,
+    set: &mut MpSet,
+    index: Value,
+    lookup_kind: LookupKind,
+    hash: usize,
+    eq_blocked: bool,
+    mut hook: Option<CallHook<'_, '_>>,
+) -> Result<Option<Value>, MapError> {
     let kind = lookup_kind as i32;
     let want_add = (kind & LookupKind::Add as i32) != 0;
     let want_remove = (kind & LookupKind::Remove as i32) != 0;
     if set.alloc == 0 {
         if want_add {
-            set_rehash(ctx, types, set, eq_blocked)?;
+            set_rehash_inner(ctx, types, set, eq_blocked, hook.as_deref_mut())?;
         } else {
             return Ok(None);
         }
@@ -209,15 +284,17 @@ pub fn set_lookup_hashed(
             }
             SetSlot::Live(elem) => {
                 // A pending raise makes `mp_obj_equal` return false
-                // (see `eq_blocked` above); a slot raise inside the
-                // comparison still propagates (`?`) — no type in the
-                // tree today has a raising `__eq__`, so the Zig's
-                // "treat as not-equal and keep probing" for that
-                // case is unobservable and not replicated.
+                // (see `eq_blocked` above). With a hook the probe
+                // is `probe_equal`: a FunBc `__eq__` runs, and a
+                // raise inside it reads as not-equal (the vendor's
+                // `mp_obj_is_true` pending guard, obj.zig:470) —
+                // the stashed raise is discarded inside
+                // `probe_equal`, never propagated.
                 let found = if eq_blocked {
                     false
                 } else {
-                    obj_equal(ctx, types, elem, index).map_err(MapError::from)?
+                    probe_equal(ctx, types, elem, index, hook.as_deref_mut())
+                        .map_err(MapError::from)?
                 };
                 if found {
                     if want_remove {
@@ -243,7 +320,7 @@ pub fn set_lookup_hashed(
                     return Ok(Some(index));
                 }
                 // Not enough room — rehash and restart.
-                set_rehash(ctx, types, set, eq_blocked)?;
+                set_rehash_inner(ctx, types, set, eq_blocked, hook.as_deref_mut())?;
                 pos = hash % set.alloc;
                 start_pos = pos;
                 avail_slot = None;

@@ -17,11 +17,11 @@ use super::map_set::MpSet;
 use super::objdict_methods::collect_iterable;
 use super::objset::{
     alloc_set, check_arity, clone_set, first, replace_set_table, set_binary_op, set_lookup_quirk,
-    set_ref_of, set_store, set_used, to_set, SetError,
+    set_lookup_quirk_hook, set_ref_of, set_store, set_store_hook, set_used, to_set, SetError,
 };
 use super::map::LookupKind;
 use crate::memory::gc::CallCtx;
-use crate::objects::slots::{BinaryOp, BuiltinFn};
+use crate::objects::slots::{BinaryOp, BuiltinFn, CallHook};
 use crate::objects::value::Value;
 use crate::pyerr::PyResult;
 
@@ -319,6 +319,24 @@ pub(crate) fn set_add(ctx: &mut CallCtx, self_v: Value, item: Value) -> Result<V
     }
 }
 
+/// `set_add` with a VM hook (G3/H5): the store's probe runs
+/// through `set_store_hook`, so an instance element's FunBc
+/// `__eq__` runs (`s.add(A())` on a set holding an equal A()
+/// does not gain a duplicate). The quirk is unchanged.
+pub(crate) fn set_add_hook(
+    ctx: &mut CallCtx,
+    self_v: Value,
+    item: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, SetError> {
+    let mut pending: Option<SetError> = None;
+    set_store_hook(ctx, self_v, item, &mut pending, hook)?;
+    match pending {
+        Some(e) => Err(e),
+        None => Ok(Value::None),
+    }
+}
+
 /// `setClearImpl` (objset.zig): drop the table (`alloc = 0`).
 pub(crate) fn set_clear(ctx: &mut CallCtx, self_v: Value) -> Result<Value, SetError> {
     let r = set_ref_of(ctx.arena, self_v);
@@ -344,6 +362,25 @@ pub(crate) fn set_discard(ctx: &mut CallCtx, self_v: Value, item: Value) -> Resu
     }
 }
 
+/// `set_discard` with a VM hook (G3/H5): the REMOVE lookup
+/// runs through `set_lookup_quirk_hook`, so an instance
+/// element's FunBc `__eq__` runs (`s.discard(A())` removes
+/// the equal element).
+pub(crate) fn set_discard_hook(
+    ctx: &mut CallCtx,
+    self_v: Value,
+    item: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, SetError> {
+    let r = set_ref_of(ctx.arena, self_v);
+    let mut pending: Option<SetError> = None;
+    let _ = set_lookup_quirk_hook(ctx, r, item, LookupKind::Remove, &mut pending, hook)?;
+    match pending {
+        Some(e) => Err(e),
+        None => Ok(Value::None),
+    }
+}
+
 /// `setPopImpl` (objset.zig): first live element in TABLE order;
 /// empty → `KeyError("pop from an empty set")`.
 pub(crate) fn set_pop(ctx: &mut CallCtx, self_v: Value) -> Result<Value, SetError> {
@@ -362,6 +399,26 @@ pub(crate) fn set_remove(ctx: &mut CallCtx, self_v: Value, item: Value) -> Resul
     let r = set_ref_of(ctx.arena, self_v);
     let mut pending: Option<SetError> = None;
     let found = set_lookup_quirk(ctx, r, item, LookupKind::Remove, &mut pending)?;
+    match found {
+        Some(_) => Ok(Value::None),
+        None => Err(SetError::KeyError(item)),
+    }
+}
+
+/// `set_remove` with a VM hook (G3/H5): the REMOVE lookup
+/// runs through `set_lookup_quirk_hook`, so an instance
+/// element's FunBc `__eq__` runs (`s.remove(A())` removes
+/// the equal element; a miss still raises `KeyError`, which
+/// overwrites a hash pending exactly as the slot does).
+pub(crate) fn set_remove_hook(
+    ctx: &mut CallCtx,
+    self_v: Value,
+    item: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, SetError> {
+    let r = set_ref_of(ctx.arena, self_v);
+    let mut pending: Option<SetError> = None;
+    let found = set_lookup_quirk_hook(ctx, r, item, LookupKind::Remove, &mut pending, hook)?;
     match found {
         Some(_) => Ok(Value::None),
         None => Err(SetError::KeyError(item)),

@@ -72,8 +72,8 @@
 //! citation. Element hashes wrapping-add onto it
 //! (`hash(frozenset({1,2}))` = 22810192+1+2 = 22810195, verified).
 
-use super::map::{hash_of, LookupKind, MapError};
-use super::map_set::{set_items, set_lookup_hashed, MpSet, SetSlot};
+use super::map::{hash_of, hash_of_hook, LookupKind, MapError};
+use super::map_set::{set_items, set_lookup_hashed, set_lookup_hashed_hook, MpSet, SetSlot};
 use super::objdict::ARG_NUM_TYPES_MISMATCH;
 use super::objdict::DictError;
 use super::objdict_methods::collect_iterable;
@@ -398,6 +398,50 @@ pub(crate) fn set_lookup_quirk(
     }
 }
 
+/// `set_lookup_quirk` with a VM hook (G3/H5): the hash goes
+/// through `hash_of_hook` and the probe through
+/// `set_lookup_hashed_hook`, so an instance element's FunBc
+/// `__hash__` / `__eq__` runs. The quirk is unchanged: a hash
+/// failure is recorded in `pending` (first wins) and the
+/// lookup proceeds at hash 0 with comparisons blocked; a
+/// probe `__eq__` raise reads as not-equal inside
+/// `probe_equal` and is discarded there (see its docs — the
+/// reference is state-dependent in that corner; the load /
+/// `in` / store cases differ, and the probe-level discard is
+/// the documented vendor guard).
+pub(crate) fn set_lookup_quirk_hook(
+    ctx: &mut CallCtx,
+    set_ref: GcRef,
+    item: Value,
+    kind: LookupKind,
+    pending: &mut Option<SetError>,
+    mut hook: Option<CallHook<'_, '_>>,
+) -> Result<Option<Value>, SetError> {
+    let hash = match hash_of_hook(ctx, ctx.types, item, hook.as_deref_mut()) {
+        Ok(h) => h,
+        Err(MapError::OutOfMemory) => return Err(SetError::OutOfMemory),
+        Err(e) => {
+            if pending.is_none() {
+                *pending = Some(SetError::from(e));
+            }
+            0
+        }
+    };
+    let eq_blocked = pending.is_some();
+    let found = with_set_table(ctx, set_ref, |ctx, table| {
+        set_lookup_hashed_hook(ctx, ctx.types, table, item, kind, hash, eq_blocked, hook.as_deref_mut())
+    });
+    match found {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if pending.is_none() {
+                *pending = Some(SetError::from(e));
+            }
+            Ok(None)
+        }
+    }
+}
+
 /// `mp_obj_set_store` (objset.zig:510): ADD lookup, quirk included.
 /// Only `OutOfMemory` escapes as `Err`; a hash failure is recorded
 /// in `pending` and the element is still inserted.
@@ -409,6 +453,22 @@ pub(crate) fn set_store(
 ) -> Result<(), SetError> {
     let r = set_ref_of(ctx.arena, set_v);
     let _ = set_lookup_quirk(ctx, r, item, LookupKind::Add, pending)?;
+    Ok(())
+}
+
+/// `set_store` with a VM hook (G3/H5): the store's probe runs
+/// through `set_lookup_quirk_hook`, so an instance element's
+/// FunBc `__eq__` runs (a set that already holds an equal
+/// instance does not gain a duplicate).
+pub(crate) fn set_store_hook(
+    ctx: &mut CallCtx,
+    set_v: Value,
+    item: Value,
+    pending: &mut Option<SetError>,
+    hook: Option<CallHook<'_, '_>>,
+) -> Result<(), SetError> {
+    let r = set_ref_of(ctx.arena, set_v);
+    let _ = set_lookup_quirk_hook(ctx, r, item, LookupKind::Add, pending, hook)?;
     Ok(())
 }
 
@@ -432,6 +492,27 @@ pub fn set_new(ctx: &mut CallCtx, type_: GcRef, items: &[Value]) -> Result<Value
     }
 }
 
+/// `set_new` with a VM hook (G3/H5): BUILD_SET builds through
+/// this (see `vm_dispatch_exec.rs`) so `{A()}` elements run
+/// their FunBc `__hash__` / `__eq__` during construction.
+pub fn set_new_hook(
+    ctx: &mut CallCtx,
+    type_: GcRef,
+    items: &[Value],
+    mut hook: Option<CallHook<'_, '_>>,
+) -> Result<Value, SetError> {
+    let set_v = alloc_set(ctx, type_, items.len());
+    let r = set_ref_of(ctx.arena, set_v);
+    let mut pending: Option<SetError> = None;
+    for &item in items {
+        set_lookup_quirk_hook(ctx, r, item, LookupKind::Add, &mut pending, hook.as_deref_mut())?;
+    }
+    match pending {
+        Some(e) => Err(e),
+        None => Ok(set_v),
+    }
+}
+
 /// `npy_set_make_new` (objset.zig:133-151), sig (0,1) — see the
 /// module docs for the pending model. `args` is positionals
 /// followed by interleaved kw pairs (the `dict_make_new` layout);
@@ -441,7 +522,7 @@ pub fn set_make_new(
     type_: GcRef,
     args: &[Value],
     n_kw: usize,
-    call: Option<CallHook<'_, '_>>,
+    mut call: Option<CallHook<'_, '_>>,
 ) -> Result<Value, SetError> {
     let Some(n_pos) = args.len().checked_sub(n_kw * 2) else {
         return Err(SetError::TypeError(ARG_NUM_TYPES_MISMATCH));
@@ -463,7 +544,7 @@ pub fn set_make_new(
     }
     // Any n_args != 0 takes the iterable path with args[0].
     let set_v = alloc_set(ctx, type_, 0);
-    match collect_iterable(ctx, args[0], call) {
+    match collect_iterable(ctx, args[0], call.as_deref_mut()) {
         Err(e) => {
             // `mp_getiter` has no pre-flight: its error overwrites
             // whatever pending was set (verified: `set(1,2)` →
@@ -473,7 +554,11 @@ pub fn set_make_new(
         Ok(items) => {
             if pending.is_none() {
                 for item in items {
-                    set_store(ctx, set_v, item, &mut pending)?;
+                    // G3/H5: the store's probe runs through the
+                    // same hook (`set_store_hook`), so an
+                    // instance element's FunBc `__eq__` runs and
+                    // `set([A(), A()])` holds one element.
+                    set_store_hook(ctx, set_v, item, &mut pending, call.as_deref_mut())?;
                     if pending.is_some() {
                         // Next `mp_iternext` returns 0 (pre-flight):
                         // no more items are pulled or stored.
@@ -551,6 +636,28 @@ pub fn set_unary_op(ctx: &mut CallCtx, op: UnaryOp, self_v: Value) -> PyResult<V
             Ok(Value::int(ctx.arena, Some(ctx.types.int), ctx.roots, hash))
         }
         _ => Err(PyError::PyRaise),
+    }
+}
+
+/// `set_binary_op`'s CONTAINS arm with a VM hook (G3/H5):
+/// the lookup runs through `set_lookup_quirk_hook`, so an
+/// instance element's FunBc `__hash__` / `__eq__` runs
+/// (`A() in s`). The pending drain is the same as the slot
+/// arm: a recorded hash failure raises (verified: `[2] in
+/// {[2]}` → `TypeError`).
+pub(crate) fn set_contains_hook(
+    ctx: &mut CallCtx,
+    set_v: Value,
+    item: Value,
+    hook: Option<CallHook<'_, '_>>,
+) -> PyResult<bool> {
+    let r = set_ref_of(ctx.arena, set_v);
+    let mut pending: Option<SetError> = None;
+    let found = set_lookup_quirk_hook(ctx, r, item, LookupKind::Lookup, &mut pending, hook)
+        .map_err(|e| ctx.record_typed(e))?;
+    match pending {
+        Some(e) => Err(ctx.record_typed(e)),
+        None => Ok(found.is_some()),
     }
 }
 

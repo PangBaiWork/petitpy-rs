@@ -269,9 +269,7 @@ pub fn os_close_ctx(
     // `open()` file's `close()`) fails EBADF there. Table removal
     // alone would return Ok, so run the real close first: on
     // failure raise the errno (the dead entry stays in the
-    // table); on success drop the entry (the drop re-closes the
-    // number, EBADF ignored). This covers registered and
-    // unregistered fds uniformly.
+    // table).
     #[cfg(feature = "unsafe-ffi")]
     {
         // FFI invariant: `close` takes any i32 fd number; the
@@ -279,7 +277,31 @@ pub fn os_close_ctx(
         if let Err(e) = crate::support::ffi::sys_close(fd) {
             return Err(errno_exc(ctx, state, e));
         }
-        state.os_fds.remove(&fd);
+        // The fd is already closed by `sys_close` above, so
+        // the table `File` must NOT be dropped: its Drop
+        // would close the number a SECOND time. The G6a
+        // comment assumed that re-close's EBADF was ignored
+        // — but the debug runtime aborts on it ("IO Safety
+        // violation: owned file descriptor already closed",
+        // rc=134; a bare `os.open` + `os.close` aborted
+        // before this fix), and in release the second close
+        // could land on a reused fd number. `into_raw_fd`
+        // consumes the `File` without closing (safe: it only
+        // transfers ownership of the number, which is
+        // already closed). H-select fix for a pre-existing
+        // G6a bug, found by the feature-build probes.
+        if let Some(f) = state.os_fds.remove(&fd) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::IntoRawFd;
+                let raw = f.into_raw_fd();
+                debug_assert_eq!(raw, fd);
+            }
+            #[cfg(not(unix))]
+            {
+                drop(f);
+            }
+        }
         // H-select: the monitor's read-ahead bytes belong to
         // a closed description — mark it stale (and clear the
         // buffer) so a later file reusing this fd number

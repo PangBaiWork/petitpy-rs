@@ -4,6 +4,8 @@
 > 2026-11-19 更新：G0（本表称 G1）已合并，主线 `f8ccf00`；
 > G2 已合并，主线 `d6c9e98`；G3 已合并，主线 `12e244e`；
 > G5 已合并，主线 `ab81588`，lib 1726（默认）/ 1734（feature 开）+ 1 ignored，
+> integration 200/202（默认）/ 202/202（feature 开），其余门全绿；
+> G4 已合并，主线 `7e0cb16`，lib 1735（默认）/ 1743（feature 开）+ 1 ignored，
 > integration 200/202（默认）/ 202/202（feature 开），其余门全绿）。
 > 来源：`README.md` "Known divergences" 一节、`scripts/*_result.txt` §4、
 > `docs/任务书.md` §3.5。探针用原版二进制
@@ -28,16 +30,16 @@
 
 | 编号 | 分歧 | 可修？ | 规模 | 依赖 | gate |
 | --- | --- | --- | --- | --- | --- |
-| H1 | `float()` 不走 `__float__` | 可修 | M | hook 缝合 | 无，需新探针 |
-| H2 | dict 查找时 FunBc `__eq__` 不跑 | 可修 | M | hook 缝合（map 探针循环） | 无，需新探针 |
-| H3 | `dict.get`/`.pop`/`.setdefault` 实例键 | 可修 | M | H2 同机制，方法拦截 | 无，需新探针 |
-| H4 | dict 子类实例键 | 可修 | M | H2 同机制，下一层 | 无，需新探针 |
-| H5 | set 字面量/存入实例键 | 可修 | M | hook 缝合（set_lookup） | 无，需新探针 |
-| H6 | `list.extend(gen)` | 可修 | S–M | hook 缝合（collect） | 无，需新探针 |
-| H7 | `str(KeyError(instance))` 打印 fallback | 可修 | M | 异常参数打印 hook | 无，需新探针 |
-| H8 | `type(iter(...))` 裸 TypeError | 可修 | M | 迭代器类型头 | 无，需新探针 |
-| H9 | `import_from` 的 FunBc 回退 | 可修 | M | hook 缝合（import） | 无，低价值 |
-| H10 | API `ppy_str`/`ppy_repr` 遇 raising `__str__` | 可修 | M | 打印 hook | 需扩展 api_test |
+| H1 | `float()` 不走 `__float__` | **已修（G4，7e0cb16）** | M | hook 缝合 | 4 新测试 + 探针全同 |
+| H2 | dict 查找时 FunBc `__eq__` 不跑 | **已修（G3，7995b3b）** | M | hook 缝合（map 探针循环） | 探针 12/12 |
+| H3 | `dict.get`/`.pop`/`.setdefault` 实例键 | **已修（G3，7995b3b）** | M | H2 同机制，方法拦截 | 探针 12/12 |
+| H4 | dict 子类实例键 | **已修（G3，7995b3b）** | M | H2 同机制，下一层 | 探针 12/12 |
+| H5 | set 字面量/存入实例键 | **已修（G3，7995b3b）** | M | hook 缝合（set_lookup） | 探针 12/12 |
+| H6 | `list.extend(gen)` | **已修（G3，7995b3b）** | S–M | hook 缝合（collect） | 探针 12/12 |
+| H7 | `str(KeyError(instance))` 打印 fallback | **已修（G4，7e0cb16）** | M | 异常参数打印 hook | 3 新测试 + 探针全同 |
+| H8 | `type(iter(...))` 裸 TypeError | **已修（G4，7e0cb16）** | M | 迭代器类型头 | 2 新测试 + 探针全同 |
+| H9 | `import_from` 的 FunBc 回退 | **已修（G4，7e0cb16，stretch）** | M | hook 缝合（import） | 探针全同 |
+| H10 | API `ppy_str`/`ppy_repr` 遇 raising `__str__` | **已修（G4，7e0cb16）** | M | 打印 hook | 新 api_h10_test.c 8/8 ×4 |
 | U1 | select ×2 | 已修（feature 开时 202/202；默认关仍 200/202） | — | unsafe-ffi（G0 lane，已合并 f8ccf00） | integration select ×2 |
 | U2 | `os.umask` 仍是 stub | 可修 | S | unsafe-ffi | integration（现有 stub 断言需改） |
 | U3 | `os.close` 只关 os.open 登记的 fd（含 stdio 复用） | 可修 | S | unsafe-ffi | 无，需新探针 |
@@ -85,58 +87,59 @@
 
 ## H — Hook/缝合族（VM hook 需穿过 ctx-only 路径）
 
-### H1 — `float()` 不走 `__float__`
+### H1 — `float()` 不走 `__float__`（G4 已修，7e0cb16）
 - 行为：`float(G(1.5))`（`G.__float__` 返回 9.9）→ REF `9.9`，Rust `TypeError: can't convert to float`。
 - 证据 **(a)**：`probe_all.py` `float_dunder`，双二进制实测。出处：F3 §4(b)、README。
-- 机制：FLOAT_MAYBE slot 路径走 stub seam，FunBc dunder 跑不起来，于是落到 native 值。修法：像 `hash` 那样对 `float` 内置做 GcRef-identity 拦截（`call_float_ctx`），与 F3 Fix 6 同形。
-- 规模 M。依赖：无（纯 Rust 缝合）；风险中——拦截点在 `builtin_vm.rs`，别动 `obj.rs` 的 slot 路径。gate：无覆盖，需新探针 + lib 测试。
+- 机制（已落地）：`call_float_ctx`（`builtin_str.rs`），在 `vm_call_intercept.rs` 按 GcRef 拦截 float 类型对象（str/bool 形态，不是 hash 的 FunBuiltin 分支——float 是类型对象）；dunder 经 `try_instance_unary_op`（`UnaryOp::FloatMaybe`）跑，结果须是 float（`mp_obj_get_float_maybe`，`obj.zig:662-690`）；非 float 返回/无 dunder/raising dunder 落到类型调用路径，报 `TypeError: can't convert to float`（raising 的 `__float__` 被吞成同一 TypeError，REF 探针确认）。4 新测试。
 
-### H2 — dict 查找时 FunBc `__eq__` 不跑
+### H2 — dict 查找时 FunBc `__eq__` 不跑（G3 已修，7995b3b）（G3 已修，7995b3b）
 - 行为：`d[A()] = "x"; d[A()]`（`A.__hash__` 返回 7，`__eq__` 按类型判等）→ REF `"x"`，Rust `KeyError`。
 - 证据 **(a)**：`probe_all.py` `dict_eq`。出处：F3 §4(c)。注意 HASH 一半已修（F3 Fix 4），只剩探针循环里的比较。
 - 机制：把 hook 穿过 `compact_lookup` / `compact_rehash` 的探针比较（目前是 ctx-only `obj_equal`）。rehash 回放也要同样处理，否则缩容/扩容后仍丢。
 - 规模 M。依赖：H3/H4/H5 同机制，建议同 lane。风险中高——`map.rs` 是全树共用的热路径，改完必须全门重跑。gate：无覆盖，需新探针。
 
-### H3 — `dict.get` / `.pop` / `.setdefault` 实例键
+### H3 — `dict.get` / `.pop` / `.setdefault` 实例键（G3 已修，7995b3b）
 - 行为：同 H2 的键，`d.get(A())` → REF `"x"`，Rust `TypeError: unsupported type for operator`；`d.pop(A(), 'miss')` 同理。
 - 证据 **(a)**：`probe_all.py` `dict_get`。出处：F3 §4(e)。
 - 机制：`dict_get_helper` 走 FunBuiltin 方法槽，无 hook；需方法拦截（与 H2 的 hash 路径汇合，或给这三个方法加 hook 版 helper）。
 - 规模 M。依赖 H2。gate：无覆盖，需新探针。
 
-### H4 — dict 子类实例键
+### H4 — dict 子类实例键（G3 已修，7995b3b）
 - 行为：`class D(dict)` 的实例用实例键下标时，`try_instance_subscr` SENTINEL → stub subscr → ctx-only dict slot，H2 的缺口再低一层。
 - 证据 **(b)**：F3 §4(f) 的源码对照；本次未单独探针（H2 的探针已证同族机制失效，dict 子类路径按代码走同一 ctx-only slot）。
 - 机制：随 H2 一起修（stub subscr 也要能拿到 hook）。规模 M（并入 H2，不单独立项计）。gate：无覆盖，需新探针。
 
-### H5 — set 字面量/存入实例键
+### H5 — set 字面量/存入实例键（G3 已修，7995b3b）
 - 行为：`{A()}` 后 `A() in s` → REF `True`，Rust `TypeError: unsupported type for operator`。
 - 证据 **(a)**：`probe_all.py` `set_inst`。出处：E2h §4（`set_lookup` → ctx-only `hash_of`）。
 - 机制：与 H2 同形，把 hook 穿过 `set_lookup` / set 存入路径。规模 M。依赖 H2（同 lane）。gate：无覆盖，需新探针。
 
-### H6 — `list.extend(gen)`
+### H6 — `list.extend(gen)`（G3 已修，7995b3b）
 - 行为：`l.extend(x for x in [1,2,3])` → REF `[1, 2, 3]`，Rust `TypeError: object not iterable`。
 - 证据 **(a)**：`probe_all.py` `list_extend_gen`。出处：E2i §4(c)（与已修的 `array.extend(gen)` 同一 hook 缺口）。
 - 机制：list 路径补 `collect_iterable` hook（E2b 修 generator collection 时留下的口子）。规模 S–M。依赖：无。gate：无 corpus 覆盖，需新探针。
 
-### H7 — `str(KeyError(instance))` 打印 fallback
+### H7 — `str(KeyError(instance))` 打印 fallback（G4 已修，7e0cb16）
 - 行为：`str(KeyError(Color.RED))` → REF `Color.RED`，Rust `<Color object at 30d>`。
 - 证据 **(a)**：`probe_all.py` `str_keyerr_inst`。出处：F3 §4(d)。
-- 机制：异常参数打印走 ctx-only fallback；需给 exception print slot 加 hook（与 F3 Fix 6 同族但独立机制）。`str(KeyError('k'))` / `(42)` 已一致，只修实例参数一路。规模 M。gate：无覆盖，需新探针。
+- 机制（已落地）：`exception_print_hook` / `print_exception_hook`（`builtin_str.rs`，镜像 `exception_print_inner` / `print_exception_chain`，参数经 hook 渲染），接在 str/repr/print 内置、未捕获 traceback 打印、`sys.print_exception`、`__repl_print__` 六处入口；异常子类自己的 `__str__`/`__repr__` 仍优先。3 新测试。
+- **分歧类（不复现）**：REF 对 raising `__str__` 的异常实例在 `str()`/`print()` 上 ABORT（rc=134，`mp_mirrors.zig:745` 空指针）；Rust 保留 fallback/传播。
 
-### H8 — `type(iter(...))` 裸 TypeError
+### H8 — `type(iter(...))` 裸 TypeError（G4 已修，7e0cb16）
 - 行为：`type(iter('ab'))` → REF `<class 'iterator'>`，Rust 裸 `TypeError`（空 message）。
 - 证据 **(a)**：`probe_all.py` `type_iter`。出处：E2b §4、E2f §4(b)。
-- 机制：GETITEM 迭代器等内部迭代器对象没有类型头；需给迭代器一个真正的类型对象（其余迭代器类型已有头）。规模 M。依赖：无；风险中——`Obj::Iter` 一族的类型头改动面广，先探针确认哪些迭代器类型受影响（list/tuple/gen/iter0 族）。gate：无覆盖（corpus iter0/1/2 不含该行），需新探针。
+- 机制（已落地）：新增 ROM 类型 `iterator`（`mp_type_polymorph_iter`）与 `range_it`（`mp_type_range_it`）；序列迭代器挂前者、range 挂后者（`new_iter` + 四处 getiter）。身份表 REF 探针钉住：list/tuple/str/set 同一对象；range/dict 各异但同名；`iter(d) is iter(d.keys())` 为 True（都走 `mp_type_dict_view_it`）。2 新测试。
 
-### H9 — `import_from` 的 FunBc 回退
+### H9 — `import_from` 的 FunBc 回退（G4 已修，7e0cb16，stretch）
 - 行为：from-import 属性缺失且模块是包时，带 FunBc `__import__` override 仍走 ctx-only `call_function_n_kw`；corpus 从未命中。
 - 证据 **(b)**：E2i §4(e) 源码对照（`runtime_import.rs`，`import_from_ctx` 传了真 override dict 但回退分支没用上）。
-- 机制：把 hook 穿过 `import_from`。规模 M。价值低（触发条件窄、无 gate），排最后。gate：无。
+- 机制（已落地）：`import_from_ctx`（`vm_rt_iter.rs`）在回退分支前探查属性+包，命中自定义 `__import__` 时经 `call_function_ctx` 调用。探针全同。
 
-### H10 — API `ppy_str` / `ppy_repr` 遇 raising `__str__`
+### H10 — API `ppy_str` / `ppy_repr` 遇 raising `__str__`（G4 已修，7e0cb16）
 - 行为：实例的 `__str__` / `__repr__` 会抛错时，`ppy_str` / `ppy_repr` 走 ctx-only 打印路径；E2d 的 hook 只活在 VM dispatch 里，不在 `obj_print_helper` 里。
 - 证据 **(b)**：F1 §4(i) 源码对照。未探针（需 C 侧用例）。
-- 机制：把 hook 线程进 `obj_print_helper`，或在 api 层拦截。规模 M。gate：需扩展 `tests/embed/api_test.c`（目前只打印 tuple/list/dict）。
+- 机制（已落地）：`printed_body`（`api.rs`）改走 `print_helper_hook`；新 `tests/embed/api_h10_test.c`（8 项，static/cdylib × 常规/stress 全过）。原版 `api_test.c` 未动（61/61）。
+- **分歧类（不复现）**：原版对 raising `__str__` ABORT（rc=134，`mp_call_function_1` 返回 NULL 后 `instance_print` 盲目打印空指针，`mp_mirrors.zig:745`——主 agent 用原版 `zig build lib` 构建 `libpetitpy.a` 直接探到）；Rust 保留 fallback + `PPY_OK`。
 
 ---
 

@@ -53,8 +53,8 @@ pub(crate) fn exit_status_for(vm: &mut Vm, exc: Value, to_stderr: bool) -> i32 {
     1
 }
 
-/// Build the traceback text for `exc` (`obj_print_exception`,
-/// the canonical printer — the same core `sys.print_exception`
+/// Build the traceback text for `exc` (`print_exception_hook`,
+/// the hook-aware printer — the same core `sys.print_exception`
 /// uses) and write it to stderr (flushing stdout first, as the
 /// Zig's `printExc` does — `print()` writes through libc's
 /// buffered stdout, and a traceback written straight to fd 1
@@ -63,13 +63,15 @@ pub(crate) fn exit_status_for(vm: &mut Vm, exc: Value, to_stderr: bool) -> i32 {
 pub(crate) fn print_traceback(vm: &mut Vm, exc: Value, to_stderr: bool) {
     use std::io::Write as _;
     let out = {
-        let (mut ctx, _state) = vm.split();
+        let (mut ctx, state) = vm.split();
         let mut out = String::new();
         let pool = ctx.pool;
-        let types = ctx.types;
-        crate::objects::obj_ops::obj_print_exception(
+        // G4/H7: the hook-aware printer — an uncaught
+        // exception's instance args run their dunders
+        // (`raise KeyError(A())` prints `KeyError: A-str`).
+        crate::runtime::builtin_str::print_exception_hook(
             &mut ctx,
-            types,
+            state,
             exc,
             &|id| pool.qstr_str(id as u16),
             &mut out,

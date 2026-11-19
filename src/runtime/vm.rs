@@ -240,6 +240,14 @@ pub struct VmState {
     pub set_add_builtin: Value,
     pub set_discard_builtin: Value,
     pub set_remove_builtin: Value,
+    /// The `__repl_print__` builtin (G4/H7): the plain
+    /// `FunBuiltin` from the builtins dict. Intercepted by
+    /// GcRef identity in `call_function_ctx` (see
+    /// `call_repl_print_ctx` in `builtin_str.rs`) — the REPL
+    /// echo renders its arg's `repr` through the hook, so an
+    /// exception arg's instance args run their dunders
+    /// (`KeyError(A())` echoes `KeyError(A-repr,)` on REF).
+    pub repl_print_builtin: Value,
     pub min_builtin: Value,
     pub max_builtin: Value,
     pub getattr_builtin: Value,
@@ -536,6 +544,7 @@ impl Vm {
                 str_format_builtin: Value::None,
                 format_builtin: Value::None,
                 gc_collect_builtin: Value::None,
+<<<<<<< HEAD
                 dict_get_builtin: Value::None,
                 dict_pop_builtin: Value::None,
                 dict_setdefault_builtin: Value::None,
@@ -543,6 +552,7 @@ impl Vm {
                 set_add_builtin: Value::None,
                 set_discard_builtin: Value::None,
                 set_remove_builtin: Value::None,
+                repl_print_builtin: Value::None,
                 min_builtin: Value::None,
                 max_builtin: Value::None,
                 getattr_builtin: Value::None,

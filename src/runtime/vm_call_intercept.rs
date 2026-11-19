@@ -185,6 +185,15 @@ pub(crate) fn intercept_builtin_call(
             ctx, state, n_args, n_kw, args,
         ));
     }
+    // `__repl_print__` (G4/H7): intercepted by GcRef identity
+    // so the REPL echo renders its arg's `repr` through the
+    // hook (see `call_repl_print_ctx`); an exception arg's
+    // instance args run their dunders.
+    if fun == state.repl_print_builtin {
+        return Some(crate::runtime::builtin_str::call_repl_print_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     // `gc.collect` (F6): intercepted by GcRef identity so the
     // finaliser drain runs with full VM state (see
     // `call_gc_collect_ctx`); the plain `gc_collect_builtin`

@@ -309,3 +309,81 @@ r_xs = repr(xs)
     assert!(fx.gb("i_g"));
     assert_eq!(fx.gs("r_xs"), "[0, 10]");
 }
+
+// ── G4/H7: exception args render through the hook ────────────────
+// Probed on the reference: `str(KeyError(A()))` is `A-str`,
+// `repr(KeyError(A()))` is `KeyError(A-repr,)`,
+// `str(KeyError(A(), "b"))` is `(A-repr, 'b')`,
+// `str(KeyError())` is empty, and a user exception subclass
+// renders its args the same way (`str(E(A()))` is `A-str`,
+// `repr(E(A()))` is `E(A-repr,)`). `print` and the uncaught
+// traceback take the same path (dual probes h7b/h7c/h7d).
+
+#[test]
+fn g4_str_repr_of_exception_with_instance_arg() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        r#"
+class A:
+    def __repr__(self):
+        return "A-repr"
+    def __str__(self):
+        return "A-str"
+s1 = str(KeyError(A()))
+r1 = repr(KeyError(A()))
+s2 = str(ValueError(A()))
+s3 = str(KeyError(A(), "b"))
+s4 = str(KeyError())
+class E(Exception):
+    pass
+s5 = str(E(A()))
+r5 = repr(E(A()))
+"#,
+    );
+    assert_eq!(fx.gs("s1"), "A-str");
+    assert_eq!(fx.gs("r1"), "KeyError(A-repr,)");
+    assert_eq!(fx.gs("s2"), "A-str");
+    assert_eq!(fx.gs("s3"), "(A-repr, 'b')");
+    assert_eq!(fx.gs("s4"), "");
+    assert_eq!(fx.gs("s5"), "A-str");
+    assert_eq!(fx.gs("r5"), "E(A-repr,)");
+}
+
+#[test]
+fn g4_exception_subclass_dunder_wins() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        r#"
+class E(Exception):
+    def __str__(self):
+        return "custom-str"
+    def __repr__(self):
+        return "custom-repr"
+s = str(E("x"))
+r = repr(E("x"))
+"#,
+    );
+    assert_eq!(fx.gs("s"), "custom-str");
+    assert_eq!(fx.gs("r"), "custom-repr");
+}
+
+#[test]
+fn g4_exception_subclass_raising_dunder_propagates_via_str() {
+    // NOTE: REF ABORTS here (rc=134, null-pointer panic at
+    // `mp_mirrors.zig:745` via `instance_print`, objtype.zig:1679
+    // — the fallback path calls `mp_obj_print_helper` with a
+    // null print fn), and likewise on `print(E("x"))`. Rust
+    // keeps the fallback / propagate behavior instead: the
+    // documented abort-vs-fallback divergence class (same as a
+    // raising `__repr__` inside a container — see
+    // `print_helper_hook`); do NOT reproduce the abort. The
+    // `str` / `repr` builtins propagate a dunder raise, so
+    // `str(E("x"))` raises the `ValueError` here.
+    let mut fx = Fx::new();
+    assert_eq!(
+        fx.raised_msg(
+            "class E(Exception):\n    def __str__(self):\n        raise ValueError(\"boom\")\nstr(E(\"x\"))\n"
+        ),
+        ("ValueError".to_string(), "boom".to_string())
+    );
+}

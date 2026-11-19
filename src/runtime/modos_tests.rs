@@ -398,6 +398,8 @@ fn os_unimplemented_stubs() {
 
 /// `run_err` on a fresh `Sx` (each stub test gets its own VM
 /// so a raised `NotImplementedError` cannot leak state).
+/// Default build only: both callers are cfg-gated to it (G6a).
+#[cfg(not(feature = "unsafe-ffi"))]
 fn fx_run_err_new(src: &str) -> (String, String) {
     let mut fx = Sx::new();
     fx.run_err(src)

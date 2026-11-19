@@ -264,14 +264,17 @@ os.rmdir(d)
     // `os_closed_stdio` (the real fd is never closed, so the
     // test process itself is unaffected). Under
     // `--features unsafe-ffi` (G6a) the real `close(2)` runs
-    // first — the test process's stdin fd IS really closed
-    // afterwards, which is fine: no unit test reads real
-    // stdin (`input()` is tested over Cursor/Vec in
-    // builtin_fns_tests.rs, and `sys.stdin.fileno()` is a
-    // VM-level constant).
-    let (name, value) = fx.run_err("import os\nos.close(0)\nos.read(0, 5)\n");
-    assert_eq!(name, "OSError");
-    assert_eq!(value, "9");
+    // first — really closing the test process's stdin fd would
+    // poison parallel tests (their `os.open` could then get
+    // fd 0 and hit the stdio arms), so the close(0) case is
+    // asserted in the subprocess test `g6a_close_stdin_ebadf`
+    // (tests/g6a_os.rs) instead, and skipped here.
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        let (name, value) = fx.run_err("import os\nos.close(0)\nos.read(0, 5)\n");
+        assert_eq!(name, "OSError");
+        assert_eq!(value, "9");
+    }
     let (name, value) = fx.run_err("import os\nos.read(999, 5)\n");
     assert_eq!(name, "OSError");
     assert_eq!(value, "9");

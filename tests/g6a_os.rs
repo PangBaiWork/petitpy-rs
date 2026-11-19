@@ -67,6 +67,24 @@ fn run_script(script: &Path, stdin_file: Option<&File>, stdout_file: Option<&Fil
     }
 }
 
+/// `os.close(0)` frees fd 0 for reuse, and a later read on it
+/// raises EBADF (G6a U3). Subprocess: closing fd 0 in-process
+/// would poison parallel lib tests (their `os.open` could
+/// then get fd 0 and hit the stdio arms).
+#[test]
+fn g6a_close_stdin_ebadf() {
+    let dir = scratch("close_stdin");
+    let script = write_script(
+        &dir,
+        "t.py",
+        "import os\nos.close(0)\ntry:\n    os.read(0, 5)\nexcept OSError as e:\n    print('read 0:', e.args[0])\nfd = os.open('/dev/null', os.O_RDONLY)\nprint('reused fd:', fd)\n",
+    );
+    let r = run_script(&script, None, None);
+    assert_eq!(r.code, 0, "stderr: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(r.stdout, b"read 0: 9\nreused fd: 0\n");
+    assert!(r.stderr.is_empty());
+}
+
 /// `os.close(1)` frees fd 1 for reuse (G6a U3): the next
 /// `os.open` gets fd 1. The result is reported through a file
 /// (stdout is /dev/null by then, by construction).

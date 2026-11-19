@@ -75,7 +75,7 @@ fn rt_error_to_exc(ctx: &mut CallCtx, state: &VmState, e: RtError) -> Value {
 /// chain, the exception, a newline). `ctx.pool` is a `Copy`
 /// shared ref, so it feeds the resolve closure without
 /// borrowing `ctx`.
-fn print_exc(ctx: &mut CallCtx, exc: Value, sink: &mut dyn std::fmt::Write) {
+fn print_exc(ctx: &mut CallCtx, exc: Value, sink: &mut dyn crate::objects::slots::ByteSink) {
     let pool = ctx.pool;
     let types = ctx.types;
     obj_print_exception(ctx, types, exc, &|id| pool.qstr_str(id as u16), sink);
@@ -94,7 +94,7 @@ fn protected_outcome(
     ctx: &mut CallCtx,
     state: &VmState,
     result: Result<Value, RtError>,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) -> Option<Value> {
     if ctx.has_pending_raise() {
         let exc = exc_from_pyerror(ctx, state, PyError::PyRaise);
@@ -119,7 +119,7 @@ pub(crate) fn call_function_1_protected_sink(
     state: &VmState,
     fun: Value,
     arg: Value,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) -> Option<Value> {
     let result = call_function_1(ctx, fun, arg);
     protected_outcome(ctx, state, result, sink)
@@ -134,7 +134,7 @@ pub(crate) fn call_function_2_protected_sink(
     fun: Value,
     arg1: Value,
     arg2: Value,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) -> Option<Value> {
     let result = call_function_2(ctx, fun, arg1, arg2);
     protected_outcome(ctx, state, result, sink)

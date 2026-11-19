@@ -39,7 +39,7 @@ use crate::objects::obj_ops::obj_print_helper;
 use crate::objects::objtype::lookup::{class_lookup, LookupHit, SlotKind};
 use crate::objects::objtype::seams::with_stub_seams;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::PrintKind;
+use crate::objects::slots::{ByteBuf, ByteSink, PrintKind};
 use crate::objects::value::{Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::vm::VmState;
@@ -157,7 +157,7 @@ pub fn print_helper_hook(
     state: &mut VmState,
     value: Value,
     kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     if is_instance(ctx.arena, value) {
         match render_instance(ctx, state, value, kind) {
@@ -400,12 +400,12 @@ fn render_print_arg(
     ctx: &mut CallCtx,
     state: &mut VmState,
     v: Value,
-    s: &mut String,
+    s: &mut ByteBuf,
 ) -> PyResult<()> {
     if is_instance(ctx.arena, v) {
         match render_instance(ctx, state, v, PrintKind::Str) {
             Ok(Some(text)) => {
-                s.push_str(&text);
+                s.write_bytes(text.as_bytes());
                 Ok(())
             }
             Ok(None) => {
@@ -542,9 +542,9 @@ fn print_to_instance_file(
         if i > 0 {
             write_file_piece(ctx, state, file, &sep_bytes)?;
         }
-        let mut s = String::new();
+        let mut s = ByteBuf::new();
         render_print_arg(ctx, state, *arg, &mut s)?;
-        write_file_piece(ctx, state, file, s.as_bytes())?;
+        write_file_piece(ctx, state, file, &s.0)?;
     }
     write_file_piece(ctx, state, file, &end_bytes)?;
     if flush {
@@ -611,7 +611,7 @@ pub(crate) fn call_print_ctx(
     // error drain below borrows `state` again.
     let result = {
         let mut render =
-            |ctx: &mut CallCtx, v: Value, s: &mut String| -> PyResult<()> {
+            |ctx: &mut CallCtx, v: Value, s: &mut ByteBuf| -> PyResult<()> {
                 render_print_arg(ctx, state, v, s)
             };
         crate::runtime::vm_builtins::print_impl_with(

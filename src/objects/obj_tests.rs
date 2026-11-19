@@ -302,7 +302,7 @@ pub(crate) fn print_marker_slot(
     _ctx: &mut CallCtx,
     _v: Value,
     _k: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let _ = sink.write_str("PRINTED");
 }

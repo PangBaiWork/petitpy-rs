@@ -281,7 +281,7 @@ pub fn fileio_print(
     ctx: &mut CallCtx,
     value: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let (fd, is_text) = match value {
         Value::Heap(r) => match ctx.arena.get(r) {
@@ -464,7 +464,7 @@ fn fileio_type_data_inner(dict: GcRef, is_text: bool, attr: Option<AttrFn>) -> T
             |ctx: &mut CallCtx,
              value: Value,
              kind: PrintKind,
-             sink: &mut dyn std::fmt::Write| {
+             sink: &mut dyn crate::objects::slots::ByteSink| {
                 fileio_print(ctx, value, kind, sink)
             },
         ),

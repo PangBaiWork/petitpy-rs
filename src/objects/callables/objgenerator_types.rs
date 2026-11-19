@@ -13,8 +13,6 @@
 //!   until C13 wires them — see the core file's module docs) and
 //!   `gen_instance_locals_dict` (`objgenerator.zig:386-441`).
 
-use std::fmt;
-
 use crate::memory::gc::CallCtx;
 use crate::objects::primitives::objint::fun_n_args;
 use crate::objects::slots::PrintKind;
@@ -34,7 +32,7 @@ pub fn gen_instance_print(
     ctx: &mut CallCtx,
     value: Value,
     _kind: PrintKind,
-    sink: &mut dyn fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let (fun, r) = match value {
         Value::Heap(r) => match ctx.arena.get(r) {

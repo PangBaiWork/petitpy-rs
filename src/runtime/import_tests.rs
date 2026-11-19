@@ -133,9 +133,9 @@ impl Ix {
 
     /// Point `sys.path` at these dirs (only).
     fn set_path(&mut self, dirs: &[PathBuf]) {
-        let paths: Vec<String> = dirs
+        let paths: Vec<Vec<u8>> = dirs
             .iter()
-            .map(|d| d.to_string_lossy().into_owned())
+            .map(|d| d.as_os_str().as_encoded_bytes().to_vec())
             .collect();
         self.vm.set_sys_path(paths);
     }

@@ -33,14 +33,17 @@ use petitpy_rs::runtime::vm::Vm;
 const USAGE: &str = "petitpy-vm — VM-only runtime (loads pre-compiled .mpy files).\n\nUsage:\n  petitpy-vm <script.mpy>   run a compiled bytecode file\n  petitpy-vm --version      print version\n  petitpy-vm --help         this message\n";
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().collect();
-    let arg1 = argv.get(1).map(String::as_str);
+    // G2 (P7a): `args_os`, not `args` — same panic as the
+    // main binary's on a non-UTF-8 `.mpy` path.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let arg1 = argv.get(1).map(|s| s.as_os_str());
+    let is = |s: &str| arg1 == Some(std::ffi::OsStr::new(s));
 
-    if argv.len() < 2 || matches!(arg1, Some("--help") | Some("-h")) {
+    if argv.len() < 2 || is("--help") || is("-h") {
         let _ = std::io::stderr().write_all(USAGE.as_bytes());
         return ExitCode::from(0);
     }
-    if matches!(arg1, Some("--version") | Some("-V")) {
+    if is("--version") || is("-V") {
         let _ = std::io::stdout()
             .write_all(format!("petitpy-vm {VERSION}\n").as_bytes());
         return ExitCode::from(0);

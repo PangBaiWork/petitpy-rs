@@ -25,8 +25,6 @@
 //! `getiter` stays `None` until C12 builds the polymorph-iter
 //! type the iterator constructors need.
 
-use std::fmt;
-
 use crate::memory::gc::CallCtx;
 use crate::objects::obj::{obj_get_int, obj_get_type, BuiltinTypes};
 use crate::objects::slots::PrintKind;
@@ -328,10 +326,11 @@ pub fn bytes_fromhex(
 /// Escapes: the quote char → `\"`, backslash → `\\`, printable
 /// (0x20–0x7E except 0x7F; str also 0x80–0xFF raw, bytes only
 /// <0x80) raw, `\n`/`\r`/`\t` escapes, else `\xHH` (lowercase).
-/// Non-ASCII runs of a str are flushed as whole UTF-8 runs (the
-/// sink is text — a lone byte >= 0x80 must never be written as a
-/// Latin-1 char).
-pub fn str_print_quoted(sink: &mut dyn fmt::Write, data: &[u8], is_bytes: bool) {
+/// Non-ASCII runs of a str are flushed as whole byte runs (the
+/// sink is byte-capable — G2 (P7a) — so a lone byte >= 0x80 is
+/// written raw, as on the reference; a `String`-backed sink
+/// still degrades it to U+FFFD via `ByteSink`'s default).
+pub fn str_print_quoted(sink: &mut dyn crate::objects::slots::ByteSink, data: &[u8], is_bytes: bool) {
     let quote = if data.contains(&b'\'') && !data.contains(&b'"') {
         b'"'
     } else {
@@ -339,9 +338,9 @@ pub fn str_print_quoted(sink: &mut dyn fmt::Write, data: &[u8], is_bytes: bool) 
     };
     let _ = sink.write_char(quote as char);
     let mut run: Vec<u8> = Vec::new();
-    let flush = |sink: &mut dyn fmt::Write, run: &mut Vec<u8>| {
+    let flush = |sink: &mut dyn crate::objects::slots::ByteSink, run: &mut Vec<u8>| {
         if !run.is_empty() {
-            let _ = sink.write_str(&String::from_utf8_lossy(run));
+            sink.write_bytes(run);
             run.clear();
         }
     };
@@ -376,11 +375,10 @@ pub fn str_print_quoted(sink: &mut dyn fmt::Write, data: &[u8], is_bytes: bool) 
 /// `str_print` (`objstr.zig:621-631`): the print slot shared by
 /// str and bytes. `PRINT_RAW`, or `PRINT_STR` on a str, prints the
 /// data as-is; otherwise (repr, or str-kind on bytes) bytes get
-/// the `b` prefix plus the quoted form. (The raw branch writes
-/// through the text sink — non-UTF-8 bytes degrade to U+FFFD there,
-/// a known limitation of C6's text-sink design; the quoted path
-/// is always ASCII-safe.)
-pub fn str_print(ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn fmt::Write) {
+/// the `b` prefix plus the quoted form. (G2 (P7a): the raw branch
+/// writes the bytes exactly through `ByteSink::write_bytes` —
+/// the old `from_utf8_lossy` degraded non-UTF-8 bytes to U+FFFD.)
+pub fn str_print(ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     // Pool-aware (C13b): `str_data` returns `None` for dynamic
     // qstr ids, so `str('x')` printed "" — the module's string
     // literals live only in the pool (`str_data_pool`'s doc).
@@ -388,7 +386,7 @@ pub fn str_print(ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dy
     let data = &data[..];
     let is_bytes = is_bytes_value(ctx.arena, value);
     if kind == PrintKind::Raw || (kind == PrintKind::Str && !is_bytes) {
-        let _ = sink.write_str(&String::from_utf8_lossy(data));
+        sink.write_bytes(data);
     } else {
         if is_bytes {
             let _ = sink.write_str("b");

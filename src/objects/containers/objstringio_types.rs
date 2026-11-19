@@ -137,7 +137,7 @@ fn stringio_type_data_inner(
             |ctx: &mut CallCtx,
              value: Value,
              kind: PrintKind,
-             sink: &mut dyn std::fmt::Write| {
+             sink: &mut dyn crate::objects::slots::ByteSink| {
                 stringio_print(ctx, value, kind, sink)
             },
         ),

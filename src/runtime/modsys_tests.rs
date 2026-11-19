@@ -368,9 +368,9 @@ impl Sx {
 #[test]
 fn set_sys_path_syncs_list_object() {
     let mut vm = Vm::new();
-    vm.set_sys_path(vec!["/tmp/abc".to_string(), "".to_string()]);
+    vm.set_sys_path(vec![b"/tmp/abc".to_vec(), b"".to_vec()]);
     let (ctx, state) = vm.split();
-    assert_eq!(state.sys_path, vec!["/tmp/abc".to_string(), "".to_string()]);
+    assert_eq!(state.sys_path, vec![b"/tmp/abc".to_vec(), b"".to_vec()]);
     let list_ref = state.sys_path_list.expect("D2 builds sys_path_list");
     let items = match ctx.arena.get(list_ref) {
         Obj::List(l) => l.items.clone(),

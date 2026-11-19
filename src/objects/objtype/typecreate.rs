@@ -437,7 +437,7 @@ pub fn super_print(
     ctx: &mut CallCtx,
     self_in: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let (t, obj) = match self_in {
         Value::Heap(r) => match ctx.arena.get(r) {
@@ -461,7 +461,7 @@ pub fn type_print(
     ctx: &mut CallCtx,
     self_in: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let Value::Heap(r) = self_in else {
         return;

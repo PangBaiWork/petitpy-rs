@@ -270,7 +270,7 @@ pub fn namedtuple_print(
     ctx: &mut CallCtx,
     v: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let (class, items) = match v {
         Value::Heap(r) => match ctx.arena.get(r) {

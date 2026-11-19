@@ -19,9 +19,10 @@
 //! Rust notes:
 //! * File I/O is `std::fs` (the Zig uses libc `fopen`/`stat`);
 //!   `PATH_MAX_LEN = 1024` is kept (`import_search.zig:115`).
-//! * `sys.path` is `VmState.sys_path` (`Vec<String>` — the `sys`
-//!   module that exposes it is D's `modsys`); `sys.modules` is
-//!   `VmState.modules` (C13) — no second table.
+//! * `sys.path` is `VmState.sys_path` (`Vec<Vec<u8>>` — raw
+//!   bytes since G2 (P7a); the `sys` module that exposes it is
+//!   D's `modsys`); `sys.modules` is `VmState.modules` (C13)
+//!   — no second table.
 //! * Names are interned by the CALLER once (the full dotted
 //!   name — `import_impl` / the opcode path); component names
 //!   are never interned inside this module: lookups compare
@@ -215,10 +216,13 @@ pub fn stat_component_in(root: &str, component: &str) -> Found {
 /// The entries come from the `sys.path` list OBJECT
 /// (`state.sys_path_list`, the `sys_mutable[0]` value — D2)
 /// when it exists, so Python `sys.path.append(x)` is visible
-/// to imports; otherwise from the `Vec<String>` (hand-built
+/// to imports; otherwise from the `Vec<Vec<u8>>` (hand-built
 /// `VmState` fixtures in the import tests). Non-str entries
 /// are skipped (the C reads the list through the str slot,
-/// which fails the same way).
+/// which fails the same way). Entries are lossy-converted
+/// for the filesystem lookup, exactly as the list-object arm
+/// already did — G2 (P7a) keeps the stored form byte-exact
+/// and converts only here, at the lookup boundary.
 pub fn search_top_level(ctx: &mut CallCtx, state: &VmState, component: &str) -> Found {
     let mut owned: Vec<String> = Vec::new();
     let entries: &[String] = match state.sys_path_list {
@@ -233,10 +237,18 @@ pub fn search_top_level(ctx: &mut CallCtx, state: &VmState, component: &str) -> 
                 }
                 &owned
             } else {
-                &state.sys_path
+                for p in &state.sys_path {
+                    owned.push(String::from_utf8_lossy(p).into_owned());
+                }
+                &owned
             }
         }
-        None => &state.sys_path,
+        None => {
+            for p in &state.sys_path {
+                owned.push(String::from_utf8_lossy(p).into_owned());
+            }
+            &owned
+        }
     };
     for entry in entries {
         let found = stat_component_in(entry, component);

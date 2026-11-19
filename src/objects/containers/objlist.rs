@@ -608,7 +608,7 @@ pub fn list_print(
     ctx: &mut CallCtx,
     value: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let types = ctx.types;
     let items = list_items_vec(ctx, value);
@@ -651,7 +651,7 @@ pub fn list_type_data(dict: GcRef) -> TypeData {
         ),
         buffer: None,
         print: Some(
-            |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn std::fmt::Write| {
+            |ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink| {
                 list_print(ctx, value, kind, sink)
             },
         ),

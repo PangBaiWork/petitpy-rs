@@ -343,13 +343,13 @@ pub fn float_make_new(
     }
 }
 
-/// A `fmt::Write` → `PrintSink` bridge: the print slot receives
-/// `&mut dyn fmt::Write` (`obj_print_helper`), while
+/// A `ByteSink` → `PrintSink` bridge: the print slot receives
+/// `&mut dyn ByteSink` (`obj_print_helper`), while
 /// `mp_print_float` writes through a `Print` (`PrintSink`).
 /// Errors are ignored, as the original ignores `mp_printf`'s
 /// return. Float output is ASCII, so a lossy conversion cannot
 /// fire — `from_utf8` falling back to `""` is unreachable.
-struct WriteSink<'a>(&'a mut dyn std::fmt::Write);
+struct WriteSink<'a>(&'a mut dyn crate::objects::slots::ByteSink);
 
 impl PrintSink for WriteSink<'_> {
     fn emit(&mut self, bytes: &[u8]) -> Result<(), crate::objects::strings::objstr_a::StrError> {
@@ -367,7 +367,7 @@ pub fn float_print(
     ctx: &mut CallCtx<'_>,
     v: Value,
     _kind: PrintKind,
-    w: &mut dyn std::fmt::Write,
+    w: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let val = match v {
         Value::Heap(r) => match ctx.arena.get(r) {

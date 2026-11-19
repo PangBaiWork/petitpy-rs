@@ -273,10 +273,11 @@ pub fn build_sys_module(
     // `sys.path` list object (`sys_mutable[0]`): built from
     // the VM's `sys_path` — Python `sys.path.append(x)`
     // mutates THIS object, and the import search reads it.
+    // G2 (P7a): entries are raw bytes.
     let path_items: Vec<Value> = state
         .sys_path
         .iter()
-        .map(|p| new_str(ctx, types, p.as_bytes()))
+        .map(|p| new_str(ctx, types, p))
         .collect();
     let path_list = new_list(ctx, types.list, &path_items);
     state.sys_path_list = Some(path_list);

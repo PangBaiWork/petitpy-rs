@@ -4,7 +4,7 @@
 
 use crate::memory::gc::CallCtx;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::PrintKind;
+use crate::objects::slots::{ByteBuf, PrintKind};
 use crate::objects::strings::mpprint::{Print, MP_PLAT_PRINT, MP_PLAT_PRINT_SINK_AWARE};
 use crate::objects::strings::objstr_format::str_format;
 use crate::objects::value::{Obj, Value};
@@ -38,7 +38,7 @@ fn print_impl(
     kwargs: &[(u32, Value)],
 ) -> PyResult<Value> {
     use crate::objects::obj_ops::obj_print_helper;
-    print_impl_with(ctx, args, kwargs, &mut |ctx: &mut CallCtx, v: Value, s: &mut String| {
+    print_impl_with(ctx, args, kwargs, &mut |ctx: &mut CallCtx, v: Value, s: &mut ByteBuf| {
         obj_print_helper(ctx, ctx.types, v, PrintKind::Str, s);
         Ok(())
     })
@@ -54,6 +54,8 @@ fn print_impl(
 /// The `print` kwargs, parsed (E2i — shared by
 /// `print_impl_with` and the VM-intercepted
 /// `print(file=<user instance>)` path in `builtin_str.rs`).
+/// G2 (P7a): the render target is a `ByteBuf`, not a `String` —
+/// a rendered non-UTF-8 `str` must reach fd 1 byte-exact.
 pub(crate) struct PrintKwargs {
     pub(crate) sep: Option<Value>,
     pub(crate) end: Option<Value>,
@@ -139,7 +141,7 @@ pub(crate) fn print_impl_with(
     ctx: &mut CallCtx,
     args: &[Value],
     kwargs: &[(u32, Value)],
-    render: &mut dyn FnMut(&mut CallCtx, Value, &mut String) -> PyResult<()>,
+    render: &mut dyn FnMut(&mut CallCtx, Value, &mut ByteBuf) -> PyResult<()>,
 ) -> PyResult<Value> {
     use crate::objects::obj::obj_is_true;
     use crate::runtime::runtime_call::call_method_n_kw;
@@ -169,9 +171,9 @@ pub(crate) fn print_impl_with(
                 if i > 0 {
                     stream_write_adaptor(ctx, f, &sep_bytes)?;
                 }
-                let mut s = String::new();
+                let mut s = ByteBuf::new();
                 render(ctx, *arg, &mut s)?;
-                stream_write_adaptor(ctx, f, s.as_bytes())?;
+                stream_write_adaptor(ctx, f, &s.0)?;
             }
             stream_write_adaptor(ctx, f, &end_bytes)?;
             if flush {
@@ -191,9 +193,9 @@ pub(crate) fn print_impl_with(
                 if i > 0 {
                     let _ = mp_print_str(&mut print, &sep_bytes);
                 }
-                let mut s = String::new();
+                let mut s = ByteBuf::new();
                 render(ctx, *arg, &mut s)?;
-                let _ = mp_print_str(&mut print, s.as_bytes());
+                let _ = mp_print_str(&mut print, &s.0);
             }
             let _ = mp_print_str(&mut print, &end_bytes);
             Ok(Value::None)
@@ -257,11 +259,11 @@ pub fn repl_print_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> 
     };
     if *arg != Value::None {
         let types = ctx.types;
-        let mut s = String::new();
+        let mut s = ByteBuf::new();
         obj_print_helper(ctx, types, *arg, PrintKind::Repr, &mut s);
         let mut sink = MP_PLAT_PRINT;
         let mut print = Print::new(&mut sink);
-        let _ = mp_print_str(&mut print, s.as_bytes());
+        let _ = mp_print_str(&mut print, &s.0);
         let _ = mp_print_str(&mut print, b"\n");
     }
     Ok(Value::None)
@@ -297,7 +299,7 @@ pub(crate) fn ellipsis_print(
     ctx: &mut CallCtx,
     v: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let is_not_implemented = match v {
         Value::Heap(r) => matches!(ctx.arena.get(r), Obj::Instance(_)),
@@ -321,7 +323,7 @@ pub(crate) fn none_print(
     _ctx: &mut CallCtx,
     _v: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let _ = sink.write_str("None");
 }

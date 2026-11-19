@@ -69,7 +69,7 @@ pub fn attrtuple_print_helper(
     ctx: &mut CallCtx,
     fields: &[u32],
     items: &[Value],
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let _ = sink.write_str("(");
     for (i, item) in items.iter().enumerate() {
@@ -90,7 +90,7 @@ pub fn attrtuple_print(
     ctx: &mut CallCtx,
     v: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let data = attrtuple_data_of(ctx.arena, v);
     attrtuple_print_helper(ctx, &data.fields, &data.items, sink);

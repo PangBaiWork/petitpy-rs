@@ -424,7 +424,7 @@ pub fn dict_view_print(
     ctx: &mut CallCtx,
     self_v: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let Some((dict, kind)) = as_dict_view(ctx.arena, self_v) else {
         return;

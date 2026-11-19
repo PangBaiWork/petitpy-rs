@@ -266,9 +266,10 @@ pub struct VmState {
     /// empty qstr (the current directory); the entry point
     /// overwrites `[0]` with the script dir and appends
     /// `PETITPY_LIB` (`main.zig:244-248`, Phase E). Added by
-    /// C15b. A `Vec<String>` (not a Python list object — the
-    /// `sys` module that exposes it is D's `modsys`).
-    pub sys_path: Vec<String>,
+    /// C15b. A `Vec<Vec<u8>>` (not a Python list object — the
+    /// `sys` module that exposes it is D's `modsys`); raw
+    /// bytes, G2 (P7a) — entries may be non-UTF-8.
+    pub sys_path: Vec<Vec<u8>>,
     /// The `sys.path` list OBJECT (`sys_mutable[0]`'s value,
     /// `modsys.zig`): the same list `sys_path` is built from.
     /// Python `sys.path.append(x)` mutates this object, and
@@ -517,7 +518,7 @@ impl Vm {
                 not_implemented: Value::None,
                 pending_sched: None,
                 compiler_linked: true,
-                sys_path: vec![String::new()],
+                sys_path: vec![Vec::new()],
                 sys_path_list: None,
                 sys_modules_dict: None,
                 sys_argv_list: None,

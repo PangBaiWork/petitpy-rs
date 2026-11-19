@@ -456,7 +456,7 @@ pub fn stringio_print(
     ctx: &mut CallCtx,
     value: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let is_text = stringio_is_text(ctx, value);
     let slot = match value {

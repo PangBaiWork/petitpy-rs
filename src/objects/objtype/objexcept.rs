@@ -475,7 +475,7 @@ fn is_oserror_type(ctx: &CallCtx, exc: Value) -> bool {
 /// already printed the subclass name — the inner print then
 /// omits its own type name. The print slot itself always calls
 /// with `false`.
-pub fn exception_print(ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+pub fn exception_print(ctx: &mut CallCtx, value: Value, kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     exception_print_inner(ctx, value, kind, false, sink);
 }
 
@@ -486,7 +486,7 @@ pub fn exception_print_inner(
     value: Value,
     kind: PrintKind,
     is_subclass: bool,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     let (args, type_name): (Vec<Value>, String) = match value {
         Value::Heap(r) => match ctx.arena.get(r) {

@@ -372,7 +372,7 @@ pub fn slice_unary_op(_ctx: &mut CallCtx, _op: UnaryOp, _self_v: Value) -> PyRes
 /// `slice_print` (objslice.zig:56-66): `slice(` + repr(start) +
 /// `, ` + repr(stop) + `, ` + repr(step) + `)`. A missing bound
 /// prints as `None` (the Zig prints the stored `OBJ_NONE`).
-pub fn slice_print(ctx: &mut CallCtx, v: Value, _kind: PrintKind, sink: &mut dyn std::fmt::Write) {
+pub fn slice_print(ctx: &mut CallCtx, v: Value, _kind: PrintKind, sink: &mut dyn crate::objects::slots::ByteSink) {
     let data = slice_data_of(ctx.arena, v);
     let _ = sink.write_str("slice(");
     print_bound(ctx, data.start, sink);
@@ -384,7 +384,7 @@ pub fn slice_print(ctx: &mut CallCtx, v: Value, _kind: PrintKind, sink: &mut dyn
 }
 
 /// One bound of a slice print: missing → `None`, else PRINT_REPR.
-fn print_bound(ctx: &mut CallCtx, b: Option<Value>, sink: &mut dyn std::fmt::Write) {
+fn print_bound(ctx: &mut CallCtx, b: Option<Value>, sink: &mut dyn crate::objects::slots::ByteSink) {
     match b {
         None => {
             let _ = sink.write_str("None");

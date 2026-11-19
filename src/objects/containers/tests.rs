@@ -45,7 +45,7 @@ pub(crate) fn str_print_double(
     ctx: &mut CallCtx,
     v: Value,
     _kind: PrintKind,
-    sink: &mut dyn std::fmt::Write,
+    sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
     if let Value::Heap(r) = v {
         if let Obj::Str(s) = ctx.arena.get(r) {

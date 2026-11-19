@@ -17,6 +17,7 @@
 //! aarch64-Linux) — they are NOT part of this port (C18 owns
 //! `va_ops.c`).
 
+use crate::objects::slots::ByteSink;
 use crate::objects::strings::objstr_a::StrError;
 use std::fmt;
 
@@ -311,5 +312,14 @@ pub struct VstrSink<'a>(pub &'a mut Vstr);
 impl fmt::Write for VstrSink<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.0.add_strn(s.as_bytes()).map_err(|_| fmt::Error)
+    }
+}
+
+// G2 (P7a): a `Vstr` is byte-based, so `write_bytes` stores the
+// bytes exactly (a non-UTF-8 `str` formatted with `{!s}`/`{!r}`
+// keeps its raw bytes, as on the reference).
+impl ByteSink for VstrSink<'_> {
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        let _ = self.0.add_strn(bytes);
     }
 }

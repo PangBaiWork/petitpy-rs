@@ -222,7 +222,6 @@ fn exception_print_payload_hook(
     is_subclass: bool,
     sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
-    use std::fmt::Write as _;
     let (args, type_name): (Vec<Value>, String) = match value {
         Value::Heap(r) => match ctx.arena.get(r) {
             Obj::Exception(e) => {
@@ -358,7 +357,6 @@ fn print_exception_chain_hook<'r>(
     depth: u8,
     sink: &mut dyn crate::objects::slots::ByteSink,
 ) {
-    use std::fmt::Write as _;
     if depth > 0 && is_exception_instance(ctx.arena, exc) {
         if let Some(cause) = exception_cause(ctx.arena, exc) {
             if !cause.is_none() {

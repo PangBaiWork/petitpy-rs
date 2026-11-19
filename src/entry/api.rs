@@ -76,7 +76,7 @@ use crate::objects::containers::objtuple::new_tuple;
 use crate::objects::obj::{
     is_bytes, is_str, obj_get_float_maybe, obj_get_int_maybe, obj_get_type, obj_is_true, obj_len,
 };
-use crate::objects::obj_ops::{obj_print_exception, obj_print_helper, obj_subscr, obj_type_name};
+use crate::objects::obj_ops::{obj_print_exception, obj_subscr, obj_type_name};
 use crate::objects::objtype::objexcept::new_exception_msg;
 use crate::objects::objtype::objmodule::new_module;
 use crate::objects::objtype::subclass::is_subclass_fast;
@@ -910,7 +910,16 @@ fn printed_body(interp: &mut Interp, h: PpyHandle, kind: PrintKind) -> Result<Va
     let o = obj_or_invalid(&mut ctx, state, o)?;
     let types = ctx.types;
     let mut out = String::new();
-    obj_print_helper(&mut ctx, types, o, kind, &mut out);
+    // G4/H10: the hook-aware printer — a FunBc `__str__` /
+    // `__repr__` runs through the VM's real call hook (the
+    // ctx-only `obj_print_helper` falls back to `<A object at
+    // …>`), and exception args render their dunders too. A
+    // raising dunder falls back to `<B object at …>` with
+    // PPY_OK (slot semantics); the ORIGINAL aborts (rc=134,
+    // null-pointer panic at `mp_mirrors.zig:745` — the
+    // documented abort-vs-fallback divergence, do not
+    // reproduce).
+    crate::runtime::builtin_str::print_helper_hook(&mut ctx, state, o, kind, &mut out);
     Ok(new_str(&mut ctx, types, out.as_bytes()))
 }
 

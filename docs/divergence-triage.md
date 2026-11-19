@@ -92,7 +92,7 @@
 - 证据 **(a)**：`probe_all.py` `float_dunder`，双二进制实测。出处：F3 §4(b)、README。
 - 机制（已落地）：`call_float_ctx`（`builtin_str.rs`），在 `vm_call_intercept.rs` 按 GcRef 拦截 float 类型对象（str/bool 形态，不是 hash 的 FunBuiltin 分支——float 是类型对象）；dunder 经 `try_instance_unary_op`（`UnaryOp::FloatMaybe`）跑，结果须是 float（`mp_obj_get_float_maybe`，`obj.zig:662-690`）；非 float 返回/无 dunder/raising dunder 落到类型调用路径，报 `TypeError: can't convert to float`（raising 的 `__float__` 被吞成同一 TypeError，REF 探针确认）。4 新测试。
 
-### H2 — dict 查找时 FunBc `__eq__` 不跑（G3 已修，7995b3b）（G3 已修，7995b3b）
+### H2 — dict 查找时 FunBc `__eq__` 不跑（G3 已修，7995b3b）
 - 行为：`d[A()] = "x"; d[A()]`（`A.__hash__` 返回 7，`__eq__` 按类型判等）→ REF `"x"`，Rust `KeyError`。
 - 证据 **(a)**：`probe_all.py` `dict_eq`。出处：F3 §4(c)。注意 HASH 一半已修（F3 Fix 4），只剩探针循环里的比较。
 - 机制：把 hook 穿过 `compact_lookup` / `compact_rehash` 的探针比较（目前是 ctx-only `obj_equal`）。rehash 回放也要同样处理，否则缩容/扩容后仍丢。

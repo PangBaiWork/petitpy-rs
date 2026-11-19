@@ -1,7 +1,10 @@
 # petitpy-rs 已知分歧 Triage 表
 
 > 只读梳理（2026-11-19，主线 master `8f9aafa`，F2 已合并；
-> 2026-11-19 更新：G0（本表称 G1）已合并，主线 `f8ccf00`）。
+> 2026-11-19 更新：G0（本表称 G1）已合并，主线 `f8ccf00`；
+> G2 已合并，主线 `d6c9e98`；G3 已合并，主线 `12e244e`；
+> G5 已合并，主线 `ab81588`，lib 1726（默认）/ 1734（feature 开）+ 1 ignored，
+> integration 200/202（默认）/ 202/202（feature 开），其余门全绿）。
 > 来源：`README.md` "Known divergences" 一节、`scripts/*_result.txt` §4、
 > `docs/任务书.md` §3.5。探针用原版二进制
 > `~/workspace/petitpy-orig/zig-out/bin/petitpy`（REF）和
@@ -46,19 +49,19 @@
 | U9 | stdio 上 `os.fsync`/`os.lseek`（重定向到常规文件时） | 可修 | S | unsafe-ffi | 无，需新探针 |
 | P1 | `super()` 构造错误丢 message | 可修 | S | 无（one-line） | 无，需新探针 |
 | P2 | CLI 路径 `NPY_GC_STRESS` 失效（`Vm::new` 不调 `gc_init`） | 可修 | S | 无（one-line） | 无，需环境变量探针 |
-| P3 | 文件写无缓冲（`/dev/full` 写时即报） | 可修 | M | 无，纯 std | 无，需新探针 |
-| P4 | `import os.path` 报错名是 `os.path` 而非 `os_path` | 可修 | S–M | import loader | 无，需新探针 |
-| P5 | 类型对象属性查找缺口（`C.x`、`int.from_bytes`） | 可修 | M | 类型 attr slot + loader 切换 | 2 个 ignored 测试 |
-| P6 | str_data 动态 qstr 残留站点 | 待审计 | M | 先审计再定 | 部分已验证修复 |
+| P3 | 文件写无缓冲（`/dev/full` 写时即报） | **已修（G5，ab81588）** | M | 无，纯 std | 9 探针全同 |
+| P4 | `import os.path` 报错名是 `os.path` 而非 `os_path` | **已修（G5，ab81588）；机制纠正：PEP 562 `__getattr__`，不是名字拼接** | S–M | import loader | 探针全同 |
+| P5 | 类型对象属性查找缺口（`C.x`、`int.from_bytes`） | **已修（G5，ab81588）；机制早已落地，0 代码改动，2 ignored 测试去 ignore** | M | 类型 attr slot + loader 切换 | 2 个 ignored 测试 → 0 |
+| P6 | str_data 动态 qstr 残留站点 | **已审计+修（G5，ab81588）；1 真修：`type_name_qstr` 改 `from_strn`** | M | 先审计再定 | 57+42 探针全同 |
 | P7a | CLI 非 UTF-8 文件名直接 panic（rc=-6） | 可修 | S | 无，纯 std | 无，需新探针 |
 | P7b | API `ppy_exec` 非 UTF-8 文件名 lossy | 可修 | M | 编译器需走字节名 | 需扩展 api_test |
-| P8 | finaliser 回调走 std stderr，不走 SinkGuard | 可修 | M | F1 的 sink | 无，需 API 探针 |
-| P9 | stress 路径 finaliser 延迟 | 可修 | M | GC/VM 边界 | 无，低价值 |
+| P8 | finaliser 回调走 std stderr，不走 SinkGuard | **已修（G5，ab81588）；纠正：走 fd 1 经 sink，不是 fd 2** | M | F1 的 sink | 新 Rust 测试 `f6_raising_del_goes_to_sink_as_fd1` |
+| P9 | stress 路径 finaliser 延迟 | **不修（G5 评估，低价值）** | M | GC/VM 边界 | 无，低价值 |
 | P10 | host 函数 kwargs 被拒 | 不是分歧（原版同样拒） | — | 无 | G2 已验证，测试钉住 |
 | P11 | API 上用户实例 `__getitem__` 未测试 | 已验证，无需修 | — | 无 | G2 探针通 |
 | P12 | DUP_TOP_TWO 潜在 NULL bug | 已修（G2） | — | 无 | 编译器对 `a[i] += x` 发该指令 |
 | P13 | 直接调 `str_join` 短调用 panic | 已由 E2c 修掉 | — | 无 | G2 已验证，无需改动 |
-| P14 | 管道 stdout 时原版缓冲输出、Rust 直写 | 可修 | M 待定 | 输出缓冲机制待定位 | 无，需时间戳探针 |
+| P14 | 管道 stdout 时原版缓冲输出、Rust 直写 | **机制已定位（G5）；待修，后续 lane** | M | libc stdio FILE*（`file_io.zig:486`） | 时间戳探针已定位 |
 | N1 | 原版崩溃（rc=134）系列 | 不修 | — | — | — |
 | N2 | subprocess `input=123` 原版挂起 | 不修 | — | — | — |
 | N3 | identity-hash / 地址值 | 不修（设计如此） | — | — | — |
@@ -194,25 +197,28 @@
 - 证据 **(b)**：F1 §4(h) 源码对照（`src/memory/gc.rs:414-418` 读 env var，但无调用方）。
 - 机制：在 `Vm::new` 或 CLI 入口调一次 `gc_init()`。规模 S。注意：`Vm::new` 也被测试用——env 变量控制，默认行为不变；但要确认 `gc_init` 在测试进程里被反复调无副作用。gate：无，需 `NPY_GC_STRESS=10` 跑 CLI 探针。
 
-### P3 — 文件写无缓冲
+### P3 — 文件写无缓冲（G5 已修，ab81588）
 - 行为：写 `/dev/full` → REF 写时成功、close 时吞掉 flush 错（`write ok / close ok`），Rust 写时即 `OSError 28`。
 - 证据 **(a)**：`probe_all.py` `full_write`。出处：F6 §4(b)。
-- 机制：给文件对象加写缓冲，flush 在 close 时（close 吞错与 REF 一致）。规模 M。风险中——缓冲改动影响所有文件写路径，需全门重跑；`os.write` 直通路径不受影响。gate：无覆盖，需新探针。
+- 机制（已落地）：`FileHandle::Owned` 改 `Rc<RefCell<BufWriter::with_capacity(4096, file)>>`（4096 = glibc 默认）；`fileio_read` 先 flush 写缓冲；`BufWriter::seek` 先 flush。原版 `npyFileWrite`（`file_io.zig:160-176`）调 libc `fwrite`，close 丢弃 `fclose` 返回值（`:214-225`）。
+- 附带真 bug（G5 修）：SEEK ioctl 把新 offset 写进 `state.offset` 而非 `state.result`（`stream.rs:277` 读 `result`）——此前所有文件 `seek`/`tell` 都返回 0。9 探针全同；`os.write` 直通路径不受影响（`/dev/full` 写时 errno 28，双边一致）。
 
-### P4 — `import os.path` 报错名是 `os.path` 而非 `os_path`
+### P4 — `import os.path` 报错名是 `os.path` 而非 `os_path`（G5 已修，ab81588）
 - 行为：`import os.path` → REF `ModuleNotFoundError: No module named 'os_path'`，Rust `No module named 'os.path'; 'os' is not a package`。
-- 证据 **(a)**：`probe_all.py` `os_path`。出处：D2 §4（C14 `load_attr_maybe` 的 parent 分支不触发 `__getattr__`，异常类型一致，只差名字）。
-- 机制：在 import loader 的 parent 分支把名字按 Zig 的拼接规则处理（`os` + `path` → `os_path`）。规模 S–M。gate：无覆盖，需新探针。
+- 证据 **(a)**：`probe_all.py` `os_path`。出处：D2 §4。
+- **机制纠正（主 agent 2026-11-19 读 `modos.zig:200-220` 确认）**：不是名字拼接，是 PEP 562 模块 `__getattr__`——`py_os_getattr`（`modos.zig:208-215`）：`os.path` → `mp_import_name(os_path)`，失败直接传播；其他属性 → import `os_ext`，失败吞掉并清 pending。原 triage “parent 分支不触发 `__getattr__`”的说法是错的。修：`process_component` 改用 `load_method_maybe_ctx`（跑模块 `__getattr__` 的 VM loader），AttributeError 按 Zig `loadAttrMaybe`（`import_search.zig:92-98`）吞掉，其他 raise 传播。探针：有 `os_path.py` 时 `os.path.join('a','b')` → `ok a/b`；无时 `ModuleNotFoundError: No module named 'os_path'`；`import os.nonexistent` → "not a package"，双边一致。
 
-### P5 — 类型对象属性查找缺口（`C.x`、`int.from_bytes`）
+### P5 — 类型对象属性查找缺口（`C.x`、`int.from_bytes`）（G5 已修，ab81588；0 代码改动）
 - 行为：`C.x`（类属性查到类上）与 `int.from_bytes(...)` 端到端调用失败；是仅剩的 2 个 ignored lib 测试（`makenew_class_attr_on_class`、`int_from_bytes_e2e_after_classmethod_wrap`）。
-- 证据 **(b)**：D5 §4 + 两个 ignored 测试的注释（`load_method_maybe_ctx` 只查 `type` 的 dict，不查类型自己的 dict，也不走通用 `TypeData.attr` slot；原版走 `mp_obj_type_attr`）。
-- 机制：port `type_attr`，并把 VM dispatch 从本地近似切到 C14 的 loader（`runtime_method.rs` 已有真 `mp_load_method`）。规模 M。风险中高——LOAD_METHOD 是热路径，改完全门重跑。gate：2 个 ignored 测试（修完去 ignore）。
+- 证据 **(b)**：D5 §4 + 两个 ignored 测试的注释。
+- 机制（已落地，无需再修）：`type_attr`（`typecreate.rs:478`，`rom.rs:125`，对照 `objtype.zig:1701-1759`）早已存在；2 个 ignored 测试 `--ignored` 跑通过，直接去 ignore。lib ignored 3→1。
+- **测试期望纠正（主 agent 2026-11-19 双二进制探针确认）**：`str(type(int.from_bytes))` 在 REF 是 `<class 'bound_method'>`，不是 `<class 'classmethod'>`；`type(int.to_bytes)` 是 `<class 'function'>`；`int.fromhex` 不存在（双边 AttributeError）。
 
-### P6 — str_data 动态 qstr 残留站点（待审计）
+### P6 — str_data 动态 qstr 残留站点（G5 已审计+修，ab81588）
 - 现状：D5 §4 列了 `objstr_methods_b.rs` 6 处（lower/upper/title/capitalize/zfill）、`methods_c.rs` 1 处、另约 30 处树内站点（str slot、`%`/format 路径）。
 - 本次实测：动态串上的 `upper/title/zfill/center` 全部一致（`probe_round2.py` `str_dynamic`），说明 headline case 已被后续 lane 修掉；D5 的清单已过期。
-- 任务：lane 先按 D5 清单逐项 grep + 探针，确认哪些残留站点仍会抛 `can't convert to str implicitly`，再修；不要按旧清单直接开工。规模 M（审计后定）。证据 **(a)** 部分 + **(b)**。
+- 审计结果（G5，57-case + 42-case 动态 qstr 电池，双边全同）：剩余 `str_data(` 站点经查是死路径（`objstr_iters.rs` 的 `str_iter_next`/`bytes_iter_next`/`str_charlen` 无 live 调用方；`methods_c.rs:445` buffer 路径已走 pool；`lookup.rs` 的 `get_qstr` 是另一函数，误报）。
+- **唯一真修（`cbd9d6c`）**：`type('ZqxjDynHeapName', (), {})` 在 Rust 抛 `MemoryError`，REF 正常——`type_name_qstr` 用 `find_strn`（只查不建）；原版 `mp_obj_str_get_qstr` 调 `qstr_from_strn`（`objstr.zig:3297-3305`）新建动态 qstr；改为 `from_strn`（intern）。`type('x'*300, (), {})`：Rust 仍 MemoryError，REF 崩溃 rc=134（N1，不复现）。
 
 ### P7a — CLI 非 UTF-8 文件名直接 panic（本次新发现）
 - 行为：脚本文件名含 `0xff` 字节时，REF 正常跑（traceback 印 `<stdin>`），Rust `thread 'main' panicked at std/src/env.rs:878`（rc=-6），`std::env::args()` 在非 Unicode 参数上 unwrap。
@@ -223,13 +229,14 @@
 - 行为：`ppy_exec` 的 filename 经 `from_utf8_lossy`，traceback 里丢字节；Zig 传原始字节当 source 名。
 - 证据 **(b)**：F1 §4(f)。机制：编译器 source 名需走字节（`&[u8]`），改动面到编译器入口。规模 M。gate：需扩展 api_test。
 
-### P8 — finaliser 回调走 std stderr，不走 SinkGuard
+### P8 — finaliser 回调走 std stderr，不走 SinkGuard（G5 已修，ab81588）
 - 行为：drain 打印 traceback 直接走 std stderr；host 装了 write sink 也收不到。
-- 证据 **(b)**：F6 §4（`finaliser.rs` drain 直写 stderr）。机制：把 sink 透传给 drain。规模 M。gate：无，需 API 探针。
+- 证据 **(b)**：F6 §4（`finaliser.rs` drain 直写 stderr）。
+- **纠正（主 agent 2026-11-19 读 `runtime_utils.zig:35-55` + `vendor_stubs.zig:22` 确认）**：原版受保护调用路径经 `mp_obj_print_exception(&mp_plat_print, ev)`（`printExcAndClear`，`runtime_utils.zig:41-48`）→ `mp_hal_stdout_tx_strn_cooked` → `output.write(1, ...)`——**fd 1、走 sink**，不是 fd 2。F6 抄的是未捕获 traceback 的另一条路径。修：`finaliser.rs` 的 `print_raised` 改 `write_sink(1, ..)`；无 sink 时直接写 stdout（先 flush stdout 保序）。新测试 `f6_raising_del_goes_to_sink_as_fd1`（录制 sink，断言恰好一次 fd-1 写，含 ValueError/boom-del）。CLI 从 Python 侧不可观测。
 
-### P9 — stress 路径 finaliser 延迟
+### P9 — stress 路径 finaliser 延迟（G5 评估：不修，低价值）
 - 行为：`alloc()` 内的 stress 收集只攒 `pending_finalisers`，无 CallCtx 可跑 `__del__`，拖到下次显式 `gc.collect()`（对象 seed-marked 保活）。
-- 证据 **(b)**：F6 §4 源码对照。机制：在 VM 顶层调用返回处等安全点补 drain。规模 M。价值低（只在 `NPY_GC_STRESS` 下可观测，且 CLI 从不 stress 收集——见 P2）。gate：无。
+- 证据 **(b)**：F6 §4 源码对照。修需把 VmState 穿进每个 alloc 点，或在 VM 热循环加 drain 点（重入风险）；可观测性极低（只在 `NPY_GC_STRESS` 下，且 CLI 从不 stress 收集——见 P2）。G5 评估后不做。
 
 ### P10 — host 函数 kwargs 被拒（不是分歧，G2 已验证关闭）
 - 行为：Python 侧带 kwargs 调 host 函数 → Rust `argument num/types mismatch`；**原版同样拒**：`mp_arg_check_num_sig`（`argcheck.zig:43`，`n_kw != 0 and !takes_kw` → terse）在 hostCall 之前就拒掉，host sig 为 `(1, maxInt(u16), false)`（`api.zig:713`）。F1 §4(a) “Zig 忽略 kwargs”的说法是错的。
@@ -247,10 +254,11 @@
 - 行为：不经 VM 拦截直接调 `str_join` 会 SIGABRT；用户代码到不了（VM 调用都过 `call_join_ctx` 的 arity 检查），只有 Rust 侧直接调用方能触发。
 - 证据 **(b)**：E2f §4(e)。G2 已验证：`str_join_builtin` 走 `builtin_method!` 宏（`args.len() < $min` 即 Err），现存测试 `e2c_short_direct_calls_error_not_panic` 通过，无需改动。
 
-### P14 — 管道 stdout 时原版缓冲输出、Rust 直写（G0 验收新发现）
+### P14 — 管道 stdout 时原版缓冲输出、Rust 直写（G0 验收新发现；机制 G5 已定位，待修）
 - 行为：`print('hello'); time.sleep(2); print('bye')`，stdout 接管道时 REF 的 `hello` 在 2.02s 后才到达（与 `bye` 同时），Rust 的 `hello` 在 0.00s 即到。两者最终输出字节相同，只差到达时间。
 - 证据 **(a)**：主 agent 2026-11-19 双二进制时间戳探针（G0 验收 §8，`~/workspace/g0_verify_main.log`）。与 C8a “`mp_plat_print` 是 plain `write(1, ...)`”表面冲突——缓冲应在 Zig std io 层或 embed 层，需源码对照定位。
-- 机制：待定。先读 `main.zig` / `embed_exec.zig` 的打印路径 + Zig std io writer 是否带缓冲；再决定是给 Rust 输出加缓冲（flush 点：换行？退出？）还是只在 print 路径。规模 M 待定。gate：无覆盖，需新探针（时间戳读管道）。建议并入 G5（P3 文件缓冲同属输出缓冲族）或单独小 lane。
+- **机制已定位（主 agent 2026-11-19 读 `file_io.zig:160-176` + `:480-495` 确认）**：REF 的 `mp_sys_stdout_obj.fp` 就是 libc 的 `stdout` FILE*（`file_io.zig:486` `mp_sys_stdout_obj.fp = stdoutFp()`；`mp_sys_stdout_buffer_obj` 同）；`npyFileWrite` 调 `fwrite` → glibc stdio 缓冲（管道全缓冲 4096，tty 行缓冲）；装了 sink 时经 `output.write(1/2, ...)` 直接旁路（`file_io.zig:166-169`）。`print()` 走 `MP_PYTHON_PRINTER` = `mp_sys_stdout_print`（`full_stubs.zig:58-62`）。Rust 的 `FileHandle::Stdout` 用 `std::io::stdout()`（LineWriter——见换行即 flush，所以管道上直写）。
+- 修形（后续 lane 的 brief 用）：给 `FileHandle::Stdout` 加 4096 字节缓冲——满了 flush、`is_terminal()` 时行 flush、装了 sink 时旁路、退出 / `sys.stdout.flush()` / `print(flush=True)` 时 flush。触点：`FileHandle::Stdout` 变体、`fileio_write`/`flush`、退出路径（embed_exec/main/REPL）。注意：P8 之后 finaliser 打印也走 fd 1——P14 lane 须检查管道下 drain 打印的时序。范围探针（`probe_p14.py`）：`-c`、脚本、文件重定向、REPL 在 REF 上都缓冲；stderr 双边都不缓冲。
 
 ---
 
@@ -372,4 +380,4 @@ D2 的实现是 open/mode 位检查；本次探针 `/dev/null` 可读、不存�
 - **G6b — unsafe-ffi 之 socket/subprocess（U4/U5/U6/U7/U8）**：`modsocket.rs` + `modsubprocess.rs`。依赖 G1 合并；与 G6a 文件不重叠，可与 G6a 并行。
 - **H9（import_from）与 P7b（API 文件名）**：价值低/改动面大，排最后；H9 可并入 G4（同 import 区），P7b 并入 G2 的 api 侧或单独留待。
 
-顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 可排（G0 已合）。H9、P7b、U8、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。P14（stdout 缓冲）建议并入 G5 或单独小 lane。
+顺序建议：G2 → G3 → G4 → G5（纯 std，无 feature 依赖，可立即排）；G6a/G6b 可排（G0 已合）。H9、P7b、U8、P9、P12、P13 是填空项，哪个 lane 顺手就带，不单独开 lane。P14（stdout 缓冲）G5 已定位机制，未修——单独小 lane（机制见 P14 节）。

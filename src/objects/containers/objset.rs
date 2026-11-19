@@ -23,9 +23,14 @@
 //! * `mp_obj_equal` is `mp_obj_is_true(equalNotEqualImpl(...))`,
 //!   and `mp_obj_is_true` returns false whenever pending is set
 //!   (obj.zig:470). A set lookup performed while a hash error is
-//!   pending NEVER finds its element — verified: with `s == {[2]}`
-//!   (inserted by the quirk below), `s.remove([2])` raises
-//!   `KeyError '[2]'` instead of removing it.
+//!   pending NEVER finds its element — verified: on a set holding
+//!   `[2]` (inserted by the quirk below), `s.remove([2])` raises
+//!   `KeyError '[2]'` instead of removing it. (Note: `s == {[2]}`
+//!   is NOT a runnable way to say that — the comparison itself
+//!   raises `TypeError: unsupported type for operator` on the
+//!   reference, because comparing re-hashes the element. The quirk
+//!   is observable via `len(s) == 1`, `list(s) == [[2]]` and
+//!   `repr(s) == '{[2]}'`.)
 //!
 //! Rust has no global pending, so this file threads a local
 //! `pending: &mut Option<SetError>` through the store/lookup
@@ -43,15 +48,17 @@
 //!   operator"` and the element is STILL inserted at hash 0 (the
 //!   Zig's `mp_unary_op` HASH bridge returns NULL on failure and
 //!   the caller reads it as hash 0) — verified: `s.add([2])`
-//!   raises but `s == {[2]}`. The loop then breaks (next
+//!   raises but the element is stored (observable via `len(s) == 1`,
+//!   `list(s) == [[2]]`, `repr(s) == '{[2]}'`). The loop then breaks (next
 //!   `mp_iternext` returns 0), so later items are not stored.
 //! * A LATER getiter failure OVERWRITES an earlier hash pending —
 //!   verified: `s.update([[]], 1)` → `TypeError 'object not
-//!   iterable'` with `s == {[], 1}`; `{1,2}.difference([[]], 1)`
+//!   iterable'` leaving the set holding `[]` and `1`;
+//!   `{1,2}.difference([[]], 1)`
 //!   → the same.
 //! * `remove`'s lookup miss raises `KeyError(item)`, which
 //!   OVERWRITES the hash pending — verified: `s.remove([2])` on
-//!   `s == {[2]}` → `KeyError '[2]'`.
+//!   a set holding `[2]` → `KeyError '[2]'`.
 //! * `OutOfMemory` propagates immediately, never recorded as pending.
 //!
 //! # Table order

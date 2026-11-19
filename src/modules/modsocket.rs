@@ -486,6 +486,45 @@ fn sock_key_of(state: &SocketState) -> TableKey {
     }
 }
 
+/// Classify `fd` for `select.select` (H-select). Returns
+/// `None` when `fd` is not a socket in the table (the caller
+/// then tries the os fd table, else `EBADF`).
+/// `Some(SocketProbe::Unprobable)`: a stream, listener,
+/// unbound, or foreign-owned socket. Pure `std` on stable
+/// Rust cannot probe its read-readiness without consuming
+/// data — `UnixStream::peek` is unstable
+/// (`unix_socket_peek`, still unstable on rustc 1.99.1),
+/// a monitor thread's `recv` would consume bytes the
+/// socket's `recv` path (in this file) does not drain, and
+/// a listener has no non-destructive probe at all (accept
+/// would consume the pending connection) — so `select`
+/// reports such a socket not-ready. That is a known gap,
+/// see `scripts/h_select_result.txt` §4; the unblock is a
+/// socket monitor + a `recv` drain, which touches this
+/// file's `recv` path and belongs after the H-socket
+/// rewrite lands. `Some(SocketProbe::Bare)`: a `fromfd`
+/// entry without an owned object — I/O on it is `EBADF`
+/// already (F5b). This is the only `modsocket.rs` addition
+/// this lane makes (the brief's peek design assumed a
+/// stable `UnixStream::peek`, which does not exist).
+pub(crate) enum SocketProbe {
+    Unprobable,
+    Bare,
+}
+
+pub(crate) fn socket_probe(fd: RawFd) -> Option<SocketProbe> {
+    match sockets().get(&fd) {
+        Some(SocketState::Stream(_))
+        | Some(SocketState::Listener(_))
+        | Some(SocketState::Unbound(_))
+        | Some(SocketState::Foreign(Some(_))) => Some(SocketProbe::Unprobable),
+        // A foreign fd without an owned object has no
+        // dup-able object (F5b): I/O on it is EBADF.
+        Some(SocketState::Foreign(None)) => Some(SocketProbe::Bare),
+        None => None,
+    }
+}
+
 /// A small int, infallible for socket fields (all fit the
 /// 62-bit window).
 fn small(n: i64) -> Value {

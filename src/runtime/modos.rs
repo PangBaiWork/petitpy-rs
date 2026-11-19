@@ -16,7 +16,7 @@
 //! | `py_os_chown` (3) | `os_chown_builtin` | `/bin/chown <uid>:<gid> <path>` (F5b — stderr's strerror text maps back to the errno; `-1` per side means "leave unchanged") |
 //! | `py_os_getpid` (0) | `os_getpid_builtin` | `std::process::id()` |
 //! | `py_os_kill` (2) | `os_kill_builtin` | `/bin/kill -s <sig> -- <pid>` (F5b — stderr's strerror text maps back to the errno; the `--` keeps a negative pid from being parsed as an option) |
-//! | `py_os_umask` (1) | `os_umask_builtin` | NOT IMPLEMENTED — no std `umask` API; raises `NotImplementedError` (see §4) |
+//! | `py_os_umask` (1) | `os_umask_builtin` | feature-gated `umask(2)` (G6a); default build raises `NotImplementedError` (no std API); `os.umask(-1)` wraps on Rust, aborts the reference (N1) |
 //! | `py_os_getcwd` (0) | `os_getcwd_builtin` | `current_dir`, raw bytes via `OsStrExt` |
 //! | `py_os_chdir` (1) | `os_chdir_builtin` | `set_current_dir` |
 //! | `py_os_getenv` kwVar(1, `default`) | `os_getenv_builtin` + `os_getenv_builtin_kw` | positional default (args[1]) and `default=` kwarg both work (probed) |
@@ -109,8 +109,11 @@ pub(crate) fn arg_int(ctx: &mut CallCtx, v: Value) -> PyResult<i64> {
 }
 
 /// A `NotImplementedError` for the syscalls pure std
-/// cannot express (`umask` — `chown`/`kill` shell out to
-/// `/bin` helpers instead, see `run_bin`).
+/// cannot express (`umask` is feature-gated FFI since G6a;
+/// `chown`/`kill` shell out to `/bin` helpers instead, see
+/// `run_bin`). Only used on the default build — the feature
+/// build has no remaining caller.
+#[cfg(not(feature = "unsafe-ffi"))]
 fn not_impl(ctx: &mut CallCtx, what: &'static str) -> PyError {
     ctx.record_raise("NotImplementedError", Some(what));
     PyError::PyRaise
@@ -596,9 +599,25 @@ pub fn os_kill_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     Ok(Value::None)
 }
 
-/// `os.umask(mask)` — NOT IMPLEMENTED (no std API).
-pub fn os_umask_builtin(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> {
-    Err(not_impl(ctx, "os.umask is not implemented (no std umask API)"))
+/// `os.umask(mask)` (`modos.zig:382-388`) — set the process
+/// file-creation mask, return the previous mask. `umask(2)`
+/// doesn't fail; the kernel masks the argument to 0777.
+/// Feature-gated (G6a): pure-std builds keep the
+/// NotImplementedError stub (no std `umask` API). A negative
+/// mask wraps with `as u32` — the reference ABORTS on
+/// `os.umask(-1)` (Zig `@intCast` panic, rc=134), N1, not
+/// reproduced.
+pub fn os_umask_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        let mask = arg_int(ctx, args[0])? as u32;
+        Ok(Value::SmallInt(crate::support::ffi::sys_umask(mask) as i64))
+    }
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        let _ = args;
+        Err(not_impl(ctx, "os.umask is not implemented (no std umask API)"))
+    }
 }
 
 /// The `os.__getattr__` stub — intercepted by GcRef identity

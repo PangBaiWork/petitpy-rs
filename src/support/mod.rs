@@ -16,6 +16,7 @@
 //!   there by this lane.
 
 pub mod errno;
+pub mod ffi;
 pub mod output;
 pub mod readline;
 pub mod smallint;

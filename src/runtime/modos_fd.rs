@@ -18,24 +18,33 @@
 //!
 //! | fd | read | write | lseek | fsync | close |
 //! |---|---|---|---|---|---|
-//! | 0 (stdin) | `stdin().read` | EBADF | ESPIPE | EINVAL (see below) | tracked in `os_closed_stdio` |
-//! | 1 (stdout) | EBADF | `stdout().write` loop | ESPIPE | EINVAL | tracked |
-//! | 2 (stderr) | EBADF | `stderr().write` loop | ESPIPE | EINVAL | tracked |
+//! | 0 (stdin) | `stdin().read` | EBADF | ESPIPE on pipes/ttys, real `lseek(2)` under `unsafe-ffi` (G6a U9) | EINVAL on pipes/ttys, real `fsync(2)` under `unsafe-ffi` (G6a U9) | real `close(2)` under `unsafe-ffi`, else tracked in `os_closed_stdio` (G6a U3) |
+//! | 1 (stdout) | EBADF | `stdout().write` loop | ESPIPE on pipes/ttys, real `lseek(2)` under `unsafe-ffi` (G6a U9) | EINVAL on pipes/ttys, real `fsync(2)` under `unsafe-ffi` (G6a U9) | real `close(2)` under `unsafe-ffi`, else tracked (G6a U3) |
+//! | 2 (stderr) | EBADF | `stderr().write` loop | ESPIPE on pipes/ttys, real `lseek(2)` under `unsafe-ffi` (G6a U9) | EINVAL on pipes/ttys, real `fsync(2)` under `unsafe-ffi` (G6a U9) | real `close(2)` under `unsafe-ffi`, else tracked (G6a U3) |
 //! | owned | table `read` (once) | table `write` loop | `seek` | `sync_all` | remove from the table |
-//! | unknown/closed | EBADF | EBADF | EBADF | EBADF | EBADF |
+//! | unknown/closed | EBADF | EBADF | EBADF | EBADF | real `close(2)` under `unsafe-ffi` (G6a U3), else EBADF |
 //!
-//! Notes: `os.close(0/1/2)` cannot close the real fd in safe
-//! Rust — the fd is recorded in `os_closed_stdio` instead, so
-//! every later use raises EBADF (the observable behavior);
-//! the only divergence is that a later `os.open` will NOT
-//! reuse the number (the reference's `close(0)` frees it for
-//! reuse — see §4). `os.fsync` on stdio returns EINVAL: the
-//! reference calls `fsync(2)`, which returns EINVAL on the
-//! pipes/ttys stdout is in the test environment, and there is
-//! no safe std `fsync` for fd 0/1/2 (see §4 — it diverges
-//! when stdout is a regular file). `os.lseek` on stdio is
-//! always ESPIPE (`std::io::Stdin` has no `Seek` — the same
-//! divergence `sys.stdin.seek` already records).
+//! Notes: on the default build `os.close(0/1/2)` cannot close the
+//! real fd in safe Rust — the fd is recorded in `os_closed_stdio`
+//! instead, so every later use raises EBADF (the observable
+//! behavior); the only divergence is that a later `os.open` will
+//! NOT reuse the number (the reference's `close(0)` frees it for
+//! reuse — see §4). Under `--features unsafe-ffi` (G6a) the real
+//! `close(2)` runs first and the record is kept, so the number IS
+//! reused, exactly like the reference. `os.fsync` on stdio returns
+//! EINVAL on the default build: the reference calls `fsync(2)`,
+//! which returns EINVAL on the pipes/ttys stdout is in the test
+//! environment; under `unsafe-ffi` the real `fsync(2)` runs, so a
+//! stdio fd redirected to a regular file syncs (U9). `os.lseek`
+//! on stdio is always ESPIPE on the default build
+//! (`std::io::Stdin` has no `Seek` — the same divergence
+//! `sys.stdin.seek` already records); under `unsafe-ffi` the
+//! real `lseek(2)` runs, so pipes/ttys still give ESPIPE from
+//! the kernel while regular files seek (U9). A file object
+//! holds the RAW fd number on both sides, so `os.close` on an
+//! `open()` file's fd leaves the object stale by number — a
+//! later write/flush through it goes to whatever reused the
+//! number, exactly like the reference (probed, G6a).
 
 /// The six `os` builtins that need VM state (the fd table),
 /// for the `call_function_ctx` interception (D2). The `func`s
@@ -181,7 +190,13 @@ fn io_exc(ctx: &mut CallCtx, state: &VmState, e: std::io::Error) -> Value {
 }
 
 
-/// `py_os_close` (`modos.zig:311-315`).
+/// `py_os_close` (`modos.zig:311-315`): `close(fd)` straight
+/// through, errno on failure. Under `--features unsafe-ffi`
+/// (G6a) the real `close(2)` runs for every fd — an unregistered
+/// fd (e.g. an `open()` file's fd) and stdio 0–2 included. On
+/// the default build the old shape stays: stdio is only
+/// recorded in `os_closed_stdio` (the fd number is NOT freed
+/// for reuse) and an unregistered fd is EBADF.
 pub fn os_close_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -192,14 +207,47 @@ pub fn os_close_ctx(
     check_arity(ctx, state, n_args, n_kw, 1, 1)?;
     let fd = arg_int(ctx, args[0]).map_err(|e| exc(ctx, state, e))? as i32;
     if (0..=2).contains(&fd) {
-        if !state.os_closed_stdio.insert(fd) {
+        if state.os_closed_stdio.contains(&fd) {
             return Err(errno_exc(ctx, state, EBADF));
         }
+        #[cfg(feature = "unsafe-ffi")]
+        {
+            // FFI invariant: `close` takes any i32 fd number;
+            // the kernel fails EBADF on an already-closed fd, it
+            // cannot fault. A failure here raises exactly like the
+            // Zig's `close(fd) < 0` branch.
+            if let Err(e) = crate::support::ffi::sys_close(fd) {
+                return Err(errno_exc(ctx, state, e));
+            }
+        }
+        state.os_closed_stdio.insert(fd);
         return Ok(Value::None);
     }
-    match state.os_fds.remove(&fd) {
-        Some(_) => Ok(Value::None),
-        None => Err(errno_exc(ctx, state, EBADF)),
+    // Feature path (G6a): the reference closes by NUMBER
+    // (`close(fd)`), with no fd table — so a registered fd whose
+    // number was already closed out from under it (e.g. by an
+    // `open()` file's `close()`) fails EBADF there. Table removal
+    // alone would return Ok, so run the real close first: on
+    // failure raise the errno (the dead entry stays in the
+    // table); on success drop the entry (the drop re-closes the
+    // number, EBADF ignored). This covers registered and
+    // unregistered fds uniformly.
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        // FFI invariant: `close` takes any i32 fd number; the
+        // kernel fails EBADF on a bad fd, it cannot fault.
+        if let Err(e) = crate::support::ffi::sys_close(fd) {
+            return Err(errno_exc(ctx, state, e));
+        }
+        state.os_fds.remove(&fd);
+        return Ok(Value::None);
+    }
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        match state.os_fds.remove(&fd) {
+            Some(_) => Ok(Value::None),
+            None => Err(errno_exc(ctx, state, EBADF)),
+        }
     }
 }
 
@@ -313,7 +361,15 @@ pub fn os_write_ctx(
     Ok(Value::SmallInt(off as i64))
 }
 
-/// `py_os_lseek` (`modos.zig:345-350`).
+/// `py_os_lseek` (`modos.zig:345-350`): `lseek(fd, pos, how)`
+/// straight through — the kernel is the authority on a bad
+/// whence / negative offset (both EINVAL there). Under
+/// `--features unsafe-ffi` (G6a) the stdio branch (fd 0–2)
+/// calls the real `lseek(2)` too, so a stdio fd redirected
+/// to a regular file seeks (U9); on pipes/ttys the kernel
+/// returns ESPIPE, as before. The registered-fd arm is
+/// unchanged (std `seek`, same outcomes). Default build:
+/// stdio is always ESPIPE(29).
 pub fn os_lseek_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -329,9 +385,22 @@ pub fn os_lseek_ctx(
         return Err(errno_exc(ctx, state, EBADF));
     }
     if (0..=2).contains(&fd) {
-        // No `Seek` on `std::io::Stdin`/`Stdout`/`Stderr` —
-        // always ESPIPE (the `sys.stdin.seek` divergence).
-        return Err(errno_exc(ctx, state, 29));
+        #[cfg(feature = "unsafe-ffi")]
+        {
+            // FFI invariant: `lseek` takes an fd number and plain
+            // integers; a bad fd fails EBADF, a bad whence fails
+            // EINVAL — neither can fault.
+            return match crate::support::ffi::sys_lseek(fd, pos, whence as i32) {
+                Ok(at) => Ok(Value::SmallInt(at)),
+                Err(e) => Err(errno_exc(ctx, state, e)),
+            };
+        }
+        #[cfg(not(feature = "unsafe-ffi"))]
+        {
+            // No `Seek` on `std::io::Stdin`/`Stdout`/`Stderr` —
+            // always ESPIPE (the `sys.stdin.seek` divergence).
+            return Err(errno_exc(ctx, state, 29));
+        }
     }
     let seek_from = match whence {
         0 => {
@@ -356,7 +425,13 @@ pub fn os_lseek_ctx(
     }
 }
 
-/// `py_os_fsync` (`modos.zig:352-356`).
+/// `py_os_fsync` (`modos.zig:352-356`): `fsync(fd)` straight
+/// through. Under `--features unsafe-ffi` (G6a) the stdio
+/// branch (fd 0–2) calls the real `fsync(2)` too, so a stdio
+/// fd redirected to a regular file syncs (U9); on pipes/ttys
+/// the kernel returns EINVAL, as before. The registered-fd
+/// arm is unchanged (std `sync_all`). Default build: stdio
+/// is always EINVAL.
 pub fn os_fsync_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -370,9 +445,21 @@ pub fn os_fsync_ctx(
         return Err(errno_exc(ctx, state, EBADF));
     }
     if (0..=2).contains(&fd) {
-        // No safe std `fsync` for fd 0/1/2 — EINVAL, the
-        // reference's answer on pipes/ttys (see the module docs).
-        return Err(errno_exc(ctx, state, EINVAL));
+        #[cfg(feature = "unsafe-ffi")]
+        {
+            // FFI invariant: `fsync` takes any i32 fd number; the
+            // kernel fails EBADF on a bad fd, it cannot fault.
+            return match crate::support::ffi::sys_fsync(fd) {
+                Ok(()) => Ok(Value::None),
+                Err(e) => Err(errno_exc(ctx, state, e)),
+            };
+        }
+        #[cfg(not(feature = "unsafe-ffi"))]
+        {
+            // No safe std `fsync` for fd 0/1/2 — EINVAL, the
+            // reference's answer on pipes/ttys (see the module docs).
+            return Err(errno_exc(ctx, state, EINVAL));
+        }
     }
     match state.os_fds.get_mut(&fd) {
         Some(f) => {

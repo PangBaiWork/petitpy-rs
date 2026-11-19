@@ -259,12 +259,22 @@ os.remove(d + "/f")
 os.rmdir(d)
 "#,
     );
-    // A closed stdio fd raises EBADF on later use (tracked in
-    // `os_closed_stdio` — the real fd is never closed, so the
-    // test process itself is unaffected).
-    let (name, value) = fx.run_err("import os\nos.close(0)\nos.read(0, 5)\n");
-    assert_eq!(name, "OSError");
-    assert_eq!(value, "9");
+    // A closed stdio fd raises EBADF on later use. On the
+    // default build the fd is only recorded in
+    // `os_closed_stdio` (the real fd is never closed, so the
+    // test process itself is unaffected). Under
+    // `--features unsafe-ffi` (G6a) the real `close(2)` runs
+    // first — really closing the test process's stdin fd would
+    // poison parallel tests (their `os.open` could then get
+    // fd 0 and hit the stdio arms), so the close(0) case is
+    // asserted in the subprocess test `g6a_close_stdin_ebadf`
+    // (tests/g6a_os.rs) instead, and skipped here.
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        let (name, value) = fx.run_err("import os\nos.close(0)\nos.read(0, 5)\n");
+        assert_eq!(name, "OSError");
+        assert_eq!(value, "9");
+    }
     let (name, value) = fx.run_err("import os\nos.read(999, 5)\n");
     assert_eq!(name, "OSError");
     assert_eq!(value, "9");
@@ -277,6 +287,28 @@ os.rmdir(d)
     let (name, value) = fx.run_err("import os\nos.open(\"/tmp\", \"x\")\n");
     assert_eq!(name, "TypeError");
     assert_eq!(value, "can't convert to int");
+}
+
+/// `os.close` on an `open()` file's fd (G6a U3): the fd is
+/// not in `os_fds`, so the default build raises EBADF; under
+/// `--features unsafe-ffi` the real `close(2)` runs and the
+/// close succeeds.
+#[test]
+fn os_close_open_file_fd() {
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        let (name, value) =
+            fx_run_err_new("f = open('/dev/null', 'r')\nimport os\nos.close(f.fileno())\n");
+        assert_eq!(name, "OSError");
+        assert_eq!(value, "9");
+    }
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        let mut fx = Sx::new();
+        fx.run_ok(
+            "f = open('/dev/null', 'r')\nimport os\nos.close(f.fileno())\nprint('os.close done')\n",
+        );
+    }
 }
 
 #[test]
@@ -302,21 +334,63 @@ os.rmdir(d)
     );
     assert_eq!(name, "OSError");
     assert_eq!(value, "22");
-    let (name, value) = fx.run_err("import os\nos.lseek(1, 0, 0)\n");
-    assert_eq!(name, "OSError");
-    assert_eq!(value, "29");
+    // `os.lseek(1, 0, 0)` on stdio: on the default build this
+    // is always ESPIPE(29) (no `Seek` on stdio). Under
+    // `--features unsafe-ffi` (G6a) the real `lseek(2)` runs,
+    // so the outcome depends on what fd 1 is in the test
+    // process — libtest's output capture makes it a regular
+    // temp file (seek succeeds, returns 0), while a pipe/tty
+    // gives ESPIPE. Both are correct kernel answers; the
+    // piped case is pinned by the subprocess test
+    // `g6a_lseek_stdio_file`/`lseek_stdio_pipe` probe instead.
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        let (name, value) = fx.run_err("import os\nos.lseek(1, 0, 0)\n");
+        assert_eq!(name, "OSError");
+        assert_eq!(value, "29");
+    }
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        match fx.run("import os\nx = os.lseek(1, 0, 0)\n") {
+            Ok(_) => {}
+            Err(VmError::Raised(exc)) => {
+                assert_eq!(fx.exc_name(exc), "OSError");
+                assert_eq!(fx.exc_value(exc), "29");
+            }
+            Err(e) => panic!("module failed without raising: {e:?}"),
+        }
+    }
 }
 
 #[test]
 fn os_unimplemented_stubs() {
     // The reference implements these; the port has no std API
-    // for `umask` (see §4) — the stub raises
+    // for `umask` on the default build (see §4) — the stub raises
     // NotImplementedError so the gap is loud, not silent.
+    // Under `--features unsafe-ffi` (G6a) the real `umask(2)`
+    // runs instead: round-trip it and restore the mask in the
+    // same program (no test asserts file modes, so the brief
+    // process-global window is unobservable).
     // `kill`/`chown` shell out to `/bin` helpers instead
     // (F5b): `kill(1, 0)` succeeds (pid 1 exists), `chown`
     // of /tmp to 0:0 succeeds as root.
-    let (name, _) = fx_run_err_new("import os\nos.umask(0o022)\n");
-    assert_eq!(name, "NotImplementedError");
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        let (name, _) = fx_run_err_new("import os\nos.umask(0o022)\n");
+        assert_eq!(name, "NotImplementedError");
+    }
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        let mut fx = Sx::new();
+        fx.run_ok(
+            "import os\nprev = os.umask(0o022)\ncur = os.umask(prev)\nassert cur == 0o022\n",
+        );
+        // `os.umask(-1)` wraps (`as u32` -> kernel masks to
+        // 0777) and returns the previous mask; the reference
+        // ABORTS there (Zig @intCast panic, rc=134), N1.
+        let mut fx = Sx::new();
+        fx.run_ok("import os\nprev = os.umask(0o022)\ncur = os.umask(-1)\nassert cur == 0o022\nos.umask(prev)\n");
+    }
     let mut fx = Sx::new();
     // `run_ok` panics if either call raises.
     fx.run_ok("import os\nos.kill(1, 0)\nos.chown(\"/tmp\", 0, 0)\n");
@@ -324,6 +398,8 @@ fn os_unimplemented_stubs() {
 
 /// `run_err` on a fresh `Sx` (each stub test gets its own VM
 /// so a raised `NotImplementedError` cannot leak state).
+/// Default build only: both callers are cfg-gated to it (G6a).
+#[cfg(not(feature = "unsafe-ffi"))]
 fn fx_run_err_new(src: &str) -> (String, String) {
     let mut fx = Sx::new();
     fx.run_err(src)

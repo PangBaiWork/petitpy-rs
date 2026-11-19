@@ -1,0 +1,175 @@
+# G6a result — unsafe-ffi os: U2 os.umask, U3 os.close, U9 stdio fsync/lseek
+
+Base: master `12e244e` (G0+G2+G3 merged). Branch: `lane/g6a-ffi-os`.
+Worktree: `~/workspace/petitpy-rs-g6a-ffi-os`. Executor: G6a lane agent.
+Probes: `~/workspace/g6a_probe/probe_g6a.py` (14 dual-binary cases, REF vs
+worktree binary). Acceptance log: `~/workspace/g6a_verify/accept.log`.
+
+## §1. What was built
+
+New shared FFI module `src/support/ffi.rs` (133 lines, `pub mod ffi` in
+`src/support/mod.rs`) — hand-written `extern "C"` declarations, zero
+dependencies, G0's pattern (private `ffi` mod, `pub fn` wrappers used
+as `crate::support::ffi::sys_*`). Wrappers: `sys_umask(u32) -> u32`
+(infallible), `sys_close(fd) -> Result<(), i32>`,
+`sys_fsync(fd) -> Result<(), i32>`,
+`sys_lseek(fd, pos: i64, whence: i32) -> Result<i64, i32>`. Errno is
+read via `__errno_location()` (glibc, same on x86_64/aarch64).
+`__errno_location` is deliberately duplicated from G0's modselect.rs
+(commented as such — same symbol, two private mods, no shared
+coupling). Every `unsafe` block carries an FFI-invariant comment
+within 3 lines above it.
+
+U2 — `os_umask_builtin` (`src/runtime/modos.rs`): under the feature,
+`arg_int(ctx, args[0])? as u32` into `sys_umask`, returns the previous
+mask as a small int. Default build keeps the NotImplementedError stub
+(the `not_impl` helper is now `#[cfg(not(feature = "unsafe-ffi"))]`
+— it had no caller on the feature build and produced a dead-code
+warning). `os.umask(-1)` wraps (`as u32` -> kernel masks to 0777);
+the reference ABORTS (Zig `@intCast` panic, rc=134) — N1, not
+reproduced.
+
+U3 — `os_close_ctx` (`src/runtime/modos_fd.rs`): under the feature,
+the real `close(2)` runs FIRST for every fd, then the table entry
+is dropped (the drop re-closes the number, EBADF ignored) and the
+stdio record is kept. Two consequences of "close by number, like
+the reference": (a) an unregistered fd (an `open()` file's fd) and
+stdio 0–2 really close, so the number is freed for reuse;
+(b) a registered fd whose number was already closed out from under
+it (e.g. by an `open()` file's `close()`) fails EBADF instead of
+returning Ok — this corner was FOUND by the stale_fd_reuse probe
+(the brief said to keep the registered arm as-is; the probe showed
+the as-is arm returned Ok where REF raises, so the arm now runs
+the syscall first too). Double close of a recorded stdio fd still
+returns EBADF via the record check (the syscall never runs twice).
+Default build: old shape verbatim (record-only stdio, EBADF for
+unregistered fds).
+
+U9 — `os_lseek_ctx` / `os_fsync_ctx` (`src/runtime/modos_fd.rs`):
+under the feature, the stdio branch (fd 0–2) calls the real
+`lseek(2)` / `fsync(2)`, so a stdio fd redirected to a regular
+file seeks/syncs; on pipes/ttys the kernel returns ESPIPE /
+EINVAL, exactly the old answers. Registered-fd arms unchanged
+(std `seek` / `sync_all`). Default build: stdio lseek always
+ESPIPE(29), stdio fsync always EINVAL — unchanged.
+
+Tests:
+- `src/runtime/modos_tests.rs`: `os_unimplemented_stubs` — umask
+  assertion cfg-gated (stub on default; real round-trip + `-1`
+  wrap on feature, mask restored in-program). NEW
+  `os_close_open_file_fd` (EBADF on default, Ok on feature).
+  `os_fd_lseek_whence` — the `os.lseek(1, 0, 0)` -> 29 assertion
+  is cfg-gated: under the feature the real `lseek(2)` runs and
+  libtest's output capture makes fd 1 a regular temp file
+  (seek succeeds, 0), while a pipe/tty gives ESPIPE — both are
+  correct kernel answers, so the feature arm accepts either
+  (the piped case is pinned by the subprocess probe).
+  `os_fd_roundtrip` — the in-process `os.close(0)` assertions
+  are cfg-gated to the default build: under the feature the real
+  close(0) would poison parallel tests (their `os.open` could
+  get fd 0 and hit the stdio arms — this actually happened once
+  mid-lane: `os_fd_lseek_whence` failed with EBADF because
+  `os_fd_roundtrip` had really closed fd 0). The close(0) case
+  moved to the subprocess test.
+- NEW `tests/g6a_os.rs` (8 tests, whole file
+  `#![cfg(feature = "unsafe-ffi")]`): `g6a_close_stdin_ebadf`,
+  `g6a_close_stdio_reuses_fd`, `g6a_close_open_file_fd`,
+  `g6a_fsync_stdout_file`, `g6a_lseek_stdin_file`,
+  `g6a_lseek_stdout_file`, `g6a_umask_roundtrip`,
+  `g6a_stale_fd_reuse` — all spawn the built binary
+  (`CARGO_BIN_EXE_petitpy-rs`) with redirected stdio.
+- README.md divergences: U2/U3/U9 rows updated (fixed under the
+  feature, old shape on default). Status-table counts NOT touched
+  (main agent updates at merge; G5's rebase will move the baseline).
+
+Commits on the branch (all by path, no `git add -A`):
+`d359eef` ffi module, `c9b38da` U2, `a312ab7` U3+U9,
+`a48d8a4` U3 registered-arm stale-fd fix, `594b351` tests,
+`b0090da` stdio-lseek test gating, `e4e2e40` close(0) to
+subprocess test, `1850c07` README.
+
+## §2. Acceptance (numbers)
+
+Acceptance script `~/workspace/g6a_accept.sh`, log
+`~/workspace/g6a_verify/accept.log` — ran on HEAD `e4e2e40`,
+SIGTERM-killed by a service restart in §7 (C acceptance);
+the missing pieces were rerun clean on the final HEAD `fc60922`
+(the only delta after `e4e2e40` is a test-only cfg-gate,
+commit `fc60922`). Gate outputs in `~/workspace/g6a_verify/`.
+
+- Default build: lib **1724/0/3** (1723 + 1 new test), bins 9,
+  entry_cli 45, g6a_os 0 (cfg'd out), **0 warnings** (forced
+  recompile). Full gate **GREEN 545/552** (7 known-fails),
+  integration **200/202** (fail set exactly {select_readable_
+  fd_is_ready, select_timeout_zero_returns_promptly}),
+  golden **585/585**, capability **GREEN**, stdlib **8/8**,
+  nano **454/541** (report-only).
+- Feature-ON build (`--features unsafe-ffi`): lib **1732/0/3**
+  (1731 + 1), bins 9, entry_cli 45, **g6a_os 8/8**, **0 warnings**
+  (forced recompile). Integration **202/202** (fail set EMPTY).
+- check_compile_mpy **PASS**, check_frozen **PASS**.
+- Probes: feature binary **14/14 PASS** (see §3); default
+  binary 5/14, the 9 fails being exactly the feature-gated gaps.
+- Unsafe audit: lane diff has **5 `unsafe {}` blocks + 4
+  `extern "C"` blocks, ALL in `src/support/ffi.rs`, each unsafe
+  block with an FFI-invariant comment above it; 0 new unsafe
+  anywhere else; api.rs `unsafe`-word count **87 = master**;
+  max touched file 835 lines (modos.rs), all < 2500.
+- C acceptance (staticlib only, api_test.c UNMODIFIED):
+  **61/61 PASS, 0 FAIL**, `nm -D` = **39** `ppy_` exports.
+
+## §3. Probes (REF vs worktree binary, byte-compare stdout+stderr+rc)
+
+`python3 ~/workspace/g6a_probe/probe_g6a.py` — 14 cases
+(`~/workspace/g6a_probe/probe_g6a.py`):
+
+Feature-ON binary: **14/14 PASS**, including `umask_neg1` as a
+documented N1 divergence (REF aborts, SIGABRT rc=-6, Zig
+`@intCast` panic at modos.zig:385; Rust wraps and returns 7).
+Cases: umask, umask_neg1, os_close_openfd, os_close_stdio,
+os_close_double, os_close_unknown, fsync_stdio_file,
+fsync_stdio_pipe, fsync_stdin_file, lseek_stdio_file,
+lseek_stdout_file, lseek_stdio_pipe, lseek_bad_whence,
+stale_fd_reuse (byte-identical incl. `close g: 9` and `HELLO`
+landing in the reused file).
+
+Default binary: **5/14 PASS** — the 9 fails are exactly the
+feature-gated gaps (U2 umask/umask_neg1, U3 os_close_openfd /
+os_close_stdio / stale_fd_reuse, U9 fsync_stdio_file /
+fsync_stdin_file / lseek_stdio_file / lseek_stdout_file), all
+raising the old stub/EBADF/ESPIPE/EINVAL as before. One probe
+artifact worth noting: `os_close_double` originally printed
+its diagnostic to stdout, which is swallowed on REF (fd 1
+really closed) but visible on the default build (fd 1 stays
+open) — the case now reports on stderr (`print(..., file=
+sys.stderr)`) and passes on both builds; the underlying EBADF
+is identical everywhere.
+
+## §4. Leftovers / notes for the main agent
+
+1. **Default build keeps the old gaps by design** (feature-gated
+   work): umask stub, close only for `os.open`-tracked fds,
+   stdio fsync EINVAL / lseek ESPIPE. The integration gate on
+   the default build is unaffected (no integration case covers
+   these).
+2. **`os.umask(-1)` wraps, REF aborts** (N1) — documented in
+   the code comment, the probe, and README; do not "fix" into
+   an abort.
+3. **In-process tests must never really close fd 0/1/2** (see
+   §1, the `os_fd_roundtrip` flake): any future U-test that
+   closes a stdio fd belongs in `tests/g6a_os.rs` (subprocess),
+   not in a lib test. Same for `os.lseek(1)` assertions — the
+   outcome depends on what fd 1 is in the test process
+   (libtest capture file vs pipe).
+4. **One transient cargo panic-strategy race** hit once during
+   the lane (`error: the crate petitpy_rs requires panic
+   strategy abort ... incompatible with unwind`, bin test
+   target) — plain rerun fixed it, same as G2/G3 §4. Not a
+   code issue.
+5. **G6b reuses `src/support/ffi.rs`** — add `socket`/`fcntl`
+   externs there (same pattern: private `ffi` mod, `pub fn`
+   wrappers, invariant comment per `unsafe` block). The
+   `__errno_location` duplication with G0's modselect.rs is
+   intentional (documented in the module comment).
+6. **P7b rides last** (unchanged): `ppy_exec` non-UTF-8 filename
+   still lossy. Untouched by this lane.

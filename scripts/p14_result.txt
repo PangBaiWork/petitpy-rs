@@ -1,0 +1,169 @@
+Lane P14 — buffer piped stdout like libc stdio (P14 divergence)
+Base: master 20a427e. Worktree: ~/workspace/petitpy-rs-p14-stdout-buffer,
+branch lane/p14-stdout-buffer. Executor completed 2026-11-19 ~19:4x CST.
+NOT merged (main agent verifies + merges).
+
+§1 — What was built
+-------------------
+The reference's stdout is libc's `stdout` FILE* (`fwrite`, glibc stdio
+buffering); Rust's `std::io::stdout()` is a LineWriter that flushed on
+every `\n`, so `print()` wrote through on pipes. Fix (3 commits):
+
+- fa14e4d "P14: buffer piped stdout like libc stdio": one
+  process-global 4096-byte stdout buffer in `src/support/output.rs`
+  (`buffered_stdout_write` + `flush_stdout_buffer`, `Mutex<Vec<u8>>`,
+  tty flag cached once via `IsTerminal`). Glibc rules: tty →
+  line-buffered (flush through the last `\n`, plus full 4096-byte
+  chunks if a newline-less write overflows); pipe/file → fully-buffered
+  (flush 4096-byte chunks as the buffer fills, remainder stays
+  buffered). All fd-1 paths route through it: `print()` no-file path
+  (`plat_print_strn`), `obj_print`, `fileio_write` Stdout arm,
+  REPL echo (same `plat_print_strn`), `sys.stdout.flush()` (FLUSH
+  ioctl arm), `print(flush=True)` on the no-file path (previously
+  IGNORED — the flag is now honored), and the pre-traceback flush
+  (`embed_exec.rs`, stderr arm). Exit flush once in `main()` and
+  `petitpy-vm` (C's `exit()` flushes stdio automatically; Rust does
+  not flush a custom buffer; aborts never reach the return, matching
+  the Zig's no-flush-on-abort). The embedding sink still bypasses the
+  buffer (via `output.write` / `write_sink`), and the embedding API
+  does NOT flush per call.
+- e5b3155 "P14: os.write(1/2) must write through immediately": the
+  brief asserted `os.write` is a raw `write(2)` "on both sides" — it
+  was NOT on Rust: it went through `std`'s Stdout LineWriter, which
+  buffers a newline-less write until the next `\n` or exit, so
+  `os.write(1, b'b')` after a `print()` only surfaced at exit, AFTER
+  the buffered print output. Now flushes `std`'s Stdout after the
+  write loop (the reference's `os.write` is a raw `write(2)` loop,
+  `modos.zig:331-343`). The process-global buffer sits ABOVE `std`'s
+  Stdout, so this flush does NOT release buffered `print()` output —
+  ordering stays 'b' first, 'a' at exit, byte-identical to REF.
+  Plus `tests/p14_stdout.rs`: 3 timestamped subprocess tests pinning
+  the arrival times (piped print buffered, `print(flush=True)`
+  immediate, `os.write` immediate).
+- README P14 row rewritten from "unbuffered" to fixed, with the
+  mechanism and probe counts.
+
+Two paths DELIBERATELY bypass the buffer, per the Zig source (NOT
+per the brief — see §4):
+- petitpy-vm traceback (`embed_exec.rs` stdout arm): the Zig's
+  `embed_run_mpy` calls `mp_obj_print_exception(&mp_plat_print, raw)`
+  with NO `fflush`. Probed on REF petitpy-vm: traceback prints BEFORE
+  earlier buffered `print()` output, which surfaces at exit.
+- Finaliser-drain print (`finaliser.rs::print_raised`): the Zig's
+  `printExcAndClear` (`runtime_utils.zig:35-40`) does NO `fflush` and
+  prints via `mp_plat_print` (plain `write(1)`). The pre-P14 code
+  flushed stdout first; that flush was removed (it was a G5/F6
+  invention contradicted by the source). Sink path unchanged.
+
+§2 — Acceptance numbers
+------------------------
+cargo test --release --lib --tests (default):
+  lib 1735 passed / 0 failed / 1 ignored; bins 9; entry_cli 45;
+  p14_stdout 3 passed. 0 warnings (forced recompile: touch
+  src/lib.rs && cargo build --release → 0 `^warning` lines).
+  (The `output filename collision` lines cargo prints under
+  `--test` builds are a pre-existing dual-crate-type artifact,
+  not source warnings.)
+cargo test --release --features unsafe-ffi --lib --tests:
+  lib 1743 passed / 0 failed / 1 ignored; bins 9; entry_cli 45;
+  p14_stdout 3 passed.
+Gate runners (scripts/run_*.py, no --bin except full_gate):
+  integration 200/202 default (only the known select ×2 — the
+    feature-gated G0 tests; 202/202 when the binary on disk is the
+    feature-ON build, see §4 note), 202/202 feature-ON
+  full 545/552 GREEN (matches known-fails baseline exactly)
+    — verified on BOTH the default and the feature-ON binary
+  golden 585/585 (rust==cpython on 576/585)
+  capability GREEN (matches baseline exactly)
+  stdlib 8/8
+  nano 454/541 (report-only, matches base)
+scripts/check_compile_mpy.py PASS (rc 0); scripts/check_frozen.py
+  PASS (rc 0).
+C acceptance (original's own test programs, UNMODIFIED, staticlib
+  only — `cc -std=c99 -Wall -Wextra -Werror -Iinclude`):
+  api_test.c vs libpetitpy_rs.a: 61/61 "all passed", rc 0, normal
+    and NPY_GC_STRESS=10
+  examples/embed/host.c vs staticlib: prints exactly "41", rc 0
+  nm libpetitpy_rs.a: 39 ` ppy_` exports (exactly the header's 39).
+0 new unsafe in the diff (grep: only doc-comment mentions);
+largest touched file 767 lines (objfileio.rs); all < 2500.
+Orig clean (petitpy-orig untouched; only read).
+
+§3 — Probes (timestamped dual-binary, `~/workspace/p14_probe/probe_p14.py`)
+------------------------------------------------------------------------
+Content + arrival-time (cumulative bytes per 0.5 s bucket) compared
+REF vs worktree binary. 10/10 PASS, all byte-identical:
+  print_sleep_print   REF=[0..2.0s: 0 bytes, 2.5s: 10]  RUST identical
+  print_5000          5001 bytes by 0.5s both (4096 + 905)
+  print_5000_sleep    4096 by 0.5s, 5001 by 1.5s both — the buffer-full
+                      flush really happens mid-program, not at exit
+  print_flush_true    'x' at 0.0s, 'y' at 1.0s both
+  stdout_write_flush  'a' only after flush (1.0s), 'b' after, both
+  print_then_os_write 'b' at 0.0s (bypasses buffer), 'a' at 1.0s, both
+  repl_piped          output arrives at exit (5 bytes), both
+  stderr_write_through stderr arrives at 1.0s (write-through), both
+  dash_c              same as print_sleep_print, both
+  vm_traceback_order  traceback (85 bytes) BEFORE 'hello' (6 bytes),
+                      both — the vm arm bypass is correct
+TTY spot-check (pty, timestamped): REF 'hello' 0.0s / 'bye' 2.0s;
+  RUST 'hello' 0.0s / 'bye' 2.0s — line-buffered on a tty, identical.
+  (`script -qec` output also byte-identical.)
+Raising-`__del__` drain print: NOT observable from the CLI on EITHER
+  binary — a plain user instance is not finaliser-flagged (only
+  `alloc_with_finaliser` objects — files/sockets — get the flag, and
+  their native `__del__` never raises), so `gc.collect()` never
+  drains a raising Python `__del__`. The sink path is covered by the
+  existing lib test `f6_raising_del_goes_to_sink_as_fd1` (still
+  passing); the no-sink ordering follows the Zig source (no fflush,
+  plain write) rather than a probe.
+Earlier probe notes (from the lane start, all confirmed in the final
+  build): petitpy-vm traceback goes via plain `write(1)` with NO
+  flush; `printExc` (petitpy stderr traceback) does `fflush(null)`
+  first — hence the buffer flush in the stderr arm only.
+
+§4 — Leftovers / things the main agent must know
+-------------------------------------------------
+1. BRIEF DEVIATION — finaliser drain bypasses the buffer. The brief
+   §1 listed the drain among the buffered paths; the Zig source says
+   otherwise (`printExcAndClear`, runtime_utils.zig:35-40, NO fflush;
+   `mp_plat_print` = plain `write(1)`). Implemented per source, and
+   removed the pre-existing flush-first in `print_raised`. The brief
+   §2 probe "drain print arrives buffered" is therefore NOT the
+   implemented behaviour — and it is unobservable from the CLI anyway
+   (see §3). If the main agent disagrees, the change is one line in
+   `finaliser.rs::print_raised` (flush before write).
+2. BRIEF PREMISE WRONG — `os.write` was NOT a raw write(2) on Rust
+   (it was `std` Stdout LineWriter). Fixed in e5b3155 (flush after
+   the write loop). The brief §2 probe "os.write 'b' arrives at
+   once" now passes because of this fix, not because of the buffer.
+3. `src/runtime/modos_fd.rs` was touched (os.write flush) — it is
+   ALSO G6a's file (U2/U3/U9 touch os.umask/os.close/fsync/lseek,
+   different functions). If G6a merges first, rebase will conflict
+   in that file; the os.write hunk is small and self-contained.
+4. Acceptance-order artifact: `cargo test --features unsafe-ffi`
+   OVERWRITES target/release/petitpy-rs with the feature-ON binary,
+   so the first integration/full runs in the acceptance script ran
+   against the feature-ON binary (integration 202/202). True default
+   numbers were re-verified afterwards with a fresh `cargo build
+   --release`: integration 200/202 (select ×2 only), full GREEN.
+   The main agent's independent verification should rebuild the
+   default binary before running the gates, or it will see 202/202
+   and think the select tests pass by default.
+5. `tests/p14_stdout.rs` is timing-sensitive by nature (arrival
+   thresholds 0.5s / 2.0s). It flaked once during development — cause
+   was a SHARED scratch dir (all three tests used the same name, so
+   parallel tests deleted each other's case file); fixed by giving
+   each test its own scratch name. It has passed 3/3 on every run
+   since (default + feature-ON + standalone).
+6. P14 is now CLOSED in the README (row rewritten). The triage doc
+   (`docs/divergence-triage.md`) still lists P14 as open — the main
+   agent should mark it closed at merge time.
+7. Probe harness kept at `~/workspace/p14_probe/probe_p14.py`
+   (outside the repo) and acceptance logs at
+   `~/workspace/p14_verify/` (test_default/feature.txt,
+   integration/full/golden/capability/stdlib/nano.txt,
+   probe_p14.log, c/api_test_static*.log). The probe compares
+   cumulative bytes per 0.5 s bucket, NOT chunk boundaries: the
+   reader thread may coalesce same-instant writes, and REF itself
+   is non-deterministic at chunk granularity (a traceback arrived
+   as 68+17 bytes in one run, 85 in the next).

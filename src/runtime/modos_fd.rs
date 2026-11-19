@@ -329,6 +329,16 @@ pub fn os_write_ctx(
                     Err(e) => return Err(io_exc(ctx, state, e)),
                 }
             }
+            // P14: the reference's `os.write` is a raw `write(2)`
+            // loop (`modos.zig:331-343`) — unbuffered, so a
+            // newline-less write lands immediately. `std`'s
+            // `Stdout` is a `LineWriter` that would buffer it
+            // until the next `\n` or exit; flush it here so
+            // `os.write(1, b'b')` arrives at once, ahead of any
+            // `print()` output still sitting in the buffered
+            // stdout (which this flush does NOT touch — the
+            // buffer sits above `std`'s `Stdout`).
+            let _ = out.flush();
         }
         _ => {
             // The table borrow must end before the error

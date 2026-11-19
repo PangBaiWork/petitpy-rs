@@ -53,16 +53,19 @@ fn rt_to_value(ctx: &mut CallCtx, state: &mut VmState, e: RtError) -> Value {
 /// to `output.write(1, ...)` (`vendor_stubs.zig:22-24`); the
 /// uncaught-traceback shape (`mp_stderr_print`, fd 2) is a
 /// different path and does NOT apply here. Without a sink, plain
-/// `write(1, ...)` (stdout, flushed first so piped output stays
-/// in order — the `print_traceback` ordering, destination
-/// corrected).
+/// `write(1, ...)` — and, like the Zig's `printExcAndClear`
+/// (`runtime_utils.zig:35-40`, NO `fflush`), it BYPASSES the
+/// buffered stdout with no flush first: on the reference a
+/// drain print goes out immediately, ahead of any `print()`
+/// output still sitting in the FILE* buffer. (P14 brief §1
+/// listed the drain among the buffered paths; the Zig source
+/// says otherwise — see `scripts/p14_result.txt` §4.)
 fn print_raised(ctx: &mut CallCtx, exc: Value) {
     use std::io::Write as _;
     let mut out = String::new();
     let pool = ctx.pool;
     let types = ctx.types;
     obj_print_exception(ctx, types, exc, &|id| pool.qstr_str(id as u16), &mut out);
-    let _ = std::io::stdout().flush();
     if crate::support::output::write_sink(1, out.as_bytes()) {
         return;
     }

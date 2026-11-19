@@ -431,11 +431,12 @@ pub fn obj_print_helper(
 /// first and written to stdout with errors ignored, as the
 /// original ignores `mp_printf`'s return. G2 (P7a): a `ByteBuf`,
 /// not a `String` — a non-UTF-8 `str` prints byte-exact.
+/// P14: through the buffered stdout (glibc stdio buffering),
+/// not a per-call write-through.
 pub fn obj_print(ctx: &mut CallCtx, types: &BuiltinTypes, value: Value, kind: PrintKind) {
     let mut s = crate::objects::slots::ByteBuf::new();
     obj_print_helper(ctx, types, value, kind, &mut s);
-    use std::io::Write as _;
-    let _ = std::io::stdout().write_all(&s.0);
+    crate::support::output::buffered_stdout_write(&s.0);
 }
 
 // ── array access / index / subscript / buffer ─────────────────────────

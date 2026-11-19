@@ -95,6 +95,19 @@ fn emit_mpy(vm: &mut Vm, in_path: &std::ffi::OsStr) -> u8 {
 }
 
 fn main() -> ExitCode {
+    // P14: C's `exit()` flushes stdio automatically; Rust does
+    // NOT flush a custom buffer on process exit, so flush the
+    // buffered stdout once here, on every exit path (script,
+    // `-c`, REPL, `--emit-mpy`, `--version` — the buffer is
+    // empty unless program output happened). Do NOT flush on
+    // abort paths (a Zig panic / `abort()` does not flush
+    // stdio either) — aborts never reach this return.
+    let code = real_main();
+    petitpy_rs::support::output::flush_stdout_buffer();
+    code
+}
+
+fn real_main() -> ExitCode {
     // G2 (P7a): `args_os`, not `args` — `std::env::args()`
     // PANICS (unwrap in env.rs) on a non-UTF-8 argument,
     // while the reference runs a `0xff` script name fine.

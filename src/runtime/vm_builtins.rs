@@ -198,6 +198,12 @@ pub(crate) fn print_impl_with(
                 let _ = mp_print_str(&mut print, &s.0);
             }
             let _ = mp_print_str(&mut print, &end_bytes);
+            // P14: `flush=True` flushes the buffered stdout
+            // (the `file=` path flushes the file object; the
+            // no-file path ignored the flag until now).
+            if flush {
+                crate::support::output::flush_stdout_buffer();
+            }
             Ok(Value::None)
         }
     }

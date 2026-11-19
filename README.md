@@ -188,13 +188,19 @@ pass a gate.
 - **Subprocess timeout kill is SIGKILL (-9), reference SIGTERM
   (-15)** (D3). **Signal handlers are recorded but never dispatched**
   (D4, the original's own MVP limitation is mirrored in structure).
-- **Piped stdout is unbuffered on Rust** (G0 probe, P14): the
-  reference buffers piped stdout (glibc stdio on the `stdout`
-  `FILE*`, `file_io.zig:486` + `fwrite`; `print` + `sleep` shows
-  both lines only after the sleep), Rust writes through per
-  `print` (Rust `Stdout` is a line writer). Mechanism located
-  by G5; the fix (a 4096-byte stdout buffer, tty line-flush,
-  sink bypass, exit flush) is a follow-up lane, not G5.
+- **Piped stdout is buffered on Rust, like the reference** (G0
+  probe, P14 — fixed by lane P14): the reference buffers piped
+  stdout (glibc stdio on the `stdout` `FILE*`, `file_io.zig:486`
+  + `fwrite`; `print` + `sleep` shows both lines only after the
+  sleep); Rust now has one process-global 4096-byte stdout
+  buffer (`support/output.rs`: line-flush on a tty, full chunks
+  on a pipe, flush at process exit, `sys.stdout.flush()` and
+  `print(flush=True)` flush it). Two paths deliberately bypass
+  the buffer, per the Zig source: the petitpy-vm traceback and
+  the finaliser-drain print (`printExcAndClear` does no `fflush`).
+  `os.write(1/2)` flushes `std`'s `Stdout` after writing (the
+  reference's is a raw `write(2)` loop). Arrival-time probes
+  10/10 byte-identical; `tests/p14_stdout.rs` pins the timing.
 - **GC finaliser is drained only at an explicit `gc.collect()`**
   (F6): a stress collection inside `alloc()` defers the `__del__`
   calls to the next explicit collect (objects are seed-marked to

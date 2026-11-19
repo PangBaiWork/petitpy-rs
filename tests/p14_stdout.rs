@@ -16,7 +16,7 @@ use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 fn bin_petitpy() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_petitpy-rs"))

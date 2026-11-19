@@ -127,9 +127,17 @@ jobs:
           cp "$BIN_DIR/petitpy-rs${{ matrix.exe }}" dist/
           cp "$BIN_DIR/petitpy-vm${{ matrix.exe }}" dist/
           cp "$BIN_DIR/zigpy-compile${{ matrix.exe }}" dist/
+          # The shared library is `libpetitpy_rs.{so,dylib}` on
+          # Unix (lib prefix) and `petitpy_rs.dll` on Windows. A
+          # missing candidate must not fail the step: under `set -e`
+          # a `for` loop exits with its last test's status, and on
+          # Linux/macOS every name test fails, which was killing
+          # this step with exit code 1 after the exes were copied.
           for ext in so dylib dll; do
-            [ -f "$BIN_DIR/petitpy_rs.$ext" ] && cp "$BIN_DIR/petitpy_rs.$ext" dist/
-          done
+            for cand in "$BIN_DIR/petitpy_rs.$ext" "$BIN_DIR/libpetitpy_rs.$ext"; do
+              [ -f "$cand" ] && cp "$cand" dist/
+            done
+          done || true
 
       - name: Build (unsafe-ffi)
         if: matrix.ffi
@@ -144,9 +152,13 @@ jobs:
           cp "$BIN_DIR/petitpy-rs${{ matrix.exe }}" dist-ffi/
           cp "$BIN_DIR/petitpy-vm${{ matrix.exe }}" dist-ffi/
           cp "$BIN_DIR/zigpy-compile${{ matrix.exe }}" dist-ffi/
+          # See Collect (default): `lib` prefix on Unix, and the
+          # loop must not fail the step when a name is absent.
           for ext in so dylib dll; do
-            [ -f "$BIN_DIR/petitpy_rs.$ext" ] && cp "$BIN_DIR/petitpy_rs.$ext" dist-ffi/
-          done
+            for cand in "$BIN_DIR/petitpy_rs.$ext" "$BIN_DIR/libpetitpy_rs.$ext"; do
+              [ -f "$cand" ] && cp "$cand" dist-ffi/
+            done
+          done || true
 
       - name: Upload artifact (default)
         uses: actions/upload-artifact@v4

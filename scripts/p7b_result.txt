@@ -1,0 +1,79 @@
+# P7b result — API `ppy_exec` 非 UTF-8 文件名 lossy（triage P7b）
+
+Base: master 455e6d2（G6b 已合）。Lane 分支 `lane/p7b-exec-filename-bytes`，
+worktree `~/workspace/petitpy-rs-p7b-filename`。HEAD 698772f（2 个 lane
+提交，见 §1）。验收输出：`~/workspace/p7b_verify_main/`（断点续跑脚本
+`~/workspace/p7b_verify.sh`，7 节全 done）；探针：`~/workspace/p7b_probe/`。
+
+## §1 构建
+
+- 076a467「source names travel as &[u8]」：`compile_to_mpy_named[_debug]`、
+  `eval_exec_body`、`eval_exec_named`、`compile_error_value_named`、
+  `register_mpy_code[_ctx]`、`compile_source_to_mpy`、`compile_and_load`、
+  `compile_to_code`、`resolve_source_file`、`exec_source_in_module`、
+  `run_main_source` 的名字参数一律 `&str`→`&[u8]`，调用点传
+  `.as_bytes()`（或 `b"..."` 字面量）。`ppy_exec` 不再
+  `from_utf8_lossy`：NULL 传 `b"<string>"`，否则 `c_str_bytes(filename)`
+  原始字节直进 `from_strn`（照抄原版 `evalExec` 传 `file` 给 `qstr(file)`）。
+  `register_main_module` / `load_module_from_mpy` / `load_module_from_source`
+  保持 `&str`（模块名，实践中 ASCII），在边界处转换；CLI 不变（P7a lossy
+  保留）；`compile()` 内建仍 lossy（范围外）。
+- 698772f「traceback printer keeps filename bytes exact + tests」：
+  名字进了 qstr 但两处 traceback 帧打印仍走 `from_utf8_lossy`，且
+  `ppy_format_exception` 用 `String` sink（`ByteSink` 默认 lossy），
+  0xff 文件名仍印成 U+FFFD。帧文件/块名改走 `ByteSink::write_bytes`
+  （字节 sink 精确、`String` sink 保持旧 lossy 默认），
+  `format_exception_body` 改用已有的 `ByteBuf` 格式化（`new_str` 按字节
+  建串，结果里留原始字节）。新测试 2 个（见 §2）。
+- 接替执行器复核：两处 diff 逐行看过，均为 brief §1 范围内的机械改动，
+  无多余内容；`ByteBuf`/`write_bytes` 为既有基础设施，未新造接口。
+
+## §2 验收（HEAD 698772f）
+
+- 默认 lib **1739/0/1**（base 1737 + 2，新测试），bins 9，entry_cli 45，
+  p14 3/3；feature lib **1755/0/1**（base 1753 + 2），g6a_os 8/8，
+  g6b_socksub 1/1，p14 3/3；ignored 1（未升）。
+- **0 warnings**：`touch src/lib.rs` 后强制重编再数，双构建皆 0。
+  （`cargo test` 时出现的 4 条 "output filename collision" 为既有现象，
+  G6b/P14 的 test 日志里同样有，与本 lane 无关；0-warning 按 `cargo build` 计。）
+- integration **200/202**（默认，只差 select ×2）/ **202/202**（feature）。
+- full **545/552 GREEN**（失败集恰为 7 个 known-fails）；golden **585/585**；
+  capability **GREEN**；stdlib **8/8**；nano **454/541**（只报数）。
+- check_compile_mpy + check_frozen：默认与 feature 双构建 **4/4 PASS**。
+- C 验收（原版 `tests/embed/api_test.c` 未改动）：默认 staticlib **61/61**
+  （`all passed`，rc 0），`NPY_GC_STRESS=10` 同样；feature staticlib
+  **61/61**。新 case 在 Rust 侧（下），C 文件未动。
+- 新测试（`src/entry/api_tests.rs`，+2）：`exec_non_utf8_filename_keeps_raw_bytes`
+  （traceback 含原始 `0xff`、无 U+FFFD）、`exec_null_filename_is_string`。
+- 审计：lane diff 里生产代码新增 `unsafe` 净 0（`api.rs` 的
+  `unsafe { c_str_bytes(filename) }` 是删掉的 lossy 行里同一个既有调用的
+  平移；其余新增 `unsafe` 只在 `api_tests.rs` 的两个新测试里，是该文件既有的
+  FFI 调用写法）；`api.rs` 的 unsafe 词数 **87**（与 master 一致）；
+  `ppy_` 导出 **39**；改动文件均 <2500 行（最大 `api.rs` 1912 行）。
+
+## §3 探针（`~/workspace/p7b_probe/`，REF vs feature vs 默认三边逐字节比）
+
+- `probe_p7b.py` 4 例，**4/4 PASS**（stdout+stderr+rc 全等）：
+  - u1_nonutf8_exec：`bad\xffname.py` + raise——三边 traceback 均印原始
+    `0xff` 字节，`File "bad\xffname.py", in <module>` + `ValueError: boom`，rc 1。
+  - u2_utf8_exec：正常文件名，同上结构，rc 1。
+  - u3_null_exec：NULL filename——三边均为 `File "<string>"`，rc 1。
+  - u4_eval：`ppy_eval` 不受影响——三边均为 `File "<string>"` + SyntaxError，rc 1。
+- 探针 C 程序 `p7b_exec_probe.c` 直接调 `ppy_exec`/`ppy_eval`，文件名取
+  argv 原始字节，全程无 UTF-8 转换；`run_probes.sh` 对 REF lib 与双 Rust
+  staticlib 各编一个探针二进制再比对。
+
+## §4 遗留项
+
+- 修了：`ppy_exec` 文件名全程字节精确（qstr 入口 + traceback 打印 +
+  `ppy_format_exception` 输出）；NULL filename 为 `"<string>"`。
+- 没修（有意的，范围外）：CLI 文件名仍 lossy（P7a 已定）；`compile()` 内建
+  的 filename 仍 lossy（`builtinevex.rs` 的 `from_utf8_lossy` 未动）；
+  模块加载路径（`register_main_module` / `load_module_from_mpy`）的名字仍
+  `&str`，在边界处由 qstr 字节 lossy 转来（模块名实践中 ASCII）。
+- 验收过程注记：前一位执行器留下的断点续跑脚本里 full gate 一节误写成
+  `scripts/run_full.py`（不存在），该节标记为 done 但 `full.txt` 只是报错；
+  接替执行器已修正脚本并用 `run_full_gate.py` 重跑，545/552 GREEN（上文数字
+  以重跑为准）。探针链接 REF 时 ld 报 `lib.o: missing .note.GNU-stack`
+  警告，来自原版 lib.o，与本 lane 无关。
+- 无其他与原版不一致的点（探针覆盖的三边输出逐字节相同）。

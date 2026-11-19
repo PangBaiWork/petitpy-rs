@@ -356,7 +356,7 @@ fn compile_glue(
     let filename_bytes =
         str_data_pool(ctx.arena, ctx.pool, args[1]).expect("filename checked above");
     let filename = String::from_utf8_lossy(&filename_bytes).into_owned();
-    crate::runtime::compile_bridge::compile_to_code(ctx, state, &src, kind, &filename)
+    crate::runtime::compile_bridge::compile_to_code(ctx, state, &src, kind, filename.as_bytes())
 }
 
 /// The `compile` interception (`call_function_ctx`): the sig

@@ -30,7 +30,7 @@ use crate::runtime::vm::Vm;
 /// bytes, not `&str` — a non-UTF-8 script name must reach
 /// `__file__` byte-exact.
 pub fn run_source(vm: &mut Vm, src: &[u8], file: Option<&[u8]>) -> i32 {
-    match vm.run_main_source(src, "<stdin>", file) {
+    match vm.run_main_source(src, b"<stdin>", file) {
         Ok(_) => 0,
         Err(exc) => exit_status_for(vm, exc, true),
     }
@@ -176,7 +176,7 @@ pub fn run_repl(vm: &mut Vm) -> i32 {
     // The persistent `__main__` globals: an empty module run
     // registers `__main__` (so `import __main__` resolves) and
     // sets `state.globals` to its dict.
-    let _ = vm.run_main_source(b"", "<stdin>", None);
+    let _ = vm.run_main_source(b"", b"<stdin>", None);
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stderr = std::io::stderr();
@@ -225,14 +225,14 @@ fn repl_exec_line_inner(vm: &mut Vm, line: &[u8], globals: GcRef) -> Result<(), 
         // Non-UTF-8 source is a `SyntaxError` (the Zig's
         // lexer fails at the first undecodable byte).
         Err(_) => {
-            return Err(vm.compile_error_value_named(CompileError::SyntaxError, "<stdin>"));
+            return Err(vm.compile_error_value_named(CompileError::SyntaxError, b"<stdin>"));
         }
     };
-    let mpy = match compile_to_mpy_named(src_str, InputKind::SingleInput, "<stdin>") {
+    let mpy = match compile_to_mpy_named(src_str, InputKind::SingleInput, b"<stdin>") {
         Ok(m) => m,
-        Err(ce) => return Err(vm.compile_error_value_named(ce, "<stdin>")),
+        Err(ce) => return Err(vm.compile_error_value_named(ce, b"<stdin>")),
     };
-    let (module_val, code_idx) = match vm.register_mpy_code(&mpy, "<stdin>", Some(globals), false) {
+    let (module_val, code_idx) = match vm.register_mpy_code(&mpy, b"<stdin>", Some(globals), false) {
         Ok(v) => v,
         Err(e) => {
             let (mut ctx, state) = vm.split();

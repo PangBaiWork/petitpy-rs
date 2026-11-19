@@ -381,7 +381,7 @@ pub fn exec_source_in_module(
     ctx: &mut CallCtx,
     state: &mut VmState,
     src: &[u8],
-    source_name: &str,
+    source_name: &[u8],
     module_obj: Value,
 ) -> Result<(), Value> {
     // `petitpy-vm`: the compiler is not linked — a `.py`
@@ -479,7 +479,7 @@ fn load_found(
             };
             let name = ctx.pool.qstr_str(full_qstr as u16).to_vec();
             let name = String::from_utf8_lossy(&name).into_owned();
-            exec_source_in_module(ctx, state, &src, &name, module_obj)
+            exec_source_in_module(ctx, state, &src, name.as_bytes(), module_obj)
         }
         FoundKind::FileMpy => {
             let Some(bytes) = read_file_full(&found.path) else {
@@ -518,7 +518,7 @@ fn load_found(
                         let name =
                             ctx.pool.qstr_str(full_qstr as u16).to_vec();
                         let name = String::from_utf8_lossy(&name).into_owned();
-                        exec_source_in_module(ctx, state, &src, &name, module_obj)?;
+                        exec_source_in_module(ctx, state, &src, name.as_bytes(), module_obj)?;
                     }
                     return Ok(());
                 }

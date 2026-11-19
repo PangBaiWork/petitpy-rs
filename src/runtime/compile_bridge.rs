@@ -56,7 +56,7 @@ pub const MP_ENOMEM: i32 = 12;
 pub fn compile_source_to_mpy(
     src: &[u8],
     kind: InputKind,
-    source_name: &str,
+    source_name: &[u8],
 ) -> Result<Vec<u8>, CompileError> {
     let src_str = std::str::from_utf8(src).map_err(|_| CompileError::SyntaxError)?;
     compile_to_mpy_named(src_str, kind, source_name)
@@ -120,7 +120,7 @@ pub fn compile_and_load(
     state: &mut VmState,
     src: &[u8],
     kind: InputKind,
-    source_name: &str,
+    source_name: &[u8],
 ) -> Result<Value, Value> {
     let mpy = match compile_source_to_mpy(src, kind, source_name) {
         Ok(m) => m,
@@ -163,7 +163,7 @@ pub fn compile_to_code(
     state: &mut VmState,
     src: &[u8],
     kind: InputKind,
-    source_name: &str,
+    source_name: &[u8],
 ) -> Result<Value, Value> {
     // `petitpy-vm`: the compiler is not linked (the Zig's
     // `compile_to_code_glue` stub).
@@ -225,9 +225,9 @@ pub(crate) fn vm_error_to_value(
 /// interns for real since C15b — `from_strn` takes `&self`).
 /// `0` (`MP_QSTRnull`) when the name cannot be interned
 /// (over-long, or an allocation failure).
-fn resolve_source_file(ctx: &CallCtx, name: &str) -> u32 {
+fn resolve_source_file(ctx: &CallCtx, name: &[u8]) -> u32 {
     ctx.pool
-        .from_strn(name.as_bytes())
+        .from_strn(name)
         .map(u32::from)
         .unwrap_or(0)
 }

@@ -82,7 +82,7 @@ use crate::objects::objtype::objmodule::new_module;
 use crate::objects::objtype::subclass::is_subclass_fast;
 use crate::objects::primitives::objfloat::new_float;
 use crate::objects::primitives::ops::static_qstr_id;
-use crate::objects::slots::{PrintKind, SubscrArg};
+use crate::objects::slots::{ByteBuf, PrintKind, SubscrArg};
 use crate::objects::strings::objstr_a::{new_bytes, new_str};
 use crate::objects::value::{DictData, MapData, Obj, Value};
 use crate::runtime::builtinimport::import_impl;
@@ -649,7 +649,7 @@ fn get_or_create_module(ctx: &mut CallCtx, state: &mut VmState, name_id: u32) ->
 fn eval_exec_body(
     interp: &mut Interp,
     src: &[u8],
-    name: &str,
+    name: &[u8],
     kind: InputKind,
 ) -> Result<Value, Value> {
     let globals = interp.main_globals;
@@ -853,9 +853,14 @@ fn format_exception_body(interp: &mut Interp, h: PpyHandle) -> Result<Value, Val
     let exc = obj_or_invalid(&mut ctx, state, exc)?;
     let types = ctx.types;
     let pool = ctx.pool;
-    let mut out = String::new();
+    // P7b: a `ByteBuf` sink, not `String` — the formatted
+    // traceback must keep non-UTF-8 filename bytes exact
+    // (a `String` sink lossies them via the `ByteSink`
+    // default); `new_str` is byte-based so the result holds
+    // the raw bytes.
+    let mut out = ByteBuf::new();
     obj_print_exception(&mut ctx, types, exc, &|id| pool.qstr_str(id as u16), &mut out);
-    let v = new_str(&mut ctx, types, out.as_bytes());
+    let v = new_str(&mut ctx, types, &out.0);
     Ok(v)
 }
 
@@ -1064,7 +1069,7 @@ pub unsafe extern "C" fn ppy_new(config: *const PpyConfig) -> *mut Interp {
     // Register `__main__` (an empty run creates the module +
     // its dict and records `d4.main_module`); the globals
     // dict is the interpreter's `main_globals`.
-    let main_globals = match vm.run_main_source(b"", "<stdin>", None) {
+    let main_globals = match vm.run_main_source(b"", b"<stdin>", None) {
         Ok(Value::Heap(r)) => match vm.arena.get(r) {
             Obj::Module(m) => m.dict,
             _ => {
@@ -1147,15 +1152,16 @@ pub unsafe extern "C" fn ppy_exec(
         // FFI invariant: `src` points to `len` readable bytes.
         unsafe { std::slice::from_raw_parts(src as *const u8, len) }
     };
-    let name_owned;
-    let name: &str = if filename.is_null() {
-        "<string>"
+    // P7b: the filename travels as raw bytes — the original's
+    // `evalExec` passes `file` straight to `qstr(file)` with
+    // no UTF-8 check and no lossy conversion, so a non-UTF-8
+    // name must reach the traceback byte-exact.
+    // FFI invariant: `filename` is NULL or a valid
+    // NUL-terminated C string.
+    let name: &[u8] = if filename.is_null() {
+        b"<string>"
     } else {
-        // `from_utf8_lossy` borrows a temporary otherwise —
-        // bind the owned string first so `name` outlives it.
-        // FFI invariant: `filename` is a valid NUL-terminated C string.
-        name_owned = String::from_utf8_lossy(unsafe { c_str_bytes(filename) });
-        &name_owned
+        unsafe { c_str_bytes(filename) }
     };
     run_bracket(py, std::ptr::null_mut(), |interp| {
         eval_exec_body(interp, src_bytes, name, InputKind::FileInput).map(|_| None)
@@ -1187,7 +1193,7 @@ pub unsafe extern "C" fn ppy_eval(
         unsafe { std::slice::from_raw_parts(src as *const u8, len) }
     };
     run_produce(py, result, |interp| {
-        eval_exec_body(interp, src_bytes, "<string>", InputKind::EvalInput)
+        eval_exec_body(interp, src_bytes, b"<string>", InputKind::EvalInput)
     })
 }
 

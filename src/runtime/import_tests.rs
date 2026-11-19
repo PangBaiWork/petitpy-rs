@@ -146,7 +146,7 @@ impl Ix {
         let compiled: Vec<(String, Vec<u8>)> = entries
             .iter()
             .map(|(name, src)| {
-                let mpy = compile_to_mpy_named(src, InputKind::FileInput, name)
+                let mpy = compile_to_mpy_named(src, InputKind::FileInput, name.as_bytes())
                     .expect("frozen source compiles");
                 (name.to_string(), mpy)
             })
@@ -198,7 +198,7 @@ impl Drop for TmpDir {
 
 /// Compile source to `.mpy` bytes (for `.mpy`-file tests).
 fn mpy_bytes(src: &str, name: &str) -> Vec<u8> {
-    compile_to_mpy_named(src, InputKind::FileInput, name).expect("source compiles")
+    compile_to_mpy_named(src, InputKind::FileInput, name.as_bytes()).expect("source compiles")
 }
 
 // ── frozen modules ───────────────────────────────────────────────────

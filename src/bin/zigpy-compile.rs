@@ -393,7 +393,7 @@ fn compile_one(input_path: &[u8], output_path: &[u8], source_name: &str) -> bool
     // Pipeline: lexer → parser → compile → mpy.write, via the Phase B
     // bridge. `FileInput` matches main.zig's `.file_input`; lexer
     // `debug_mode` is `true`, matching main.zig:238 (see header notes).
-    let bytes = match compile_to_mpy_named_debug(src, InputKind::FileInput, source_name, true) {
+    let bytes = match compile_to_mpy_named_debug(src, InputKind::FileInput, source_name.as_bytes(), true) {
         Ok(bytes) => bytes,
         Err(CompileError::OutOfMemory) => {
             print_err_line(&compile_err_line(

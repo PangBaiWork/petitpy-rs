@@ -376,16 +376,18 @@ fn print_exception_chain_hook<'r>(
         if !tb.is_empty() {
             let _ = sink.write_str("Traceback (most recent call last):\n");
             for frame in tb.iter().rev() {
+                // P7b: file/block names are raw qstr bytes — see
+                // `print_exception_chain` in obj_ops.rs.
                 let file = resolve(frame.name);
-                let _ = write!(sink, "  File \"{}\"", String::from_utf8_lossy(file));
+                let _ = sink.write_str("  File \"");
+                sink.write_bytes(file);
+                let _ = sink.write_str("\"");
                 match frame.block {
                     Some(b) => {
                         let name = resolve(b);
-                        let _ = write!(
-                            sink,
-                            ", in {}\n",
-                            String::from_utf8_lossy(name)
-                        );
+                        let _ = sink.write_str(", in ");
+                        sink.write_bytes(name);
+                        let _ = sink.write_str("\n");
                     }
                     None => {
                         let _ = sink.write_str("\n");

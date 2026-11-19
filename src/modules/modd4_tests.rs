@@ -9,6 +9,9 @@
 //! every assertion was probed on the reference binary
 //! 2026-11-18 (see `scripts/d4_result.txt` §2).
 
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
+
 use crate::compiler::bridge::compile_to_mpy_named;
 use crate::compiler::parser::InputKind;
 use crate::objects::containers::objdict::dict_get_value;
@@ -354,6 +357,7 @@ fn d4_select_negative_timeout() {
 }
 
 #[test]
+#[cfg(not(feature = "unsafe-ffi"))]
 fn d4_select_nonempty_not_implemented() {
     let mut fx = Fx::new();
     assert_eq!(
@@ -363,6 +367,128 @@ fn d4_select_nonempty_not_implemented() {
             "select.select is not implemented (no std select API)".to_string()
         )
     );
+}
+
+// ── select, real select(2) (`unsafe-ffi` only, G0) ────────────────
+
+#[test]
+#[cfg(feature = "unsafe-ffi")]
+fn g0_select_devnull_readable() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "import os, select\n\
+         fd = os.open('/dev/null', os.O_RDONLY)\n\
+         r, w, x = select.select([fd], [], [], 0)\n\
+         a = len(r)\n\
+         b = r[0]\n\
+         os.close(fd)\n",
+    );
+    assert_eq!(fx.g_int("a"), 1);
+    // The result keeps the original fd object.
+    assert!(fx.g_int("b") >= 0);
+}
+
+#[test]
+#[cfg(feature = "unsafe-ffi")]
+fn g0_select_listener_readable_then_drained() {
+    // No `os.pipe` in the VM's os module (D2 never exposed it), so
+    // the readable → drained transition is driven through a Unix
+    // listener: a Rust std thread connects shortly after the script
+    // starts blocking in select (the modsocket_tests.rs pattern).
+    let path = format!("/tmp/g0_sel_listen_{}", std::process::id());
+    let _ = std::fs::remove_file(&path);
+    let client_path = path.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = UnixStream::connect(&client_path);
+    });
+    let mut fx = Fx::new();
+    let src = format!(
+        "import socket, select, os\n\
+         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         s.bind({path:?}); s.listen(1); s.setblocking(False)\n\
+         r, _, _ = select.select([s.fileno()], [], [], 5)\n\
+         a = len(r)\n\
+         c, _ = s.accept()\n\
+         r, _, _ = select.select([s.fileno()], [], [], 0)\n\
+         b = len(r)\n\
+         c.close(); s.close(); os.remove({path:?})\n"
+    );
+    fx.run_ok(&src);
+    let _ = handle.join();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(fx.g_int("a"), 1);
+    assert_eq!(fx.g_int("b"), 0);
+}
+
+#[test]
+#[cfg(feature = "unsafe-ffi")]
+fn g0_select_write_ready() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "import os, select\n\
+         fd = os.open('/dev/null', os.O_WRONLY)\n\
+         _, w, _ = select.select([], [fd], [], 0)\n\
+         a = len(w)\n\
+         os.close(fd)\n",
+    );
+    assert_eq!(fx.g_int("a"), 1);
+}
+
+#[test]
+#[cfg(feature = "unsafe-ffi")]
+fn g0_select_ebadf() {
+    let mut fx = Fx::new();
+    assert_eq!(
+        fx.raised_msg(
+            "import os, select\n\
+             fd = os.open('/dev/null', os.O_RDONLY)\n\
+             os.close(fd)\n\
+             select.select([fd], [], [], 0)\n",
+        ),
+        ("OSError".to_string(), "9".to_string())
+    );
+}
+
+#[test]
+#[cfg(feature = "unsafe-ffi")]
+fn g0_select_fd_over_1024_skipped() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "import select\n\
+         r, w, x = select.select([2000], [], [], 0)\n\
+         a = len(r) + len(w) + len(x)\n",
+    );
+    assert_eq!(fx.g_int("a"), 0);
+}
+
+#[test]
+#[cfg(feature = "unsafe-ffi")]
+fn g0_select_dup_fd() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "import os, select\n\
+         fd = os.open('/dev/null', os.O_RDONLY)\n\
+         r, _, _ = select.select([fd, fd], [], [], 0)\n\
+         a = len(r)\n\
+         os.close(fd)\n",
+    );
+    // filterReady appends per input item, like the Zig.
+    assert_eq!(fx.g_int("a"), 2);
+}
+
+#[test]
+#[cfg(feature = "unsafe-ffi")]
+fn g0_select_xlist_not_ready() {
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "import os, select\n\
+         fd = os.open('/dev/null', os.O_RDONLY)\n\
+         _, _, x = select.select([], [], [fd], 0)\n\
+         a = len(x)\n\
+         os.close(fd)\n",
+    );
+    assert_eq!(fx.g_int("a"), 0);
 }
 
 #[test]

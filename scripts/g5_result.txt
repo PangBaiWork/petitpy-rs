@@ -1,0 +1,226 @@
+# G5 结果（pure-std medium: P3/P4/P5/P6/P8/P9 + P14）
+
+基线 master a4f1041（G0+G2 已合并）。工作树
+~/workspace/petitpy-rs-g5-purestd-medium，分支 lane/g5-purestd-medium。
+提交：P4 0cbebe1、P5 09cec30、P6 cbd9d6c、P3 8dbdc06、P8 10c8426。
+0 unsafe（全 lane 无 unsafe 增量；grep 见 §2）。
+
+## §1 各项
+
+### P4 — import os.path 报错名（DONE, 0cbebe1）
+- 机制（triage 假设“在 parent 分支拼名字”是错的）：`import os.path`
+不是 import-loader 拼名，而是 PEP 562 模块 `__getattr__`：
+`modos.zig:208-215`（`py_os_getattr`）：`os.path` 时 import
+`os_path`（失败即传播——故 REF 报 `ModuleNotFoundError: No
+module named 'os_path'`），其它属性 import `os_ext`（失败吞
+掉、pending 清掉），查到属性返回，否则 `AttributeError("no
+attribute '%q'")`。
+- Rust 已有 `os_getattr_stub` + `os_getattr_ctx`
+（modos.rs:604-693），VM loader `load_method_maybe_ctx`
+（vm_rt_name.rs:186）也已走模块 `__getattr__`，但
+`process_component`（builtinimport.rs）用的是 C14 的
+`load_attr_maybe`（import_search.rs:294），其 AttrFn 适配器
+不带 `__getattr__` 缝合，于是落到 "not a package" 报错。
+- 修（builtinimport.rs 唯一文件，+20/−3）：`process_component`
+改用 `load_method_maybe_ctx`，AttributeError 按 Zig 的
+`loadAttrMaybe`（import_search.zig:92-98）吞掉；其它 raise
+原样传播（`os_path` 的 ModuleNotFoundError）。
+`exception_match` 需 `Value::Heap(state.exc.attribute_error)`
+（第一次传裸 GcRef 报 E0308，已修）。
+- 验证：有 `os_path.py` 时 `import os.path;
+print(os.path.join('a','b'))` → `ok a/b` rc=0；无时
+`ModuleNotFoundError: No module named 'os_path'` rc=1；
+`import os.nonexistent` → `ModuleNotFoundError: No module
+named 'os.nonexistent'; 'os' is not a package`（与 REF 一致——
+REF 的 `__getattr__` 对 nonexistent 报 AttributeError，被吞
+掉后触发 "not a package"）；`os.nonexistent` 属性访问 →
+`AttributeError: no attribute 'nonexistent'`（双边一致）。
+- 探针：~/workspace/g5_probe/probe_p3.py 的 p4_ospath 用例。
+
+### P5 — type 对象属性查找（DONE，机制已落地；测试 09cec30）
+- 两个 ignored 测试的行为与 REF 已逐字节一致，机制早已落地，
+不是 G5 修的：
+- `makenew_class_attr_on_class`（vm_tests_b.rs:450，`C.x`），
+`--ignored` 运行通过。
+- `int_from_bytes_e2e_after_classmethod_wrap`
+（builtinhelp_tests.rs:355）：失败只因测试期望写错——它期望
+`str(type(int.from_bytes)) == "<class 'classmethod'>"`，但
+REF 印的是 `<class 'bound_method'>` / `<bound_method>`（G5
+探针 /tmp/g5_p5.py 在 REF 与 Rust 上验证，2026-11-19；
+另：`type(int.to_bytes)` 是 `<class 'function'>`，
+`int.to_bytes` 印 `<function>`；`int.fromhex` 不存在，
+双边 AttributeError）。期望已按 REF 更正。
+- `type_attr` 已移植并接线：typecreate.rs:478、rom.rs:125，
+逐行对过 objtype.zig:1701-1759（含 store 半的 fixed-map
+no-op 与 HAS_SPECIAL_ACCESSORS），一致。
+- 扩展探针 ~/workspace/g5_probe/probe_p5x.py（类属性、继承属性、
+方法、classmethod、staticmethod、`__name__` / `__bases__` /
+`__mro__`、`type(C.x)`、`type(C.m)`、`int.to_bytes`、
+`int.from_bytes(b'\x02','big')`、缺属性 AttributeError）——除
+函数地址值外逐字节一致（N3/N4：REF 印 ASLR 裸指针如
+`0x74b932dde8a0`，Rust 印 arena 索引如 `0x267`，已知设计差异）。
+
+### P3 — 文件写缓冲（DONE, 8dbdc06）
+- 机制（读原版确认）：`npyFileWrite`（file_io.zig:160-176）
+调 libc `fwrite(buf, 1, size, fp)`；CLOSE 时 `_ = fclose(fp)`
+（~214-225），返回值丢弃，flush 错误在 close 处被吞。
+Rust 之前直写 `std::fs::File`，故 /dev/full 在 write 时
+即报 OSError 28。
+- 修：`FileHandle::Owned` 改为
+`Rc<RefCell<BufWriter::with_capacity(4096, file)>>`
+（4096 = glibc 默认文件缓冲大小，value_data.rs）；
+`fileio_read` 先 flush 写缓冲（libc `FILE*` 换向 flush；
+flush 失败在此处报出，如原版 `fread` 经 `ferror` 报出）；
+`BufWriter::seek` 先 flush（同 `fseek`）；open_impl 构造处
+包 BufWriter（objfileio.rs）。
+- 附带真 bug（同文件）：SEEK ioctl 把新偏移写进
+`state.offset` 而非 `state.result`——`stream_seek`
+（stream.rs:277）读的是 `result`，故所有文件 `seek` /
+`tell` 返回 0（探针 p3e：REF tell 5，Rust 0）。现写
+`state.result`，与 StringIO 后端（objstringio.rs:423）
+与 stream fixture（stream_fixture.rs:104）一致；fileio
+seek 测试原断言 `st.offset` 是在钉这个 bug，已改为断言
+`st.result`（objfileio_tests.rs）。
+- 探针 ~/workspace/g5_probe/probe_p3.py 9 用例全 SAME
+（p3a 小写 /dev/full、p3b 5000 字节写 /dev/full、p3c
+写读往返、p3d flush 到 /dev/full、p3e tell、p4_ospath、
+p5a/b/c）。`os.write` 直接路径 triage 已断言不受影响
+（G5 未重探——主 agent 验收时可顺带确认）。
+
+### P6 — str_data 动态 qstr 残留站点审计（DONE，审计 + 1 修，cbd9d6c）
+- 审计方法：D5 清单逐项 grep + 双二进制探针。
+- 57 用例电池 /tmp/g5_p6.py（字面量串 +
+bytes：大小写、zfill/center/ljust、strip/split/join、
+replace、find、format/%、encode、partition、is*、swapcase、
+splitlines、拼接/重复/下标/切片/len/contains/eq/lt/hash/
+repr/iter/reversed/sorted + bytes 变体 + int/float 解析 +
+dict 键 + set 成员 + getattr）——全 SAME。
+- 42 用例电池 /tmp/g5_p6b.py（真正动态 qstr：
+`ZqxjDynamicClassName.__name__` 与
+`zqxj_dynamic_func_name.__name__`，`id()` 双边 4914，
+`type(s)` 是 str）——全 SAME。
+- 剩余 arena-only `str_data(` 站点逐个判定：
+- objstr_b.rs `get_qstr` / `get_str` / `get_data`：
+唯一调用方是 `type_name_qstr`（typecreate.rs:129-130）；
+见下修。
+- objstr_iters.rs `str_iter_next` / `bytes_iter_next` /
+`str_charlen`：`new_str_iterator` 无活调用方（str 迭代
+走 getitem 迭代器，runtime_iter.rs `getiter` → `__getitem__`
+检查 → `new_getitem_iter`，下标路径用 `str_data_pool`）；
+`str_charlen` 无调用方。死路径，不可达。
+- objstr_methods_c.rs:445 buffer 路径：Qstr 分支已显式走
+pool（C18b 修过）。无问题。
+- lookup.rs:405/452 的 `get_qstr` 是另一函数（`__get__`
+qstr 访问器），误报。
+- 修（cbd9d6c）：`type('ZqxjDynHeapName', (), {})`——REF 正常，
+Rust 报 `MemoryError: out of memory`。`type_name_qstr` 用
+`find_strn`（只查不建），堆串名字既非静态又不在池中即报
+OutOfMemory（文档化的 C13 缺口）。原版
+`mp_obj_str_get_qstr` 对堆串调 `qstr_from_strn`
+（objstr.zig:3297-3305），建动态 qstr；`typeMakeNewImpl`
+即调它（objtype.zig:1497）。改为 `from_strn`（intern，
+建动态条目）。`type('Foo'+'Bar', (), {})` 与
+`type('ZqxjDynHeapName', (), {})` 现与 REF 一致；
+`type('x'*300, (), {})` Rust 仍报 MemoryError，REF 崩溃
+（qstr_from_strn panic，rc=134）——N1 类原版崩溃，不复现。
+- 探针：~/workspace/g5_probe/probe_p6.py、probe_p6b.py、
+probe_p6c.py（type 堆串名）。
+
+### P8 — finaliser drain 不走 SinkGuard（DONE, 10c8426）
+- 机制（读原版确认，比 triage 假设更大）：原版受保护调用
+经 `mp_obj_print_exception(&mp_plat_print, ev)`
+（runtime_utils.zig:41-48，vendor runtime_utils.c:30 亦同）
+→ `mp_hal_stdout_tx_strn_cooked` → `output.write(1,...)`
+（vendor_stubs.zig:22-24）——**fd 1**，有 sink 时走 sink。
+F6 的 Rust 实现印到 fd 2（stderr）直写，sink 全绕过——它
+抄的是未捕获回溯（`mp_stderr_print`）的形状，是另一条路。
+- 修（finaliser.rs `print_raised`）：`write_sink(1,..)`，
+无 sink 时 plain stdout 写（先 flush stdout 保序）。
+模块头文档与 F6 测试注释同步更正（fd 1，非 stderr）。
+- 门：CLI 上此行为不可从 Python 观察（native close 永不
+raise；改 `__del__` 双边同禁——F6 结论），故门是 Rust 测试
+`f6_raising_del_goes_to_sink_as_fd1`（vm_tests_f6.rs）：装
+录制 sink，断言 drain 恰好一次 fd-1 写入，含 ValueError /
+boom-del；既有测试 setup 抽成 `install_raising_del_instance`
+helper。双二进制探针 ~/workspace/g5_probe/probe_p8.py
+记录不可观察性（最接近的可观察程序双边静默）。
+
+### P9 — stress 路径 finaliser 延迟（未做，见 §4）
+### P14 — 管道 stdout 缓冲（未做，见 §4；机制已定位）
+
+## §2 验收（默认构建）
+
+
+
+## §3 改动文件
+
+- src/runtime/builtinimport.rs（P4，+20/−3）
+- src/runtime/vm_tests_b.rs、src/runtime/builtinhelp_tests.rs
+（P5，un-ignore + 期望更正）
+- src/objects/objtype/typecreate.rs（P6，`from_strn`）
+- src/objects/value_data.rs、src/objects/containers/objfileio.rs、
+src/objects/containers/objfileio_tests.rs（P3，BufWriter +
+seek `result` + 测试断言）
+- src/runtime/finaliser.rs、src/runtime/vm_tests_f6.rs
+（P8，fd 1 + sink + 测试）
+- README.md（Known divergences：删“文件写无缓冲”，
+finaliser 句改为 fd 1 + sink，新增 P14 条目）
+- 本结果文件 scripts/g5_result.txt
+- 探针 ~/workspace/g5_probe/：probe_p3.py、probe_p5.py、
+probe_p6.py、probe_p6b.py、probe_p6c.py、probe_p8.py、
+probe_p14.py、run_acceptance.sh；门输出
+~/workspace/g5_verify/acceptance.log
+
+## §4 遗留
+
+### P9 — stress 路径 finaliser 延迟（低价值，未做）
+- 现状：stress 收集在 `GcArena::alloc_inner` 内触发
+（gc.rs:572-576），只调 `collect_inner`，pending
+finalisers 列入 `pending_finalisers`；drain
+（`drain_pending_finalisers`）只在显式 `gc.collect()` 后
+经 `call_gc_collect_ctx` 跑（有 `&mut CallCtx` +
+`&mut VmState` 才行）。
+- 为何不动：原版在任意 collect 内同步跑 finaliser
+（gc.zig:298 `runFinalisers`，全局 VM 状态，`__del__`
+可任意调）；Rust 的 collect 在 arena、drain 在 VM，
+stress 点（`alloc_inner`）只有 `&mut GcArena` +
+`&RootSet`，`CallCtx::alloc` 有 ctx 无 VmState。修它要么
+把 VmState 穿进每个 alloc 点（树级改动），要么在 VM 主
+循环加定期 drain 点（热路径 + 重入风险）。可观察性极低：
+需 NPY_GC_STRESS 下文件失活后又无显式 collect 才漏关
+fd。留给后续 lane。
+- triage P4 条目机制已证伪（见 §1 P4）——triage 文档待
+主 agent 在 G5 合并时同步更正。
+
+### P14 — 管道 stdout 缓冲（机制已定位，改动面大，follow-up lane）
+- 范围探针 ~/workspace/g5_probe/probe_p14.py：p14a `-c`、
+p14b 脚本、p14d 文件重定向、p14e REPL——REF 均缓冲
+stdout（行在 2s 后同到），Rust 直写；p14c stderr 双边
+立即到（stderr 无缓冲）。
+- 机制（已定位）：REF 的 `mp_sys_stdout_obj.fp` 就是 libc
+的 `stdout` FILE*（file_io.zig:486，
+`mp_sys_stdout_buffer_obj` 同）；`npyFileWrite` 走
+`fwrite`，故 glibc stdio 缓冲：管道时全缓冲 4096 字节，
+tty 时行缓冲。`print()` 走 `MP_PYTHON_PRINTER` =
+`mp_sys_stdout_print`（`{&mp_sys_stdout_obj,
+mp_stream_write_adaptor}`，full_stubs.zig:58-62）。
+有 sink 时 bypass 缓冲，`output.write(1,...)` 立即
+（file_io.zig:166-169）。Rust 侧 `FileHandle::Stdout`
+走 `std::io::stdout().write_all`（objfileio.rs:178），
+Rust `Stdout` 是 LineWriter，见换行即 flush，故管道下
+直写。
+- 修的形状（follow-up lane）：`FileHandle::Stdout` 加
+4096 字节缓冲，满即 flush；`is_terminal()` 时见换行
+flush（行缓冲）；有 sink 时 bypass；退出时、
+`sys.stdout.flush()`、`print(flush=True)` 时 flush。
+触点：FileHandle::Stdout 变体、fileio_write/flush、
+退出路径（embed_exec/main/REPL）。P3 同机制的
+BufWriter 只盖了 `Owned` 文件，未盖 stdio——P14 与 P3
+是同一缓冲层的两半。
+- 注：P8 修完后 finaliser 打印走 fd 1（stdout），故也进
+同一缓冲问题域——P14 lane 需一并确认 drain 打印在管道
+下的时序。
+
+### P7b — API ppy_exec 非 UTF-8 文件名（未做，按计划最后）
+- 仍 lossy（G2 §4 遗留）。需编译器入口接受字节名，
+单独立项。

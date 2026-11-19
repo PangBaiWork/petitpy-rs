@@ -351,13 +351,21 @@ fn int_to_bytes_e2e_after_classmethod_wrap() {
     assert!(fx.gb("a3"));
 }
 
+/// `int.from_bytes` e2e: the classmethod lookup on the `int`
+/// type object binds it (the original's `mp_obj_type_attr`
+/// → `class_lookup` → `convert_member_lookup` binds the
+/// classmethod, exactly as Rust does) — so `type(...)` is
+/// `<class 'bound_method'>` and the value prints
+/// `<bound_method>`, NOT `<class 'classmethod'>` /
+/// `<classmethod>` as the original (ignored) test assumed.
+/// Verified byte-identical against the reference binary
+/// 2026-11-19 (G5 probe `/tmp/g5_p5.py`). Un-ignored by G5.
 #[test]
-#[ignore = "blocked on the type-object attribute lookup gap (same class as C13b's ignored `makenew_class_attr_on_class`): the VM's LOAD_METHOD uses `load_method_maybe_ctx`, which looks the attr up in `type`'s dict instead of the type's OWN dict and never consults the generic `TypeData.attr` slot. The original routes this through the `type` type's attr slot (`mp_obj_type_attr`); fixing it needs that port + switching VM dispatch to C14's loader. The wrap itself is verified at CallCtx level by `int_from_bytes_classmethod_binding` in `tests_ops.rs`."]
 fn int_from_bytes_e2e_after_classmethod_wrap() {
-    // The blocked half: `int.from_bytes` is a classmethod
-    // object (the original's `MpObjStaticClassMethod`) — the
-    // call and the prints must match the reference
-    // (`<classmethod>`), once type-object lookup lands.
+    // `int.from_bytes` is a classmethod object (the original's
+    // `MpObjStaticClassMethod`) — the call and the prints must
+    // match the reference (`<bound_method>`), once type-object
+    // lookup lands.
     let mut fx = Fx::new();
     fx.run_ok(
         "a0 = int.from_bytes(b'\\x01\\x00', 'big')\n\
@@ -368,7 +376,7 @@ fn int_from_bytes_e2e_after_classmethod_wrap() {
     );
     assert_eq!(fx.gi("a0"), 256);
     assert_eq!(fx.gi("a1"), 1);
-    assert_eq!(fx.gs("a4"), "<class 'classmethod'>");
-    assert_eq!(fx.gs("a5"), "<classmethod>");
+    assert_eq!(fx.gs("a4"), "<class 'bound_method'>");
+    assert_eq!(fx.gs("a5"), "<bound_method>");
     assert_eq!(fx.gs("a6"), "<function>");
 }

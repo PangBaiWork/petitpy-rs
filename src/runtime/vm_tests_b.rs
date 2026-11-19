@@ -439,14 +439,13 @@ fn makenew_class_attr() {
     assert_eq!(fx.gi("b"), 1);
 }
 
-/// `C.x` (attribute read ON the class object) — ignored until
-/// C14 rewrites `load_method_maybe_ctx` (its doc: "C14 subsumes
-/// this whole function"): the interim looks `x` up in `type`'s
-/// locals dict instead of `C`'s own dict, so it raises
-/// `AttributeError("no attribute 'x'")`. The instance read
-/// (`c.x`, above) already proves the class dict is wired.
+/// `C.x` (attribute read ON the class object) — the type
+/// type's attr slot (`type_attr`, `typecreate.rs`) routes this
+/// through `class_lookup` with `is_type=true`, exactly as the
+/// original's `mp_obj_type_attr` does. Un-ignored by G5: the
+/// mechanism landed before G5 (the `type` ROM wires
+/// `attr: Some(type_attr)`), the test just predates it.
 #[test]
-#[ignore]
 fn makenew_class_attr_on_class() {
     let mut fx = Fx::new();
     fx.run_ok("class C:\n x = 1\na = C.x\n");

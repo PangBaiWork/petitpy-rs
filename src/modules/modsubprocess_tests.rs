@@ -4,9 +4,12 @@
 //! `/bin/cat`, `/bin/echo`, `/bin/sh`, `/usr/bin/env`,
 //! `/bin/pwd`, `/usr/bin/head`) — the same surface the
 //! reference probes used. The timeout test pins
-//! `returncode -15` (`SIGTERM`) under `unsafe-ffi` and
-//! `-9` (`SIGKILL` — the documented divergence from the
-//! reference) on the default build.
+//! `returncode -9` (`SIGKILL`, no grace) on BOTH builds:
+//! Phase H deletes the `unsafe-ffi` SIGTERM+grace path
+//! (U5), so the default and feature builds behave the
+//! same. The fd tests pin the shared-offset / shared-
+//! append / socket-fd dup semantics on BOTH builds too
+//! (Phase H deletes the `pre_exec` dup2 (U8)).
 
 use std::os::unix::io::AsRawFd;
 
@@ -262,27 +265,22 @@ import _subprocess
 r = _subprocess._spawn_and_wait(["/bin/sleep", "5"], None, 0.2, None, None, -4, -4, -4)
 "#,
     );
-    // Under `unsafe-ffi` the timeout arm sends `SIGTERM`
-    // (U5): a plain `sleep` dies on it, returncode -15.
-    // On the default build `std` kills with `SIGKILL`,
-    // so the returncode is -9 — the documented
-    // divergence (see the module docs).
-    #[cfg(feature = "unsafe-ffi")]
-    assert_eq!(fx.g_result("r"), (-15, None, None, true));
-    #[cfg(not(feature = "unsafe-ffi"))]
+    // Unified (Phase H): the timeout arm always sends
+    // `SIGKILL` (no `SIGTERM`, no grace), so the
+    // returncode is -9 on BOTH builds.
     assert_eq!(fx.g_result("r"), (-9, None, None, true));
 }
 
-/// A child that IGNORES `SIGTERM` is `SIGKILL`ed after
-/// the 1.0 s grace (U5): returncode -9, timed out. (A
-/// plain `/bin/sleep` dies on `SIGTERM` itself: -15 —
-/// see `subprocess_timeout`.) Feature only: on the
-/// default build there is no grace, the kill is
-/// `SIGKILL` at once.
-#[cfg(feature = "unsafe-ffi")]
+/// A child that IGNORES `SIGTERM` is `SIGKILL`ed at once
+/// (Phase H: no 1.0 s grace — the U5 path is deleted):
+/// returncode -9, timed out, and the whole call takes
+/// well under a second (the old feature build spent the
+/// 1.0 s grace first, so this also pins "no grace").
 #[test]
-fn subprocess_timeout_sigterm_grace() {
+fn subprocess_timeout_sigterm_ignored() {
+    use std::time::Instant;
     let mut fx = Fx::new();
+    let start = Instant::now();
     fx.run_ok(
         r#"
 import _subprocess
@@ -290,6 +288,11 @@ r = _subprocess._spawn_and_wait(["/bin/sh", "-c", "trap \"\" TERM; sleep 5"], No
 "#,
     );
     assert_eq!(fx.g_result("r"), (-9, None, None, true));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "timed-out kill took {:?}, expected < 1s (no grace)",
+        start.elapsed()
+    );
 }
 
 #[test]
@@ -421,11 +424,8 @@ r = _subprocess._spawn_and_wait(["/bin/sh", "-c", "head -c 200000 /dev/zero"], N
 }
 
 /// File-descriptor stream modes: stdin from a file,
-/// stdout to a file. On the default build the modes are
-/// served by the `/proc/self/fd` re-open (see the module
-/// docs); under `unsafe-ffi` they go through the
-/// `pre_exec` `dup2` (U8) — same result for plain files
-/// at offset 0, so this test runs on both builds.
+/// stdout to a file (Phase H: the modes are served by
+/// duping the fd, so this runs on both builds).
 #[test]
 fn subprocess_fd_modes() {
     let in_path = "/tmp/petitpy-d3-sub-in.txt";
@@ -433,8 +433,7 @@ fn subprocess_fd_modes() {
     std::fs::write(in_path, b"data").expect("write input file");
     std::fs::write(out_path, b"").expect("write output file");
     // The `File`s stay alive for the whole test: dropping
-    // one would close its fd before the child re-opens it
-    // via `/proc/self/fd`.
+    // one would close its fd before the child dups it.
     let in_file = std::fs::File::open(in_path).expect("open input");
     let in_fd = in_file.as_raw_fd();
     let out_file = std::fs::OpenOptions::new()
@@ -463,12 +462,10 @@ fn subprocess_fd_modes() {
     let _ = std::fs::remove_file(out_path);
 }
 
-/// The child reads from the SHARED offset (U8): the
-/// parent seeks to 3 first, the child gets the rest —
-/// the `dup2` shares the file offset. Feature only: the
-/// default build's `/proc` re-open starts at offset 0,
-/// so the child would see all bytes.
-#[cfg(feature = "unsafe-ffi")]
+/// The child reads from the SHARED offset: the parent
+/// seeks to 3 first, the child gets the rest — the dup
+/// shares the file offset (Phase H: the dup replaces the
+/// `pre_exec` dup2 (U8), so this runs on both builds).
 #[test]
 fn subprocess_fd_shared_offset() {
     use std::io::Seek;
@@ -488,12 +485,9 @@ fn subprocess_fd_shared_offset() {
     let _ = std::fs::remove_file(in_path);
 }
 
-/// The child appends after existing content (U8): the
-/// fd was opened `O_APPEND` and the `dup2` shares the
-/// append mode. Feature only: the default build's
-/// `/proc` re-open has no `O_APPEND` and starts at
-/// offset 0, so the child would overwrite.
-#[cfg(feature = "unsafe-ffi")]
+/// The child appends after existing content: the fd was
+/// opened `O_APPEND` and the dup shares the append mode
+/// (Phase H: runs on both builds).
 #[test]
 fn subprocess_fd_append() {
     use std::io::Write;
@@ -516,10 +510,9 @@ fn subprocess_fd_append() {
     let _ = std::fs::remove_file(out_path);
 }
 
-/// stdout to a SOCKET fd (U8): the child output arrives
-/// on the pair's peer. Feature only: the default build's
-/// `/proc` re-open fails `ENXIO` on a socket fd.
-#[cfg(feature = "unsafe-ffi")]
+/// stdout to a SOCKET fd: the child output arrives on
+/// the pair's peer (Phase H: the dup covers socket fds,
+/// so this runs on both builds).
 #[test]
 fn subprocess_fd_socket() {
     use std::io::Read;
@@ -536,13 +529,9 @@ fn subprocess_fd_socket() {
     assert_eq!(buf, b"hi\n");
 }
 
-/// `stderr=STDOUT` with `stdout=fd` (U8): both streams
-/// land in the same file, in write order — the Zig's
-/// `dup2(1, 2)` of the CHILD's stdout. Feature only:
-/// the default build's stderr re-open has its own
-/// offset, so the two writes would not interleave in
-/// order.
-#[cfg(feature = "unsafe-ffi")]
+/// `stderr=STDOUT` with `stdout=fd`: both streams land
+/// in the same file, in write order — the second dup of
+/// the stdout fd (Phase H: runs on both builds).
 #[test]
 fn subprocess_fd_stderr_stdout() {
     let out_path = "/tmp/petitpy-d3-sub-merge-out.txt";

@@ -1,0 +1,138 @@
+H-subprocess — 纯 Rust std subprocess 统一（删 feature 分支）
+Lane: lane/h-subprocess, worktree ~/workspace/petitpy-rs-h-subprocess, baseline d316394.
+Brief: scripts/h_subprocess_brief.md (master checkout).
+User instruction (overrides agent-rules "对照原文" for this module only):
+"根据 python api 功能来统一一下行为，不用保证和 petitpy 原理一致，但是必须保证纯 rust"。
+
+§1 — 改了什么
+-----------
+- src/modules/modsubprocess.rs（唯一改的源码文件；796 → 744 行）：
+  - 删 U5：超时 kill 的 `unsafe-ffi` SIGTERM + 1.0s grace 路径。两构建一律
+    `Child::kill()`（SIGKILL，无 grace），超时 returncode 一律 -9。
+    （std 里没有 SIGTERM；CPython `Popen.kill()` 也是 SIGKILL。）
+  - 删 U8：`pre_exec` dup2 的 feature 路径 + `CommandExt` import。
+    fd 流模式改走 `fd_stdio()`：`BorrowedFd::borrow_raw(fd)` +
+    `try_clone_to_owned()` → `File::from(OwnedFd)` → `Stdio::from(File)`。
+    dup 共享原 fd 的 offset/append，socket fd 可进 stdio；解析不到的 fd
+    → dup 失败 `EBADF` → `OSError(9)`。`stderr=STDOUT` + `stdout=fd`
+    时对 stdout fd 再 dup 一次（两 child fd 指向同一 open file
+    description，写顺序交错）。
+  - 模块头文档：U5/U8 分歧列表换成统一行为说明。
+  - 只改这一个文件。没碰 modsocket.rs / modselect.rs / frozen 包。
+- src/modules/modsubprocess_tests.rs：
+  - `subprocess_timeout`：删 cfg 分支，两构建都断言 -9。
+  - `subprocess_timeout_sigterm_grace`（feature-only，测已删行为）删掉，
+    改为两构建都跑的 `subprocess_timeout_sigterm_ignored`：trap 掉
+    SIGTERM 的子进程超时后 -9，且整次调用 < 1.0s（钉死"无 grace"；
+    旧 feature 构建要先等 1.0s grace，总耗时 > 1.2s）。
+  - 4 个 fd 测试去 feature 门（`subprocess_fd_shared_offset` /
+    `subprocess_fd_append` / `subprocess_fd_socket` /
+    `subprocess_fd_stderr_stdout`），两构建都跑。
+- tests/h_subprocess.rs（新增，跑在 petitpy 二进制上，8 个探针）：
+  - `h_fd_stdin_stream`：stream fd 作 stdin，子进程读到数据。
+  - `h_fd_stdout_file`：`os.open` 的 fd 作 stdout，输出落文件。
+  - `h_fd_stdout_shared_offset`：父进程先写 "AAA"，子进程接续写
+    "BBB" → 文件 "AAABBB\n"（dup 共享 offset 的证明）。
+  - `h_fd_socket`：socket fd 作 stdout，数据从对端出来。
+  - `h_timeout`：`timeout=0.2` 跑 `sleep 10` → `(-9, None, None, True)`。
+  - `h_spawn_fail`：不存在的命令 → 127。
+  - `h_fd_bad`：fd 9999 → `OSError: [Errno 9] EBADF`，exit 1。
+  - `h_frozen_subprocess`：经 frozen `subprocess.py`：`run` +
+    `capture_output`、`call`、`check_output`、`check=True` →
+    `CalledProcessError`、`timeout` → `TimeoutExpired`、file 对象
+    作 stdout（`fileno()` 走 fd 模式）。
+  - 探针注：`Command` 在 exec 时会关掉除 stdio 外的所有 fd，所以
+    Rust 侧的 fd 是以 petitpy 自身 stdio（fd 0）传进去的，脚本里用
+    0 号 fd；文件 fd 则在脚本内经 `os.open` 取得（真实端到端路径）。
+
+§2 — 验证数字
+-----------
+- lib（默认构建）：`cargo test --lib`（单线程复核，并行结果相同）：
+  1734 passed / 10 failed / 1 ignored，共 1745。
+  基线 master d316394（未改动检出，同命令）：1729 / 10 / 1，共 1740。
+  失败集合完全相同（diff 为空），本 lane：+5 通过（4 个去门 fd 测试
+  + 1 个改写后的 grace 测试），0 新失败。10 个失败全是基线已有的：
+  objdict dict_fixed_map_rejects_writes、dict_make_new_empty_and_kwargs；
+  primitives make_new_two_arg_errors、binary_arithmetic_sign_rules；
+  builtin_vm round_builtin；mpz_ops abs_neg_not_cases、
+  assign_and_trait_cases、bitwise_cases、free_functions_cover_every_mpz_fn；
+  probe probe_vectors（多为 mpn.rs debug_assert，也有 map.rs:269
+  "fixed tables hold qstr keys"）。
+  注意：brief 写的"默认 1739 / feature 1755"是 d1770f2 时的数，
+  已过期——d316394 基线本身就是 1729 + 这 10 个失败，不是本 lane
+  掉的。
+- lib（feature 构建）：全套在两棵树上都跑不完——基线已有的 abort，
+  与本 lane 无关：`cargo test --lib --features unsafe-ffi` 在
+  `g0_select_devnull_readable` 处以 "fatal runtime error: IO Safety
+  violation: owned file descriptor already closed, aborting" 中止
+  （SIGABRT）；master 未改动检出同命令在同一测试、同一位置（此前
+  均通过 242 个测试）中止。继续跳过后又在 `g0_select_dup_fd`、
+  `os_close_open_file_fd` 同类 abort。都是 G0 select / os fd 区的
+  旧问题，等 H-select / 主 agent 定夺，本 lane 不动。
+  subprocess 过滤的 feature 运行：18/18（见 §3）。
+- 全门（默认构建，release 二进制）：full 545/552 GREEN（与已知失败
+  基线完全一致）；integration 200/202（仅 select ×2：
+  select_readable_fd_is_ready、select_timeout_zero_returns_promptly，
+  等 H-select）；golden 585/585；capability GREEN（67/67）；
+  stdlib 8/8；nano 454/541 report-only。
+- 全门（feature 构建，release 二进制）：full 545/552 GREEN；
+  integration 202/202；golden 585/585；capability GREEN；
+  stdlib 8/8；nano 454/541 report-only。
+- 0 warnings：两构建均强制重编验证（`touch src/lib.rs &&
+  cargo build --release [--features unsafe-ffi]`，grep warning 均为 0）。
+- check_compile_mpy：两构建 PASS（byte mismatches: 0）。
+  check_frozen：两构建 PASS（38141 bytes across 23 .mpy files）。
+- unsafe：`grep -c "unsafe {"` = 1（第 260 行，`BorrowedFd::borrow_raw`
+  的 dup 表达式，std-only，不变量写在 `fd_stdio` 文档里），无
+  `unsafe fn` / `unsafe extern`。验收标准已按主 agent 决定更新
+  （见 §4 第 4 项）。
+- 文件行数：modsubprocess.rs 744、modsubprocess_tests.rs 556、
+  tests/h_subprocess.rs 249，均 < 2500。
+- 无新依赖（Cargo.toml 未动）。原项目只读（未动）。
+
+§3 — 探针结果（含双构建 diff）
+------------------------------
+- lib subprocess 测试：默认构建 18/18，feature 构建 18/18。
+  命令：`cargo test --lib modsubprocess` /
+  `cargo test --lib --features unsafe-ffi modsubprocess`。
+- 二进制探针 tests/h_subprocess.rs：默认 8/8，feature 8/8；
+  逐探针结果 diff 为空（仅 runner 的编译行/二进制哈希/测试顺序/
+  计时 0.34s vs 0.35s 不同）。
+  命令：`cargo test --test h_subprocess` /
+  `cargo test --test h_subprocess --features unsafe-ffi`。
+- 全门：（见 §2）
+
+§4 — 已知遗留
+--------------
+1. 超时 returncode 一律 -9（原 feature 构建是 -15，有意统一，见 brief）。
+2. fd 解析不到报 `OSError(EBADF)`（全平台统一，文档注明）。
+3. `Popen` 仍不支持（frozen `subprocess.py` 层面，本 lane 不动）。
+4. brief 前提偏差——主 agent 已决定：接受。`BorrowedFd::borrow_raw`
+   在 std 里是 `unsafe fn`，所以 `src/modules/modsubprocess.rs`
+   里有且仅有 1 个 `unsafe` 块（第 260 行，dup 表达式，不变量写
+   在 `fd_stdio` 文档里；无 FFI、无 C）。主 agent 的理由：从
+   BuiltinFn（只有 CallCtx，拿不到 VmState/fd 表）把 fd int 转成
+   安全对象的唯一办法就是它；拦截版要碰 4 个文件（含并行的
+   H-socket 的 modsocket.rs），代价不成比例；该块是 sound 的
+   （立即 dup、坏 fd 走 EBADF 错误、不变量已写在文档里），且无
+   FFI、无 C，符合"纯 Rust"。验收标准改成：modsubprocess.rs
+   允许且仅允许这 1 个 unsafe 块（std-only，带不变量注释）。
+   （原 brief 的"全 safe"与"grep unsafe 为空"不能同时满足——
+   要做到全 safe 只能走拦截模式：`VmState` 加字段 +
+   `vm_call_intercept.rs` 加分支 + `modsocket.rs` 加 `pub(crate)`
+   dup 助手。）
+5. Windows fd 模式：合成 fd 只在 `state.os_fds` 里，`FunBuiltin`
+   看不到，所以 Windows 上除 0/1/2（dup std handle）外一律
+   `EBADF`。Windows 的 fd 模式此前也从未工作过（`/proc` 重开
+   报 ENOENT）。主 agent 已确认：记在 §4 即可，不是回归。
+6. `sys_kill` / `sys_dup2` / `SIGTERM` / `SIGKILL`
+   （`src/support/ffi.rs`）在本 lane 后已无任何调用方
+   （grep 确认；原先唯一的调用方就是本模块的 U5/U8）。
+   它们是 `pub` 项所以不产生 dead-code 警告。主 agent：先不动
+   （H-socket 可能还在用），清理以后再定。
+7. 基线 lib 数与 brief 不符（非本 lane 回归，见 §2）：brief 的
+   "1739/1755"是 d1770f2 的数；d316394 基线默认构建是 1729/10/1，
+   feature 构建全套跑不完（g0 select / os fd 区的 IO Safety
+   abort）。本 lane 默认 +5、feature 到 abort 点前与基线完全
+   一致，0 新失败。主 agent 验证时会看到同样的基线状态。
+8. （无其他遗留。超时 -9、fd EBADF、Popen 不支持见上 1–3 项。）

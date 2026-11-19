@@ -92,7 +92,9 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 #[cfg(not(feature = "unsafe-ffi"))]
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, OwnedFd, RawFd};
+#[cfg(feature = "unsafe-ffi")]
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(not(feature = "unsafe-ffi"))]
 use std::path::Path;
@@ -560,7 +562,7 @@ fn sock_bind(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// is TypeError, as the Zig's `mp_obj_get_int`).
 fn sock_listen(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, _fields) = self_socket(ctx, args)?;
-    let backlog = int_arg(ctx, args[1])? as i32;
+    let _backlog = int_arg(ctx, args[1])? as i32;
     if fd < 0 {
         return Err(raise_os_error(ctx, EBADF));
     }
@@ -569,7 +571,7 @@ fn sock_listen(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         if !sockets().contains_key(&fd) {
             return Err(raise_os_error(ctx, EINVAL));
         }
-        return crate::support::ffi::sys_listen(fd, backlog)
+        return crate::support::ffi::sys_listen(fd, _backlog)
             .map(|()| Value::None)
             .map_err(|e| raise_os_error(ctx, e));
     }
@@ -702,8 +704,8 @@ fn sock_setblocking(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// module docs).
 fn sock_getsockopt(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, _fields) = self_socket(ctx, args)?;
-    let level = int_arg(ctx, args[1])? as i32;
-    let opt = int_arg(ctx, args[2])? as i32;
+    let _level = int_arg(ctx, args[1])? as i32;
+    let _opt = int_arg(ctx, args[2])? as i32;
     let buflen = int_arg(ctx, args[3])?;
     if buflen <= 0 || buflen > 4096 {
         return Err(raise_os_error(ctx, EINVAL));
@@ -713,7 +715,7 @@ fn sock_getsockopt(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     }
     #[cfg(feature = "unsafe-ffi")]
     {
-        let bytes = crate::support::ffi::sys_getsockopt(fd, level, opt, buflen as i32)
+        let bytes = crate::support::ffi::sys_getsockopt(fd, _level, _opt, buflen as i32)
             .map_err(|e| raise_os_error(ctx, e))?;
         return Ok(new_bytes(ctx, ctx.types, &bytes));
     }

@@ -356,7 +356,30 @@ print("DNS_CREATE_SERVER_OK")
         std::thread::sleep(Duration::from_millis(100));
     }
     let port = port.expect("server did not write the port file");
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to server");
+    // The server writes the port file before `setblocking`
+    // + `accept`, so a single connect can race the
+    // listener setup on a slow runner (the same class as
+    // the Build #22 `h_select_listener_never_ready` race):
+    // retry the connect (200×10ms, the 72eef1f pattern),
+    // then fail with the last error.
+    let mut stream = None;
+    let mut last_err = None;
+    for _ in 0..200 {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let mut stream = match stream {
+        Some(s) => s,
+        None => panic!("connect to server: {:?}", last_err),
+    };
     stream.write_all(b"hello").expect("write hello");
     let mut buf = [0u8; 5];
     stream.read_exact(&mut buf).expect("read world");

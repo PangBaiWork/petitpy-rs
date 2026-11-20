@@ -700,10 +700,57 @@ pub enum NameInfoAddr {
     Inet6(Ipv6Addr, u16, u32, u32),
 }
 
+/// Translate Python-facing (`glibc`) `NI_*` flags to the
+/// kernel values for `getnameinfo(3)`. The Python-visible
+/// constants (`dns.rs`) stay glibc values on every Unix;
+/// only the FFI boundary translates. Darwin (BSD)
+/// `netdb.h`: `NI_NOFQDN 0x1, NI_NUMERICHOST 0x2,
+/// NI_NAMEREQD 0x4, NI_NUMERICSERV 0x8, NI_DGRAM 0x10` —
+/// glibc swaps the first four (`NUMERICHOST 1,
+/// NUMERICSERV 2, NOFQDN 4, NAMEREQD 8`), so passing the
+/// Python flags straight through left `NI_NUMERICSERV`
+/// unset on macOS and the service resolved to its name
+/// (`"http"` instead of `"80"` — Build #24,
+/// `sockffi_dns_reverse`). Unknown bits pass through
+/// unchanged. Identity on Linux/Android/Windows (glibc
+/// and Winsock values already match the Python ones).
+#[cfg(all(feature = "unsafe-ffi", target_os = "macos"))]
+fn translate_ni_flags(py_flags: i32) -> i32 {
+    // glibc bit → Darwin bit: NUMERICHOST 1→2,
+    // NUMERICSERV 2→8, NOFQDN 4→1, NAMEREQD 8→4,
+    // DGRAM 16→16.
+    let mut kernel = py_flags & !(1 | 2 | 4 | 8 | 16);
+    if py_flags & 1 != 0 {
+        kernel |= 2;
+    }
+    if py_flags & 2 != 0 {
+        kernel |= 8;
+    }
+    if py_flags & 4 != 0 {
+        kernel |= 1;
+    }
+    if py_flags & 8 != 0 {
+        kernel |= 4;
+    }
+    if py_flags & 16 != 0 {
+        kernel |= 16;
+    }
+    kernel
+}
+
+/// Translate Python-facing (`glibc`) `NI_*` flags to the
+/// kernel values — identity everywhere except macOS (see
+/// the macOS arm above).
+#[cfg(all(feature = "unsafe-ffi", not(target_os = "macos")))]
+fn translate_ni_flags(py_flags: i32) -> i32 {
+    py_flags
+}
+
 /// `getnameinfo(3)` — reverse lookup. Returns
 /// `(hostname, service)`; on failure the gai error code.
-/// `flags` are the `NI_*` flags, passed through
-/// (e.g. `NI_NUMERICHOST`).
+/// `flags` are the Python-facing `NI_*` flags
+/// (`NI_NUMERICHOST` etc.); they are translated to the
+/// kernel values on macOS (`translate_ni_flags`).
 ///
 /// Build #23: the `sockaddr` is built with
 /// `crate::support::ffi`'s constructors, which set the
@@ -721,6 +768,11 @@ pub enum NameInfoAddr {
 /// as-is, as before.
 #[cfg(feature = "unsafe-ffi")]
 pub fn getnameinfo_owned(addr: &NameInfoAddr, flags: i32) -> Result<(String, String), i32> {
+    // Build #24: `flags` arrive Python-facing (glibc
+    // values); translate to the kernel values on macOS —
+    // the Darwin `NI_*` bits differ (see
+    // `translate_ni_flags`).
+    let flags = translate_ni_flags(flags);
     let mut host = [0u8; NI_MAXHOST];
     let mut serv = [0u8; NI_MAXSERV];
     let rc = match addr {

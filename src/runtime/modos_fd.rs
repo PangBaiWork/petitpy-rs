@@ -263,6 +263,11 @@ fn io_exc(ctx: &mut CallCtx, state: &VmState, e: std::io::Error) -> Value {
 /// the default build the old shape stays: stdio is only
 /// recorded in `os_closed_stdio` (the fd number is NOT freed
 /// for reuse) and an unregistered fd is EBADF.
+/// Windows exception (Build #24): a registered fd there is a
+/// SYNTHETIC id, not a CRT fd, so the feature build drops
+/// the table `File` instead of calling `_close` (which would
+/// fail EBADF); an unregistered fd is EBADF, as on the
+/// default build.
 pub fn os_close_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -306,37 +311,56 @@ pub fn os_close_ctx(
         // On `sys_close` failure the monitor is still stale:
         // the fd is already gone from the VM's view.
         crate::support::readiness::note_closed(fd);
-        // FFI invariant: `close` takes any i32 fd number; the
-        // kernel fails EBADF on a bad fd, it cannot fault.
-        if let Err(e) = crate::support::ffi::sys_close(fd) {
-            return Err(errno_exc(ctx, state, e));
-        }
-        // The fd is already closed by `sys_close` above, so
-        // the table `File` must NOT be dropped: its Drop
-        // would close the number a SECOND time. The G6a
-        // comment assumed that re-close's EBADF was ignored
-        // — but the debug runtime aborts on it ("IO Safety
-        // violation: owned file descriptor already closed",
-        // rc=134; a bare `os.open` + `os.close` aborted
-        // before this fix), and in release the second close
-        // could land on a reused fd number. `into_raw_fd`
-        // consumes the `File` without closing (safe: it only
-        // transfers ownership of the number, which is
-        // already closed). H-select fix for a pre-existing
-        // G6a bug, found by the feature-build probes.
-        if let Some(f) = state.os_fds.remove(&fd) {
-            #[cfg(unix)]
-            {
+        // Build #24: on Windows a registered fd is a
+        // SYNTHETIC id (`alloc_win_fd`, ≥100 — the `File`
+        // is a real Win32 HANDLE via std, not a CRT fd),
+        // so the CRT `_close(fd)` below cannot close it
+        // and fails EBADF, raising `OSError(9)` instead of
+        // succeeding (every `os.open` + `os.close` on the
+        // Windows feature build). Skip the real close for
+        // registered fds there and drop the table `File`
+        // instead — the default-build behavior. An
+        // unregistered fd is EBADF, as on the default
+        // build. Unix keeps the real `close(2)` by number
+        // (the reference closes by number, so an
+        // unregistered fd is closed too — or EBADF).
+        #[cfg(unix)]
+        {
+            // FFI invariant: `close` takes any i32 fd number; the
+            // kernel fails EBADF on a bad fd, it cannot fault.
+            if let Err(e) = crate::support::ffi::sys_close(fd) {
+                return Err(errno_exc(ctx, state, e));
+            }
+            // The fd is already closed by `sys_close` above, so
+            // the table `File` must NOT be dropped: its Drop
+            // would close the number a SECOND time. The G6a
+            // comment assumed that re-close's EBADF was ignored
+            // — but the debug runtime aborts on it ("IO Safety
+            // violation: owned file descriptor already closed",
+            // rc=134; a bare `os.open` + `os.close` aborted
+            // before this fix), and in release the second close
+            // could land on a reused fd number. `into_raw_fd`
+            // consumes the `File` without closing (safe: it only
+            // transfers ownership of the number, which is
+            // already closed). H-select fix for a pre-existing
+            // G6a bug, found by the feature-build probes.
+            if let Some(f) = state.os_fds.remove(&fd) {
                 use std::os::unix::io::IntoRawFd;
                 let raw = f.into_raw_fd();
                 debug_assert_eq!(raw, fd);
             }
-            #[cfg(not(unix))]
-            {
-                drop(f);
-            }
+            return Ok(Value::None);
         }
-        return Ok(Value::None);
+        #[cfg(not(unix))]
+        {
+            return match state.os_fds.remove(&fd) {
+                Some(f) => {
+                    drop(f);
+                    Ok(Value::None)
+                }
+                None => Err(errno_exc(ctx, state, EBADF)),
+            };
+        }
     }
     #[cfg(not(feature = "unsafe-ffi"))]
     {

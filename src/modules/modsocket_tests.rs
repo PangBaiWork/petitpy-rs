@@ -833,19 +833,29 @@ fn socket_fromfd() {
     }
 }
 
-/// `fileno()` changes across `bind()` on BOTH builds now
-/// (the placeholder fd is swapped for the listener — the
-/// documented pure-`std` divergence from the reference,
-/// which keeps one fd; the old feature-only
-/// `socket_fileno_stable_on_bind` is gone with the FFI
-/// implementation).
+/// `fileno()` across `bind()`: on the default build it
+/// CHANGES (the placeholder fd is swapped for the
+/// listener — the documented pure-`std` divergence from
+/// the reference, which keeps one fd). Under
+/// `unsafe-ffi` the socket has a real fd at
+/// construction, so `fileno()` is STABLE (the reference
+/// behaviour). (The old feature-only
+/// `socket_fileno_stable_on_bind` was removed when both
+/// builds used the placeholder; the FFI implementation
+/// restores stability for the feature build.)
 #[test]
 fn socket_fileno_changes_on_bind() {
     let path = "/tmp/petitpy-d3-sock-fdchange.sock";
     unlink(path);
+    // `==` under `unsafe-ffi` (stable fd), `!=` on the
+    // default build (placeholder swap).
+    #[cfg(feature = "unsafe-ffi")]
+    let cmp = "==";
+    #[cfg(not(feature = "unsafe-ffi"))]
+    let cmp = "!=";
     let mut fx = Fx::new();
     fx.run_ok(&format!(
-        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\nbefore = s.fileno()\ns.bind('{path}')\nafter = s.fileno()\nassert before >= 0\nassert after >= 0\nassert before != after\ns.close()\n"
+        "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\nbefore = s.fileno()\ns.bind('{path}')\nafter = s.fileno()\nassert before >= 0\nassert after >= 0\nassert before {cmp} after\ns.close()\n"
     ));
     unlink(path);
 }

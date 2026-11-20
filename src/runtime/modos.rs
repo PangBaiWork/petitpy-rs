@@ -85,10 +85,14 @@ pub(crate) fn os_err(ctx: &mut CallCtx, e: &std::io::Error) -> PyError {
     raise_os_error(ctx, code)
 }
 
-/// Map a Win32 error code to the POSIX errno the `os` module
-/// reports (`ERROR_*` → `E*`).
+/// Map a Win32 error code to the POSIX errno the `os` /
+/// `socket` modules report (`ERROR_*` → `E*`,
+/// `WSAE*` → `E*`). Winsock codes are in the same `i32`
+/// space (10000+); the socket FFI layer returns them raw
+/// and the caller maps them here, so Python sees one
+/// errno numbering on every platform.
 #[cfg(windows)]
-fn win32_to_errno(code: i32) -> i32 {
+pub(crate) fn win32_to_errno(code: i32) -> i32 {
     match code {
         2 => 2,   // ERROR_FILE_NOT_FOUND → ENOENT
         3 => 2,   // ERROR_PATH_NOT_FOUND → ENOENT
@@ -97,6 +101,47 @@ fn win32_to_errno(code: i32) -> i32 {
         32 => 13, // ERROR_SHARING_VIOLATION → EACCES
         87 => 22, // ERROR_INVALID_PARAMETER → EINVAL
         183 => 17, // ERROR_ALREADY_EXISTS → EEXIST
+        10004 => 4, // WSAEINTR → EINTR
+        10009 => 9, // WSAEBADF → EBADF
+        10013 => 13, // WSAEACCES → EACCES
+        10014 => 14, // WSAEFAULT → EFAULT
+        10022 => 22, // WSAEINVAL → EINVAL
+        10035 => 11, // WSAEWOULDBLOCK → EAGAIN
+        10036 => 115, // WSAEINPROGRESS → EINPROGRESS
+        10037 => 114, // WSAEALREADY → EALREADY
+        10038 => 88, // WSAENOTSOCK → ENOTSOCK
+        10039 => 89, // WSAEDESTADDRREQ → EDESTADDRREQ
+        10040 => 90, // WSAEMSGSIZE → EMSGSIZE
+        10041 => 91, // WSAEPROTOTYPE → EPROTOTYPE
+        10042 => 92, // WSAENOPROTOOPT → ENOPROTOOPT
+        10043 => 93, // WSAEPROTONOSUPPORT → EPROTONOSUPPORT
+        10044 => 94, // WSAESOCKTNOSUPPORT → ESOCKTNOSUPPORT
+        10045 => 95, // WSAEOPNOTSUPP → EOPNOTSUPP
+        10046 => 96, // WSAEPFNOSUPPORT → EPFNOSUPPORT
+        10047 => 97, // WSAEAFNOSUPPORT → EAFNOSUPPORT
+        10048 => 98, // WSAEADDRINUSE → EADDRINUSE
+        10049 => 99, // WSAEADDRNOTAVAIL → EADDRNOTAVAIL
+        10050 => 100, // WSAENETDOWN → ENETDOWN
+        10051 => 101, // WSAENETUNREACH → ENETUNREACH
+        10052 => 102, // WSAENETRESET → ENETRESET
+        10053 => 103, // WSAECONNABORTED → ECONNABORTED
+        10054 => 104, // WSAECONNRESET → ECONNRESET
+        10055 => 105, // WSAENOBUFS → ENOBUFS
+        10056 => 106, // WSAEISCONN → EISCONN
+        10057 => 107, // WSAENOTCONN → ENOTCONN
+        10058 => 108, // WSAESHUTDOWN → ESHUTDOWN
+        10059 => 109, // WSAETOOMANYREFS → ETOOMANYREFS
+        10060 => 110, // WSAETIMEDOUT → ETIMEDOUT
+        10061 => 111, // WSAECONNREFUSED → ECONNREFUSED
+        10062 => 40, // WSAELOOP → ELOOP
+        10063 => 36, // WSAENAMETOOLONG → ENAMETOOLONG
+        10064 => 112, // WSAEHOSTDOWN → EHOSTDOWN
+        10065 => 113, // WSAEHOSTUNREACH → EHOSTUNREACH
+        10066 => 39, // WSAENOTEMPTY → ENOTEMPTY
+        10068 => 87, // WSAEUSERS → EUSERS
+        10069 => 122, // WSAEDQUOT → EDQUOT
+        10070 => 116, // WSAESTALE → ESTALE
+        10071 => 66, // WSAEREMOTE → EREMOTE
         _ => code,
     }
 }
@@ -777,12 +822,12 @@ pub fn os_kill_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// `os.umask(-1)` (Zig `@intCast` panic, rc=134), N1, not
 /// reproduced.
 pub fn os_umask_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    #[cfg(feature = "unsafe-ffi")]
+    #[cfg(all(feature = "unsafe-ffi", unix))]
     {
         let mask = arg_int(ctx, args[0])? as u32;
         Ok(Value::SmallInt(crate::support::ffi::sys_umask(mask) as i64))
     }
-    #[cfg(not(feature = "unsafe-ffi"))]
+    #[cfg(not(all(feature = "unsafe-ffi", unix)))]
     {
         let _ = args;
         Err(not_impl(ctx, "os.umask is not implemented (no std umask API)"))

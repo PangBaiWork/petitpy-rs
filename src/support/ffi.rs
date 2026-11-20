@@ -499,8 +499,7 @@ pub struct Sockaddr {
 
 /// Generic socket address (16 bytes). Only used as a cast
 /// target for `sockaddr_in` / `sockaddr_in6` /
-/// `sockaddr_storage` (Windows has no `sockaddr_un` path
-/// in S1).
+/// `sockaddr_un` / `sockaddr_storage`.
 #[cfg(feature = "unsafe-ffi")]
 #[cfg(windows)]
 #[repr(C)]
@@ -650,7 +649,7 @@ impl SockaddrIn6 {
     }
 }
 
-/// `sockaddr_un` (Unix only). Linux: 110 bytes (family +
+/// `sockaddr_un`. Linux: 110 bytes (family +
 /// 108-byte path); macOS: 106 bytes (len + family +
 /// 104-byte path).
 #[cfg(feature = "unsafe-ffi")]
@@ -662,7 +661,21 @@ pub struct SockaddrUn {
     pub sun_path: [u8; 108],
 }
 
-/// `sockaddr_un` (Unix only). Linux: 110 bytes (family +
+/// `sockaddr_un` (Windows). Winsock's layout is the
+/// same as Linux: 110 bytes (`sun_family: u16` +
+/// 108-byte path). Build #25: the Windows `to_raw` stub
+/// returned length 0 for `AF_UNIX`, so the round-trip
+/// read back an empty path.
+#[cfg(feature = "unsafe-ffi")]
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockaddrUn {
+    pub sun_family: u16,
+    pub sun_path: [u8; 108],
+}
+
+/// `sockaddr_un`. Linux: 110 bytes (family +
 /// 108-byte path); macOS: 106 bytes (len + family +
 /// 104-byte path).
 #[cfg(feature = "unsafe-ffi")]
@@ -676,7 +689,7 @@ pub struct SockaddrUn {
 }
 
 #[cfg(feature = "unsafe-ffi")]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl SockaddrUn {
     /// Build an `AF_UNIX` address from a path (already
     /// truncated to the `sun_path` limit by the caller;
@@ -1335,13 +1348,18 @@ pub fn sys_umask(mask: u32) -> u32 {
 
 /// `umask` on Windows — the MSVC CRT `_umask`
 /// (RustPython `host_env::nt::umask`). Infallible like the
-/// Unix call: the CRT masks the argument to 0777 and
-/// always succeeds, returning the previous mask.
+/// Unix call: it returns the previous mask and never
+/// fails — but it does NOT mask to 0777 like Unix.
+/// Only `_S_IREAD` (0o400) / `_S_IWRITE` (0o200) are
+/// honoured; any other bit is ignored (Microsoft Learn
+/// `_umask`), so a Unix `0o022` round-trip cannot hold
+/// there — `_umask(0o022)` stores 0 and the test uses
+/// `0o200` on Windows instead (Build #25).
 #[cfg(all(feature = "unsafe-ffi", windows))]
 pub fn sys_umask(mask: u32) -> u32 {
-    // FFI invariant: `_umask` cannot fail and takes any
-    // `c_int` (the CRT masks to 0777); no errno read is
-    // needed.
+    // FFI invariant: `_umask` cannot fail ("no error
+    // return", Microsoft Learn `_umask`) and takes any
+    // `c_int`; no errno read is needed.
     unsafe { ffi::_umask(mask as i32) as u32 }
 }
 

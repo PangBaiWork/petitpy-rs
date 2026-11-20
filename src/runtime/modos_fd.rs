@@ -320,8 +320,12 @@ pub fn os_close_ctx(
         // Windows feature build). Skip the real close for
         // registered fds there and drop the table `File`
         // instead — the default-build behavior. An
-        // unregistered fd is EBADF, as on the default
-        // build. Unix keeps the real `close(2)` by number
+        // unregistered fd falls through to the real CRT
+        // `_close(fd)` (Build #25): a builtin `open()`
+        // file's fd is a real CRT fd, not in `os_fds`,
+        // and `os.close` must close it — a bad number
+        // still fails EBADF there.
+        // Unix keeps the real `close(2)` by number
         // (the reference closes by number, so an
         // unregistered fd is closed too — or EBADF).
         #[cfg(unix)]
@@ -358,7 +362,17 @@ pub fn os_close_ctx(
                     drop(f);
                     Ok(Value::None)
                 }
-                None => Err(errno_exc(ctx, state, EBADF)),
+                // Build #25: unregistered is NOT EBADF
+                // outright — a builtin `open()` file's fd
+                // is a real CRT fd (not in `os_fds`), so
+                // close it by number like Unix does. A
+                // synthetic id (>=100) that is not
+                // registered fails EBADF in `_close`
+                // anyway, so the error result is unchanged.
+                None => match crate::support::ffi::sys_close(fd) {
+                    Ok(()) => Ok(Value::None),
+                    Err(e) => Err(errno_exc(ctx, state, e)),
+                },
             };
         }
     }

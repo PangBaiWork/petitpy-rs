@@ -138,7 +138,12 @@ impl SockAddr {
                 storage._inner[..n].copy_from_slice(bytes);
                 n as u32
             }
-            #[cfg(unix)]
+            // Windows has the same `sockaddr_un` layout as
+            // Linux (`sun_family: u16` + 108-byte path, see
+            // `ffi.rs`), so this arm covers it too (Build
+            // #25: the old Windows stub returned length 0,
+            // and the round-trip read back an empty path).
+            #[cfg(any(unix, windows))]
             SockAddr::Unix { path } => {
                 let sa = ffi::SockaddrUn::new(path);
                 let n = std::mem::size_of::<ffi::SockaddrUn>();
@@ -154,14 +159,6 @@ impl SockAddr {
                 storage._inner[..n].copy_from_slice(bytes);
                 ffi::SockaddrUn::len_for(path)
             }
-            // Build #20: `ffi::SockaddrUn` does not exist
-            // on Windows (Unix-only in `ffi.rs`), and
-            // there is no Winsock `sockaddr_un` mapping
-            // in this port — return length 0, so the
-            // `bind` / `connect` / `sendto` call fails
-            // with the OS error instead of not compiling.
-            #[cfg(windows)]
-            SockAddr::Unix { .. } => 0,
         }
     }
 
@@ -209,11 +206,13 @@ impl SockAddr {
     }
 }
 
-/// Read a kernel `sockaddr_un` back (Unix only). Split
-/// out of `SockAddr::from_raw` so the `#[cfg]` stays on
-/// a whole function: `#[cfg]` on an `else if` arm is
-/// fragile, and on Windows `ffi::SockaddrUn` does not
-/// exist at all (Build #20).
+/// Read a kernel `sockaddr_un` back. Split out of
+/// `SockAddr::from_raw` so the `#[cfg]` stays on a whole
+/// function: `#[cfg]` on an `else if` arm is fragile.
+/// The path starts at offset 2 on every platform (see
+/// `ffi.rs`): Linux and Windows have a `u16` family,
+/// macOS a `len` byte + a family byte — the `sun_path`
+/// field itself starts at offset 2 in all three.
 /// An all-NUL path is an unnamed address (empty path):
 /// Build #20, macOS `accept()` returns `addrlen > 2`
 /// with a zeroed path for the unbound peer (Linux
@@ -222,7 +221,7 @@ impl SockAddr {
 /// of NUL bytes instead of empty. Safe: no filesystem
 /// path is all NULs, and an abstract name with real
 /// content (leading NUL + non-NUL bytes) is preserved.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn unix_sockaddr_un(storage: &ffi::SockaddrStorage, len: u32) -> Option<SockAddr> {
     // SAFETY (invariant): the family matched, so
     // `storage` holds a kernel-written `sockaddr_un`;
@@ -247,14 +246,6 @@ fn unix_sockaddr_un(storage: &ffi::SockaddrStorage, len: u32) -> Option<SockAddr
     Some(SockAddr::Unix {
         path: raw[..end].to_vec(),
     })
-}
-
-/// Windows has no `sockaddr_un` in this port (see
-/// `to_raw`): an `AF_UNIX` family from the kernel has
-/// no address to read back.
-#[cfg(windows)]
-fn unix_sockaddr_un(_storage: &ffi::SockaddrStorage, _len: u32) -> Option<SockAddr> {
-    None
 }
 
 /// Translate a Python-facing family (`modsocket.rs`

@@ -419,15 +419,36 @@ fn os_unimplemented_stubs() {
     }
     #[cfg(feature = "unsafe-ffi")]
     {
+        // Build #25: MSVC `_umask` only honours `_S_IREAD`
+        // (0o400) / `_S_IWRITE` (0o200) — any other bit is
+        // ignored (Microsoft Learn `_umask`), so the Unix
+        // `0o022` round-trip cannot hold on Windows:
+        // `_umask(0o022)` stores 0 and `cur` comes back 0,
+        // not `0o022` (a bare `assert` fails with a `None`
+        // value, which is the `os_unimplemented_stubs`
+        // failure Build #25 showed). Use the one manifest
+        // bit the CRT tracks on Windows. Both blocks stay
+        // in this one test on purpose: `umask` is
+        // process-global, so two parallel test fns would
+        // race on it — the `assert` messages below locate
+        // a failure instead.
+        #[cfg(windows)]
+        let mask = 0o200;
+        #[cfg(not(windows))]
+        let mask = 0o022;
         let mut fx = Sx::new();
-        fx.run_ok(
-            "import os\nprev = os.umask(0o022)\ncur = os.umask(prev)\nassert cur == 0o022\n",
-        );
+        fx.run_ok(&format!(
+            "import os\nprev = os.umask({mask:#o})\ncur = os.umask(prev)\nassert cur == {mask:#o}, 'umask round-trip'\n",
+        ));
         // `os.umask(-1)` wraps (`as u32` -> kernel masks to
         // 0777) and returns the previous mask; the reference
         // ABORTS there (Zig @intCast panic, rc=134), N1.
+        // On Windows `_umask(-1)` stores `_S_IREAD |
+        // _S_IWRITE` and still returns the previous mask.
         let mut fx = Sx::new();
-        fx.run_ok("import os\nprev = os.umask(0o022)\ncur = os.umask(-1)\nassert cur == 0o022\nos.umask(prev)\n");
+        fx.run_ok(&format!(
+            "import os\nprev = os.umask({mask:#o})\ncur = os.umask(-1)\nassert cur == {mask:#o}, 'umask(-1)'\nos.umask(prev)\n",
+        ));
     }
     // `run_ok` panics if either call raises. Unix only: `kill` and
     // `chown` shell out to /bin helpers. `kill` targets our own

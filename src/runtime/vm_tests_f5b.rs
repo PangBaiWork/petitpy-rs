@@ -193,7 +193,11 @@ fn f5b_itertools_zip_longest_repeat() {
 /// (every call raises `NotImplementedError` — safe Rust
 /// cannot take ownership of a raw fd); implemented under
 /// `unsafe-ffi` (S3), where it wraps the fd as-is (no dup —
-/// `fileno() == fd`).
+/// `fileno() == fd`). On Windows `fromfd(AF_UNIX)` stays
+/// `NotImplementedError` even under `unsafe-ffi` (Build
+/// #25): the fd here is a plain file's CRT fd, which can
+/// never be a SOCKET, so implementing it for this test
+/// is meaningless.
 #[test]
 fn f5b_socket_fromfd() {
     let mut fx = Fx::new();
@@ -205,11 +209,15 @@ fn f5b_socket_fromfd() {
     let path = std::env::temp_dir().join(format!("petitpy_fromfd_f5b_{}", std::process::id()));
     std::fs::write(&path, b"").unwrap();
     let p = path.to_string_lossy().replace('\\', "/");
-    #[cfg(not(feature = "unsafe-ffi"))]
+    // Windows under `unsafe-ffi` expects the same
+    // `NotImplementedError` as the default build (see the
+    // doc comment above) — `fromfd(AF_UNIX)` is refused
+    // there by design.
+    #[cfg(any(not(feature = "unsafe-ffi"), windows))]
     fx.run_ok(&format!(
         "import socket, os\nfd = os.open({p:?}, os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    ok = False\nexcept NotImplementedError:\n    ok = True\n",
     ));
-    #[cfg(feature = "unsafe-ffi")]
+    #[cfg(all(feature = "unsafe-ffi", not(windows)))]
     // `detach()`, NOT `close()`, releases the socket: the fd
     // is ALSO owned by the VM's `os_fds` table (it came from
     // `os.open`), and `close()` here would close it twice —

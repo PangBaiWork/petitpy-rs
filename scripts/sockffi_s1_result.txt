@@ -1,0 +1,287 @@
+Socket FFI lane S1 (core) — result
+====================================
+Branch: lane/socket-ffi-s1, base b12c2d2 (master).
+Worktree: /home/hatch/workspace/petitpy-rs-sock-s1.
+Date: 2026-11-20. One commit, own files only, no push.
+
+§1  Files changed
+-----------------
+- src/support/ffi.rs (1741 lines): rewritten/expanded per brief
+  §2.1. Portable errno() (Linux __errno_location, macOS
+  __error, Android __errno, Windows WSAGetLastError);
+  RawFd (i32 Unix / usize Windows); INVALID_SOCKET;
+  raw externs cfg-gated (Unix POSIX socket calls; Windows
+  ws2_32 block with #[link(name="ws2_32")], incl.
+  WSAStartup/WSAGetLastError/closesocket/ioctlsocket/
+  WSAPoll/WSADuplicateSocket/WSASocket; kernel32
+  GetCurrentProcessId); wsa_ensure() (OnceLock, 512-byte
+  WSADATA, MAKEWORD(2,2)); sockaddr structs with macOS
+  sa_len/sin_len/sin6_len/sun_len variants + constructors
+  hiding layout (SockaddrIn/In6/Un::new + len_for,
+  SockaddrStorage::new + family()); Addrinfo with
+  per-platform field order; Msghdr/Iovec Unix-only;
+  Pollfd; platform-correct constants (AF_INET6, SOL_SOCKET,
+  SO_REUSEADDR/BROADCAST/SNDBUF/RCVBUF/RCVTIMEO/SNDTIMEO/
+  REUSEPORT/KEEPALIVE/ERROR, TCP_NODELAY, IP_TTL,
+  SHUT_RD/WR/RDWR, MSG_*, O_NONBLOCK, F_GETFL/F_SETFL,
+  FIONBIO, EINTR/EAGAIN/EWOULDBLOCK/EINPROGRESS,
+  POLLIN/POLLOUT/POLLERR/POLLHUP, EINVAL, ETIMEDOUT);
+  os wrappers now cfg(all(feature="unsafe-ffi", unix));
+  socket wrappers sys_socket/sys_bind/sys_listen/
+  sys_accept/sys_connect/sys_send/sys_recv/sys_sendto/
+  sys_recvfrom/sys_sendmsg/sys_recvmsg (declared now, S3
+  uses)/sys_shutdown/sys_getsockname/sys_getpeername/
+  sys_setsockopt/sys_getsockopt/sys_closesocket/sys_dup/
+  sys_fcntl/sys_ioctlsocket/sys_socketpair/sys_poll
+  (poll/WSAPoll — chosen over select for
+  connect_timeout; S3 reuses it for the select probe).
+- src/modules/modsocket_ffi.rs (1167 lines, NEW, whole
+  file #[cfg(feature="unsafe-ffi")]): SockAddr enum
+  (Inet/Inet6/Unix; family() returns Python-facing
+  2/10/1; to_raw/from_raw); translate_family;
+  translate_sockopt (Python-facing Linux-numbered
+  (level,opt) -> kernel numbers; unknown pairs pass
+  through -> kernel ENOPROTOOPT); timeval_bytes (Unix) /
+  timeout_dword_ms (Windows); FfiSocket (fd, family/kind/
+  proto Python-facing, blocking, read_timeout,
+  write_timeout, bound, listening, closed) with Drop,
+  new (real fd), from_raw (S3's fromfd; bound=true),
+  fileno, bind (bound check -> EINVAL first), listen
+  (unbound -> EINVAL first; sets listening), accept
+  (inherits listener blocking/timeouts), connect,
+  connect_timeout (nonblocking + poll POLLOUT with
+  deadline, EINTR retry, SO_ERROR check, ETIMEDOUT,
+  blocking restored on every path), send/recv/sendto/
+  recvfrom/shutdown/getsockname/getpeername/setsockopt/
+  getsockopt/setblocking/settimeout/close/dup; plus the
+  Python-level fns sock_bind_ffi/sock_listen_ffi/
+  sock_accept_ffi/sock_connect_ffi/sock_recv_ffi/
+  sock_send_ffi/sock_sendall_ffi/sock_sendto_ffi/
+  sock_recvfrom_ffi/sock_getpeername/sock_getsockname/
+  sock_shutdown and ffi_os_error (win32_to_errno on
+  Windows, else raise_os_error).
+- src/modules/modsocket.rs (2499 lines, under the 2500
+  cap): SocketState::Ffi variant; socket() construction
+  split (feature on -> FfiSocket::new, real fd, no
+  placeholder; off -> existing path untouched, as two
+  cfg-gated tail-expression blocks); helper arms
+  set_nonblocking/set_timeouts (now &mut self — the FFI
+  setters update shadow fields)/is_listener/is_stream/
+  is_datagram/sock_key_of; apply_opt FFI early-return
+  (lands opts in the kernel); 1-line dispatch in 9
+  methods (bind/listen/accept/connect/recv/send/sendall/
+  sendto/recvfrom); sock_dup Ffi arm; 3 feature-only
+  SOCKET_LOCALS entries (getpeername/getsockname/
+  shutdown); module doc updated (FFI backend note;
+  several doc paragraphs compressed to stay <2500);
+  SocketState::Unbound gets #[allow(dead_code)] (never
+  constructed under the feature — the placeholder is
+  compiled out); a set of items made pub(crate) for
+  modsocket_ffi.rs (self_socket, parse_inet_addr,
+  parse_unix_path, inet_addr_tuple, sockets, settings,
+  get_settings, alloc_socket, apply_settings, int_arg,
+  str_arg, EINVAL, EBADF, EAFNOSUPPORT, MAX_RECV,
+  SocketState, TableKey, SockSettings + its fields).
+- src/modules/mod.rs: `pub mod modsocket_ffi;` under
+  #[cfg(feature="unsafe-ffi")].
+- src/runtime/modos.rs: win32_to_errno made pub(crate)
+  and extended with the WSA rows (10004-10071 -> POSIX
+  errnos); os-wrapper call sites gated to
+  all(feature="unsafe-ffi", unix) (umask/close/lseek/
+  fsync — the MSVC CRT lacks these symbols, so the
+  feature must compile on Windows).
+- src/runtime/modos_fd.rs: same os-wrapper call-site
+  gating (os_close stdio + registered-fd, os_lseek
+  stdio, os_fsync stdio).
+- src/modules/modsocket_tests.rs: socket_fileno_changes_
+  on_bind is now feature-aware (asserts `==` under
+  unsafe-ffi — the fd is stable — and `!=` on the
+  default build — the placeholder swap); doc updated.
+- tests/sockffi_core.rs (368 lines, NEW,
+  #![cfg(feature="unsafe-ffi")]): 9 live tests + 2
+  ignored (see §3).
+
+§2  Design decisions (beyond the brief, recorded)
+-----------------------------------------------
+- FFI getsockopt/setsockopt use the SockSettings shadow
+  as source of truth (pinned tests require it:
+  SO_PEERCRED -> ENOPROTOOPT, unset RCVBUF/SNDBUF ->
+  ENOPROTOOPT, RCVBUF set -> exact value — the kernel
+  doubles it to 8192, so the shadow must answer);
+  setsockopt ALSO lands in the kernel via an apply_opt
+  FFI arm (real effect). FfiSocket::getsockopt exists
+  for internal use only (SO_ERROR in connect_timeout).
+- FfiSocket has a `bound: bool` field (kernel
+  auto-binds INET listen; UNIX double-bind gives
+  EADDRINUSE not EINVAL — pinned behaviour is EINVAL
+  for both) and a `listening: bool` field (for
+  is_listener). from_raw sets bound=true.
+- modsocket.rs holds the socket-table lock across FFI
+  calls (including blocking ones) — safe in this VM
+  because Python execution is single-threaded and only
+  the VM thread ever takes the table lock (readiness
+  monitors use their own table); documented in
+  modsocket_ffi.rs header.
+- AF_UNIX works through FFI on Unix in S1 (generic
+  SockAddr machinery) — S3's AF_UNIX scope reduces to
+  the Windows probe + dedicated tests. The AF_UNIX-on-
+  Windows construction check (NotImplementedError) is
+  left as-is for S3.
+- Module constants stay Linux-numbered
+  (Python-facing); translation happens at the FFI
+  boundary. Changing them to platform-correct values
+  would change default-build behaviour on macOS/
+  Windows — out of S1 scope.
+- sys_ioctlsocket declared in S1 (setblocking needs
+  it) though brief §2.1 said S3.
+- SockaddrUn::len_for now takes the path (not just
+  its length): abstract addresses (leading NUL) are
+  NOT NUL-terminated (length 2 + len), filesystem
+  paths get the trailing NUL (2 + len + 1).
+- SockAddr::from_raw returns an empty Unix address
+  (path []) for an unnamed peer (kernel sets addrlen
+  0) instead of None -> EINVAL. Verified: pure-Rust
+  std reports the same peer as unnamed
+  (as_pathname() == None) — Linux does NOT autobind
+  an AF_UNIX datagram socket here (neither connected
+  send nor unconnected send_to), so the abstract
+  case does not arise on this kernel; the abstract
+  handling is defensive and correct.
+- SocketState::set_nonblocking/set_timeouts and
+  apply_settings now take &mut self / &mut SocketState
+  (the FFI setters update FfiSocket shadow fields);
+  call sites (swap_in, sock_accept, sock_dup,
+  sock_setblocking, sock_settimeout, setsockopt
+  timeout arm) switched to get_mut.
+- The `socket_fileno_changes_on_bind` lib test was
+  updated (see §1) because it pinned the placeholder
+  behaviour that S1 intentionally removes under the
+  feature build.
+
+§3  Tests
+---------
+New file tests/sockffi_core.rs (feature build only):
+  cargo test --release --features unsafe-ffi --test sockffi_core
+  => 9 passed, 0 failed, 2 ignored.
+  Live: fileno stable across bind; TCP bind/listen/
+  accept/connect roundtrip + send/recv; TCP accept
+  (VM server, Rust client, port via file);
+  AF_UNIX datagram sendto/recvfrom (client binds so
+  the VM can reply); AF_UNIX datagram from an UNBOUND
+  peer (recvfrom returns (b'ping', b''), not an
+  error); setsockopt/getsockopt (SO_REUSEADDR,
+  TCP_NODELAY, SO_RCVTIMEO 16-byte timeval);
+  connect with a timeout set (exercises
+  connect_timeout's nonblocking + poll path, succeeds
+  against a listener); shutdown + getpeername/
+  getsockname (SHUT_WR -> peer sees EOF); dup (new
+  fd, still sends after the original is closed).
+  Ignored (sandbox): AF_INET UDP roundtrip and the
+  blackhole connect timeout (ETIMEDOUT) — the sandbox
+  returns EPERM for UDP loopback sendto and for any
+  non-loopback connect (verified with standalone std
+  probes: UDP send_to -> EPERM errno 1; connect to
+  10.255.255.1 -> PermissionDenied raw=Some(1) in
+  42us). Run with `-- --ignored` on an unsandboxed
+  host.
+  Note: petitpy's getsockopt REQUIRES a buflen and
+  returns bytes (no int form); the first version of
+  the test called it with 2 args and failed with
+  TypeError "argument num/types mismatch" — a test
+  bug, not an implementation bug. Fixed to pass
+  buflen and compare bytes.
+
+§4  Verification (all on this worktree, release)
+-------------------------------------------------
+- cargo check --release / --features unsafe-ffi /
+  --all-targets both builds: 0 warnings (only the 2
+  pre-existing tests/h_subprocess.rs unused-mut
+  warnings).
+- Default build (zero regression):
+  cargo test --release --lib => 1771 passed, 0 failed,
+  2 ignored (== baseline).
+  cargo test --release --tests => rc=0. lib 1771/0/2,
+  entry_cli 45/45, h_select 10/10, h_socket 7/7
+  (1 ignored), h_subprocess 8/8, g6b_socksub 1/1,
+  p14_stdout 3/3, zigpy-compile 9/9; sockffi_core 0
+  (correct — feature-gated); g6a_os 0 (correct).
+  (One run hit the known LTO stale-object link failure
+  when switching feature/default in the same target
+  dir; a plain rerun passed.)
+  Gates (default binary): full 545/552 GREEN (7 known
+  fails), integration 201/202 (only
+  socket_fromfd_wraps_fd), golden 585/585, capability
+  67/67 GREEN, stdlib 8/8, nano 454/541 (report-only,
+  == baseline).
+  check_compile_mpy PASS (0 failures, 0 mismatches);
+  check_frozen PASS (23/23 identical).
+- Feature build:
+  cargo test --release --features unsafe-ffi --lib =>
+  1770 passed, 1 failed, 2 ignored. The single
+  failure is modules::modsocket_tests::socket_makefile
+  (see §5).
+  cargo test --release --features unsafe-ffi --test
+  sockffi_core => 9 passed, 2 ignored (see §3).
+  Gates (feature binary): full 545/552 GREEN,
+  integration 201/202 (only socket_fromfd_wraps_fd),
+  golden 585/585, capability 67/67 GREEN.
+- grep of the lane diff for `unsafe`: only the FFI
+  boundary — ffi.rs raw extern "C" call sites and
+  modsocket_ffi.rs struct<->bytes conversion
+  (to_raw/from_raw, with invariant comments). No
+  unsafe in modsocket.rs, modos.rs, modos_fd.rs,
+  modsocket_tests.rs, or tests/sockffi_core.rs.
+- File sizes: modsocket.rs 2499 (<2500), modsocket_
+  ffi.rs 1167, ffi.rs 1741, modsocket_tests.rs 888,
+  sockffi_core.rs 368.
+- Default binary size: 2,098,848 bytes (master
+  2,098,592; +256 from the FFI dispatch scaffolding
+  that compiles in both builds — the cfg'd FFI code
+  itself is compiled out).
+
+§5  Leftover issues / for S3 (and the merger)
+----------------------------------------------
+1. Feature lib has ONE failure:
+   modules::modsocket_tests::socket_makefile —
+   makefile() on an FFI socket returns EINVAL
+   (sock_makefile's match falls into `Some(_) ->
+   EINVAL` for the Ffi variant). This is the brief's
+   documented S3 scope ("makefile naturally returns
+   EINVAL for Ffi"); implementing it needs
+   File::from_raw_fd (unsafe) to build the
+   socketfile wrapper, which the brief reserves for
+   S3. Default build is unaffected (1771/0/2).
+2. Windows/macOS/Android branches are UNVALIDATED
+   locally (no local cross-compilation per the CI
+   constraint; the CI workflow still gates unsafe-ffi
+   to the Linux rows only). The code is cfg-correct
+   by construction (checked by reading), but no
+   Windows/macOS/Android build or run was done here.
+3. AF_INET UDP test and the blackhole connect-timeout
+   test are #[ignore]d (sandbox EPERM, see §3).
+   The ETIMEDOUT branch of connect_timeout is
+   therefore untested here; the nonblocking + poll
+   path IS tested (connect with timeout, §3).
+4. Module constants stay Linux-numbered
+   (Python-facing); translation is at the FFI
+   boundary (see §2). S2/S3 should not "fix" the
+   constants without a default-build behaviour
+   decision.
+5. `listening` and `bound` fields on FfiSocket were
+   added beyond the brief's §2.3 struct (needed for
+   the pinned EINVAL behaviour and is_listener).
+   sys_ioctlsocket was declared in S1 though the
+   brief said S3 (setblocking needs it).
+6. getpeername/getsockname/shutdown are feature-only
+   methods (no std implementation); on the default
+   build those attributes do not exist on sockets.
+7. Cargo emits "output filename collision"
+   warnings for libpetitpy_rs during `cargo test`
+   builds (pre-existing, also on the base — a cargo
+   packaging quirk, not from this lane; it does not
+   fail the build).
+8. The feature build overwrites target/release/
+   petitpy-rs; always rebuild the default binary
+   (`cargo build --release`) before running default
+   gates/probes (acceptance-order artifact — observed
+   again in this lane).

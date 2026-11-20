@@ -1,48 +1,43 @@
 //! The `socket` module (H-socket rewrite): a SINGLE
 //! cross-platform pure-`std` implementation. Behaviour is
 //! defined by the Python `socket` API (CPython semantics),
-//! identical on every platform and architecture; no libc
-//! FFI, no C, no feature-gated branches. The
-//! old Windows stub (`modsocket_win.rs`) and the old
-//! AF_UNIX-only implementation are gone.
+//! identical on every platform and architecture. Under
+//! `--features unsafe-ffi` the `SocketState::Ffi` backend
+//! (`modsocket_ffi.rs`) replaces the placeholder with a
+//! real `socket(2)` handle; the default build is unchanged.
 //!
 //! What is implemented (CPython semantics):
 //! `socket.socket(family, type[, proto])` with `AF_UNIX`
 //! / `AF_INET` / `AF_INET6` × `SOCK_STREAM` / `SOCK_DGRAM`;
-//! methods `bind` / `listen` / `accept` / `connect` /
-//! `recv` / `send` / `sendall` / `sendto` / `recvfrom` /
-//! `setblocking` / `settimeout` / `gettimeout` /
-//! `getsockopt` / `setsockopt` / `fileno` / `close` /
-//! `dup` / `makefile`; module function
+//! methods `bind` / `listen` / `accept` / `connect` / `recv`
+//! / `send` / `sendall` / `sendto` / `recvfrom` / `setblocking`
+//! / `settimeout` / `gettimeout` / `getsockopt` / `setsockopt`
+//! / `fileno` / `close` / `dup` / `makefile`; module function
 //! `getaddrinfo(host, port[, family[, type[, proto]]])`;
-//! `fromfd` exists but raises `NotImplementedError`
-//! (safe Rust cannot take ownership of a raw fd).
-//! `gethostname` / `gethostbyname` are NOT implemented
-//! (`std` has no API).
+//! `fromfd` raises `NotImplementedError` (safe Rust cannot
+//! take ownership of a raw fd); `gethostname` /
+//! `gethostbyname` are NOT implemented (`std` has no API).
 //!
 //! Transport: `AF_INET`/`AF_INET6` via `std::net`
 //! (`TcpListener` / `TcpStream` / `UdpSocket`);
-//! `AF_UNIX` via `std::os::unix::net` (`cfg(unix)`). On
-//! Windows `socket(AF_UNIX, ...)` raises
-//! `NotImplementedError` at construction (`std` has no
+//! `AF_UNIX` via `std::os::unix::net` (`cfg(unix)`); on
+//! Windows it raises `NotImplementedError` (`std` has no
 //! AF_UNIX API there).
 //!
-//! Representation: a socket is an `Obj::Instance` with an
-//! empty members map and `subobj = [fd, family, type,
-//! proto]` (small ints), header type the socket `TypeData`,
+//! Representation: a socket is an `Obj::Instance` with
+//! `subobj = [fd, family, type, proto]` (small ints),
 //! allocated with `alloc_with_finaliser` so the GC
-//! finaliser drain runs `__del__` (= `close`) when the
-//! socket becomes unreachable. The OS socket itself lives
-//! in the process-global `SOCKETS` table, keyed by the OS
-//! fd on Unix / the `SOCKET` handle value on Windows
-//! (`TableKey = i64`; `value.rs`/`gc.rs` are over the line
-//! cap, so there is no new `Obj` variant and no arena
-//! field for it). Operations that can block clone the
-//! stored object (`try_clone`, safe) and never hold the
-//! table lock across I/O.
+//! finaliser drain runs `__del__` (= `close`) when it
+//! becomes unreachable. The OS socket lives in the
+//! process-global `SOCKETS` table, keyed by the OS fd on
+//! Unix / the `SOCKET` handle value on Windows
+//! (`TableKey = i64`; `value.rs`/`gc.rs` are over the
+//! line cap, so there is no new `Obj` variant and no
+//! arena field). Blocking operations clone the stored
+//! object (`try_clone`, safe) and never hold the table
+//! lock across I/O.
 //!
-//! Known limitations (all documented here, see the result
-//! file §4):
+//! Known limitations (see the result file §4):
 //! - The constructor cannot create an unbound stream
 //!   socket in pure `std` (no such constructor), so the
 //!   instance is created over a REAL placeholder socket
@@ -57,33 +52,29 @@
 //! - `bind("")` on `AF_UNIX` binds an UNNAMED socket (std
 //!   behaviour), not the reference's abstract socket.
 //! - Timeouts: `settimeout`/`setblocking`/`gettimeout` use
-//!   shadow state (std has no timeout getters) and land on
-//!   the socket via `set_read_timeout` / `set_write_timeout`
-//!   / `set_nonblocking`. `accept()` ignores a listener
+//!   shadow state (std has no timeout getters) and land via
+//!   `set_read_timeout` / `set_write_timeout` /
+//!   `set_nonblocking`. `accept()` ignores a listener
 //!   timeout (no readiness interface is built or used in
 //!   this lane); `connect()` with a timeout uses
 //!   `TcpStream::connect_timeout` for `AF_INET`/`AF_INET6`
 //!   only (`UnixStream::connect` has no timeout form), and
-//!   a nonblocking `connect()` blocks (std's `connect`
-//!   creates a blocking socket).
+//!   a nonblocking `connect()` blocks.
 //! - `getsockopt`/`setsockopt` keep per-socket shadow state
 //!   `(level, opt) -> bytes`. Only these land in `std`:
-//!   `TCP_NODELAY` -> `set_nodelay` (stream),
-//!   `SO_BROADCAST` -> `set_broadcast` (UDP), `IP_TTL` ->
-//!   `set_ttl` (INET), `SO_RCVTIMEO`/`SO_SNDTIMEO` ->
-//!   read/write timeouts. `SO_REUSEADDR`, `SO_RCVBUF`,
-//!   `SO_SNDBUF` are shadow-only (std has no query API;
-//!   `SO_REUSEADDR` is set by std itself at `bind`).
-//!   `SO_PEERCRED` is `OSError(ENOPROTOOPT)` everywhere
-//!   (std has no stable API); any other `(level, opt)` is
-//!   `ENOPROTOOPT` too.
+//!   `TCP_NODELAY` -> `set_nodelay` (stream), `SO_BROADCAST`
+//!   -> `set_broadcast` (UDP), `IP_TTL` -> `set_ttl` (INET),
+//!   `SO_RCVTIMEO`/`SO_SNDTIMEO` -> read/write timeouts.
+//!   `SO_REUSEADDR`, `SO_RCVBUF`, `SO_SNDBUF` are
+//!   shadow-only (std has no query API; `SO_REUSEADDR` is
+//!   set by std itself at `bind`). `SO_PEERCRED` and any
+//!   other `(level, opt)` are `OSError(ENOPROTOOPT)`.
 //! - `recv()` has no size cap (the old 4096/`EFBIG` cap was
 //!   the Zig's stack buffer); a request over 64 MiB is
 //!   `MemoryError` (a `Vec` that large would abort).
 //! - `sendto` on a stream socket is `EISCONN` (connected)
 //!   or `ENOTCONN` (not connected); `send`/`sendall` on a
-//!   listener is `ENOTCONN` (107, CPython — this also fixes
-//!   the G6b §4 leftover, where it was `EINVAL`).
+//!   listener is `ENOTCONN` (107, CPython; fixes G6b §4).
 //! - `makefile()` is stream-only (`EINVAL` otherwise) and
 //!   returns this module's `socketfile` wrapper object
 //!   (`read(n)` / `readline([limit])` / `write()` /
@@ -96,7 +87,7 @@
 //!   runtime via `RuntimeQstr::from_strn` (which returns
 //!   the static id on hit); the `.mpy` loader interns by
 //!   string, so the ids line up at runtime (covered by the
-//!   unit tests, which compile and run real scripts).
+//!   unit tests).
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -131,12 +122,12 @@ use crate::pyerr::{PyError, PyResult};
 use crate::runtime::raise::{malloc_fail, raise_os_error};
 
 /// Linux errno values used below.
-const EINVAL: i32 = 22;
+pub(crate) const EINVAL: i32 = 22;
 const ENAMETOOLONG: i32 = 36;
 const EPIPE: i32 = 32;
-const EBADF: i32 = 9;
+pub(crate) const EBADF: i32 = 9;
 const ENOPROTOOPT: i32 = 92;
-const EAFNOSUPPORT: i32 = 97;
+pub(crate) const EAFNOSUPPORT: i32 = 97;
 const EOPNOTSUPP: i32 = 95;
 const ENOTCONN: i32 = 107;
 const EISCONN: i32 = 106;
@@ -147,7 +138,7 @@ const SUN_PATH_LEN: usize = 108;
 
 /// Largest single `recv`/`recvfrom` buffer (a bigger
 /// request is `MemoryError`, not a `Vec` that aborts).
-const MAX_RECV: i64 = 64 * 1024 * 1024;
+pub(crate) const MAX_RECV: i64 = 64 * 1024 * 1024;
 
 /// Address families / socket types (also module constants).
 const AF_UNSPEC: i32 = 0;
@@ -172,17 +163,17 @@ const SO_PEERCRED: i32 = 17;
 
 /// Process-global socket-table key: the OS fd on Unix, the
 /// `SOCKET` handle value on Windows. `fileno()` returns it.
-type TableKey = i64;
+pub(crate) type TableKey = i64;
 
 /// The owned OS side of one socket instance.
-enum SocketState {
+pub(crate) enum SocketState {
     /// Not yet bound/connected: the placeholder `UdpSocket`
     /// bound to `127.0.0.1:0` (a real fd), replaced by the
     /// real object at `bind()`/`connect()`. For a datagram
     /// socket the placeholder IS usable: `sendto` /
     /// `recv` / `recvfrom` work on it (CPython auto-binds an
     /// unbound UDP socket the same way).
-    Unbound(UdpSocket),
+    #[allow(dead_code)] Unbound(UdpSocket),
     /// Bound stream listener (INET). Already listening:
     /// `std`'s `bind` listens, so `listen()` is a
     /// validation no-op.
@@ -200,13 +191,17 @@ enum SocketState {
     /// Datagram socket (UNIX), bound and/or connected.
     #[cfg(unix)]
     DatagramUnix(UnixDatagram),
+    /// FFI socket (feature `unsafe-ffi`): a real handle
+    /// from `socket(2)`, stable across bind/connect.
+    #[cfg(feature = "unsafe-ffi")]
+    Ffi(crate::modules::modsocket_ffi::FfiSocket),
 }
 
 impl SocketState {
     /// `set_nonblocking` on the stored object (every
     /// variant supports it; the flag lives on the shared
     /// file description).
-    fn set_nonblocking(&self, nb: bool) -> io::Result<()> {
+    fn set_nonblocking(&mut self, nb: bool) -> io::Result<()> {
         match self {
             SocketState::Unbound(u) | SocketState::Datagram(u) => u.set_nonblocking(nb),
             SocketState::ListenerTcp(l) => l.set_nonblocking(nb),
@@ -217,6 +212,10 @@ impl SocketState {
             SocketState::StreamUnix(s) => s.set_nonblocking(nb),
             #[cfg(unix)]
             SocketState::DatagramUnix(d) => d.set_nonblocking(nb),
+            #[cfg(feature = "unsafe-ffi")]
+            SocketState::Ffi(f) => f
+                .setblocking(!nb)
+                .map_err(io::Error::from_raw_os_error),
         }
     }
 
@@ -224,7 +223,7 @@ impl SocketState {
     /// stored object. Listeners have no read/write
     /// timeouts in `std` — a no-op for them (the shadow
     /// state still records the value).
-    fn set_timeouts(&self, r: Option<Duration>, w: Option<Duration>) -> io::Result<()> {
+    fn set_timeouts(&mut self, r: Option<Duration>, w: Option<Duration>) -> io::Result<()> {
         match self {
             SocketState::ListenerTcp(_) => Ok(()),
             #[cfg(unix)]
@@ -247,6 +246,8 @@ impl SocketState {
                 d.set_read_timeout(r)?;
                 d.set_write_timeout(w)
             }
+            #[cfg(feature = "unsafe-ffi")]
+            SocketState::Ffi(f) => f.settimeout(r, w).map_err(io::Error::from_raw_os_error),
         }
     }
 
@@ -255,6 +256,8 @@ impl SocketState {
             SocketState::ListenerTcp(_) => true,
             #[cfg(unix)]
             SocketState::ListenerUnix(_) => true,
+            #[cfg(feature = "unsafe-ffi")]
+            SocketState::Ffi(f) => f.listening,
             _ => false,
         }
     }
@@ -264,6 +267,8 @@ impl SocketState {
             SocketState::StreamTcp(_) => true,
             #[cfg(unix)]
             SocketState::StreamUnix(_) => true,
+            #[cfg(feature = "unsafe-ffi")]
+            SocketState::Ffi(f) => f.kind == SOCK_STREAM,
             _ => false,
         }
     }
@@ -273,6 +278,8 @@ impl SocketState {
             SocketState::Datagram(_) => true,
             #[cfg(unix)]
             SocketState::DatagramUnix(_) => true,
+            #[cfg(feature = "unsafe-ffi")]
+            SocketState::Ffi(f) => f.kind == SOCK_DGRAM,
             _ => false,
         }
     }
@@ -286,7 +293,7 @@ fn sockets_table() -> &'static Mutex<HashMap<TableKey, SocketState>> {
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn sockets() -> std::sync::MutexGuard<'static, HashMap<TableKey, SocketState>> {
+pub(crate) fn sockets() -> std::sync::MutexGuard<'static, HashMap<TableKey, SocketState>> {
     sockets_table().lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -296,22 +303,22 @@ fn sockets() -> std::sync::MutexGuard<'static, HashMap<TableKey, SocketState>> {
 /// `SOCKETS`; the entry migrates when the key changes at
 /// `bind()`/`connect()`/`dup()`).
 #[derive(Clone, Default)]
-struct SockSettings {
+pub(crate) struct SockSettings {
     /// `gettimeout()` source: `None` = blocking,
     /// `Some(ZERO)` = nonblocking, `Some(d)` = timeout.
     /// Set only by `settimeout` / `setblocking`.
-    timeout: Option<Duration>,
+    pub(crate) timeout: Option<Duration>,
     /// Applied read/write timeouts (set by `settimeout`
     /// and by `SO_RCVTIMEO` / `SO_SNDTIMEO`).
-    read_timeout: Option<Duration>,
-    write_timeout: Option<Duration>,
+    pub(crate) read_timeout: Option<Duration>,
+    pub(crate) write_timeout: Option<Duration>,
     /// Nonblocking flag (set by `setblocking` /
     /// `settimeout(0)`).
-    nonblocking: bool,
+    pub(crate) nonblocking: bool,
     /// `(level, opt) -> canonical bytes` (int options:
     /// 4-byte little-endian). Timeout options live in
     /// `read_timeout` / `write_timeout`, not here.
-    opts: HashMap<(i32, i32), Vec<u8>>,
+    pub(crate) opts: HashMap<(i32, i32), Vec<u8>>,
 }
 
 fn settings_table() -> &'static Mutex<HashMap<TableKey, SockSettings>> {
@@ -319,12 +326,12 @@ fn settings_table() -> &'static Mutex<HashMap<TableKey, SockSettings>> {
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn settings() -> std::sync::MutexGuard<'static, HashMap<TableKey, SockSettings>> {
+pub(crate) fn settings() -> std::sync::MutexGuard<'static, HashMap<TableKey, SockSettings>> {
     settings_table().lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Read a socket's settings (default when never set).
-fn get_settings(key: TableKey) -> SockSettings {
+pub(crate) fn get_settings(key: TableKey) -> SockSettings {
     settings().get(&key).cloned().unwrap_or_default()
 }
 
@@ -343,7 +350,7 @@ fn migrate_settings(old: TableKey, new: TableKey) {
 /// (bind/connect/dup): nonblocking, read/write timeouts,
 /// and the std-landing sockopts. Best-effort: the shadow
 /// is the source of truth, so a failed apply is ignored.
-fn apply_settings(state: &SocketState, s: &SockSettings) {
+pub(crate) fn apply_settings(state: &mut SocketState, s: &SockSettings) {
     let _ = state.set_nonblocking(s.nonblocking);
     let _ = state.set_timeouts(s.read_timeout, s.write_timeout);
     for ((level, opt), v) in &s.opts {
@@ -354,6 +361,8 @@ fn apply_settings(state: &SocketState, s: &SockSettings) {
 /// Apply one landed sockopt to a state object (the
 /// `setsockopt` landing path, shared with `apply_settings`).
 fn apply_opt(state: &SocketState, level: i32, opt: i32, v: &[u8]) {
+    #[cfg(feature = "unsafe-ffi")]
+    if let SocketState::Ffi(f) = state { let _ = f.setsockopt(level, opt, v); return; }
     let n = int_opt_value(v);
     match (level, opt) {
         (IPPROTO_TCP, TCP_NODELAY) => {
@@ -483,6 +492,8 @@ fn sock_key_of(state: &SocketState) -> TableKey {
         SocketState::StreamUnix(s) => sock_key(s),
         #[cfg(unix)]
         SocketState::DatagramUnix(d) => sock_key(d),
+        #[cfg(feature = "unsafe-ffi")]
+        SocketState::Ffi(f) => f.fileno(),
     }
 }
 
@@ -548,7 +559,7 @@ fn qid(ctx: &mut CallCtx, name: &[u8]) -> u32 {
 /// `mp_obj_get_int` (`obj.rs`), mapped through the typed
 /// raise (`ObjError::IntConversion` is TypeError "can't
 /// convert to int").
-fn int_arg(ctx: &mut CallCtx, v: Value) -> PyResult<i64> {
+pub(crate) fn int_arg(ctx: &mut CallCtx, v: Value) -> PyResult<i64> {
     obj_get_int(ctx, ctx.types, v).map_err(|e| ctx.record_typed(e))
 }
 
@@ -557,7 +568,7 @@ fn int_arg(ctx: &mut CallCtx, v: Value) -> PyResult<i64> {
 /// "can't convert to str implicitly" — the `sendall` shape
 /// (`mp_obj_str_get_data` raises; probed:
 /// `sendall(bytearray(b"hi"))` is that TypeError).
-fn str_arg(ctx: &mut CallCtx, v: Value) -> PyResult<Vec<u8>> {
+pub(crate) fn str_arg(ctx: &mut CallCtx, v: Value) -> PyResult<Vec<u8>> {
     let pool = ctx.pool;
     let resolver: QstrResolver<'_> = &|id| {
         let Ok(id16) = u16::try_from(id) else {
@@ -646,7 +657,7 @@ fn socketfile_type(ctx: &mut CallCtx) -> PyResult<GcRef> {
 
 /// Read `self` (args[0]) as a socket instance: returns the
 /// arena ref, the table key, and `[family, type, proto]`.
-fn self_socket(ctx: &mut CallCtx, args: &[Value]) -> PyResult<(GcRef, TableKey, [i32; 3])> {
+pub(crate) fn self_socket(ctx: &mut CallCtx, args: &[Value]) -> PyResult<(GcRef, TableKey, [i32; 3])> {
     let bad = |ctx: &mut CallCtx| -> PyError {
         ctx.record_raise("TypeError", Some("expected a socket"));
         PyError::PyRaise
@@ -688,7 +699,7 @@ fn set_fd(ctx: &mut CallCtx, r: GcRef, fd: TableKey) {
 
 /// Allocate a socket instance (finaliser set, so the GC
 /// drain runs `__del__` when it becomes unreachable).
-fn alloc_socket(
+pub(crate) fn alloc_socket(
     ctx: &mut CallCtx,
     fd: TableKey,
     family: i32,
@@ -791,7 +802,7 @@ fn locals_dict(ctx: &mut CallCtx, fun_builtin_var: GcRef, entries: &[MethodEntry
 /// wildcard address); port is an int in `0..=65535`
 /// (`OverflowError` outside). A non-tuple / wrong-length
 /// tuple is `TypeError`.
-fn parse_inet_addr(ctx: &mut CallCtx, v: Value, family: i32) -> PyResult<SocketAddr> {
+pub(crate) fn parse_inet_addr(ctx: &mut CallCtx, v: Value, family: i32) -> PyResult<SocketAddr> {
     let Some(items) = tuple_items(ctx, v) else {
         ctx.record_raise("TypeError", Some("address must be a (host, port) tuple"));
         return Err(PyError::PyRaise);
@@ -857,7 +868,7 @@ fn resolve_inet(
 /// shape, pinned by the unit tests); the path is the
 /// bytes up to the first NUL; `>= 108` bytes is
 /// `ENAMETOOLONG`.
-fn parse_unix_path(ctx: &mut CallCtx, v: Value) -> PyResult<Vec<u8>> {
+pub(crate) fn parse_unix_path(ctx: &mut CallCtx, v: Value) -> PyResult<Vec<u8>> {
     let Some(bytes) = path_bytes(ctx, v) else {
         return Err(raise_os_error(ctx, EINVAL));
     };
@@ -870,7 +881,7 @@ fn parse_unix_path(ctx: &mut CallCtx, v: Value) -> PyResult<Vec<u8>> {
 
 /// The peer address of an INET socket as a CPython
 /// `(host, port)` tuple value.
-fn inet_addr_tuple(ctx: &mut CallCtx, a: SocketAddr) -> Value {
+pub(crate) fn inet_addr_tuple(ctx: &mut CallCtx, a: SocketAddr) -> Value {
     let types = ctx.types;
     let host = new_str(ctx, types, a.ip().to_string().as_bytes());
     let port = small(a.port() as i64);
@@ -937,10 +948,21 @@ fn socket_ctor(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         );
         return Err(PyError::PyRaise);
     }
-    let placeholder = UdpSocket::bind("127.0.0.1:0").map_err(|e| io_os_error(ctx, e))?;
-    let key = sock_key(&placeholder);
-    sockets().insert(key, SocketState::Unbound(placeholder));
-    alloc_socket(ctx, key, family, type_, proto)
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        let f = crate::modules::modsocket_ffi::FfiSocket::new(family, type_, proto)
+            .map_err(|e| crate::modules::modsocket_ffi::ffi_os_error(ctx, e))?;
+        let key = f.fileno();
+        sockets().insert(key, SocketState::Ffi(f));
+        alloc_socket(ctx, key, family, type_, proto)
+    }
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        let placeholder = UdpSocket::bind("127.0.0.1:0").map_err(|e| io_os_error(ctx, e))?;
+        let key = sock_key(&placeholder);
+        sockets().insert(key, SocketState::Unbound(placeholder));
+        alloc_socket(ctx, key, family, type_, proto)
+    }
 }
 
 /// `socket.fromfd(fd, family, type[, proto=0])`: CUT in
@@ -1098,7 +1120,7 @@ fn swap_in(ctx: &mut CallCtx, r: GcRef, old_key: TableKey, new_state: SocketStat
     sockets().insert(new_key, new_state);
     migrate_settings(old_key, new_key);
     let s = get_settings(new_key);
-    if let Some(st) = sockets().get(&new_key) {
+    if let Some(st) = sockets().get_mut(&new_key) {
         apply_settings(st, &s);
     }
     set_fd(ctx, r, new_key);
@@ -1360,6 +1382,7 @@ fn parse_timeval(v: &[u8]) -> Option<Duration> {
 /// abstract socket).
 fn sock_bind(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (r, fd, fields) = self_socket(ctx, args)?;
+    #[cfg(feature = "unsafe-ffi")] if matches!(sockets().get(&fd), Some(SocketState::Ffi(_))) { return crate::modules::modsocket_ffi::sock_bind_ffi(ctx, args); }
     let (family, type_) = (fields[0], fields[1]);
     if fd < 0 {
         return Err(raise_os_error(ctx, EBADF));
@@ -1412,6 +1435,7 @@ fn sock_bind(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// `EINVAL` / `EBADF`.
 fn sock_listen(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, _fields) = self_socket(ctx, args)?;
+    #[cfg(feature = "unsafe-ffi")] if matches!(sockets().get(&fd), Some(SocketState::Ffi(_))) { return crate::modules::modsocket_ffi::sock_listen_ffi(ctx, args); }
     let _backlog = match args.get(1) {
         Some(v) => int_arg(ctx, *v)? as i32,
         None => 0,
@@ -1436,6 +1460,7 @@ fn sock_listen(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// table lock is not held across the blocking call.
 fn sock_accept(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, fields) = self_socket(ctx, args)?;
+    #[cfg(feature = "unsafe-ffi")] if matches!(sockets().get(&fd), Some(SocketState::Ffi(_))) { return crate::modules::modsocket_ffi::sock_accept_ffi(ctx, args); }
     if fd < 0 {
         return Err(raise_os_error(ctx, EBADF));
     }
@@ -1457,7 +1482,7 @@ fn sock_accept(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let new_key = sock_key_of(&new_state);
     let parent_settings = get_settings(fd);
     sockets().insert(new_key, new_state);
-    if let Some(st) = sockets().get(&new_key) {
+    if let Some(st) = sockets().get_mut(&new_key) {
         apply_settings(st, &parent_settings);
     }
     settings().insert(new_key, parent_settings);
@@ -1481,6 +1506,7 @@ fn sock_accept(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// connect leaves the socket unbound.
 fn sock_connect(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (r, fd, fields) = self_socket(ctx, args)?;
+    #[cfg(feature = "unsafe-ffi")] if matches!(sockets().get(&fd), Some(SocketState::Ffi(_))) { return crate::modules::modsocket_ffi::sock_connect_ffi(ctx, args); }
     let (family, type_) = (fields[0], fields[1]);
     if fd < 0 {
         return Err(raise_os_error(ctx, EBADF));
@@ -1608,6 +1634,7 @@ fn sock_connect(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// was the Zig's stack buffer).
 fn sock_recv(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, fields) = self_socket(ctx, args)?;
+    #[cfg(feature = "unsafe-ffi")] if matches!(sockets().get(&fd), Some(SocketState::Ffi(_))) { return crate::modules::modsocket_ffi::sock_recv_ffi(ctx, args); }
     let n_signed = int_arg(ctx, args[1])?;
     if fd < 0 {
         return Err(raise_os_error(ctx, EBADF));
@@ -1631,6 +1658,7 @@ fn sock_recv(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// socket is `EINVAL`; closed is `EBADF`.
 fn sock_send(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, fields) = self_socket(ctx, args)?;
+    #[cfg(feature = "unsafe-ffi")] if matches!(sockets().get(&fd), Some(SocketState::Ffi(_))) { return crate::modules::modsocket_ffi::sock_send_ffi(ctx, args); }
     let data = str_arg(ctx, args[1])?;
     let mut h = io_handle(ctx, fd, fields, ENOTCONN, EINVAL)?;
     let n = h.write(&data).map_err(|e| io_os_error(ctx, e))?;
@@ -1647,6 +1675,7 @@ fn sock_send(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// `send` (datagrams are atomic).
 fn sock_sendall(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, fields) = self_socket(ctx, args)?;
+    #[cfg(feature = "unsafe-ffi")] if matches!(sockets().get(&fd), Some(SocketState::Ffi(_))) { return crate::modules::modsocket_ffi::sock_sendall_ffi(ctx, args); }
     let data = str_arg(ctx, args[1])?;
     let mut h = io_handle(ctx, fd, fields, ENOTCONN, EINVAL)?;
     h.write_all(&data).map_err(|e| io_os_error(ctx, e))?;
@@ -1659,6 +1688,7 @@ fn sock_sendall(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// a closed socket is `EBADF`.
 fn sock_sendto(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, fields) = self_socket(ctx, args)?;
+    #[cfg(feature = "unsafe-ffi")] if matches!(sockets().get(&fd), Some(SocketState::Ffi(_))) { return crate::modules::modsocket_ffi::sock_sendto_ffi(ctx, args); }
     let (family, type_) = (fields[0], fields[1]);
     let data = str_arg(ctx, args[1])?;
     if fd < 0 {
@@ -1705,6 +1735,7 @@ fn sock_sendto(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// and report the peer address.
 fn sock_recvfrom(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, fields) = self_socket(ctx, args)?;
+    #[cfg(feature = "unsafe-ffi")] if matches!(sockets().get(&fd), Some(SocketState::Ffi(_))) { return crate::modules::modsocket_ffi::sock_recvfrom_ffi(ctx, args); }
     let n_signed = int_arg(ctx, args[1])?;
     if fd < 0 {
         return Err(raise_os_error(ctx, EBADF));
@@ -1736,8 +1767,8 @@ fn sock_setblocking(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         return Err(raise_os_error(ctx, EBADF));
     }
     {
-        let table = sockets();
-        match table.get(&fd) {
+        let mut table = sockets();
+        match table.get_mut(&fd) {
             Some(s) => s
                 .set_nonblocking(!blocking)
                 .map_err(|e| io_os_error(ctx, e))?,
@@ -1794,8 +1825,8 @@ fn sock_settimeout(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         }
     };
     {
-        let table = sockets();
-        match table.get(&fd) {
+        let mut table = sockets();
+        match table.get_mut(&fd) {
             Some(s) => {
                 s.set_nonblocking(nonblocking)
                     .map_err(|e| io_os_error(ctx, e))?;
@@ -1976,7 +2007,7 @@ fn sock_setsockopt(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
             }
             let (r, w) = (st.read_timeout, st.write_timeout);
             settings().insert(fd, st);
-            if let Some(s) = sockets().get(&fd) {
+            if let Some(s) = sockets().get_mut(&fd) {
                 let _ = s.set_timeouts(r, w);
             }
         }
@@ -2042,13 +2073,15 @@ fn sock_dup(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
             Some(SocketState::DatagramUnix(d)) => {
                 SocketState::DatagramUnix(d.try_clone().map_err(|e| io_os_error(ctx, e))?)
             }
+            #[cfg(feature = "unsafe-ffi")]
+            Some(SocketState::Ffi(f)) => SocketState::Ffi(f.dup().map_err(|e| crate::modules::modsocket_ffi::ffi_os_error(ctx, e))?),
             None => return Err(raise_os_error(ctx, EBADF)),
         }
     };
     let new_key = sock_key_of(&new_state);
     let st = get_settings(fd);
     sockets().insert(new_key, new_state);
-    if let Some(s) = sockets().get(&new_key) {
+    if let Some(s) = sockets().get_mut(&new_key) {
         apply_settings(s, &st);
     }
     settings().insert(new_key, st);
@@ -2326,6 +2359,9 @@ pub const SOCKET_LOCALS: &[MethodEntry] = &[
     MethodEntry { name: "close", func: sock_close, min: 1, max: 1, kw_func: None },
     MethodEntry { name: "dup", func: sock_dup, min: 1, max: 1, kw_func: None },
     MethodEntry { name: "makefile", func: sock_makefile, min: 1, max: 2, kw_func: None },
+    #[cfg(feature = "unsafe-ffi")] MethodEntry { name: "getpeername", func: crate::modules::modsocket_ffi::sock_getpeername, min: 1, max: 1, kw_func: None },
+    #[cfg(feature = "unsafe-ffi")] MethodEntry { name: "getsockname", func: crate::modules::modsocket_ffi::sock_getsockname, min: 1, max: 1, kw_func: None },
+    #[cfg(feature = "unsafe-ffi")] MethodEntry { name: "shutdown", func: crate::modules::modsocket_ffi::sock_shutdown, min: 2, max: 2, kw_func: None },
 ];
 
 pub const FILE_LOCALS: &[MethodEntry] = &[

@@ -1,4 +1,4 @@
-# H-select 结果（lane/h-select，基线 d316394）
+# H-select 结果（lane/h-select，基线 master 36f537c，rebase 后）
 
 ## §1 改了什么
 
@@ -8,7 +8,7 @@
 
 ### 新文件
 
-- `src/support/readiness.rs`（新增，~620 行）：每 fd 一个 monitor 线程 +
+- `src/support/readiness.rs`（新增，812 行）：每 fd 一个 monitor 线程 +
   共享读缓冲。`ensure_monitor(fd, file)`（`File::try_clone`，共享
   description/offset）；`take_buffered` / `wait_buffered` /
   `drain_into(fd, buf) -> (usize, bool)`（两条读路径共用）；`note_closed`
@@ -25,7 +25,7 @@
   fd ≥ 1024 接受且就绪；devnull + listener sanity。所有等待都有 deadline
   （子进程 15s、writer open / connect 5s，超时 kill）。
 
-### 改写：`src/modules/modselect.rs`（367 行 → ~470 行，FFI 路径全删）
+### 改写：`src/modules/modselect.rs`（503 行，FFI 路径全删）
 
 - 删：`ffi` mod、`FdSet`、`select_real`、`timeval_from_secs`、
   `list_len`、全部 `#[cfg(feature = "unsafe-ffi")]` 分支。
@@ -69,10 +69,21 @@
 - `src/runtime/vm_call_intercept.rs`：`fun == state.select_builtin` 时调
   `modselect::call_select_ctx`（os fd builtins 同形——`FunBuiltin` 槽看
   不到 `state.os_fds`）。
-- `src/modules/modsocket.rs`（+39 行，唯一新增）：`socket_probe(fd) ->
+- `src/modules/modsocket.rs`（+36 行，唯一新增）：`socket_probe(fd) ->
   Option<SocketProbe>`（`Unprobable`：stream/listener/未绑定/他人所有；
   `Bare`：`fromfd` 且无自有对象 → EBADF，与已有“他人 fd 上 I/O”规则一致）。
   除此之外不碰 modsocket（H-socket 的文件）。
+  **Rebase 到 master 36f537c（H-socket 已合入）后重写**：H-socket 把
+  modsocket.rs 整个重写了（2422 行，`SOCKETS` 表改为 `HashMap<TableKey,
+  SocketState>`，`TableKey = i64` 即 OS fd 本身；`SocketState` 为
+  `Unbound`/`ListenerTcp`/`ListenerUnix`/`StreamTcp`/`StreamUnix`/
+  `Datagram`/`DatagramUnix`，无旧版的 `Stream`/`Listener`/`Foreign`；
+  `fromfd` 已删，改为抛 NotImplementedError）。旧 `socket_probe` 在
+  rebase 时文本上合入了，但引用了不存在的变体（编不过）。新版：
+  `socket_probe(fd: i32)` 只查表——fd 在 `SOCKETS` 里即
+  `Some(Unprobable)`，否则 `None`。`Bare` 变体已删（新版不存在无自有
+  对象的 socket fd；未知 fd 落到 os fd 表 / EBADF）。`subobj` 形状未变
+  （4 个 small-int，[0]=fd），所以 modselect 的 socket 实例判定不用改。
 
 ### 读路径（防数据丢失——select 启动 monitor 后，读必须先排空缓冲）
 
@@ -132,7 +143,7 @@
   `d4_select_negative_timeout` / `d4_select_bad_arg` /
   `d4_select_too_few_args`。
 
-### 提交（分支 lane/h-select，基线 d316394）
+### 提交（分支 lane/h-select，基线 d316394 → rebase 到 master 36f537c）
 
 - `38e8a06` readiness 数据信号 + seek 失效 + fd 复用 guard
 - `b8c03a9` fileio 读先排空缓冲
@@ -140,21 +151,39 @@
 - `0c076ad` 共享 drain helper；os.read/os.close/os.lseek 接入
 - `7234c89` 纯 std select 重写 + VmState 拦截 + settle 握手
 - `52f77c8` 二进制探针 + 修 feature os.close 双重 close
+- `e6139cd` 结果文件（§2/§3，rebase 前的数）
+- rebase 到 master `36f537c`（H-socket + H-subprocess 已合入）：
+  8 个提交全部干净合入（0 冲突——但 `socket_probe` 文本合入后引用了
+  新版不存在的变体，见上），随后：
+- `2b3155d` socket_probe 按新版 modsocket 重写 + 删 Bare
+
+**下文 §2/§3 是 rebase 后（HEAD 2b3155d，基线 master 36f537c）的实测数。
+旧基线 d316394 下的 integration 202/202 已失效（见 §2 说明）。**
 
 ## §2 验证数字
 
-HEAD `52f77c8`（分支 lane/h-select，基线 d316394；release 构建，
+HEAD `2b3155d`（分支 lane/h-select，基线 master `36f537c`；release 构建，
 除非注明）。验证脚本 `~/workspace/h_select_verify.sh`（checkpointed，
-输出在 `~/workspace/h_select_verify/`，每节独立文件）。
+输出在 `~/workspace/h_select_verify/`，每节独立文件）；基线数在临时
+worktree `/tmp/petitpy-base-36f537c`（HEAD `36f537c07a30d801b2491a8532543108373cded1`，
+输出在 `~/workspace/h_select_verify/base_36f537c/`）实测。
 
-| 门 | 默认构建 | feature 构建（`--features unsafe-ffi`） | 基线 |
+**注意——旧数已失效**：本节旧版写的 integration 202/202 是旧基线
+d316394（H-socket 合入前）的数。rebase 到 36f537c 后，H-socket 砍了
+`socket.fromfd`，integration 上限变为 201/202：唯一失败是
+`socket_fromfd_wraps_fd`（`NotImplementedError: socket.fromfd is not
+implemented`，故意的），select 两项已变绿。默认构建 199/202 → 201/202
+（恰好修掉 2 个 select 测试）；feature 构建 201/202 不变（select 测试
+在基线已通过真 `select(2)`，fromfd 在基线与 lane 都失败）。
+
+| 门 | 默认构建 | feature 构建（`--features unsafe-ffi`） | 基线（36f537c 实测） |
 |---|---|---|---|
-| lib（`cargo test --release --lib`） | 1757 passed / 0 failed / 1 ignored | 1765 passed / 0 failed / 1 ignored | 1739 / 1755（d316394 实测，0 failed / 1 ignored） |
+| lib（`cargo test --release --lib`） | 1771 passed / 0 failed / 2 ignored | 1771 passed / 0 failed / 2 ignored | 默认 1753 / feature 1761（0 failed / 2 ignored） |
 | bins（`cargo test --release --bins`） | 9 passed | 9 passed | 9 |
 | entry_cli | 45 passed | 45 passed | 45 |
 | h_select（release） | 10/10 | 10/10 | —（新增） |
 | h_select（debug） | 10/10 | 10/10 | —（新增） |
-| integration | **202/202** | 202/202 | 默认 200/202（`select_readable_fd_is_ready`、`select_timeout_zero_returns_promptly` 两红变绿，见 §3） |
+| integration | **201/202**（唯一失败 `socket_fromfd_wraps_fd`） | **201/202**（同左） | 默认 199/202（fromfd + 2 select）、feature 201/202（仅 fromfd） |
 | full | 545/552 GREEN（恰为 7 个 known-fails） | 545/552 GREEN | 545/552 GREEN |
 | golden | 585/585 | 585/585 | 585/585 |
 | capability | 67/67 GREEN（1 CPYTHON DIFF `async_def`——基线行为） | 67/67 GREEN | 67/67 GREEN |
@@ -163,26 +192,23 @@ HEAD `52f77c8`（分支 lane/h-select，基线 d316394；release 构建，
 | check_compile_mpy + check_frozen | PASS / PASS | PASS / PASS | PASS |
 | warnings（强制重编） | 0 | 0 | 0 |
 
-lib 增量对账（实测，非推断）：默认 +18 = 新增 11（readiness 9 +
-modd4 2）+ 解门控 7（g0_ 测试原只在 feature 编）；feature +10 =
-新增 19 − 移除/改名 9（`--list` diff 逐项核对：HEAD 独有 19 项——
-10 个 `h_select_*` modd4 测试 + 9 个 readiness 测试；基线独有 9 项——
-7 个 `g0_select_*` + 2 个已删的 modselect feature 测试
-`fd_set_bits`/`timeval_conversion`）。0 failed、1 ignored 与基线相同。
+lib 增量对账（实测，`cargo test --release --lib -- --list` diff，输出在
+`~/workspace/h_select_verify/debug_check/`）：默认 +18 = lane-only 19 −
+base-only 1（lane-only：10 个 `h_select_*` modd4 测试 + 9 个 readiness
+测试；base-only：`d4_select_nonempty_not_implemented` 改名）；即新增 11
+（readiness 9 + modd4 2）+ 解门控 7（g0_ 测试原只在 feature 编）。
+feature +10 = lane-only 19 − base-only 9（base-only：7 个 `g0_select_*` +
+2 个已删的 modselect feature 测试 `fd_set_bits` / `timeval_conversion`）。
+0 failed、2 ignored 与基线相同。
 
 `unsafe`：lane 模块（modselect.rs、readiness.rs、modos_fd.rs、
 objfileio.rs）中无任何 `unsafe` 代码块（`grep -E "unsafe\s*\{|
-unsafe\s+fn|unsafe\s+extern"` 为空）。"unsafe" 一词仅出现在：
+unsafe\s+fn|unsafe\s+extern"` 为空，rc=1）。"unsafe" 一词仅出现在：
 readiness.rs:70 的一条 doc 注释，以及 modos_fd.rs 里 pre-existing 的
 注释与 `#[cfg(feature = "unsafe-ffi")]` 属性（G6a 的 FFI 调用在
 ffi.rs，不在本 lane 改动内）。文件行数：modselect.rs 503、
 readiness.rs 812、modos_fd.rs 575、objfileio.rs 800、h_select.rs 466，
-均 < 2500。lane diff（vs d316394）：10 文件，+1922/−346。
-
-注：验证脚本的 A13/B13（warnings）节的 rc 回显有 bug——它取的是
-pipeline 末尾 `head` 的状态（恒 0），故 warnings 数是事后单独重跑
-确认的：`touch src/lib.rs && cargo build --release[--features
-unsafe-ffi] 2>&1 | grep -ci warning`，两构建均为 0。
+均 < 2500。lane diff（vs 36f537c）：11 文件，+2210/−346。
 
 ## §3 探针（含双构建 diff）
 
@@ -209,7 +235,8 @@ diff 为空。release 版：A05/B05 各 10/10；debug 版：10/10、10/10。
 
 ### 与 reference 的对照（integration 门）
 
-integration 门 202/202（默认构建）中，之前两红的 select 测试现在
+integration 门 201/202（双构建；唯一失败是 `socket_fromfd_wraps_fd`，
+fromfd 被 H-socket 砍掉，故意的）中，之前两红的 select 测试现在
 PASS（`tests/test_integration_os.py` 的期望值即 reference 行为）：
 `select_timeout_zero_returns_promptly`（AF_UNIX listener，timeout 0 →
 `r == []`）、`select_readable_fd_is_ready`（`os.open('/dev/null')` →
@@ -221,15 +248,19 @@ socket 有数据时 select `0`、随后 `recv` 得 5 字节。
 
 ## §4 遗留项
 
-1. **Socket（stream/listener/未绑定）永不 ready**——`UnixStream::peek`
-   仍是 unstable（stable rustc 1.99.1 上不可用），monitor `recv` 会消费
-   socket `recv` 路径不排空的字节。解开办法：socket monitor + `recv`
-   排空进 `modsocket.rs`，在 H-socket 重写落地后做（会碰 H-socket 的
-   `recv` 路径）。后果：brief 里的 socket-pair 探针（accepted socket 有
-   数据 → ready）无法通过，现作为 pinned-limitation 探针（assert
-   not-ready + 注释）。Listener 同类：`accept` 会消费 pending 连接，
-   故同样 not-ready；`g0_select_listener_readable_then_drained`（feature
-   原先经真 `select(2)` 通过）已改为 assert 该 limitation。
+1. **Socket（stream/listener/未绑定/datagram，INET 或 UNIX）永不 ready**——
+   `UnixStream::peek` 仍是 unstable（stable rustc 1.99.1 上不可用），
+   monitor `recv` 会消费 socket `recv` 路径不排空的字节。解开办法：
+   socket monitor + `recv` 排空进 `modsocket.rs`，在 H-socket 重写落地后做
+   （会碰 H-socket 的 `recv` 路径）。H-socket 现已合入 master（36f537c），
+   所以解开的前提已满足，但仍不在本 lane 做（超出 select 范围；INET
+   stream/datagram 理论上可用稳定的 `TcpStream::peek`/`UdpSocket::peek`
+   探，UNIX stream 仍无稳定 peek——实现时需按 family 区分）。
+   后果：brief 里的 socket-pair 探针（accepted socket 有数据 → ready）
+   无法通过，现作为 pinned-limitation 探针（assert not-ready + 注释）。
+   Listener 同类：`accept` 会消费 pending 连接，故同样 not-ready；
+   `g0_select_listener_readable_then_drained`（feature 原先经真 `select(2)`
+   通过）已改为 assert 该 limitation。
 2. **Brief 的 "clone 保护原 blocking 状态" 在 OS 层面是错的**——`O_NONBLOCK`
    是 per-description 的，dup 共享它（已有的 `setblocking` 行为亦然）。
    peek 取消后此点已无关，记于此。

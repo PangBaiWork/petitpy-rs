@@ -309,6 +309,15 @@ pub fn fileio_ioctl(
             };
             if !data.closed {
                 data.closed = true;
+                // H-select: invalidate the monitor BEFORE the
+                // handle is dropped (which closes the OS fd and
+                // frees the number) — a later `note_closed`
+                // could land on a monitor for a NEW file reusing
+                // this fd (this raced
+                // `note_seek_clears_buffer_and_stales_monitor`
+                // on CI).
+                let fd = data.fd;
+                crate::support::readiness::note_closed(fd);
                 // Replacing the handle drops the `Rc` — the
                 // `File` closes NOW (the C's `fclose`), not
                 // when the GC collects the object. Stdio
@@ -317,12 +326,6 @@ pub fn fileio_ioctl(
                 if matches!(data.handle, FileHandle::Owned(_)) {
                     data.handle = FileHandle::Closed;
                 }
-                // H-select: the monitor's read-ahead bytes
-                // belong to a closed description — mark it
-                // stale (and clear the buffer) so a later
-                // file reusing this fd number starts fresh.
-                let fd = data.fd;
-                crate::support::readiness::note_closed(fd);
             }
             Ok(0)
         }

@@ -272,6 +272,14 @@ pub fn os_close_ctx(
     // table).
     #[cfg(feature = "unsafe-ffi")]
     {
+        // H-select: invalidate the monitor BEFORE `sys_close`
+        // frees the number — a `note_closed` after the close
+        // could land on a monitor for a NEW file reusing this
+        // fd (this raced
+        // `note_seek_clears_buffer_and_stales_monitor` on CI).
+        // On `sys_close` failure the monitor is still stale:
+        // the fd is already gone from the VM's view.
+        crate::support::readiness::note_closed(fd);
         // FFI invariant: `close` takes any i32 fd number; the
         // kernel fails EBADF on a bad fd, it cannot fault.
         if let Err(e) = crate::support::ffi::sys_close(fd) {
@@ -302,18 +310,21 @@ pub fn os_close_ctx(
                 drop(f);
             }
         }
-        // H-select: the monitor's read-ahead bytes belong to
-        // a closed description — mark it stale (and clear the
-        // buffer) so a later file reusing this fd number
-        // starts fresh.
-        crate::support::readiness::note_closed(fd);
         return Ok(Value::None);
     }
     #[cfg(not(feature = "unsafe-ffi"))]
     {
         match state.os_fds.remove(&fd) {
-            Some(_) => {
+            Some(f) => {
+                // H-select: invalidate the monitor BEFORE the
+                // `File` is dropped (which closes the OS fd and
+                // frees the number) — a later `note_closed`
+                // could land on a monitor for a NEW file reusing
+                // this fd (this raced
+                // `note_seek_clears_buffer_and_stales_monitor`
+                // on CI).
                 crate::support::readiness::note_closed(fd);
+                drop(f);
                 Ok(Value::None)
             }
             None => Err(errno_exc(ctx, state, EBADF)),

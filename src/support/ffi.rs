@@ -67,6 +67,9 @@ mod ffi {
 
     use super::{Msghdr, Pollfd, Sockaddr};
 
+    #[cfg(windows)]
+    use super::{FdSet, Timeval, WsaMsg};
+
     /// `socklen_t` on Unix, `int` on Windows (all Winsock
     /// length parameters are `int`).
     #[cfg(unix)]
@@ -257,6 +260,42 @@ mod ffi {
         pub fn closesocket(s: usize) -> c_int;
         pub fn ioctlsocket(s: usize, cmd: c_int, argp: *mut u32) -> c_int;
         pub fn WSAPoll(fds: *mut Pollfd, nfds: u32, timeout: c_int) -> c_int;
+        // FFI invariant: `WSASendMsg` / `WSARecvMsg` take a
+        // socket, a caller-owned `WSAMSG` (whose buffers
+        // point to caller-owned slices) and a pointer to a
+        // caller-owned `DWORD` for the byte count; the last
+        // two parameters are always null here (no
+        // overlapped I/O). `SOCKET_ERROR` (-1) on failure,
+        // 0 on success.
+        pub fn WSASendMsg(
+            s: usize,
+            msg: *const WsaMsg,
+            flags: u32,
+            sent: *mut u32,
+            overlapped: *mut c_void,
+            completion: *mut c_void,
+        ) -> c_int;
+        pub fn WSARecvMsg(
+            s: usize,
+            msg: *mut WsaMsg,
+            received: *mut u32,
+            overlapped: *mut c_void,
+            completion: *mut c_void,
+        ) -> c_int;
+        // FFI invariant: `select` takes a count (ignored on
+        // Windows — the sets carry their own counts) and
+        // pointers to caller-owned `fd_set`s (null = no set
+        // for that direction) plus a caller-owned `timeval`
+        // (null = block forever). Returns the number of
+        // ready sockets, 0 on timeout, `SOCKET_ERROR` on
+        // failure.
+        pub fn select(
+            nfds: c_int,
+            readfds: *mut FdSet,
+            writefds: *mut FdSet,
+            exceptfds: *mut FdSet,
+            timeout: *const Timeval,
+        ) -> c_int;
         pub fn WSADuplicateSocket(s: usize, pid: u32, info: *mut u8) -> c_int;
         pub fn WSASocket(
             af: c_int,
@@ -284,7 +323,7 @@ mod ffi {
 /// after a failed call, before any other call can touch
 /// the cell.
 #[cfg(feature = "unsafe-ffi")]
-fn errno() -> i32 {
+pub(crate) fn errno() -> i32 {
     #[cfg(target_os = "linux")]
     {
         // FFI invariant: `__errno_location` never returns
@@ -319,7 +358,7 @@ fn errno() -> i32 {
 /// Every Windows wrapper calls this first; on Unix it does
 /// not exist (no startup is needed).
 #[cfg(all(feature = "unsafe-ffi", windows))]
-fn wsa_ensure() -> Result<(), i32> {
+pub(crate) fn wsa_ensure() -> Result<(), i32> {
     use std::sync::OnceLock;
     static WSA: OnceLock<Result<(), i32>> = OnceLock::new();
     *WSA.get_or_init(|| {
@@ -719,6 +758,51 @@ pub struct Pollfd {
     pub fd: usize,
     pub events: i16,
     pub revents: i16,
+}
+
+/// `WSABUF` (S3's `WSASendMsg` / `WSARecvMsg`, Windows
+/// only): a length + pointer pair.
+#[cfg(feature = "unsafe-ffi")]
+#[cfg(windows)]
+#[repr(C)]
+pub struct WsaBuf {
+    pub len: u32,
+    pub buf: *mut u8,
+}
+
+/// `WSAMSG` (S3's `WSASendMsg` / `WSARecvMsg`, Windows
+/// only). `name` is `NULL` when no address is given
+/// (connected send / receive without the peer); `control`
+/// is always the empty buffer (no ancillary data).
+#[cfg(feature = "unsafe-ffi")]
+#[cfg(windows)]
+#[repr(C)]
+pub struct WsaMsg {
+    pub name: *mut Sockaddr,
+    pub namelen: i32,
+    pub buffers: *mut WsaBuf,
+    pub buffer_count: u32,
+    pub control: WsaBuf,
+    pub flags: u32,
+}
+
+/// `fd_set` (S3's `select`, Windows only): a count plus
+/// room for 64 sockets (`FD_SETSIZE`).
+#[cfg(feature = "unsafe-ffi")]
+#[cfg(windows)]
+#[repr(C)]
+pub struct FdSet {
+    pub count: u32,
+    pub sockets: [usize; 64],
+}
+
+/// `timeval` (S3's `select`, Windows only).
+#[cfg(feature = "unsafe-ffi")]
+#[cfg(windows)]
+#[repr(C)]
+pub struct Timeval {
+    pub sec: i32,
+    pub usec: i32,
 }
 
 // ── Platform-correct constants ──────────────────────────────────────
@@ -1434,7 +1518,7 @@ pub fn sys_recvfrom(
 }
 
 /// `sendmsg(2)` (S3 uses it; S1 only declares it).
-/// Unix only — Windows uses `WSASendMsg` (S3).
+/// Unix only — Windows uses `WSASendMsg` below.
 #[cfg(all(feature = "unsafe-ffi", unix))]
 pub fn sys_sendmsg(fd: RawFd, msg: *const Msghdr, flags: i32) -> Result<usize, i32> {
     // FFI invariant: `sendmsg` takes an fd and a pointer
@@ -1450,7 +1534,7 @@ pub fn sys_sendmsg(fd: RawFd, msg: *const Msghdr, flags: i32) -> Result<usize, i
 }
 
 /// `recvmsg(2)` (S3 uses it; S1 only declares it).
-/// Unix only — Windows uses `WSARecvMsg` (S3).
+/// Unix only — Windows uses `WSARecvMsg` below.
 #[cfg(all(feature = "unsafe-ffi", unix))]
 pub fn sys_recvmsg(fd: RawFd, msg: *mut Msghdr, flags: i32) -> Result<usize, i32> {
     // FFI invariant: `recvmsg` takes an fd and a pointer
@@ -1462,6 +1546,108 @@ pub fn sys_recvmsg(fd: RawFd, msg: *mut Msghdr, flags: i32) -> Result<usize, i32
         Err(errno())
     } else {
         Ok(r as usize)
+    }
+}
+
+/// `WSASendMsg` (S3 uses it): the Windows counterpart of
+/// `sys_sendmsg`. Same return shape (bytes sent) as the
+/// Unix wrapper; the `sent` out-parameter is managed here
+/// so callers use one signature.
+#[cfg(all(feature = "unsafe-ffi", windows))]
+pub fn sys_sendmsg(fd: RawFd, msg: *const WsaMsg, flags: u32) -> Result<usize, i32> {
+    wsa_ensure()?;
+    // FFI invariant: `WSASendMsg` takes a socket, a
+    // pointer to a caller-owned `WSAMSG` (whose buffers
+    // point to caller-owned slices) and a pointer to a
+    // caller-owned `DWORD` for the byte count; the last two
+    // parameters are always null (no overlapped I/O). A bad
+    // socket fails with `SOCKET_ERROR`, it cannot fault on
+    // valid pointers.
+    let mut sent: u32 = 0;
+    let r = unsafe {
+        ffi::WSASendMsg(
+            fd,
+            msg,
+            flags,
+            &mut sent,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if r < 0 {
+        Err(errno())
+    } else {
+        Ok(sent as usize)
+    }
+}
+
+/// `WSARecvMsg` (S3 uses it): the Windows counterpart of
+/// `sys_recvmsg`. Same return shape (bytes received) as
+/// the Unix wrapper; the `received` out-parameter is
+/// managed here. The caller reads the message flags back
+/// from the `WSAMSG` it owns.
+#[cfg(all(feature = "unsafe-ffi", windows))]
+pub fn sys_recvmsg(fd: RawFd, msg: *mut WsaMsg) -> Result<usize, i32> {
+    wsa_ensure()?;
+    // FFI invariant: `WSARecvMsg` takes a socket, a
+    // pointer to a caller-owned `WSAMSG` (whose buffers
+    // point to caller-owned slices) and a pointer to a
+    // caller-owned `DWORD` for the byte count; the last two
+    // parameters are always null (no overlapped I/O). A bad
+    // socket fails with `SOCKET_ERROR`, it cannot fault on
+    // valid pointers.
+    let mut received: u32 = 0;
+    let r = unsafe {
+        ffi::WSARecvMsg(
+            fd,
+            msg,
+            &mut received,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if r < 0 {
+        Err(errno())
+    } else {
+        Ok(received as usize)
+    }
+}
+
+/// `select` (S3 uses it; Windows only — Unix uses
+/// `poll`). `read` / `write` / `except` are `Some` for a
+/// set to test, `None` for no set; `timeout_ms` is `None`
+/// for "block forever", `Some(ms)` for a bounded wait.
+/// Returns the number of ready sockets (0 = timeout).
+#[cfg(all(feature = "unsafe-ffi", windows))]
+pub fn sys_select(
+    read: Option<&mut FdSet>,
+    write: Option<&mut FdSet>,
+    except: Option<&mut FdSet>,
+    timeout_ms: Option<i32>,
+) -> Result<i32, i32> {
+    wsa_ensure()?;
+    // FFI invariant: `select` takes pointers to
+    // caller-owned `fd_set`s (null = no set for that
+    // direction) and a pointer to a caller-owned `timeval`
+    // (null = block forever); a bad socket fails with
+    // `SOCKET_ERROR`, it cannot fault on valid pointers.
+    let tv = timeout_ms.map(|ms| Timeval {
+        sec: ms / 1000,
+        usec: (ms % 1000) * 1000,
+    });
+    let r = unsafe {
+        ffi::select(
+            0,
+            read.map_or(std::ptr::null_mut(), |s| s as *mut FdSet),
+            write.map_or(std::ptr::null_mut(), |s| s as *mut FdSet),
+            except.map_or(std::ptr::null_mut(), |s| s as *mut FdSet),
+            tv.as_ref().map_or(std::ptr::null(), |t| t as *const Timeval),
+        )
+    };
+    if r < 0 {
+        Err(errno())
+    } else {
+        Ok(r)
     }
 }
 

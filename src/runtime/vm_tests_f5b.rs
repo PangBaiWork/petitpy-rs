@@ -189,19 +189,37 @@ fn f5b_itertools_zip_longest_repeat() {
     assert_eq!(fx.gi("g"), 3);
 }
 
-/// `socket.fromfd` is CUT in H-socket: every call raises
-/// `NotImplementedError` (safe Rust cannot take ownership
-/// of a raw fd).
+/// `socket.fromfd`: CUT in H-socket on the DEFAULT build
+/// (every call raises `NotImplementedError` — safe Rust
+/// cannot take ownership of a raw fd); implemented under
+/// `unsafe-ffi` (S3), where it wraps the fd as-is (no dup —
+/// `fileno() == fd`).
 #[test]
-fn f5b_socket_fromfd_not_implemented() {
+fn f5b_socket_fromfd() {
     let mut fx = Fx::new();
     // Any readable file gives a valid fd for fromfd; /dev/null
     // does not exist on Windows.
-    let path = std::env::temp_dir().join(format!("petitpy_fromfd_{}", std::process::id()));
+    // Distinct from `modsocket_tests::socket_fromfd`'s temp
+    // file (same process, tests run in parallel — a shared
+    // name races create/remove and flakes with ENOENT).
+    let path = std::env::temp_dir().join(format!("petitpy_fromfd_f5b_{}", std::process::id()));
     std::fs::write(&path, b"").unwrap();
     let p = path.to_string_lossy().replace('\\', "/");
+    #[cfg(not(feature = "unsafe-ffi"))]
     fx.run_ok(&format!(
         "import socket, os\nfd = os.open({p:?}, os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    ok = False\nexcept NotImplementedError:\n    ok = True\n",
+    ));
+    #[cfg(feature = "unsafe-ffi")]
+    // `detach()`, NOT `close()`, releases the socket: the fd
+    // is ALSO owned by the VM's `os_fds` table (it came from
+    // `os.open`), and `close()` here would close it twice —
+    // the stale `os_fds` File aborts the debug build with an
+    // IO Safety violation when the VM drops (the `fromfd`
+    // double-ownership hazard). `detach()` removes the socket
+    // from the table without closing, so the fd is closed
+    // exactly once, by `os_fds`.
+    fx.run_ok(&format!(
+        "import socket, os\nfd = os.open({p:?}, os.O_RDONLY)\ns = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\nok = s.fileno() == fd and s.detach() == fd and s.fileno() == -1\n",
     ));
     assert_eq!(fx.g("ok"), Some(Value::Bool(true)));
     let _ = std::fs::remove_file(&path);

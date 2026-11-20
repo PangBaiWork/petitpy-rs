@@ -68,7 +68,7 @@ pub const AF_UNIX: i32 = 1;
 /// the Python-facing one (`AF_INET` 2 / `AF_INET6` 10 /
 /// `AF_UNIX` 1); the kernel encoding is produced by
 /// `to_raw` and read back by `from_raw`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SockAddr {
     Inet { ip: Ipv4Addr, port: u16 },
     Inet6 {
@@ -846,8 +846,9 @@ fn small(n: i64) -> Value {
 
 /// A `SockAddr` as a CPython address value: an
 /// `(host, port)` tuple for INET, pathname bytes for
-/// UNIX.
-fn sockaddr_value(ctx: &mut CallCtx, a: &SockAddr) -> Value {
+/// UNIX. `pub(crate)`: the FFI-advanced module
+/// (`modsocket_ffi_adv.rs`) uses it for `recvmsg`.
+pub(crate) fn sockaddr_value(ctx: &mut CallCtx, a: &SockAddr) -> Value {
     match a {
         SockAddr::Inet { ip, port } => {
             inet_addr_tuple(ctx, StdSocketAddr::new(IpAddr::V4(*ip), *port))
@@ -867,7 +868,9 @@ fn sockaddr_value(ctx: &mut CallCtx, a: &SockAddr) -> Value {
 
 /// Parse a `connect` / `sendto` target address into a
 /// `SockAddr` (INET `(host, port)` tuple / UNIX path).
-fn parse_target(ctx: &mut CallCtx, v: Value, family: i32) -> PyResult<SockAddr> {
+/// `pub(crate)`: the FFI-advanced module
+/// (`modsocket_ffi_adv.rs`) uses it for `sendmsg`.
+pub(crate) fn parse_target(ctx: &mut CallCtx, v: Value, family: i32) -> PyResult<SockAddr> {
     match family {
         AF_UNIX => Ok(SockAddr::Unix {
             path: parse_unix_path(ctx, v)?,

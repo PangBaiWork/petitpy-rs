@@ -44,12 +44,14 @@
 //!   the call starts is still seen; the read paths
 //!   (`fileio_read`, `os.read`) drain the buffer first, so
 //!   no byte is lost or reordered.
-//! - socket fds: never ready — `UnixStream::peek` is
-//!   UNSTABLE on the stable toolchain (rustc 1.99.1) and a
-//!   monitor `recv` would consume bytes the socket `recv`
-//!   path does not drain. The unblock (a socket monitor +
-//!   `recv` drain in `modsocket.rs`) belongs after the
-//!   H-socket rewrite lands (see §4).
+//! - socket fds: never ready on the DEFAULT build —
+//!   `UnixStream::peek` is UNSTABLE on the stable toolchain
+//!   (rustc 1.99.1) and a monitor `recv` would consume bytes
+//!   the socket `recv` path does not drain. Under
+//!   `unsafe-ffi` (socket FFI lane S3) they are probed live
+//!   instead: `modsocket::socket_readable` runs `poll(2)`
+//!   with timeout 0 on the fd — non-destructive, so the
+//!   bytes stay for the socket's `recv` (see §4).
 //! - wlist: always ready (validated at entry; a pure-`std`
 //!   write-readiness probe does not exist) — documented
 //!   approximation, see §4.
@@ -164,14 +166,15 @@ fn int_item(ctx: &mut CallCtx, state: &VmState, v: Value) -> Result<Option<i64>,
 /// The fd behind one `select` item, resolved without
 /// starting a monitor (validation, and the shared core of
 /// read resolution). `File` carries a cloned `File` for the
-/// monitor start; `Socket` is just the fd number.
+/// monitor start; `Socket` is just the fd number (the
+/// readiness probe re-polls it live — see `Entry::ready`).
 enum ResolvedFd {
     // Only constructed on Unix: the `socket_probe` block in
     // `resolve_fd_number` is `#[cfg(unix)]`, so on Windows
     // this variant is never constructed (allowed, not deleted
     // — the `resolve_read` match below stays uniform).
     #[allow(dead_code)]
-    Socket,
+    Socket(i32),
     File { fd: i32, file: std::fs::File },
 }
 
@@ -188,7 +191,7 @@ fn resolve_fd_number(ctx: &mut CallCtx, state: &mut VmState, fd: i64) -> Result<
         use crate::modules::modsocket::{socket_probe, SocketProbe};
         if let Some(p) = socket_probe(fd) {
             return match p {
-                SocketProbe::Unprobable => Ok(ResolvedFd::Socket),
+                SocketProbe::Unprobable => Ok(ResolvedFd::Socket(fd)),
             };
         }
     }
@@ -302,9 +305,12 @@ fn fileno_qstr() -> u32 {
 /// (returned in the result, in input order) plus what the
 /// probe loop needs.
 enum Entry {
-    /// A socket fd: pure `std` cannot probe it, so it never
-    /// reports ready (see the module docs).
-    Socket { item: Value },
+    /// A socket fd: on the default build it never reports
+    /// ready (see the module docs); under `unsafe-ffi`
+    /// `ready()` re-polls the fd live with `poll(2)` on
+    /// every probe-loop iteration (socket FFI lane S3), so
+    /// data arriving during the timeout is caught.
+    Socket { item: Value, fd: i32 },
     /// A file fd with its monitor (kept `Arc`: the table
     /// entry may be removed while the monitor still holds
     /// drainable bytes).
@@ -314,7 +320,7 @@ enum Entry {
 impl Entry {
     fn item(&self) -> Value {
         match self {
-            Entry::Socket { item } => *item,
+            Entry::Socket { item, .. } => *item,
             Entry::File { item, .. } => *item,
         }
     }
@@ -322,10 +328,12 @@ impl Entry {
     /// Ready when the monitor holds bytes, EOF was reached,
     /// or the monitor died (the next read is then an OS read
     /// — which surfaces the error, or the fresh data after a
-    /// seek — so reporting ready is correct).
+    /// seek — so reporting ready is correct). A socket is
+    /// ready when `socket_readable` says so (default build:
+    /// never; feature build: a live `poll(2)`).
     fn ready(&self) -> bool {
         match self {
-            Entry::Socket { .. } => false,
+            Entry::Socket { fd, .. } => crate::modules::modsocket::socket_readable(*fd),
             Entry::File { mon, .. } => {
                 mon.buffered_len() > 0 || mon.is_eof() || mon.is_dead()
             }
@@ -337,7 +345,7 @@ impl Entry {
 /// a file fd).
 fn resolve_read(ctx: &mut CallCtx, state: &mut VmState, item: Value) -> Result<Entry, Value> {
     match resolve_fd_of(ctx, state, item)? {
-        ResolvedFd::Socket => Ok(Entry::Socket { item }),
+        ResolvedFd::Socket(fd) => Ok(Entry::Socket { item, fd }),
         ResolvedFd::File { fd, file } => {
             let mon = ensure_monitor(fd, &file).map_err(|e| {
                 let pe = raise_os_error(ctx, e.raw_os_error().unwrap_or(EIO));

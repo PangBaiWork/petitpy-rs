@@ -238,7 +238,15 @@ mod ffi {
             len: *mut Socklen,
         ) -> c_int;
         pub fn dup(fd: c_int) -> c_int;
-        pub fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
+        // `fcntl` is a VARIADIC C function (`int fcntl(int,
+        // int, ...)` — `libc` declares it so): calling it
+        // through a fixed 3-arg prototype is UB. On macOS
+        // aarch64 the `F_SETFL` in `FfiSocket::setblocking`
+        // did not take effect (Build #27: the child server
+        // died with EAGAIN at `accept`, i.e. the listener
+        // was still non-blocking after `setblocking(True)`,
+        // while the same flow clears the flag on Linux).
+        pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
         pub fn socketpair(
             domain: c_int,
             ty: c_int,

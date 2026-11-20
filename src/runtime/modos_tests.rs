@@ -495,8 +495,15 @@ fn os_unimplemented_stubs() {
 
 /// `run_err` on a fresh `Sx` (each stub test gets its own VM
 /// so a raised `NotImplementedError` cannot leak state).
-/// Default build only: both callers are cfg-gated to it (G6a).
-#[cfg(not(feature = "unsafe-ffi"))]
+/// Default build only, plus Windows under `unsafe-ffi`:
+/// the `os_close_open_file_fd` Windows branch (Build #27)
+/// is `#[cfg(windows)]` — it runs under both builds
+/// because Windows raises EBADF on both (the fd is a
+/// synthetic id, not a CRT fd) — so the helper must exist
+/// there too, or the lib test target fails to compile
+/// under `--features unsafe-ffi` on Windows (E0425,
+/// Build #27). The Unix callers stay default-only (G6a).
+#[cfg(any(not(feature = "unsafe-ffi"), windows))]
 fn fx_run_err_new(src: &str) -> (String, String) {
     let mut fx = Sx::new();
     fx.run_err(src)

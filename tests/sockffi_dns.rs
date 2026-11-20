@@ -308,6 +308,14 @@ fn sockffi_dns_create_server() {
     let dir = scratch("create-server");
     let port_file = dir.join("port.txt");
     let port_path = port_file.to_string_lossy().replace('\\', "/");
+    // Build #28: the child records its shadow timeout
+    // here before `accept`; the fail-fast panic below
+    // prints it, so a child-side failure says whether
+    // `setblocking(True)` took effect at the Python level
+    // (None) or not (0.0). A file, not stdout — the
+    // success path asserts the child's stdout exactly.
+    let diag_file = dir.join("diag.txt");
+    let diag_path = diag_file.to_string_lossy().replace('\\', "/");
     let script = write_script(
         &dir,
         "srv.py",
@@ -325,6 +333,9 @@ f.close()
 # non-blocking default itself is what is under test
 # above — the server was created non-blocking).
 srv.setblocking(True)
+d = open("{diag_path}", "w")
+d.write("gettimeout after setblocking(True): " + str(srv.gettimeout()))
+d.close()
 conn, addr = srv.accept()
 data = conn.recv(5)
 assert data == b"hello", data
@@ -380,9 +391,11 @@ print("DNS_CREATE_SERVER_OK")
                 last_err = Some(e);
                 if let Ok(Some(status)) = child.try_wait() {
                     let out = child.wait_with_output().expect("wait for petitpy");
+                    let diag = std::fs::read_to_string(&diag_file).unwrap_or_default();
                     panic!(
-                        "server child exited ({}) before accept; stdout: {}; stderr: {}",
+                        "server child exited ({}) before accept; diag: {}; stdout: {}; stderr: {}",
                         status,
+                        diag,
                         String::from_utf8_lossy(&out.stdout),
                         String::from_utf8_lossy(&out.stderr)
                     );

@@ -208,6 +208,24 @@ jobs:
         if: matrix.ffi
         run: cargo test --release --lib --target ${{ matrix.target }} --features unsafe-ffi ${{ matrix.no_run }}
 
+      # Build #23: the Windows feature lib run dies with
+      # STATUS_STACK_BUFFER_OVERRUN (0xc0000409) and no
+      # named test, and the parallel run cannot name the
+      # crashing test (the last-ok line moves between
+      # builds). Re-run the same suite single-threaded so
+      # the log names it. `always()` so it runs even when
+      # the step above fails; Windows-only (the crash is
+      # Windows-only). A fresh audit of the Windows FFI
+      # surface (WSAMSG / WSABUF / FdSet / Pollfd /
+      # Addrinfo / Servent layouts, WSARecvMsg fetch,
+      # stack buffers) found no conclusive overrun, so
+      # this round's Windows fix is diagnostic-only —
+      # remove this step once the crashing test is named
+      # and fixed.
+      - name: Diagnose lib crash (unsafe-ffi, single-threaded)
+        if: ${{ always() && matrix.os == 'windows-latest' }}
+        run: cargo test --release --lib --target ${{ matrix.target }} --features unsafe-ffi -- --test-threads=1
+
       - name: Test integration (unsafe-ffi)
         if: matrix.ffi
         run: cargo test --release --tests --target ${{ matrix.target }} --features unsafe-ffi ${{ matrix.no_run }}

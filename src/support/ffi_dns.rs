@@ -11,12 +11,16 @@
 //!
 //! Merge notes (the main agent reconciles these at merge):
 //! - The `#[repr(C)]` structs (`Sockaddr`, `SockaddrIn`,
-//!   `SockaddrIn6`, `SockaddrStorage`, `Addrinfo`, `Servent`)
-//!   duplicate the canonical definitions S1 owns in
-//!   `ffi.rs` / `modsocket_ffi.rs` (brief §2.1, "S1 定").
-//!   They are defined here because S1's file is not in this
-//!   worktree yet and `ffi_dns.rs` must compile standalone;
-//!   at merge, delete the duplicates here and use S1's.
+//!   `SockaddrIn6`, `SockaddrStorage`, `Addrinfo`) used to
+//!   be duplicated here (S1's file was not in this
+//!   worktree yet when this lane was written); Build #23
+//!   deleted the duplicates and uses S1's canonical
+//!   definitions in `crate::support::ffi` — the local
+//!   copies had the Linux `sockaddr` layout on every
+//!   platform, so `getnameinfo` built a malformed
+//!   `sockaddr_in` on macOS (no `sin_len`, family in the
+//!   wrong place) and every reverse lookup failed. Only
+//!   `Servent` is still defined here (`ffi.rs` has none).
 //! - `errno()` duplicates the portable-errno helper S1 adds
 //!   to `ffi.rs` (brief §1.3: Linux `__errno_location`,
 //!   macOS `__error`, Android `__errno`, Windows
@@ -46,6 +50,15 @@ use std::ffi::{CStr, CString};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(all(feature = "unsafe-ffi", windows))]
 use std::sync::OnceLock;
+
+/// The canonical `sockaddr` / `addrinfo` structs (S1's
+/// `crate::support::ffi` — Build #23: the local copies
+/// had the Linux layout on every platform, which broke
+/// `getnameinfo` on macOS; these have the platform
+/// layout, with `sin_len` on macOS, and the constructors
+/// that build them). `Servent` stays local (see below).
+#[cfg(feature = "unsafe-ffi")]
+use crate::support::ffi::{Addrinfo, Sockaddr, SockaddrIn, SockaddrIn6};
 
 /// The raw declarations (private mod).
 #[cfg(feature = "unsafe-ffi")]
@@ -145,113 +158,11 @@ mod ffi {
     }
 }
 
-/// `struct sockaddr` (generic): family + 14 bytes. The
-/// layout is the same on Unix and Windows.
-#[cfg(feature = "unsafe-ffi")]
-#[repr(C)]
-pub struct Sockaddr {
-    pub sa_family: u16,
-    pub sa_data: [u8; 14],
-}
-
-/// `struct sockaddr_in` (IPv4): 16 bytes. The layout is
-/// the same on Unix and Windows. `sin_port` and `sin_addr`
-/// are in network byte order (their memory holds the
-/// network-order bytes).
-#[cfg(feature = "unsafe-ffi")]
-#[repr(C)]
-pub struct SockaddrIn {
-    pub sin_family: u16,
-    pub sin_port: u16,
-    pub sin_addr: u32,
-    pub sin_zero: [u8; 8],
-}
-
-/// `struct sockaddr_in6` (IPv6): 28 bytes. The layout is
-/// the same on Unix and Windows.
-#[cfg(feature = "unsafe-ffi")]
-#[repr(C)]
-pub struct SockaddrIn6 {
-    pub sin6_family: u16,
-    pub sin6_port: u16,
-    pub sin6_flowinfo: u32,
-    pub sin6_addr: [u8; 16],
-    pub sin6_scope_id: u32,
-}
-
-/// `struct sockaddr_storage`: 128 bytes, 8-aligned — big
-/// enough for any `sockaddr` (S1's canonical definition
-/// replaces this at merge).
-#[cfg(feature = "unsafe-ffi")]
-#[repr(C)]
-pub struct SockaddrStorage {
-    pub ss_family: u16,
-    pub __ss_pad1: [u8; 6],
-    pub __ss_align: u64,
-    pub __ss_pad2: [u8; 112],
-}
-
-/// `struct addrinfo` — Unix layout (glibc / BSD):
-/// `ai_addrlen` is `socklen_t` (`u32`), `ai_addr` comes
-/// before `ai_canonname`. Linux / Android only — macOS
-/// puts `ai_canonname` before `ai_addr` (see the
-/// variant below).
-/// Build #20: this variant used to cover all of Unix,
-/// so on macOS `getaddrinfo_owned` read the (usually
-/// NULL) canonname pointer as `ai_addr` and skipped
-/// every entry → `socket.getaddrinfo` returned an empty
-/// list. The layout now mirrors the correct 3-variant
-/// definition in `src/support/ffi.rs`.
-#[cfg(all(feature = "unsafe-ffi", unix, not(target_os = "macos")))]
-#[repr(C)]
-pub struct Addrinfo {
-    pub ai_flags: i32,
-    pub ai_family: i32,
-    pub ai_socktype: i32,
-    pub ai_protocol: i32,
-    pub ai_addrlen: u32,
-    pub ai_addr: *mut Sockaddr,
-    pub ai_canonname: *mut std::os::raw::c_char,
-    pub ai_next: *mut Addrinfo,
-}
-
-/// `struct addrinfo` — macOS (Darwin) layout:
-/// `ai_addrlen` is `socklen_t` (`u32`), but
-/// `ai_canonname` comes before `ai_addr` (unlike Linux).
-/// Build #20: added — without it the Unix variant above
-/// misread every macOS `getaddrinfo` result.
-#[cfg(all(feature = "unsafe-ffi", target_os = "macos"))]
-#[repr(C)]
-pub struct Addrinfo {
-    pub ai_flags: i32,
-    pub ai_family: i32,
-    pub ai_socktype: i32,
-    pub ai_protocol: i32,
-    pub ai_addrlen: u32,
-    pub ai_canonname: *mut std::os::raw::c_char,
-    pub ai_addr: *mut Sockaddr,
-    pub ai_next: *mut Addrinfo,
-}
-
-/// `struct addrinfo` — Windows layout (`ADDRINFOA`):
-/// `ai_addrlen` is `size_t` and `ai_canonname` comes
-/// before `ai_addr`.
-#[cfg(all(feature = "unsafe-ffi", windows))]
-#[repr(C)]
-pub struct Addrinfo {
-    pub ai_flags: i32,
-    pub ai_family: i32,
-    pub ai_socktype: i32,
-    pub ai_protocol: i32,
-    pub ai_addrlen: usize,
-    pub ai_canonname: *mut std::os::raw::c_char,
-    pub ai_addr: *mut Sockaddr,
-    pub ai_next: *mut Addrinfo,
-}
-
 /// `struct servent`: `s_port` is in network byte order.
 /// It is an `int` on Unix and a `short` on Windows
-/// (Winsock's `servent`).
+/// (Winsock's `servent`). Defined here — `ffi.rs` has no
+/// canonical `Servent` (Build #23: the other structs
+/// above moved to `crate::support::ffi`).
 #[cfg(feature = "unsafe-ffi")]
 #[repr(C)]
 pub struct Servent {
@@ -267,15 +178,44 @@ pub struct Servent {
 /// Address families, PYTHON-numbered (`AF_INET6` 10 —
 /// the value `modsocket.rs` exposes). These are NOT the
 /// kernel values on macOS (30) / Windows (23): anything
-/// handed to C, or compared against a kernel family from
-/// `ai_family`, must use `crate::support::ffi`'s
-/// platform-correct constants (see `sockaddr_from_raw`)
-/// or `translate_family` in `modsocket_ffi.rs`.
-/// (`AF_INET` 2 agrees everywhere.)
+/// handed to C must use `kernel_family` (below), which
+/// translates to `crate::support::ffi`'s platform-correct
+/// constants, or compare against a kernel family from
+/// `ai_family` with `crate::support::ffi`'s constants
+/// (see `sockaddr_from_raw`). (`AF_INET` 2 agrees
+/// everywhere.) These consts are only used for the
+/// Python-facing length match in `inet_pton_owned`.
 #[cfg(feature = "unsafe-ffi")]
 pub const AF_INET: i32 = 2;
 #[cfg(feature = "unsafe-ffi")]
 pub const AF_INET6: i32 = 10;
+
+/// Translate a Python-facing family (`AF_INET` 2 /
+/// `AF_INET6` 10) to the kernel family for a C call.
+/// Build #23: `inet_pton` / `inet_ntop` passed the
+/// Python family raw, and Darwin family 10 is
+/// `AF_CCITT`, not `AF_INET6` (30) — so every IPv6
+/// `inet_pton` / `inet_ntop` on macOS failed with
+/// `EAFNOSUPPORT` 47. (`AF_INET` 2 is the identity.)
+#[cfg(feature = "unsafe-ffi")]
+fn kernel_family(py_family: i32) -> i32 {
+    if py_family == AF_INET6 {
+        crate::support::ffi::AF_INET6
+    } else {
+        py_family
+    }
+}
+
+/// `EAI_SYSTEM` as the C library returns it from
+/// `getaddrinfo` / `getnameinfo`: glibc / bionic -11,
+/// Darwin 11 (the BSD values — cf. Build #22's
+/// `EAI_*_RAW` pattern in `modsocket::dns`). The
+/// `EAI_SYSTEM` const there is the glibc value on every
+/// platform, so this file defines its own raw value.
+#[cfg(all(feature = "unsafe-ffi", target_os = "macos"))]
+const EAI_SYSTEM_RAW: i32 = 11;
+#[cfg(all(feature = "unsafe-ffi", unix, not(target_os = "macos")))]
+const EAI_SYSTEM_RAW: i32 = -11;
 
 /// `getnameinfo` buffer sizes (brief §6: `NI_MAXHOST`
 /// 1025, `NI_MAXSERV` 32 — the same on every platform).
@@ -467,7 +407,11 @@ pub fn sys_getservbyname(
 
 /// `getservbyport(3)` — returns the `servent` pointer, or
 /// null when the port is unknown. Same pointer discipline
-/// as `sys_getservbyname`.
+/// as `sys_getservbyname`. `port` is in NETWORK byte order
+/// (POSIX: the argument "shall be a value obtained by
+/// converting a `uint16_t` in network byte order to
+/// `int`"); the caller (`getservbyport_owned`) converts
+/// from host order.
 #[cfg(feature = "unsafe-ffi")]
 pub fn sys_getservbyport(
     port: i32,
@@ -483,6 +427,8 @@ pub fn sys_getservbyport(
 
 /// `inet_pton(3)` — parses a presentation-format address
 /// into `dst` (4 bytes for `AF_INET`, 16 for `AF_INET6`).
+/// `af` is the KERNEL family (callers translate from the
+/// Python-facing family first — see `kernel_family`).
 /// Returns `Ok` on success. On failure: `Err(0)` when the
 /// string is not a valid address for the family
 /// (`inet_pton` returns 0 and does NOT set errno — the 0
@@ -511,8 +457,10 @@ pub fn sys_inet_pton(af: i32, src: *const std::os::raw::c_char, dst: *mut u8) ->
 
 /// `inet_ntop(3)` — formats the packed address at `src`
 /// (4 / 16 bytes) into `dst` (a writable buffer of `size`
-/// bytes, NUL-terminated). Returns `Ok` on success, the
-/// errno on failure (`EAFNOSUPPORT` for a bad family,
+/// bytes, NUL-terminated). `af` is the KERNEL family
+/// (callers translate from the Python-facing family
+/// first — see `kernel_family`). Returns `Ok` on success,
+/// the errno on failure (`EAFNOSUPPORT` for a bad family,
 /// `ENOSPC` for a too-small buffer).
 #[cfg(feature = "unsafe-ffi")]
 pub fn sys_inet_ntop(
@@ -637,7 +585,7 @@ fn sockaddr_from_raw(sa: *mut Sockaddr, len: usize, family: i32) -> Option<Resol
             // `sockaddr_in` (the list guarantees
             // `ai_addrlen` bytes); reading it cannot fault.
             let sin = unsafe { &*(sa as *const SockaddrIn) };
-            let ip = Ipv4Addr::from(sin.sin_addr.to_ne_bytes());
+            let ip = Ipv4Addr::from(sin.sin_addr);
             let port = u16::from_be(sin.sin_port);
             Some(ResolvedAddr::Inet(SocketAddr::new(ip.into(), port)))
         }
@@ -756,18 +704,28 @@ pub enum NameInfoAddr {
 /// `(hostname, service)`; on failure the gai error code.
 /// `flags` are the `NI_*` flags, passed through
 /// (e.g. `NI_NUMERICHOST`).
+///
+/// Build #23: the `sockaddr` is built with
+/// `crate::support::ffi`'s constructors, which set the
+/// platform layout (`sin_len` + the kernel family on
+/// macOS). The old code built the Linux layout inline
+/// (`sin_family` as a `u16` at offset 0), so on Darwin
+/// the call saw `sin_len = 2`, `sin_family = 0
+/// (AF_UNSPEC)` and failed — `gethostbyaddr` /
+/// `getnameinfo` / `getfqdn` all raised the raw Darwin
+/// gai code `EAI_NODATA` (5, displayed as `EIO`).
+/// An `EAI_SYSTEM` return is mapped to the thread
+/// errno (the gai code itself is not an errno — raising
+/// it would report e.g. `EDEADLK` on Darwin, where
+/// `EAI_SYSTEM` is 11); every other gai code is raised
+/// as-is, as before.
 #[cfg(feature = "unsafe-ffi")]
 pub fn getnameinfo_owned(addr: &NameInfoAddr, flags: i32) -> Result<(String, String), i32> {
     let mut host = [0u8; NI_MAXHOST];
     let mut serv = [0u8; NI_MAXSERV];
     let rc = match addr {
         NameInfoAddr::Inet(ip, port) => {
-            let sa = SockaddrIn {
-                sin_family: AF_INET as u16,
-                sin_port: port.to_be(),
-                sin_addr: u32::from_ne_bytes(ip.octets()),
-                sin_zero: [0; 8],
-            };
+            let sa = SockaddrIn::new(port.to_be(), ip.octets());
             sys_getnameinfo(
                 &sa as *const SockaddrIn as *const Sockaddr,
                 std::mem::size_of::<SockaddrIn>() as u32,
@@ -779,13 +737,7 @@ pub fn getnameinfo_owned(addr: &NameInfoAddr, flags: i32) -> Result<(String, Str
             )
         }
         NameInfoAddr::Inet6(ip, port, flow, scope) => {
-            let sa = SockaddrIn6 {
-                sin6_family: AF_INET6 as u16,
-                sin6_port: port.to_be(),
-                sin6_flowinfo: *flow,
-                sin6_addr: ip.octets(),
-                sin6_scope_id: *scope,
-            };
+            let sa = SockaddrIn6::new(port.to_be(), *flow, ip.octets(), *scope);
             sys_getnameinfo(
                 &sa as *const SockaddrIn6 as *const Sockaddr,
                 std::mem::size_of::<SockaddrIn6>() as u32,
@@ -798,6 +750,10 @@ pub fn getnameinfo_owned(addr: &NameInfoAddr, flags: i32) -> Result<(String, Str
         }
     };
     if rc != 0 {
+        #[cfg(unix)]
+        if rc == EAI_SYSTEM_RAW {
+            return Err(errno());
+        }
         return Err(rc);
     }
     Ok((cstr_to_string(&host), cstr_to_string(&serv)))
@@ -840,11 +796,23 @@ pub fn getservbyname_owned(name: &str, proto: Option<&str>) -> Option<u16> {
 /// unknown (the caller falls back to the built-in table,
 /// then errors). The `servent` is read immediately and
 /// never stored.
+///
+/// Build #23: `port` is passed in NETWORK byte order —
+/// `getservbyport(3)` compares it directly against the
+/// network-order `s_port`, so the old host-order call
+/// matched the wrong service on macOS: `htons(20480) ==
+/// 80`, and macOS's full `/etc/services` has `emwavemsg
+/// 20480/tcp+udp`, so `getservbyport(80)` returned
+/// `"emwavemsg"` instead of falling through to the
+/// built-in table (Linux's minimal `/etc/services` has
+/// no 20480 entry, so the bug was masked there; `22`
+/// would likewise have matched `pcanywherestat`
+/// 5632/udp).
 #[cfg(feature = "unsafe-ffi")]
 pub fn getservbyport_owned(port: u16, proto: Option<&str>) -> Option<String> {
     let proto_c = proto.map(truncate_cstring);
     let sp = sys_getservbyport(
-        port as i32,
+        port.to_be() as i32,
         proto_c.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
     );
     if sp.is_null() {
@@ -865,12 +833,14 @@ pub fn getservbyport_owned(port: u16, proto: Option<&str>) -> Option<String> {
 /// into packed bytes (4 for `AF_INET`, 16 for
 /// `AF_INET6`). On failure: `Err(0)` for an invalid
 /// string (see `sys_inet_pton`), `Err(errno)` for a bad
-/// family.
+/// family. `af` is the PYTHON-facing family; it is
+/// translated to the kernel family for the C call
+/// (Build #23 — see `kernel_family`).
 #[cfg(feature = "unsafe-ffi")]
 pub fn inet_pton_owned(af: i32, ip: &str) -> Result<Vec<u8>, i32> {
     let src = truncate_cstring(ip);
     let mut dst = [0u8; 16];
-    sys_inet_pton(af, src.as_ptr(), dst.as_mut_ptr())?;
+    sys_inet_pton(kernel_family(af), src.as_ptr(), dst.as_mut_ptr())?;
     // The family was validated by the caller (only
     // `AF_INET` / `AF_INET6` reach here); the fallback
     // is unreachable defence.
@@ -885,11 +855,14 @@ pub fn inet_pton_owned(af: i32, ip: &str) -> Result<Vec<u8>, i32> {
 /// `inet_ntop(3)` — formats packed bytes (4 / 16) as a
 /// presentation-format string. The caller validates the
 /// length against the family first. On failure the errno.
+/// `af` is the PYTHON-facing family; it is translated
+/// to the kernel family for the C call (Build #23 — see
+/// `kernel_family`).
 #[cfg(feature = "unsafe-ffi")]
 pub fn inet_ntop_owned(af: i32, packed: &[u8]) -> Result<String, i32> {
     let mut dst = [0u8; 64];
     sys_inet_ntop(
-        af,
+        kernel_family(af),
         packed.as_ptr(),
         dst.as_mut_ptr() as *mut std::os::raw::c_char,
         dst.len() as u32,

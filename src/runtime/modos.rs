@@ -92,7 +92,8 @@ pub(crate) fn os_err(ctx: &mut CallCtx, e: &std::io::Error) -> PyError {
 /// and the caller maps them here, so Python sees one
 /// errno numbering on every platform. Also reused by the
 /// socket FFI DNS layer (`modsocket::dns`); unknown codes
-/// pass through unchanged.
+/// pass through unchanged. WSA values are from CPython's
+/// `socketmodule.c` `winsock_errors` table.
 #[cfg(windows)]
 pub(crate) fn win32_to_errno(code: i32) -> i32 {
     match code {
@@ -103,11 +104,13 @@ pub(crate) fn win32_to_errno(code: i32) -> i32 {
         32 => 13, // ERROR_SHARING_VIOLATION → EACCES
         87 => 22, // ERROR_INVALID_PARAMETER → EINVAL
         183 => 17, // ERROR_ALREADY_EXISTS → EEXIST
+        // Winsock codes (WSA* → E*).
         10004 => 4, // WSAEINTR → EINTR
         10009 => 9, // WSAEBADF → EBADF
         10013 => 13, // WSAEACCES → EACCES
         10014 => 14, // WSAEFAULT → EFAULT
         10022 => 22, // WSAEINVAL → EINVAL
+        10024 => 24, // WSAEMFILE → EMFILE
         10035 => 11, // WSAEWOULDBLOCK → EAGAIN
         10036 => 115, // WSAEINPROGRESS → EINPROGRESS
         10037 => 114, // WSAEALREADY → EALREADY

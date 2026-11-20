@@ -400,14 +400,19 @@ fn h_select_devnull_readable() {
 #[cfg(unix)]
 #[test]
 fn h_select_listener_never_ready() {
-    // H-select: a listener is never ready — pure `std` has no
-    // non-destructive probe for it (`UnixStream::peek` is
-    // unstable; `accept` would consume the pending
-    // connection). The connect thread still runs, so this
-    // pins the limitation even WITH a pending connection
-    // (the old G0 test asserted ready here via real
-    // `select(2)`). Timeout 0.2s, not 5s — nothing will ever
-    // make it ready.
+    // H-select: a listener is never ready on the DEFAULT
+    // build — pure `std` has no non-destructive probe for it
+    // (`UnixStream::peek` is unstable; `accept` would consume
+    // the pending connection). The connect thread still runs,
+    // so this pins the limitation even WITH a pending
+    // connection (the old G0 test asserted ready here via real
+    // `select(2)`). Under `unsafe-ffi` (S3) the socket probe
+    // is a real `poll(2)`, which DOES report a listener with
+    // a pending connection as readable — the CPython answer —
+    // so the feature build expects 1. Timeout 0.2s, not 5s:
+    // on the default build nothing will ever make it ready;
+    // on the feature build the client connects at 100ms,
+    // inside the window.
     let path = format!("/tmp/h_sel_listen_{}", std::process::id());
     let _ = std::fs::remove_file(&path);
     let client_path = path.clone();
@@ -433,7 +438,10 @@ fn h_select_listener_never_ready() {
     fx.run_ok(&src);
     let _ = handle.join();
     let _ = std::fs::remove_file(&path);
-    assert_eq!(fx.g_int("a"), 0);
+    // Default: never ready (0). Feature (`unsafe-ffi`):
+    // `poll(2)` sees the pending connection (1).
+    let expected = if cfg!(feature = "unsafe-ffi") { 1 } else { 0 };
+    assert_eq!(fx.g_int("a"), expected);
 }
 
 #[test]

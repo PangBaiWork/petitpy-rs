@@ -319,10 +319,13 @@ fn socket_probe(dir: &Path, script_src: &str, send_data: bool) -> Run {
 }
 
 /// An accepted socket WITH data waiting: `select` still
-/// reports not-ready (the pinned limitation), and the
-/// following `recv` proves the 5 bytes were there.
+/// reports not-ready on the DEFAULT build (the pinned
+/// limitation), and the following `recv` proves the 5 bytes
+/// were there. Under `unsafe-ffi` (socket FFI lane S3) the
+/// socket IS reported ready — see
+/// `h_select_socket_with_data_ready` below.
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "unsafe-ffi")))]
 fn h_select_socket_with_data_not_ready() {
     let dir = scratch("sock_data");
     let sock = dir.join("sock");
@@ -341,6 +344,33 @@ fn h_select_socket_with_data_not_ready() {
     );
     let r = socket_probe(&dir, &src, true);
     assert_run(&r, b"0\n5\n");
+}
+
+/// An accepted socket WITH data waiting: under `unsafe-ffi`
+/// (socket FFI lane S3) `select` reports it ready — the
+/// `poll(2)` probe in `modsocket::socket_readable` is
+/// non-destructive, so the following `recv` still gets the
+/// 5 bytes.
+#[test]
+#[cfg(all(unix, feature = "unsafe-ffi"))]
+fn h_select_socket_with_data_ready() {
+    let dir = scratch("sock_data_ready");
+    let sock = dir.join("sock");
+    let src = format!(
+        "import socket, select, os\n\
+         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         s.bind({:?}); s.listen(1)\n\
+         c, _ = s.accept()\n\
+         r, _, _ = select.select([c.fileno()], [], [], 0.5)\n\
+         print(len(r))\n\
+         data = c.recv(5)\n\
+         print(len(data))\n\
+         c.close(); s.close(); os.remove({:?})\n",
+        sock.to_str().unwrap(),
+        sock.to_str().unwrap()
+    );
+    let r = socket_probe(&dir, &src, true);
+    assert_run(&r, b"1\n5\n");
 }
 
 /// An accepted socket with no data: not-ready as well.

@@ -1,0 +1,218 @@
+Socket FFI lane S3 — result (advanced + platform + select cooperation)
+=====================================================================
+Worktree: /home/hatch/workspace/petitpy-rs-sock-s3, branch lane/socket-ffi-s3
+Base: b12c2d2 (master). S1/S2 NOT in this worktree — this lane was
+verified STANDALONE against the frozen brief §2.3 signatures.
+Date: 2026-11-20. Do NOT push (main agent merges).
+
+FILES CHANGED (10; git diff --stat: 582 insertions, 56 deletions)
+---------------------------------------------------------------------
+NEW src/modules/modsocket_ffi_adv.rs (1547 lines, whole file
+  #![cfg(feature = "unsafe-ffi")], self-contained so it compiles
+  standalone until S1's modsocket_ffi.rs lands):
+  - Private `mod ffi`: raw externs + safe Result<_, i32> wrappers
+    following frozen §2.1 (Unix: socket/bind/listen/accept/connect/
+    send/recv/sendmsg/recvmsg/fcntl/poll + per-platform errno
+    Linux __errno_location / macOS __error / Android __errno;
+    Windows: WSAStartup/WSAGetLastError/socket/bind/listen/accept/
+    connect/send/recv/getsockname/getsockopt/closesocket/ioctlsocket/
+    select/WSASendMsg/WSARecvMsg, #[link(name = "ws2_32")], WSA
+    errors converted via win32_to_errno).
+  - RawFd alias (i32 Unix / usize Windows), SockaddrStorage (128B),
+    AdvAddr enum (Inet/Inet6/Unix) with to_sockaddr/from_sockaddr.
+  - Public fns: ffi_sendmsg, ffi_recvmsg, check_fd_valid,
+    makefile_file (unsafe, documented precondition),
+    ffi_unix_bind/connect/accept, ffi_socket, close_raw,
+    af_unix_supported, poll_readable (Unix poll(2), timeout 0),
+    winsock_socketpair (Windows loopback TCP pair, non-blocking
+    accept + 5s deadline via Winsock select), sock_key/raw_fd_from_key.
+  - #[cfg(test)] unit tests: 9, all passing.
+NEW tests/sockffi_adv.rs (185 lines, #![cfg(feature = "unsafe-ffi")]):
+  6 petitpy-script-driven integration tests (see below).
+MOD src/modules/mod.rs: +1 (pub mod modsocket_ffi_adv).
+MOD src/runtime/modos.rs: win32_to_errno made pub(crate); WSA*
+  codes added (10004->4 ... 10071->66, values from CPython
+  socketmodule.c winsock_errors table).
+MOD src/modules/modsocket.rs (+415/-~36; file now 2842 lines —
+  OVER the 2500 cap, see §MERGE ISSUE 1):
+  - socket_readable(fd) (pub(crate), all platforms; Unix+feature
+    -> table membership + poll_readable; else false).
+  - socket_fromfd dispatcher + socket_fromfd_ffi (validate
+    family/type/proto, check_fd_valid, ONE unsafe block with
+    FromRawFd/FromRawSocket per (family, type_), insert into
+    table, alloc_socket).
+  - sock_sendmsg / sock_recvmsg / sock_detach + helpers
+    parse_sendmsg_addr / adv_addr_value + msg_fd (real-fd
+    resolution incl. unbound AF_UNIX datagram swap-in, see §4)
+    + 3 MethodEntry entries in SOCKET_LOCALS.
+  - list_items import gated on the feature.
+MOD src/modules/modselect.rs: ResolvedFd::Socket -> Socket(i32);
+  Entry::Socket { item, fd }; ready() calls
+  modsocket::socket_readable(fd) (live re-poll each probe-loop
+  iteration). Docs updated (default never-ready, feature live poll).
+MOD tests/h_select.rs: h_select_socket_with_data_not_ready gated
+  to #[cfg(all(unix, not(feature = "unsafe-ffi")))]; added
+  h_select_socket_with_data_ready (#[cfg(all(unix, feature =
+  "unsafe-ffi"))], expects 1\n5\n).
+MOD src/modules/modd4_tests.rs: h_select_listener_never_ready
+  now expects 1 under the feature (poll(2) sees the pending
+  connection — the CPython answer), 0 on default; comment updated.
+MOD src/modules/modsocket_tests.rs: socket_fromfd split by
+  feature (default: NotImplementedError x2; feature: valid fd
+  wraps as-is via detach, invalid fd -> OSError 9).
+MOD src/runtime/vm_tests_f5b.rs: f5b_socket_fromfd_not_implemented
+  renamed f5b_socket_fromfd, split by feature the same way.
+
+TEST COMMANDS + COUNTS (all run in this worktree)
+---------------------------------------------------------------------
+cargo test --release --features unsafe-ffi --test sockffi_adv
+  -> 6 passed, 0 failed (NEW).
+  sendmsg/recvmsg AF_UNIX stream pair; sendmsg/recvmsg AF_UNIX
+  datagram with explicit address; fromfd wraps /dev/null fd
+  (fileno() == fd); fromfd invalid fd 99999 -> OSError 9;
+  detach (fileno -1, returned fd > 0); recvmsg ancbufsize != 0
+  -> NotImplementedError.
+cargo test --release --features unsafe-ffi --test h_select
+  -> 10 passed, 0 failed. (Default build: also 10/10.)
+cargo test --release --features unsafe-ffi --lib
+  -> 1780 passed, 0 failed, 2 ignored.
+  (1771 baseline + 9 new modsocket_ffi_adv unit tests.)
+cargo test --release --lib (default)
+  -> 1771 passed, 0 failed, 2 ignored. (= baseline, zero regression.)
+cargo test --lib --features unsafe-ffi (debug)
+  -> ABORTS with the PRE-EXISTING "fatal runtime error: IO Safety
+  violation: owned file descriptor already closed" (SIGABRT) after
+  1175 tests pass (baseline ~1166). Same error, same area
+  (runtime/os tests). All 9 modsocket_ffi_adv unit tests pass in
+  the debug run. The lane's fromfd tests are NOT a trigger
+  (verified in isolation 8/8 clean — see §4).
+cargo check --all-targets (default) and
+  --features unsafe-ffi: 0 warnings in lib. Only the 2 pre-existing
+  unused-mut warnings in tests/h_subprocess.rs:83,155 (plus the
+  cargo summary line).
+GATES (feature binary, target/release/petitpy-rs):
+  full_gate: 545/552 GREEN (matches known-fails baseline exactly).
+  integration: 202/202 passed (fromfd fixed — the brief's key
+  feature acceptance).
+  golden: 585/585 passed. capability: GREEN.
+  stdlib: 8/8 passed. nano: 454/541 (report-only, = baseline).
+GATES (default binary): full 545/552 GREEN, integration 201/202
+  (only socket_fromfd_wraps_fd fails — by design on default),
+  golden 585/585, capability GREEN, stdlib 8/8, nano 454/541.
+
+DIFF VS BASELINE (b12c2d2)
+---------------------------------------------------------------------
+Default build: zero regression everywhere (lib 1771/0/2, all gates
+identical to baseline).
+Feature build: lib 1771 -> 1780 (+9 new unit tests, 0 failed);
+integration 201/202 -> 202/202 (fromfd fixed); all other gates
+identical. 3 lib tests that pinned the old behaviour were updated
+to be feature-aware (see FILES CHANGED): h_select_listener_
+never_ready, socket_fromfd, f5b_socket_fromfd (renamed).
+
+UNSAFE AUDIT
+---------------------------------------------------------------------
+All unsafe is at the FFI boundary or the single fromfd block, as
+the brief allows: 31 `unsafe {` blocks in modsocket_ffi_adv.rs
+(each a thin wrapper over one extern call) + 1 in modsocket.rs
+(socket_fromfd_ffi, with a SAFETY comment). No other new unsafe.
+`grep -c "unsafe {"`: modsocket_ffi_adv.rs 31, modsocket.rs 1.
+
+§4 — FINDINGS (verified by reading code / probing, not assumed)
+---------------------------------------------------------------------
+1. fromfd must NOT dup and must NOT check SO_TYPE: the integration
+   test socket_fromfd_wraps_fd wraps a NON-socket fd
+   (os.open('/dev/null', O_RDONLY)) via fromfd(AF_UNIX,
+   SOCK_STREAM) and requires fileno() == fd. Only liveness
+   validation (fcntl F_GETFD -> EBADF). This pins petitpy's
+   behaviour, NOT CPython's (CPython dups).
+2. fromfd DOUBLE-OWNERSHIP hazard (same class as H-select §4(9)):
+   the wrapped fd stays in state.os_fds too. Closing the socket
+   closes the fd; the stale os_fds File then aborts the DEBUG
+   build (IO Safety violation) when the VM drops. The lane's lib
+   tests use detach() instead of close() to release fromfd
+   sockets (fd closed exactly once, by os_fds). The release
+   binary is unaffected (double close is benign EBADF there;
+   integration gate 202/202 proves it). A real fix (dup on
+   fromfd, or removing the fd from os_fds) would break the
+   pinned fileno() == fd behaviour — left for the main agent.
+3. sendmsg/recvmsg on an UNBOUND socket: the table holds the
+   AF_INET placeholder UdpSocket, but the instance may claim
+   AF_UNIX — sending a sockaddr_un to it is EAFNOSUPPORT (97).
+   msg_fd() resolves the real fd: bound/connected sockets use
+   their stored fd; unbound INET datagrams use the placeholder
+   (CPython auto-binds UDP); unbound AF_UNIX datagrams swap in
+   a real UnixDatagram::unbound() first (same swap_in as
+   bind/connect, settings migrate); unbound stream -> EINVAL,
+   listener -> ENOTCONN (send) / EINVAL (recv).
+4. select on sockets is now LIVE under the feature: poll(2)
+   timeout 0, POLLIN|POLLERR|POLLHUP. A listener WITH a pending
+   connection reports readable (CPython behaviour); with no
+   connection it stays not-ready (h_select_socket_no_data_
+   not_ready and the devnull/listener sanity probes still pass
+   on both builds).
+5. Winsock facts recorded for S1/S2 merge: WSARecvMsg takes 5
+   args (flags back in msg.dwFlags), WSASendMsg takes 6 (flags
+   is an input); AF_INET6=23, AF_UNIX=29, SOL_SOCKET=0xFFFF,
+   SO_TYPE=0x1008, FIONBIO=0x8004667E, INVALID_SOCKET=usize::MAX,
+   WSADATA 408 bytes opaque, select nfds ignored (pass 0),
+   fd_set = u32 count + 64 SOCKETs.
+6. Test flake found + fixed: the two fromfd lib tests shared one
+   temp path (keyed only by process id) and ran in parallel —
+   one removed the file while the other os.open'd it (ENOENT).
+   Paths are now distinct (petitpy_fromfd_sock_ / _f5b_).
+   Verified 8/8 clean runs in isolation.
+
+MERGE ISSUES (for the main agent)
+---------------------------------------------------------------------
+1. modsocket.rs is 2842 lines — OVER the 2500 cap (base 2463,
+   this lane +379 net). The two contiguous feature-gated blocks
+   to move out at merge (into S1's modsocket_ffi.rs, which is
+   the natural home — they only need pub(crate) access to a
+   dozen modsocket.rs helpers): lines ~978-1079 (socket_fromfd
+   dispatcher + socket_fromfd_ffi, ~102 lines) and lines
+   ~1851-2099 (parse_sendmsg_addr, adv_addr_value, msg_fd,
+   sock_sendmsg, sock_recvmsg, sock_detach, ~249 lines).
+   S1/S2 also add to modsocket.rs, so a split is needed at
+   merge regardless of this lane. modsocket_ffi_adv.rs itself
+   is 1547 lines (under cap).
+2. Interface gaps vs frozen brief §2.3 (S1 builds modsocket_ffi.rs
+   in parallel; this lane wrote against §2.3, it does not exist
+   here): this lane's FFI layer is a PRIVATE `mod ffi` inside
+   modsocket_ffi_adv.rs with a module-level #[allow(dead_code)]
+   (temporary — S1's ffi.rs §2.1 replaces it at merge); 8
+   merge-API fns carry targeted #[allow(dead_code)] with a
+   one-line justification each. At merge: delete this lane's
+   `mod ffi` + RawFd/SockaddrStorage/AdvAddr and re-point the
+   public fns at S1's ffi.rs / ffi_dns.rs / FfiSocket types.
+   makefile FFI cooperation is implemented as makefile_file()
+   (unsafe fn taking RawFd) — S1's makefile arm should call it
+   after removing the socket from the table (see the fn's doc).
+   detach's Ffi arm + makefile's FFI arm + AF_UNIX Ffi arms
+   (bind/connect/accept via ffi_unix_*) are merge steps, not
+   done here (no FfiSocket exists in this worktree).
+3. Windows code is LOCALLY UNVERIFIED (user constraint: no local
+   cross-compilation). All #[cfg(windows)] branches in
+   modsocket_ffi_adv.rs (WSAStartup, winsock_socketpair,
+   WSASendMsg/WSARecvMsg, win32_to_errno WSA table) and the
+   Windows arms of socket_fromfd_ffi / sock_detach / msg_fd
+   need CI (windows-x86_64) to prove them. macOS/Android errno
+   accessors (__error / __errno) are likewise CI-only.
+4. Windows select-on-socket is still EBADF: socket_readable's
+   Windows arm returns false (no Winsock select wired into
+   poll_readable yet — poll_readable is Unix-only). The
+   h_select socket probes are #[cfg(unix)]; Windows select on
+   a socket stays never-ready until someone adds a Winsock
+   select/poll path.
+5. AF_UNIX on Windows: socket_ctor still rejects it before this
+   lane's code runs, so the Windows AF_UNIX FFI arms are
+   unreachable until the ctor is opened up (S1's scope). The
+   probe (af_unix_supported) exists for that step.
+
+NOT DONE / OUT OF SCOPE
+---------------------------------------------------------------------
+- S1's modsocket_ffi.rs + S2's ffi_dns.rs do not exist here;
+  nothing in this lane creates them (per the brief).
+- modselect.rs was NOT rewritten (per the brief §4 — only the
+  socket side of select cooperation).
+- No local cross-compilation (user constraint); see merge issue 3.

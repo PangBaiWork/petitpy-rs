@@ -28,6 +28,7 @@ pub mod modsocket;
 pub mod modsocket_ffi;
 #[cfg(feature = "unsafe-ffi")]
 pub mod modsocket_ffi_adv;
+pub mod modsocket_file;
 pub mod modstruct;
 pub mod modsubprocess;
 pub mod modtime;

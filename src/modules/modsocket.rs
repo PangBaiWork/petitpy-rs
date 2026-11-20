@@ -90,7 +90,7 @@
 //!   unit tests).
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -106,11 +106,6 @@ use std::time::Duration;
 
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objdict::{dict_get_value, dict_store};
-use crate::objects::containers::objlist::new_list;
-#[cfg(feature = "unsafe-ffi")]
-use crate::objects::containers::objlist::list_items;
-#[cfg(feature = "unsafe-ffi")]
-use crate::modules::modsocket_ffi_adv::AdvAddr;
 use crate::objects::containers::objtuple::{new_tuple, tuple_items};
 use crate::objects::obj::{obj_get_float, obj_get_int, obj_get_int_maybe};
 use crate::objects::primitives::objfloat::new_float;
@@ -139,7 +134,7 @@ pub(crate) const EBADF: i32 = 9;
 const ENOPROTOOPT: i32 = 92;
 pub(crate) const EAFNOSUPPORT: i32 = 97;
 const EOPNOTSUPP: i32 = 95;
-const ENOTCONN: i32 = 107;
+pub(crate) const ENOTCONN: i32 = 107;
 const EISCONN: i32 = 106;
 const EPROTONOSUPPORT: i32 = 93;
 
@@ -151,12 +146,15 @@ const SUN_PATH_LEN: usize = 108;
 pub(crate) const MAX_RECV: i64 = 64 * 1024 * 1024;
 
 /// Address families / socket types (also module constants).
+/// `pub(crate)`: the FFI-advanced module (`modsocket_ffi_adv.rs`)
+/// builds the same Python-facing values (its `ffi_socket`
+/// translates them to kernel values via `translate_family`).
 const AF_UNSPEC: i32 = 0;
-const AF_UNIX: i32 = 1;
-const AF_INET: i32 = 2;
-const AF_INET6: i32 = 10;
-const SOCK_STREAM: i32 = 1;
-const SOCK_DGRAM: i32 = 2;
+pub(crate) const AF_UNIX: i32 = 1;
+pub(crate) const AF_INET: i32 = 2;
+pub(crate) const AF_INET6: i32 = 10;
+pub(crate) const SOCK_STREAM: i32 = 1;
+pub(crate) const SOCK_DGRAM: i32 = 2;
 const IPPROTO_IP: i32 = 0;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
@@ -261,7 +259,10 @@ impl SocketState {
         }
     }
 
-    fn is_listener(&self) -> bool {
+    /// `pub(crate)`: the FFI-advanced module
+    /// (`modsocket_ffi_adv.rs`) classifies listener states
+    /// in `msg_fd`.
+    pub(crate) fn is_listener(&self) -> bool {
         match self {
             SocketState::ListenerTcp(_) => true,
             #[cfg(unix)]
@@ -426,7 +427,9 @@ fn int_opt_value(v: &[u8]) -> i32 {
 /// The `read`/`write` side of a `makefile()` object:
 /// a `try_clone()`d dup of the underlying stream, so
 /// closing the socket does not close the file.
-enum SocketIo {
+/// `pub(crate)`: the FFI-advanced module (`modsocket_ffi_adv.rs`)
+/// builds `SocketIo` values for the `makefile` FFI arm.
+pub(crate) enum SocketIo {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
@@ -466,11 +469,13 @@ impl Write for SocketIo {
 /// `subobj[0]` is `-1` then); the reader/writer are
 /// `Option` so an I/O call can take one out and not hold
 /// the table lock across blocking I/O.
-struct SocketFileState {
-    reader: Option<BufReader<SocketIo>>,
-    writer: Option<BufWriter<SocketIo>>,
-    can_read: bool,
-    can_write: bool,
+/// `pub(crate)`: the FFI-advanced module (`modsocket_ffi_adv.rs`)
+/// owns `sock_makefile`, which inserts `SocketFileState` rows.
+pub(crate) struct SocketFileState {
+    pub(crate) reader: Option<BufReader<SocketIo>>,
+    pub(crate) writer: Option<BufWriter<SocketIo>>,
+    pub(crate) can_read: bool,
+    pub(crate) can_write: bool,
 }
 
 /// The process-global makefile table: file id -> state.
@@ -479,11 +484,11 @@ fn socket_files_table() -> &'static Mutex<HashMap<u64, SocketFileState>> {
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn socket_files() -> std::sync::MutexGuard<'static, HashMap<u64, SocketFileState>> {
+pub(crate) fn socket_files() -> std::sync::MutexGuard<'static, HashMap<u64, SocketFileState>> {
     socket_files_table().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn next_file_id() -> u64 {
+pub(crate) fn next_file_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
@@ -503,7 +508,9 @@ fn sock_key<T: AsRawSocket>(t: &T) -> TableKey {
 }
 
 /// The table key of a stored state object.
-fn sock_key_of(state: &SocketState) -> TableKey {
+/// `pub(crate)`: the FFI-advanced module (`modsocket_ffi_adv.rs`)
+/// uses the table key of a socket state (`fromfd` / `msg_fd`).
+pub(crate) fn sock_key_of(state: &SocketState) -> TableKey {
     match state {
         SocketState::Unbound(u) | SocketState::Datagram(u) => sock_key(u),
         SocketState::ListenerTcp(l) => sock_key(l),
@@ -661,7 +668,9 @@ fn path_bytes(ctx: &mut CallCtx, v: Value) -> Option<Vec<u8>> {
 /// when the error carries one, else a small `ErrorKind`
 /// table (the socket calls are syscalls, so the raw errno
 /// is present in practice).
-fn io_os_error(ctx: &mut CallCtx, e: io::Error) -> PyError {
+/// `pub(crate)`: the FFI-advanced module (`modsocket_ffi_adv.rs`)
+/// reports `std` I/O errors from the moved `makefile` / `msg_fd`.
+pub(crate) fn io_os_error(ctx: &mut CallCtx, e: io::Error) -> PyError {
     let errno = match e.raw_os_error() {
         Some(n) => n,
         None => match e.kind() {
@@ -738,7 +747,9 @@ pub(crate) fn self_socket(ctx: &mut CallCtx, args: &[Value]) -> PyResult<(GcRef,
 /// Write back `subobj[0]` (the table key) after `bind()` /
 /// `connect()` swap the placeholder for the real object,
 /// and after `close()`.
-fn set_fd(ctx: &mut CallCtx, r: GcRef, fd: TableKey) {
+/// `pub(crate)`: the FFI-advanced module (`modsocket_ffi_adv.rs`)
+/// updates the instance fd after a swap (`msg_fd`) / detach.
+pub(crate) fn set_fd(ctx: &mut CallCtx, r: GcRef, fd: TableKey) {
     if let Obj::Instance(d) = ctx.arena.get_mut(r) {
         if !d.subobj.is_empty() {
             d.subobj[0] = small(fd);
@@ -773,7 +784,9 @@ pub(crate) fn alloc_socket(
 /// Allocate a `makefile()` instance (finaliser set, so the
 /// GC drain runs `__del__` = `close` when it becomes
 /// unreachable). `subobj = [file_id]`.
-fn alloc_file(ctx: &mut CallCtx, file_id: u64) -> PyResult<Value> {
+/// `pub(crate)`: the FFI-advanced module (`modsocket_ffi_adv.rs`)
+/// allocates the file object for the `makefile` FFI arm.
+pub(crate) fn alloc_file(ctx: &mut CallCtx, file_id: u64) -> PyResult<Value> {
     let file_type = socketfile_type(ctx)?;
     let inst = Obj::Instance(InstanceData {
         members: MapData::new(),
@@ -788,7 +801,9 @@ fn alloc_file(ctx: &mut CallCtx, file_id: u64) -> PyResult<Value> {
 /// returns the arena ref and the file id (`-1` after
 /// `close()` — callers map that to the closed-file
 /// `ValueError`).
-fn self_file(ctx: &mut CallCtx, args: &[Value]) -> PyResult<(GcRef, i64)> {
+/// `pub(crate)`: the `socketfile` methods
+/// (`modsocket_file.rs`) validate the file instance.
+pub(crate) fn self_file(ctx: &mut CallCtx, args: &[Value]) -> PyResult<(GcRef, i64)> {
     let bad = |ctx: &mut CallCtx| -> PyError {
         ctx.record_raise("TypeError", Some("expected a socket file"));
         PyError::PyRaise
@@ -807,7 +822,9 @@ fn self_file(ctx: &mut CallCtx, args: &[Value]) -> PyResult<(GcRef, i64)> {
 
 /// Write back a file instance's `subobj[0]` (the file id)
 /// after `close()` (`-1`).
-fn set_file_id(ctx: &mut CallCtx, r: GcRef, id: i64) {
+/// `pub(crate)`: the `socketfile` methods
+/// (`modsocket_file.rs`) store `-1` on close.
+pub(crate) fn set_file_id(ctx: &mut CallCtx, r: GcRef, id: i64) {
     if let Obj::Instance(d) = ctx.arena.get_mut(r) {
         if !d.subobj.is_empty() {
             d.subobj[0] = small(id);
@@ -1033,7 +1050,7 @@ fn socket_ctor(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 fn socket_fromfd(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     #[cfg(feature = "unsafe-ffi")]
     {
-        socket_fromfd_ffi(ctx, args)
+        crate::modules::modsocket_ffi_adv::socket_fromfd_ffi(ctx, args)
     }
     #[cfg(not(feature = "unsafe-ffi"))]
     {
@@ -1044,91 +1061,6 @@ fn socket_fromfd(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         );
         Err(PyError::PyRaise)
     }
-}
-
-/// `socket.fromfd` under `unsafe-ffi` (S3). The fd is taken
-/// as-is — NOT dup'd (the integration test
-/// `socket_fromfd_wraps_fd` requires `fileno() == fd`) —
-/// and is NOT checked for socket-ness (the test wraps a
-/// `/dev/null` fd); only liveness is checked (`EBADF` for
-/// an invalid fd, via `check_fd_valid`). At merge S1's
-/// `FfiSocket::from_raw` replaces the `std` wrapping below
-/// (same validation, same no-dup rule).
-#[cfg(feature = "unsafe-ffi")]
-fn socket_fromfd_ffi(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    use crate::modules::modsocket_ffi_adv::{check_fd_valid, raw_fd_from_key};
-    let fd = int_arg(ctx, args[0])?;
-    let family = int_arg(ctx, args[1])? as i32;
-    let type_ = int_arg(ctx, args[2])? as i32;
-    let proto = match args.get(3) {
-        Some(v) => int_arg(ctx, *v)? as i32,
-        None => 0,
-    };
-    match family {
-        AF_UNIX | AF_INET | AF_INET6 => {}
-        _ => return Err(raise_os_error(ctx, EAFNOSUPPORT)),
-    }
-    match type_ {
-        SOCK_STREAM | SOCK_DGRAM => {}
-        _ => return Err(raise_os_error(ctx, EINVAL)),
-    }
-    #[cfg(windows)]
-    if family == AF_UNIX {
-        // `std` has no `UnixStream` on Windows; S1's
-        // `FfiSocket::from_raw` covers this at merge.
-        ctx.record_raise(
-            "NotImplementedError",
-            Some("socket.fromfd(AF_UNIX) is not implemented on Windows"),
-        );
-        return Err(PyError::PyRaise);
-    }
-    let raw = raw_fd_from_key(fd);
-    check_fd_valid(raw).map_err(|e| raise_os_error(ctx, e))?;
-    // SAFETY (the single `fromfd` unsafe block): `raw` was
-    // validated by `check_fd_valid` immediately above, so it
-    // is a live fd owned by no other Rust object; this call
-    // takes ownership (the socket table becomes the sole
-    // owner). The (family, type_) pair selects the wrapper
-    // type; a non-socket fd (e.g. `/dev/null`) is still a
-    // valid fd, and the wrapper only stores the number — I/O
-    // on it fails with the OS error, it cannot fault.
-    let state = unsafe {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::FromRawFd;
-            match (family, type_) {
-                (AF_UNIX, SOCK_STREAM) => {
-                    SocketState::StreamUnix(UnixStream::from_raw_fd(raw))
-                }
-                (AF_UNIX, SOCK_DGRAM) => {
-                    SocketState::DatagramUnix(UnixDatagram::from_raw_fd(raw))
-                }
-                (AF_INET | AF_INET6, SOCK_STREAM) => {
-                    SocketState::StreamTcp(TcpStream::from_raw_fd(raw))
-                }
-                (AF_INET | AF_INET6, SOCK_DGRAM) => {
-                    SocketState::Datagram(UdpSocket::from_raw_fd(raw))
-                }
-                _ => unreachable!("family/type validated above"),
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::FromRawSocket;
-            match (family, type_) {
-                (AF_INET | AF_INET6, SOCK_STREAM) => {
-                    SocketState::StreamTcp(TcpStream::from_raw_socket(raw))
-                }
-                (AF_INET | AF_INET6, SOCK_DGRAM) => {
-                    SocketState::Datagram(UdpSocket::from_raw_socket(raw))
-                }
-                _ => unreachable!("family/type validated above"),
-            }
-        }
-    };
-    let key = sock_key_of(&state);
-    sockets().insert(key, state);
-    alloc_socket(ctx, key, family, type_, proto)
 }
 
 /// `socket.getaddrinfo(host, port[, family[, type[,
@@ -1197,7 +1129,9 @@ fn socket_getaddrinfo(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// state under its own key, move the settings over,
 /// re-apply them to the new object, and update
 /// `subobj[0]`. Returns the new key.
-fn swap_in(ctx: &mut CallCtx, r: GcRef, old_key: TableKey, new_state: SocketState) -> TableKey {
+/// `pub(crate)`: the FFI-advanced module (`modsocket_ffi_adv.rs`)
+/// swaps in a real datagram socket for `sendmsg` / `recvmsg`.
+pub(crate) fn swap_in(ctx: &mut CallCtx, r: GcRef, old_key: TableKey, new_state: SocketState) -> TableKey {
     let new_key = sock_key_of(&new_state);
     sockets().remove(&old_key);
     sockets().insert(new_key, new_state);
@@ -1838,255 +1772,6 @@ fn sock_recvfrom(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     Ok(Value::Heap(tuple))
 }
 
-/// Parse a `sendmsg` address argument: an `(host, port)`
-/// tuple for INET, a path for UNIX (FFI lane, S3).
-#[cfg(feature = "unsafe-ffi")]
-fn parse_sendmsg_addr(ctx: &mut CallCtx, v: Value, family: i32) -> PyResult<AdvAddr> {
-    match family {
-        #[cfg(unix)]
-        AF_UNIX => Ok(AdvAddr::Unix(parse_unix_path(ctx, v)?)),
-        AF_INET | AF_INET6 => {
-            let a = parse_inet_addr(ctx, v, family)?;
-            match a {
-                SocketAddr::V4(_) => Ok(AdvAddr::Inet(a)),
-                SocketAddr::V6(_) => Ok(AdvAddr::Inet6(a)),
-            }
-        }
-        _ => Err(raise_os_error(ctx, EAFNOSUPPORT)),
-    }
-}
-
-/// An `AdvAddr` as a Python value: `(host, port)` for INET,
-/// pathname bytes for UNIX (FFI lane, S3).
-#[cfg(feature = "unsafe-ffi")]
-fn adv_addr_value(ctx: &mut CallCtx, a: &AdvAddr) -> Value {
-    match a {
-        AdvAddr::Inet(addr) | AdvAddr::Inet6(addr) => inet_addr_tuple(ctx, *addr),
-        AdvAddr::Unix(path) => new_bytes(ctx, ctx.types, path),
-    }
-}
-
-/// Resolve the real fd for `sendmsg`/`recvmsg` (FFI lane,
-/// S3). Bound/connected sockets use their stored fd; an
-/// unbound INET datagram uses the placeholder (CPython
-/// auto-binds an unbound UDP socket the same way); an
-/// unbound AF_UNIX datagram swaps in a real unbound
-/// `UnixDatagram` first — the placeholder is an AF_INET UDP
-/// socket, and sending a `sockaddr_un` to it is
-/// `EAFNOSUPPORT` (the kernel rejects the family). An
-/// unbound stream socket is `EINVAL`, a listener is
-/// `listener_err` (`ENOTCONN` for sends, `EINVAL` for
-/// receives — the `sock_send` / `sock_recv` shapes).
-#[cfg(feature = "unsafe-ffi")]
-fn msg_fd(
-    ctx: &mut CallCtx,
-    r: GcRef,
-    fd: TableKey,
-    fields: [i32; 3],
-    listener_err: i32,
-) -> PyResult<crate::modules::modsocket_ffi_adv::RawFd> {
-    use crate::modules::modsocket_ffi_adv::raw_fd_from_key;
-    if fd < 0 {
-        return Err(raise_os_error(ctx, EBADF));
-    }
-    let (family, type_) = (fields[0], fields[1]);
-    // Classify the stored state. The lock is released
-    // before any swap — `swap_in` re-locks the table.
-    enum Action {
-        Use(crate::modules::modsocket_ffi_adv::RawFd),
-        SwapUnixDgram,
-        Fail(i32),
-    }
-    let action = {
-        let table = sockets();
-        match table.get(&fd) {
-            None => Action::Fail(EBADF),
-            Some(s) if s.is_listener() => Action::Fail(listener_err),
-            Some(SocketState::Unbound(_)) if type_ == SOCK_STREAM => Action::Fail(EINVAL),
-            Some(SocketState::Unbound(_)) if family == AF_UNIX => {
-                #[cfg(unix)]
-                {
-                    Action::SwapUnixDgram
-                }
-                #[cfg(not(unix))]
-                {
-                    Action::Fail(EAFNOSUPPORT)
-                }
-            }
-            Some(SocketState::Unbound(_)) => Action::Use(raw_fd_from_key(fd)),
-            Some(s) => Action::Use(raw_fd_from_key(sock_key_of(s))),
-        }
-    };
-    match action {
-        Action::Fail(e) => Err(raise_os_error(ctx, e)),
-        Action::Use(raw) => Ok(raw),
-        Action::SwapUnixDgram => {
-            #[cfg(unix)]
-            {
-                let d = UnixDatagram::unbound().map_err(|e| io_os_error(ctx, e))?;
-                let new_key = swap_in(ctx, r, fd, SocketState::DatagramUnix(d));
-                Ok(raw_fd_from_key(new_key))
-            }
-            #[cfg(not(unix))]
-            {
-                Err(raise_os_error(ctx, EAFNOSUPPORT))
-            }
-        }
-    }
-}
-
-/// `sock.sendmsg(buffers[, flags[, address]]) -> int` (FFI
-/// lane, S3): gather-send via `sendmsg(2)`. `buffers` is a
-/// list/tuple of bytes-like; `flags` defaults to 0;
-/// `address` is an `(host, port)` tuple for INET or a path
-/// for UNIX. No ancillary data (CPython's `sendmsg` takes
-/// none — the control buffer is always empty).
-#[cfg(feature = "unsafe-ffi")]
-fn sock_sendmsg(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    use crate::modules::modsocket_ffi_adv::ffi_sendmsg;
-    let (r, fd, fields) = self_socket(ctx, args)?;
-    if fd < 0 {
-        return Err(raise_os_error(ctx, EBADF));
-    }
-    // Copy the buffer values out first: `list_items` /
-    // `tuple_items` borrow `ctx` and `str_arg` needs `&mut ctx`.
-    let items: Vec<Value> = match list_items(ctx, args[1]) {
-        Some(items) => items.to_vec(),
-        None => match tuple_items(ctx, args[1]) {
-            Some(items) => items.to_vec(),
-            None => {
-                ctx.record_raise(
-                    "TypeError",
-                    Some("sendmsg buffers must be a list or tuple"),
-                );
-                return Err(PyError::PyRaise);
-            }
-        },
-    };
-    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(items.len());
-    for v in items {
-        bufs.push(str_arg(ctx, v)?);
-    }
-    let bufs_ref: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
-    let flags = match args.get(2) {
-        Some(v) => int_arg(ctx, *v)? as i32,
-        None => 0,
-    };
-    let addr = match args.get(3) {
-        Some(v) if *v != Value::None => Some(parse_sendmsg_addr(ctx, *v, fields[0])?),
-        _ => None,
-    };
-    let raw = msg_fd(ctx, r, fd, fields, ENOTCONN)?;
-    let n = ffi_sendmsg(raw, &bufs_ref, flags, addr.as_ref())
-        .map_err(|e| raise_os_error(ctx, e))?;
-    Ok(small(n as i64))
-}
-
-/// `sock.recvmsg(bufsize[, ancbufsize[, flags]]) ->
-/// (bytes, ancdata, msg_flags, address)` (FFI lane, S3).
-/// `ancbufsize != 0` is `NotImplementedError` (no ancillary
-/// data support — never silently dropped); the returned
-/// ancillary list is always empty.
-#[cfg(feature = "unsafe-ffi")]
-fn sock_recvmsg(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    use crate::modules::modsocket_ffi_adv::ffi_recvmsg;
-    let (r, fd, fields) = self_socket(ctx, args)?;
-    let n_signed = int_arg(ctx, args[1])?;
-    if fd < 0 {
-        return Err(raise_os_error(ctx, EBADF));
-    }
-    if n_signed < 0 {
-        return Err(raise_os_error(ctx, EINVAL));
-    }
-    if n_signed > MAX_RECV {
-        return Err(malloc_fail(ctx));
-    }
-    let ancbufsize = match args.get(2) {
-        Some(v) => int_arg(ctx, *v)?,
-        None => 0,
-    };
-    if ancbufsize != 0 {
-        ctx.record_raise(
-            "NotImplementedError",
-            Some("recvmsg ancillary data is not implemented"),
-        );
-        return Err(PyError::PyRaise);
-    }
-    let flags = match args.get(3) {
-        Some(v) => int_arg(ctx, *v)? as i32,
-        None => 0,
-    };
-    let mut buf = vec![0u8; n_signed as usize];
-    let raw = msg_fd(ctx, r, fd, fields, EINVAL)?;
-    let (got, addr, msg_flags) =
-        ffi_recvmsg(raw, &mut [&mut buf[..]], flags).map_err(|e| raise_os_error(ctx, e))?;
-    buf.truncate(got);
-    let data = new_bytes(ctx, ctx.types, &buf);
-    let ancdata = Value::Heap(new_list(ctx, ctx.types.list, &[]));
-    let addr_v = match addr {
-        Some(a) => adv_addr_value(ctx, &a),
-        None => Value::None,
-    };
-    let tuple = new_tuple(
-        ctx,
-        ctx.types.tuple,
-        &[data, ancdata, small(msg_flags as i64), addr_v],
-    );
-    Ok(Value::Heap(tuple))
-}
-
-/// `sock.detach() -> int` (FFI lane, S3): remove the socket
-/// from the table WITHOUT closing it and return the raw fd;
-/// the instance's fd becomes -1 (CPython). The caller owns
-/// the fd afterwards. (FfiSocket arm at merge:
-/// `SocketState::Ffi(f) => f.fd` — the fd is already a plain
-/// int there, no extraction needed.)
-#[cfg(feature = "unsafe-ffi")]
-fn sock_detach(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    let (r, fd, _fields) = self_socket(ctx, args)?;
-    if fd < 0 {
-        return Err(raise_os_error(ctx, EBADF));
-    }
-    // `IntoRawFd` / `IntoRawSocket` are safe: they transfer
-    // ownership of the number out of the owned object without
-    // closing it. (Dropping the state instead would CLOSE the
-    // fd — exactly what `detach` must not do.)
-    let raw: TableKey = {
-        let mut table = sockets();
-        let Some(state) = table.remove(&fd) else {
-            return Err(raise_os_error(ctx, EBADF));
-        };
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::IntoRawFd;
-            match state {
-                SocketState::Unbound(u) | SocketState::Datagram(u) => {
-                    u.into_raw_fd() as TableKey
-                }
-                SocketState::ListenerTcp(l) => l.into_raw_fd() as TableKey,
-                SocketState::ListenerUnix(l) => l.into_raw_fd() as TableKey,
-                SocketState::StreamTcp(s) => s.into_raw_fd() as TableKey,
-                SocketState::StreamUnix(s) => s.into_raw_fd() as TableKey,
-                SocketState::DatagramUnix(d) => d.into_raw_fd() as TableKey,
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::IntoRawSocket;
-            match state {
-                SocketState::Unbound(u) | SocketState::Datagram(u) => {
-                    u.into_raw_socket() as TableKey
-                }
-                SocketState::ListenerTcp(l) => l.into_raw_socket() as TableKey,
-                SocketState::StreamTcp(s) => s.into_raw_socket() as TableKey,
-            }
-        }
-    };
-    settings().remove(&fd);
-    set_fd(ctx, r, -1);
-    Ok(small(raw))
-}
-
 /// `sock.setblocking(bool)`: `set_nonblocking` on the
 /// stored object (the flag lives on the shared file
 /// description, so it sticks). Also updates the shadow
@@ -2428,6 +2113,9 @@ fn sock_dup(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// closing the socket does not close the file. Mode
 /// defaults to `'r'`; only `[rwb+]` are accepted, at
 /// least one of `r`/`w`/`+` (`ValueError` otherwise).
+/// FFI sockets dup the same way (`FfiSocket::dup`); the
+/// dup is wrapped in a `std` stream, and the socket keeps
+/// its own fd.
 fn sock_makefile(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let (_r, fd, _fields) = self_socket(ctx, args)?;
     if fd < 0 {
@@ -2468,6 +2156,43 @@ fn sock_makefile(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
             Some(SocketState::StreamUnix(s)) => {
                 SocketIo::Unix(s.try_clone().map_err(|e| io_os_error(ctx, e))?)
             }
+            #[cfg(feature = "unsafe-ffi")]
+            Some(SocketState::Ffi(f)) => {
+                // No `UnixStream` on Windows, so an AF_UNIX
+                // socket has no file form there (same
+                // `EINVAL` as a non-stream socket below).
+                #[cfg(windows)]
+                if f.family == AF_UNIX {
+                    return Err(raise_os_error(ctx, EINVAL));
+                }
+                // `dup` the fd (the socket keeps its own);
+                // the dup is owned by the `std` stream
+                // below. `forget` releases the temporary
+                // `FfiSocket` without closing the dup.
+                let dup = f
+                    .dup()
+                    .map_err(|e| crate::modules::modsocket_ffi::ffi_os_error(ctx, e))?;
+                let raw = dup.fd;
+                std::mem::forget(dup);
+                // SAFETY: `raw` is a live fd just dup'd
+                // above; `forget` released the `FfiSocket`
+                // without closing it, so the `std` stream
+                // is the sole owner.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::FromRawFd;
+                    if f.family == AF_UNIX {
+                        SocketIo::Unix(unsafe { UnixStream::from_raw_fd(raw) })
+                    } else {
+                        SocketIo::Tcp(unsafe { TcpStream::from_raw_fd(raw) })
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::FromRawSocket;
+                    SocketIo::Tcp(unsafe { TcpStream::from_raw_socket(raw) })
+                }
+            }
             Some(_) => return Err(raise_os_error(ctx, EINVAL)),
             None => return Err(raise_os_error(ctx, EBADF)),
         }
@@ -2492,183 +2217,6 @@ fn sock_makefile(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         },
     );
     alloc_file(ctx, id)
-}
-
-// ── `socketfile` methods (self = args[0]) ──────────────────────────
-
-/// `f.read([n]) -> bytes`: `n < 0` (or omitted) reads to
-/// EOF; `read(0)` is `b''`. The reader is taken out of
-/// the table for the call (no lock across blocking I/O)
-/// and put back afterwards. A closed file or a
-/// write-only file is `ValueError`.
-fn file_read(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    let (_r, id) = self_file(ctx, args)?;
-    let n = match args.get(1) {
-        Some(v) => int_arg(ctx, *v)?,
-        None => -1,
-    };
-    let mut reader = {
-        let mut files = socket_files();
-        let Some(st) = files.get_mut(&(id as u64)) else {
-            ctx.record_raise("ValueError", Some("I/O operation on closed file."));
-            return Err(PyError::PyRaise);
-        };
-        if !st.can_read {
-            ctx.record_raise("ValueError", Some("not readable"));
-            return Err(PyError::PyRaise);
-        }
-        match st.reader.take() {
-            Some(r) => r,
-            None => {
-                ctx.record_raise("ValueError", Some("I/O operation on closed file."));
-                return Err(PyError::PyRaise);
-            }
-        }
-    };
-    let mut buf = Vec::new();
-    let res = if n < 0 {
-        reader.read_to_end(&mut buf)
-    } else {
-        let mut limited = reader.take(n as u64);
-        let r = limited.read_to_end(&mut buf);
-        reader = limited.into_inner();
-        r
-    };
-    {
-        let mut files = socket_files();
-        if let Some(st) = files.get_mut(&(id as u64)) {
-            st.reader = Some(reader);
-        }
-    }
-    res.map_err(|e| io_os_error(ctx, e))?;
-    Ok(new_bytes(ctx, ctx.types, &buf))
-}
-
-/// `f.readline([n]) -> bytes`: one line up to and
-/// including `'\n'` (or EOF); `n >= 0` caps the bytes.
-/// Same take/put-back and error rules as `read`.
-fn file_readline(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    let (_r, id) = self_file(ctx, args)?;
-    let n = match args.get(1) {
-        Some(v) => int_arg(ctx, *v)?,
-        None => -1,
-    };
-    let mut reader = {
-        let mut files = socket_files();
-        let Some(st) = files.get_mut(&(id as u64)) else {
-            ctx.record_raise("ValueError", Some("I/O operation on closed file."));
-            return Err(PyError::PyRaise);
-        };
-        if !st.can_read {
-            ctx.record_raise("ValueError", Some("not readable"));
-            return Err(PyError::PyRaise);
-        }
-        match st.reader.take() {
-            Some(r) => r,
-            None => {
-                ctx.record_raise("ValueError", Some("I/O operation on closed file."));
-                return Err(PyError::PyRaise);
-            }
-        }
-    };
-    let mut buf = Vec::new();
-    let res = if n < 0 {
-        reader.read_until(b'\n', &mut buf)
-    } else {
-        let mut limited = reader.take(n as u64);
-        let r = limited.read_until(b'\n', &mut buf);
-        reader = limited.into_inner();
-        r
-    };
-    {
-        let mut files = socket_files();
-        if let Some(st) = files.get_mut(&(id as u64)) {
-            st.reader = Some(reader);
-        }
-    }
-    res.map_err(|e| io_os_error(ctx, e))?;
-    Ok(new_bytes(ctx, ctx.types, &buf))
-}
-
-/// `f.write(bytes) -> int`: the data must be str/bytes
-/// (a bytearray is TypeError "can't convert to str
-/// implicitly"); returns the bytes written. A closed
-/// file or a read-only file is `ValueError`.
-fn file_write(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    let (_r, id) = self_file(ctx, args)?;
-    let data = str_arg(ctx, args[1])?;
-    let mut writer = {
-        let mut files = socket_files();
-        let Some(st) = files.get_mut(&(id as u64)) else {
-            ctx.record_raise("ValueError", Some("I/O operation on closed file."));
-            return Err(PyError::PyRaise);
-        };
-        if !st.can_write {
-            ctx.record_raise("ValueError", Some("not writable"));
-            return Err(PyError::PyRaise);
-        }
-        match st.writer.take() {
-            Some(w) => w,
-            None => {
-                ctx.record_raise("ValueError", Some("I/O operation on closed file."));
-                return Err(PyError::PyRaise);
-            }
-        }
-    };
-    let res = writer.write_all(&data);
-    {
-        let mut files = socket_files();
-        if let Some(st) = files.get_mut(&(id as u64)) {
-            st.writer = Some(writer);
-        }
-    }
-    res.map_err(|e| io_os_error(ctx, e))?;
-    Ok(small(data.len() as i64))
-}
-
-/// `f.flush() -> None`: flushes the writer. A closed
-/// file is `ValueError`.
-fn file_flush(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    let (_r, id) = self_file(ctx, args)?;
-    let mut writer = {
-        let mut files = socket_files();
-        let Some(st) = files.get_mut(&(id as u64)) else {
-            ctx.record_raise("ValueError", Some("I/O operation on closed file."));
-            return Err(PyError::PyRaise);
-        };
-        match st.writer.take() {
-            Some(w) => w,
-            None => {
-                ctx.record_raise("ValueError", Some("I/O operation on closed file."));
-                return Err(PyError::PyRaise);
-            }
-        }
-    };
-    let res = writer.flush();
-    {
-        let mut files = socket_files();
-        if let Some(st) = files.get_mut(&(id as u64)) {
-            st.writer = Some(writer);
-        }
-    }
-    res.map_err(|e| io_os_error(ctx, e))?;
-    Ok(Value::None)
-}
-
-/// `f.close() -> None` (idempotent): flushes the writer,
-/// drops the table entry (closing both dups), and stores
-/// `-1`.
-fn file_close(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    let (r, id) = self_file(ctx, args)?;
-    let mut files = socket_files();
-    if let Some(mut st) = files.remove(&(id as u64)) {
-        if let Some(mut w) = st.writer.take() {
-            let _ = w.flush();
-        }
-    }
-    drop(files);
-    set_file_id(ctx, r, -1);
-    Ok(Value::None)
 }
 
 // ── Type / module tables ────────────────────────────────────────────
@@ -2705,19 +2253,19 @@ pub const SOCKET_LOCALS: &[MethodEntry] = &[
     #[cfg(feature = "unsafe-ffi")] MethodEntry { name: "getsockname", func: crate::modules::modsocket_ffi::sock_getsockname, min: 1, max: 1, kw_func: None },
     #[cfg(feature = "unsafe-ffi")] MethodEntry { name: "shutdown", func: crate::modules::modsocket_ffi::sock_shutdown, min: 2, max: 2, kw_func: None },
     #[cfg(feature = "unsafe-ffi")]
-    MethodEntry { name: "sendmsg", func: sock_sendmsg, min: 2, max: 4, kw_func: None },
+    MethodEntry { name: "sendmsg", func: crate::modules::modsocket_ffi_adv::sock_sendmsg, min: 2, max: 4, kw_func: None },
     #[cfg(feature = "unsafe-ffi")]
-    MethodEntry { name: "recvmsg", func: sock_recvmsg, min: 2, max: 4, kw_func: None },
+    MethodEntry { name: "recvmsg", func: crate::modules::modsocket_ffi_adv::sock_recvmsg, min: 2, max: 4, kw_func: None },
     #[cfg(feature = "unsafe-ffi")]
-    MethodEntry { name: "detach", func: sock_detach, min: 1, max: 1, kw_func: None },
+    MethodEntry { name: "detach", func: crate::modules::modsocket_ffi_adv::sock_detach, min: 1, max: 1, kw_func: None },
 ];
 
 pub const FILE_LOCALS: &[MethodEntry] = &[
-    MethodEntry { name: "read", func: file_read, min: 1, max: 2, kw_func: None },
-    MethodEntry { name: "readline", func: file_readline, min: 1, max: 2, kw_func: None },
-    MethodEntry { name: "write", func: file_write, min: 2, max: 2, kw_func: None },
-    MethodEntry { name: "flush", func: file_flush, min: 1, max: 1, kw_func: None },
-    MethodEntry { name: "close", func: file_close, min: 1, max: 1, kw_func: None },
+    MethodEntry { name: "read", func: crate::modules::modsocket_file::file_read, min: 1, max: 2, kw_func: None },
+    MethodEntry { name: "readline", func: crate::modules::modsocket_file::file_readline, min: 1, max: 2, kw_func: None },
+    MethodEntry { name: "write", func: crate::modules::modsocket_file::file_write, min: 2, max: 2, kw_func: None },
+    MethodEntry { name: "flush", func: crate::modules::modsocket_file::file_flush, min: 1, max: 1, kw_func: None },
+    MethodEntry { name: "close", func: crate::modules::modsocket_file::file_close, min: 1, max: 1, kw_func: None },
 ];
 
 fn type_data(name_id: u32, dict: GcRef) -> TypeData {

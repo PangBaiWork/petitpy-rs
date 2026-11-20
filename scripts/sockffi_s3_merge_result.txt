@@ -1,0 +1,182 @@
+S3 merge integration — result
+=============================
+Base: master 647087a (S1 + S2 merged); S3 rebased as 44e46ed.
+Worktree: ~/workspace/petitpy-rs-sock-s3, branch lane/socket-ffi-s3.
+Verification logs: ~/workspace/sockffi_s3_merge_verify/ (verify.sh,
+resumable per section; lib_default.log / lib_feature.log /
+sockffi_files.log are from this session).
+
+§1. What the merge did
+- Deleted S3's private `mod ffi` (~607 lines) in
+  modsocket_ffi_adv.rs. Every call site now uses S1's
+  `crate::support::ffi` (`sys_socket`, `sys_bind` /
+  `sys_listen` / `sys_accept` / `sys_connect`, `sys_send` /
+  `sys_recv`, `sys_sendmsg` / `sys_recvmsg`, `sys_getsockname`,
+  `sys_getsockopt`, `sys_closesocket` / `sys_close`, `sys_dup`,
+  `sys_fcntl`, `sys_ioctlsocket`, `sys_socketpair`, `sys_poll`;
+  `Iovec` / `Msghdr` / `Pollfd` / `SockaddrStorage`).
+  No private duplicate remains.
+- Deleted `AdvAddr` + `SockaddrStorage` + `unix_sockaddr_len`;
+  all addresses are S1's `SockAddr` (`to_raw` / `from_raw`).
+  `parse_sendmsg_addr` deleted (S1's `parse_target` does the
+  same); `adv_addr_value` deleted (S1's `sockaddr_value` does
+  the same). `parse_target` + `sockaddr_value` made `pub(crate)`
+  in modsocket_ffi.rs; `SockAddr` gained `PartialEq` + `Eq`
+  (needed by the round-trip test).
+- `ffi.rs` additions (S1's file): Windows `WsaBuf` / `WsaMsg` /
+  `FdSet` / `Timeval` structs; `WSASendMsg` / `WSARecvMsg` /
+  `select` externs; Windows `sys_sendmsg` / `sys_recvmsg` /
+  `sys_select` wrappers (same `Result<usize, i32>` return shape
+  as the Unix ones — the `sent` / `received` out-parameters are
+  managed inside); `errno()` and `wsa_ensure()` made `pub(crate)`.
+- Moved from modsocket.rs to modsocket_ffi_adv.rs:
+  `socket_fromfd_ffi`, `msg_fd`, `sock_sendmsg`,
+  `sock_recvmsg`, `sock_detach`.
+  - `socket_fromfd_ffi` now wraps the fd in
+    `FfiSocket::from_raw` (per the S3 code note) instead of the
+    `std` wrapping — no dup, no socket-ness check, `fileno() ==
+    fd` preserved; the FFI method arms now apply to fromfd
+    sockets. Error mapping uses `ffi_os_error` (raw Winsock
+    codes are mapped there, not in `raise_os_error`).
+  - `sock_detach` gained the missing FFI arm (this was a
+    compile error in the rebased tree, E0004): the removed
+    `FfiSocket` sets `closed = true` so its `Drop` skips the
+    close — the fd is returned to the caller, not closed.
+  - `sock_sendmsg` / `sock_recvmsg` errors now go through
+    `ffi_os_error` (same Winsock-mapping reason).
+- `sock_makefile`: NOT moved to adv (it exists in both builds;
+  adv is feature-only, so the move broke the default build).
+  Restored in modsocket.rs with the FFI arm: `dup` the fd
+  (`FfiSocket::dup`), wrap the dup in a `std` stream via
+  `FromRawFd` / `FromRawSocket` (the socket keeps its own fd);
+  AF_UNIX on Windows is `EINVAL`. This fixes the feature-lib
+  `socket_makefile` failure (S1 §5(1)).
+- New module `src/modules/modsocket_file.rs` (197 lines, NOT
+  feature-gated): the five `socketfile` methods (`file_read`,
+  `file_readline`, `file_write`, `file_flush`, `file_close`)
+  moved out of modsocket.rs; `FILE_LOCALS` now references them.
+  (The brief's specified moves alone left modsocket.rs at 2516;
+  the makefile restore + FFI arm needed a further ~60-line move,
+  and the file methods are the coherent both-builds chunk.)
+- Visibility widened (`pub(crate)`) for the moved code:
+  modsocket.rs `AF_UNIX` / `AF_INET` / `AF_INET6` /
+  `SOCK_STREAM` / `SOCK_DGRAM` / `ENOTCONN`, `SocketIo`
+  (+ fields), `SocketFileState` (+ fields), `socket_files`,
+  `next_file_id`, `alloc_file`, `sock_key_of`, `set_fd`,
+  `swap_in`, `io_os_error`, `is_listener`, `self_file`,
+  `set_file_id`; modsocket_ffi.rs `sockaddr_value`,
+  `parse_target`.
+- Line counts (all < 2500): modsocket.rs 2850 -> 2398;
+  modsocket_ffi_adv.rs 1547 -> 1092; ffi.rs 1741 -> 1927;
+  modsocket_ffi.rs 1167 -> 1170; new modsocket_file.rs 197.
+
+§2. Decisions (where the brief left a choice)
+- `fromfd` uses `FfiSocket::from_raw`, not the `std` wrapping:
+  the S3 code comment said so ("at merge S1's `FfiSocket::
+  from_raw` replaces the `std` wrapping"), and integration
+  202/202 confirms it behaves the same (fileno() == fd).
+- `makefile` on an FFI socket dups instead of transferring
+  ownership: `makefile_file` (takes ownership) cannot feed
+  `SocketIo`, which needs a `TcpStream` / `UnixStream`; the
+  dup keeps socket and file independently usable, matching
+  the `std` path (`try_clone`). `makefile_file` stays as the
+  tested ownership primitive (unit test only).
+- AF_UNIX arms: S1's `FfiSocket::bind` / `connect` / `accept`
+  already handle AF_UNIX on Unix through the generic `SockAddr`
+  machinery, so no new arms were needed there; S3's
+  `ffi_unix_bind` / `connect` / `accept` are now thin
+  `SockAddr` wrappers used by the unit tests (and the Windows
+  probe path).
+
+§3. Findings (bugs / behaviour found while merging)
+- `sock_detach` had NO `Ffi` arm in the rebased tree — the
+  feature build did not compile (E0004). Fixed by the arm in §1.
+- `h_select_socket_object_never_ready` (modd4_tests.rs) was not
+  made feature-aware by S3 (only the listener test was): under
+  the feature build `poll(2)` reports the unconnected socket as
+  ready (1). Verified against CPython: `select.select` on an
+  unbound `AF_UNIX` stream socket returns it (1). Made
+  feature-aware the same way as the listener test (expects 1
+  under the feature, 0 on default).
+- S1's `SockAddr::to_raw` for an unnamed Unix address returns
+  len 3 (`len_for` = family + path + NUL), not 2 as S3's
+  `unix_sockaddr_len` did; the kernel reports an unnamed peer
+  with len 0. The round-trip test now asserts len 3 and
+  `from_raw(&st, 0) == Some(Unix { path: [] })`. (An unnamed
+  address is never passed to `bind` / `connect` in production,
+  so len 3 is harmless.)
+- S3's `winsock_socketpair` had a latent Windows-only compile
+  bug: `Ok(n) if n > 0 => break` in a loop whose value is the
+  accepted fd (`break` with no value vs `break fd`). It never
+  compiled on Windows (no Windows host here). Fixed to fall
+  through to the `accept` below (`Ok(n) if n > 0 => {}`).
+- S3's `winsock_socketpair` also compared the raw Winsock
+  error to `11` (`EAGAIN`) after `accept`; S1's wrappers return
+  raw WSA codes (`WSAEWOULDBLOCK` 10035), so the check now
+  maps through `win32_to_errno` first.
+- S3's private `sys_ioctlsocket` took `&mut u32`; S1's takes
+  `arg: u32` by value — call sites updated. S1's
+  `sys_socketpair` returns `[RawFd; 2]`, not an out-param.
+  S1's `sys_getsockopt` returns `Result<usize, i32>` (bytes
+  written); call sites discard it. S1's `sys_sendmsg` /
+  `sys_recvmsg` are Unix-only; the Windows versions are the
+  new wrappers in `ffi.rs` (§1).
+
+§4. Leftovers / handoffs (not fixed here)
+- `fromfd` double-ownership hazard (S3 §4, H-select §4(9)
+  class): the wrapped fd stays in `os_fds`; closing the
+  socket then dropping the VM aborts the DEBUG build. Release
+  is harmless (integration 202/202). NOT fixed: a real fix
+  (dup on fromfd, or removing the fd from `os_fds`) would
+  break the pinned `fileno() == fd` behaviour. Left
+  documented (module docs of modsocket_ffi_adv.rs).
+- `ffi_dns.rs` dedup (S2 §3(c)): it still duplicates S1's
+  `Sockaddr` / `SockaddrIn` / `SockaddrIn6` / `SockaddrStorage`
+  / `Addrinfo` / `Servent` / `errno()` / `ensure_winsock()`.
+  Explicitly out of scope for this merge; a separate later
+  merge step.
+- Windows / macOS / Android branches are locally UNVERIFIED
+  (no local cross-compilation per the user's constraint) —
+  CI must prove them. In particular the new Windows
+  `sys_sendmsg` / `sys_recvmsg` / `sys_select` wrappers and
+  the fixed `winsock_socketpair` loop have never compiled
+  anywhere (no Windows host here); the `break` fix in §3 is
+  from reading the code, not from a compiler.
+- The feature DEBUG lib suite still aborts with the known IO
+  Safety violation (pre-existing baseline, ~1166 tests in;
+  not re-run here — release is the gate).
+- `makefile_file` is now used only by its unit test
+  (`sock_makefile` dups instead); kept with
+  `#[allow(dead_code)]` as the tested ownership primitive.
+
+§5. Verification (release; logs in
+~/workspace/sockffi_s3_merge_verify/)
+- `cargo check --all-targets` both builds: 0 new warnings
+  (only the 2 pre-existing `h_subprocess` unused-`mut`).
+- Lib: default 1771 passed / 0 failed / 2 ignored;
+  feature 1780 passed / 0 failed / 2 ignored
+  (1771 + S3's 9 unit tests; `socket_makefile` passes under
+  the feature — the S1 §5(1) failure is GONE).
+- `sockffi_core` (feature) 9/9 (+2 ignored);
+  `sockffi_dns` (feature) 10/10; `sockffi_adv` (feature) 6/6.
+- `cargo test --release --tests` (default) rc=0:
+  entry_cli 45/45, h_select 10/10, h_socket 7/7 (1 ignored).
+- Gates, default build: full GREEN (7 fails = known-fails
+  baseline, 545/552); integration 201/202 (only
+  `socket_fromfd_wraps_fd`, by design); golden 585/585;
+  capability GREEN; stdlib 8/8; nano 454/541 (report-only).
+- Gates, feature build: full GREEN (545/552); integration
+  202/202; golden 585/585; capability GREEN; stdlib 8/8;
+  nano 454/541 (report-only).
+- `check_compile_mpy` PASS (0 rust compile failures,
+  0 byte mismatches); `check_frozen` PASS (23/23 identical).
+- Files < 2500 (§1). `unsafe` audit: ffi.rs 44 blocks (all
+  inside FFI wrappers incl. the 3 new Windows ones, each with
+  an invariant comment); ffi_dns.rs 24 (S2, unchanged);
+  modsocket_ffi.rs 6 (S1's `SockAddr` raw-pointer reads);
+  modsocket_ffi_adv.rs 1 `unsafe fn` (`makefile_file`) + 1
+  `unsafe {}` (its unit test); modsocket.rs 3 (the makefile
+  FFI arm's `from_raw_fd` / `from_raw_socket`, SAFETY comment);
+  modsocket_file.rs 0; dns.rs 0. No new `unsafe` outside the
+  FFI boundary + fromfd (none — `FfiSocket::from_raw` is safe)
+  + makefile `from_raw_fd`.

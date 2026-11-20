@@ -1,5 +1,6 @@
 //! S3 — socket FFI, advanced + platform + `select` cooperation.
-//! (Lane `socket-ffi-s3`, brief `scripts/socket_ffi_brief.md` §3 S3.)
+//! (Lane `socket-ffi-s3`, brief `scripts/socket_ffi_brief.md` §3 S3,
+//! merged onto S1+S2.)
 //!
 //! Whole file is `#[cfg(feature = "unsafe-ffi")]`: the default
 //! build sees nothing here and stays byte-identical.
@@ -7,57 +8,42 @@
 //! Contents:
 //! - `sendmsg` / `recvmsg` (plain buffers only; no ancillary data
 //!   — CPython's `sendmsg` has no ancillary parameter, and
-//!   `recvmsg` with `ancbufsize != 0` is rejected by the
-//!   `modsocket.rs` layer, never silently dropped).
+//!   `recvmsg` with `ancbufsize != 0` is rejected here, never
+//!   silently dropped).
+//! - `socket.fromfd` (no dup, no socket-ness check — the
+//!   integration test wraps a `/dev/null` fd and requires
+//!   `fileno() == fd`) and `sock.detach`.
+//! - `sock.makefile` (FFI arm: `dup` the fd and wrap the dup in
+//!   a `std` stream — the socket keeps its own fd, so the file
+//!   and the socket stay independently usable).
 //! - `fromfd` validation (`check_fd_valid`) and the `makefile`
 //!   cooperation primitive (`makefile_file`).
 //! - AF_UNIX via FFI (`ffi_unix_bind` / `ffi_unix_connect` /
 //!   `ffi_unix_accept`; Windows AF_UNIX is probed at runtime).
-//! - Windows platform finish: `WSAStartup` (`OnceLock`),
-//!   `closesocket`, `ioctlsocket(FIONBIO)`, the loopback-TCP
-//!   `socketpair`, `SOCKET`/`TableKey` conversion, and WSA
-//!   error codes → errno via `win32_to_errno`.
+//! - Windows platform finish: `closesocket`,
+//!   `ioctlsocket(FIONBIO)`, the loopback-TCP `socketpair`,
+//!   `SOCKET`/`TableKey` conversion. Winsock error codes come
+//!   back raw from `ffi.rs` and are mapped to POSIX errnos by
+//!   the caller (`ffi_os_error` in `modsocket_ffi.rs`).
 //! - `poll(2)` readiness (`poll_readable`), the `select`
-//!   cooperation: non-destructive, so `select` on a socket
-//!   with pending data reports readable (H-select §4(1)).
+//!   cooperation for sockets under the feature.
 //!
-//! MERGE NOTES (read before merging S1/S2/S3):
-//! - S1's `ffi.rs` (§2.1) will provide these same wrappers
-//!   (`sys_socket`, `sys_bind`, ... `sys_sendmsg`, `sys_recvmsg`,
-//!   `msghdr`, `iovec`, `addrinfo`, portable `errno()`). At merge,
-//!   DELETE the private `mod ffi` below and rewire the call
-//!   sites to `crate::support::ffi::sys_*` — the signatures are
-//!   the frozen §2.1 ones, so the rewire is mechanical (only the
-//!   path changes). `last_error` (this file's `ffi::errno`) is
-//!   replaced by `ffi::errno()` the same way.
-//! - `AdvAddr` is this lane's local address type (INET/INET6/
-//!   UNIX). S1's `SockAddr` (§2.3) replaces it at merge; the
-//!   variants and the `to_sockaddr` / `from_sockaddr` shapes
-//!   match, so the call sites (`ffi_sendmsg`, `ffi_recvmsg`,
-//!   `ffi_unix_*`) only change the type name.
-//! - `RawFd` (`i32` Unix, `usize` Windows) is S1's
-//!   `FfiSocket.fd` type; `sock_key` / `raw_fd_from_key` are
-//!   the `TableKey = i64` conversions for it.
-//! - The free functions here map to `FfiSocket` methods (§2.3)
-//!   at merge: `ffi_sendmsg` → `FfiSocket::sendmsg`,
-//!   `ffi_recvmsg` → `FfiSocket::recvmsg`,
-//!   `ffi_unix_bind/connect/accept` → the AF_UNIX arms of
-//!   `FfiSocket::bind/connect/accept`, `makefile_file` → the
-//!   `makefile` FFI arm, `check_fd_valid` → the `fromfd`
-//!   validation, `poll_readable` → the `select` probe.
-//! - `detach` needs NO FFI primitive (`IntoRawFd` is safe `std`;
-//!   for `FfiSocket` the fd is already a plain int). It is
-//!   implemented as `sock_detach` in `modsocket.rs`; the FFI
-//!   arm at merge is one line (`SocketState::Ffi(f) => f.fd`).
+//! All raw syscalls, `sockaddr` structs and the `SockAddr`
+//! address type live in `crate::support::ffi` /
+//! `crate::modules::modsocket_ffi` (S1, brief §2.3) — this
+//! file holds no private duplicate. The Python-facing
+//! family/type constants come from `modsocket.rs` and are
+//! translated to kernel values by `translate_family` inside
+//! `ffi_socket`.
 //!
-//! INTERFACE GAPS (no S1 interface to build on yet — this file
-//! is self-contained so it compiles standalone):
-//! - The private `mod ffi` below duplicates the frozen §2.1
-//!   wrappers S1 will put in `ffi.rs` (see merge note). It is
-//!   temporary by design; it is NOT a second implementation to
-//!   keep.
-//! - `SockaddrStorage` / `AdvAddr` duplicate the frozen §2.1/§2.3
-//!   address types for the same reason.
+//! Known gaps / merge notes (unchanged from the standalone S3
+//! result; see `scripts/sockffi_s3_result.txt` §4):
+//! - `fromfd` double-ownership hazard: the wrapped fd stays
+//!   in `os_fds`; closing the socket then dropping the VM
+//!   aborts the DEBUG build (same class as H-select §4(9)).
+//!   Release is harmless. A real fix (dup on `fromfd`, or
+//!   removing the fd from `os_fds`) would break the pinned
+//!   `fileno() == fd` behaviour — left for a later decision.
 //! - Windows code (`winsock_socketpair`, `WSASendMsg` /
 //!   `WSARecvMsg`, AF_UNIX probe) is NOT locally verifiable
 //!   (no Windows host here; user constraint: no local
@@ -69,11 +55,33 @@
 #![cfg(feature = "unsafe-ffi")]
 
 use std::fs::File;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(any(windows, test))]
+use std::net::Ipv4Addr;
+#[cfg(test)]
+use std::net::Ipv6Addr;
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixDatagram;
 #[cfg(windows)]
 use std::os::windows::io::FromRawSocket;
+
+use crate::memory::gc::CallCtx;
+use crate::modules::modsocket::{
+    alloc_socket, int_arg, io_os_error, self_socket, set_fd, settings, sock_key_of, sockets,
+    str_arg, swap_in, SocketState, TableKey, AF_INET, AF_INET6, AF_UNIX, EAFNOSUPPORT, EBADF,
+    EINVAL, ENOTCONN, MAX_RECV, SOCK_DGRAM, SOCK_STREAM,
+};
+use crate::modules::modsocket_ffi::{
+    ffi_os_error, parse_target, sockaddr_value, translate_family, FfiSocket, SockAddr,
+};
+use crate::objects::containers::objlist::{list_items, new_list};
+use crate::objects::containers::objtuple::{new_tuple, tuple_items};
+use crate::objects::strings::objstr_a::new_bytes;
+use crate::objects::value::{GcRef, Value};
+use crate::pyerr::{PyError, PyResult};
+use crate::runtime::raise::{malloc_fail, raise_os_error};
+use crate::support::ffi;
 
 /// The OS socket handle: `i32` fd on Unix, `SOCKET` (`usize`)
 /// on Windows. S1's `FfiSocket.fd` is this type (brief §2.3).
@@ -82,29 +90,10 @@ pub type RawFd = i32;
 #[cfg(windows)]
 pub type RawFd = usize;
 
-/// OS-level address families (the values the syscalls see —
-/// note `AF_INET6` is 10 on Unix but 23 on Winsock; the
-/// Python-facing constants in `modsocket.rs` are separate).
-const AF_INET: i32 = 2;
-#[cfg(unix)]
-const AF_INET6: i32 = 10;
-#[cfg(windows)]
-const AF_INET6: i32 = 23;
-#[cfg(unix)]
-const AF_UNIX: i32 = 1;
-#[cfg(windows)]
-const AF_UNIX: i32 = 29;
-/// `SOCK_STREAM` / `SOCK_DGRAM`: only the Windows
-/// `socketpair` path and the unit tests use them (Unix
-/// production code passes the type through `FfiSocket`),
-/// so they exist on Windows and in test builds only.
-#[cfg(any(windows, test))]
-const SOCK_STREAM: i32 = 1;
-#[cfg(any(windows, test))]
-const SOCK_DGRAM: i32 = 2;
-
 /// `SOL_SOCKET` / `SO_TYPE` for the `fromfd` validation
 /// (`getsockopt` on Windows; Unix uses `fcntl(F_GETFD)`).
+/// Kernel values (Winsock: `SOL_SOCKET` 0xFFFF, `SO_TYPE`
+/// 0x1008) — `sys_getsockopt` takes kernel values.
 #[cfg(windows)]
 const SOL_SOCKET: i32 = 0xFFFF;
 #[cfg(windows)]
@@ -126,766 +115,15 @@ const POLLHUP: i16 = 16;
 #[cfg(windows)]
 const FIONBIO: i32 = 0x8004_667E_u32 as i32;
 
-/// Winsock `INVALID_SOCKET` (Windows).
-#[cfg(windows)]
-const INVALID_SOCKET: usize = usize::MAX;
-
-/// Raw `extern "C"` declarations + safe wrappers, following
-/// the `src/support/ffi.rs` pattern: every wrapper returns
-/// `Result<_, i32>` (POSIX errno; on Windows the Winsock code
-/// is converted through `win32_to_errno` inside the wrapper,
-/// so callers only ever see POSIX errnos). See the module
-/// docs for the S1 merge note — this `mod ffi` is temporary.
-#[allow(dead_code)]
-// Allowed: this module is the frozen §2.1 wrapper layer S1
-// will provide in `ffi.rs`; on Unix several wrappers are only
-// reached via the merge-API functions below (unit tests +
-// S1's `FfiSocket` at merge), so they read as dead until the
-// merge. The whole module is deleted at merge.
-mod ffi {
-    use std::os::raw::c_int;
-    #[cfg(windows)]
-    use std::sync::OnceLock;
-
-    // ── errno (Unix, per-platform) ──
-    #[cfg(target_os = "linux")]
-    extern "C" {
-        fn __errno_location() -> *mut c_int;
-    }
-    #[cfg(target_os = "macos")]
-    extern "C" {
-        fn __error() -> *mut c_int;
-    }
-    #[cfg(target_os = "android")]
-    extern "C" {
-        fn __errno() -> *mut c_int;
-    }
-    #[cfg(all(
-        unix,
-        not(any(target_os = "linux", target_os = "macos", target_os = "android"))
-    ))]
-    compile_error!(
-        "socket FFI errno: unsupported Unix target — add the platform errno accessor (__errno_location / __error / __errno) here"
-    );
-
-    /// The calling thread's errno, read immediately after a
-    /// failed call (Unix). FFI invariant: the accessor never
-    /// returns null and the cell is only read here.
-    #[cfg(unix)]
-    pub(crate) fn errno() -> i32 {
-        #[cfg(target_os = "linux")]
-        unsafe {
-            *__errno_location()
-        }
-        #[cfg(target_os = "macos")]
-        unsafe {
-            *__error()
-        }
-        #[cfg(target_os = "android")]
-        unsafe {
-            *__errno()
-        }
-    }
-
-    /// The last Winsock error as a POSIX errno (Windows).
-    /// FFI invariant: `WSAGetLastError` is infallible and
-    /// returns the calling thread's last Winsock code.
-    #[cfg(windows)]
-    pub(crate) fn wsa_error() -> i32 {
-        crate::runtime::modos::win32_to_errno(unsafe { WSAGetLastError() })
-    }
-
-    /// `WSAStartup(MAKEWORD(2,2))`, once per process
-    /// (Windows). Must run before any Winsock call.
-    #[cfg(windows)]
-    pub(crate) fn ensure_winsock() -> Result<(), i32> {
-        static STARTUP: OnceLock<Result<(), i32>> = OnceLock::new();
-        *STARTUP.get_or_init(|| {
-            // WSADATA is 408 bytes on 64-bit Windows; it is
-            // only written by WSAStartup, never read here —
-            // an opaque zeroed buffer is enough.
-            let mut data = [0u8; 408];
-            // FFI invariant: WSAStartup takes a version word
-            // and a caller-provided buffer; it returns 0 on
-            // success, else the Winsock error code directly
-            // (not via WSAGetLastError).
-            let r = unsafe { WSAStartup(0x0202, data.as_mut_ptr()) };
-            if r == 0 {
-                Ok(())
-            } else {
-                Err(crate::runtime::modos::win32_to_errno(r))
-            }
-        })
-    }
-
-    // ── FFI structs (private to this module) ──
-    /// `struct iovec` (Unix): one scatter/gather element.
-    #[repr(C)]
-    #[cfg(unix)]
-    pub(crate) struct Iovec {
-        pub iov_base: *mut u8,
-        pub iov_len: usize,
-    }
-
-    /// `struct msghdr` (Unix, x86_64/aarch64: 56 bytes).
-    #[repr(C)]
-    #[cfg(unix)]
-    pub(crate) struct Msghdr {
-        pub msg_name: *mut u8,
-        pub msg_namelen: u32,
-        pub msg_iov: *mut Iovec,
-        pub msg_iovlen: usize,
-        pub msg_control: *mut u8,
-        pub msg_controllen: usize,
-        pub msg_flags: c_int,
-    }
-
-    /// `struct pollfd` (Unix): one fd to probe.
-    #[repr(C)]
-    #[cfg(unix)]
-    pub(crate) struct Pollfd {
-        pub fd: c_int,
-        pub events: i16,
-        pub revents: i16,
-    }
-
-    /// `WSABUF` (Windows): one scatter/gather element.
-    #[repr(C)]
-    #[cfg(windows)]
-    pub(crate) struct WsaBuf {
-        pub len: u32,
-        pub buf: *mut u8,
-    }
-
-    /// `WSAMSG` (Windows, 64-bit: 56 bytes).
-    #[repr(C)]
-    #[cfg(windows)]
-    pub(crate) struct WsaMsg {
-        pub name: *mut u8,
-        pub namelen: c_int,
-        pub lp_buffers: *mut WsaBuf,
-        pub buffer_count: u32,
-        pub control: WsaBuf,
-        pub flags: u32,
-    }
-
-    /// `fd_set` (Windows): `fd_count` + up to 64 sockets.
-    #[repr(C)]
-    #[cfg(windows)]
-    pub(crate) struct FdSet {
-        pub fd_count: u32,
-        pub fd_array: [usize; 64],
-    }
-
-    /// `struct timeval` (Windows): seconds + microseconds
-    /// (`long` is `i32` on Windows).
-    #[repr(C)]
-    #[cfg(windows)]
-    pub(crate) struct Timeval {
-        pub tv_sec: i32,
-        pub tv_usec: i32,
-    }
-
-    // ── Unix socket calls ──
-    #[cfg(unix)]
-    extern "C" {
-        fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
-        fn bind(fd: c_int, addr: *const u8, len: u32) -> c_int;
-        fn listen(fd: c_int, backlog: c_int) -> c_int;
-        fn accept(fd: c_int, addr: *mut u8, len: *mut u32) -> c_int;
-        fn connect(fd: c_int, addr: *const u8, len: u32) -> c_int;
-        fn send(fd: c_int, buf: *const u8, len: usize, flags: c_int) -> isize;
-        fn recv(fd: c_int, buf: *mut u8, len: usize, flags: c_int) -> isize;
-        fn sendmsg(fd: c_int, msg: *const Msghdr, flags: c_int) -> isize;
-        fn recvmsg(fd: c_int, msg: *mut Msghdr, flags: c_int) -> isize;
-        fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
-        fn poll(fds: *mut Pollfd, nfds: u32, timeout: c_int) -> c_int;
-    }
-
-    /// `socket(2)`. FFI invariant: three plain ints; on -1
-    /// the thread errno holds the failure.
-    #[cfg(unix)]
-    pub(crate) fn sys_socket(domain: i32, ty: i32, proto: i32) -> Result<super::RawFd, i32> {
-        let r = unsafe { socket(domain, ty, proto) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(r)
-        }
-    }
-
-    /// `bind(2)`. FFI invariant: the address bytes are a
-    /// caller-built `sockaddr` of `len` bytes; on -1 errno
-    /// holds the failure.
-    #[cfg(unix)]
-    pub(crate) fn sys_bind(fd: super::RawFd, addr: *const u8, len: u32) -> Result<(), i32> {
-        let r = unsafe { bind(fd, addr, len) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// `listen(2)`. FFI invariant: plain ints; on -1 errno
-    /// holds the failure.
-    #[cfg(unix)]
-    pub(crate) fn sys_listen(fd: super::RawFd, backlog: i32) -> Result<(), i32> {
-        let r = unsafe { listen(fd, backlog) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// `accept(2)`. FFI invariant: `addr`/`len` are a
-    /// caller-provided buffer; on -1 errno holds the
-    /// failure (EAGAIN on a non-blocking listener is a
-    /// normal outcome, not a fault).
-    #[cfg(unix)]
-    pub(crate) fn sys_accept(
-        fd: super::RawFd,
-        addr: *mut u8,
-        len: *mut u32,
-    ) -> Result<super::RawFd, i32> {
-        let r = unsafe { accept(fd, addr, len) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(r)
-        }
-    }
-
-    /// `connect(2)`. FFI invariant: the address bytes are a
-    /// caller-built `sockaddr` of `len` bytes; on -1 errno
-    /// holds the failure.
-    #[cfg(unix)]
-    pub(crate) fn sys_connect(fd: super::RawFd, addr: *const u8, len: u32) -> Result<(), i32> {
-        let r = unsafe { connect(fd, addr, len) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// `send(2)`. FFI invariant: `buf` points at `len`
-    /// readable bytes for the call; -1 is the only error
-    /// return (0 is a valid short write).
-    #[cfg(unix)]
-    pub(crate) fn sys_send(
-        fd: super::RawFd,
-        buf: *const u8,
-        len: usize,
-        flags: i32,
-    ) -> Result<usize, i32> {
-        let r = unsafe { send(fd, buf, len, flags) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(r as usize)
-        }
-    }
-
-    /// `recv(2)`. FFI invariant: `buf` points at `len`
-    /// writable bytes for the call; -1 is the only error
-    /// return (0 is EOF, not an error).
-    #[cfg(unix)]
-    pub(crate) fn sys_recv(
-        fd: super::RawFd,
-        buf: *mut u8,
-        len: usize,
-        flags: i32,
-    ) -> Result<usize, i32> {
-        let r = unsafe { recv(fd, buf, len, flags) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(r as usize)
-        }
-    }
-
-    /// `sendmsg(2)`. FFI invariant: `msg` points at a
-    /// caller-built `Msghdr` whose iovecs point at live
-    /// buffers; -1 is the only error return.
-    #[cfg(unix)]
-    pub(crate) fn sys_sendmsg(
-        fd: super::RawFd,
-        msg: *const Msghdr,
-        flags: i32,
-    ) -> Result<usize, i32> {
-        let r = unsafe { sendmsg(fd, msg, flags) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(r as usize)
-        }
-    }
-
-    /// `recvmsg(2)`. FFI invariant: `msg` points at a
-    /// caller-built `Msghdr` whose iovecs point at live
-    /// writable buffers; -1 is the only error return.
-    #[cfg(unix)]
-    pub(crate) fn sys_recvmsg(
-        fd: super::RawFd,
-        msg: *mut Msghdr,
-        flags: i32,
-    ) -> Result<usize, i32> {
-        let r = unsafe { recvmsg(fd, msg, flags) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(r as usize)
-        }
-    }
-
-    /// `fcntl(2)`. FFI invariant: plain ints; on -1 errno
-    /// holds the failure.
-    #[cfg(unix)]
-    pub(crate) fn sys_fcntl(fd: super::RawFd, cmd: i32, arg: i32) -> Result<i32, i32> {
-        let r = unsafe { fcntl(fd, cmd, arg) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(r)
-        }
-    }
-
-    /// `poll(2)`. FFI invariant: `fds` points at `nfds`
-    /// caller-built `Pollfd`s; -1 is the only error return
-    /// (0 is a timeout, not an error).
-    #[cfg(unix)]
-    pub(crate) fn sys_poll(fds: *mut Pollfd, nfds: u32, timeout_ms: i32) -> Result<i32, i32> {
-        let r = unsafe { poll(fds, nfds, timeout_ms) };
-        if r < 0 {
-            Err(errno())
-        } else {
-            Ok(r)
-        }
-    }
-
-    // ── Winsock calls (ws2_32) ──
-    #[cfg(windows)]
-    #[link(name = "ws2_32")]
-    extern "C" {
-        fn WSAStartup(w_version_requested: u16, lp_wsa_data: *mut u8) -> c_int;
-        fn WSAGetLastError() -> c_int;
-        fn socket(af: c_int, kind: c_int, protocol: c_int) -> usize;
-        fn bind(s: usize, addr: *const u8, namelen: c_int) -> c_int;
-        fn listen(s: usize, backlog: c_int) -> c_int;
-        fn accept(s: usize, addr: *mut u8, addrlen: *mut c_int) -> usize;
-        fn connect(s: usize, addr: *const u8, namelen: c_int) -> c_int;
-        fn send(s: usize, buf: *const u8, len: c_int, flags: c_int) -> c_int;
-        fn recv(s: usize, buf: *mut u8, len: c_int, flags: c_int) -> c_int;
-        fn getsockname(s: usize, addr: *mut u8, addrlen: *mut c_int) -> c_int;
-        fn getsockopt(
-            s: usize,
-            level: c_int,
-            optname: c_int,
-            optval: *mut u8,
-            optlen: *mut c_int,
-        ) -> c_int;
-        fn closesocket(s: usize) -> c_int;
-        fn ioctlsocket(s: usize, cmd: c_int, argp: *mut u32) -> c_int;
-        fn select(
-            nfds: c_int,
-            readfds: *mut FdSet,
-            writefds: *mut FdSet,
-            exceptfds: *mut FdSet,
-            timeout: *const Timeval,
-        ) -> c_int;
-        fn WSASendMsg(
-            s: usize,
-            msg: *const WsaMsg,
-            flags: u32,
-            sent: *mut u32,
-            overlapped: *mut u8,
-            completion: *mut u8,
-        ) -> c_int;
-        fn WSARecvMsg(
-            s: usize,
-            msg: *mut WsaMsg,
-            received: *mut u32,
-            overlapped: *mut u8,
-            completion: *mut u8,
-        ) -> c_int;
-    }
-
-    /// Winsock `socket`. FFI invariant: three plain ints;
-    /// on `INVALID_SOCKET` the Winsock error holds the
-    /// failure. Every Winsock wrapper below calls
-    /// `ensure_winsock()` first, so no caller can forget
-    /// `WSAStartup`.
-    #[cfg(windows)]
-    pub(crate) fn sys_socket(domain: i32, ty: i32, proto: i32) -> Result<super::RawFd, i32> {
-        ensure_winsock()?;
-        let r = unsafe { socket(domain, ty, proto) };
-        if r == super::INVALID_SOCKET {
-            Err(wsa_error())
-        } else {
-            Ok(r)
-        }
-    }
-
-    /// Winsock `bind` (`namelen` is `int` on Winsock,
-    /// unlike the Unix `socklen_t`).
-    #[cfg(windows)]
-    pub(crate) fn sys_bind(fd: super::RawFd, addr: *const u8, len: i32) -> Result<(), i32> {
-        ensure_winsock()?;
-        let r = unsafe { bind(fd, addr, len) };
-        if r != 0 {
-            Err(wsa_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Winsock `listen`.
-    #[cfg(windows)]
-    pub(crate) fn sys_listen(fd: super::RawFd, backlog: i32) -> Result<(), i32> {
-        ensure_winsock()?;
-        let r = unsafe { listen(fd, backlog) };
-        if r != 0 {
-            Err(wsa_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Winsock `accept` (`addrlen` is `int*` on Winsock).
-    #[cfg(windows)]
-    pub(crate) fn sys_accept(
-        fd: super::RawFd,
-        addr: *mut u8,
-        len: *mut c_int,
-    ) -> Result<super::RawFd, i32> {
-        ensure_winsock()?;
-        let r = unsafe { accept(fd, addr, len) };
-        if r == super::INVALID_SOCKET {
-            Err(wsa_error())
-        } else {
-            Ok(r)
-        }
-    }
-
-    /// Winsock `connect`.
-    #[cfg(windows)]
-    pub(crate) fn sys_connect(fd: super::RawFd, addr: *const u8, len: i32) -> Result<(), i32> {
-        ensure_winsock()?;
-        let r = unsafe { connect(fd, addr, len) };
-        if r != 0 {
-            Err(wsa_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Winsock `send` (`len` is `int`; clamped, a buffer
-    /// over 2 GiB cannot be sent in one call anyway).
-    #[cfg(windows)]
-    pub(crate) fn sys_send(
-        fd: super::RawFd,
-        buf: *const u8,
-        len: usize,
-        flags: i32,
-    ) -> Result<usize, i32> {
-        ensure_winsock()?;
-        let len = len.min(i32::MAX as usize) as c_int;
-        let r = unsafe { send(fd, buf, len, flags) };
-        if r < 0 {
-            Err(wsa_error())
-        } else {
-            Ok(r as usize)
-        }
-    }
-
-    /// Winsock `recv`.
-    #[cfg(windows)]
-    pub(crate) fn sys_recv(
-        fd: super::RawFd,
-        buf: *mut u8,
-        len: usize,
-        flags: i32,
-    ) -> Result<usize, i32> {
-        ensure_winsock()?;
-        let len = len.min(i32::MAX as usize) as c_int;
-        let r = unsafe { recv(fd, buf, len, flags) };
-        if r < 0 {
-            Err(wsa_error())
-        } else {
-            Ok(r as usize)
-        }
-    }
-
-    /// Winsock `getsockname`.
-    #[cfg(windows)]
-    pub(crate) fn sys_getsockname(
-        fd: super::RawFd,
-        addr: *mut u8,
-        len: *mut c_int,
-    ) -> Result<(), i32> {
-        ensure_winsock()?;
-        let r = unsafe { getsockname(fd, addr, len) };
-        if r != 0 {
-            Err(wsa_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Winsock `getsockopt` (used by the `fromfd`
-    /// validation on Windows).
-    #[cfg(windows)]
-    pub(crate) fn sys_getsockopt(
-        fd: super::RawFd,
-        level: i32,
-        opt: i32,
-        val: *mut u8,
-        len: *mut c_int,
-    ) -> Result<(), i32> {
-        ensure_winsock()?;
-        let r = unsafe { getsockopt(fd, level, opt, val, len) };
-        if r != 0 {
-            Err(wsa_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// `closesocket` — Windows closes a `SOCKET` with this,
-    /// NOT `close` (which would corrupt the CRT fd table).
-    #[cfg(windows)]
-    pub(crate) fn sys_closesocket(fd: super::RawFd) -> Result<(), i32> {
-        ensure_winsock()?;
-        // FFI invariant: `closesocket` takes any SOCKET value;
-        // an invalid one fails with WSAENOTSOCK, it cannot fault.
-        let r = unsafe { closesocket(fd) };
-        if r != 0 {
-            Err(wsa_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// `ioctlsocket` (Windows non-blocking switch).
-    #[cfg(windows)]
-    pub(crate) fn sys_ioctlsocket(fd: super::RawFd, cmd: i32, argp: *mut u32) -> Result<(), i32> {
-        ensure_winsock()?;
-        let r = unsafe { ioctlsocket(fd, cmd, argp) };
-        if r != 0 {
-            Err(wsa_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Winsock `select` (the `nfds` argument is ignored on
-    /// Windows; pass 0).
-    #[cfg(windows)]
-    pub(crate) fn sys_select(
-        readfds: *mut FdSet,
-        writefds: *mut FdSet,
-        exceptfds: *mut FdSet,
-        timeout: *const Timeval,
-    ) -> Result<i32, i32> {
-        ensure_winsock()?;
-        let r = unsafe { select(0, readfds, writefds, exceptfds, timeout) };
-        if r < 0 {
-            Err(wsa_error())
-        } else {
-            Ok(r)
-        }
-    }
-
-    /// `WSASendMsg` (Windows). `sent` receives the byte
-    /// count; the overlapped/completion args are null
-    /// (synchronous call). Returns 0 on success.
-    #[cfg(windows)]
-    pub(crate) fn sys_sendmsg(
-        fd: super::RawFd,
-        msg: *const WsaMsg,
-        flags: u32,
-        sent: *mut u32,
-    ) -> Result<(), i32> {
-        ensure_winsock()?;
-        // FFI invariant: `msg` points at a caller-built
-        // `WsaMsg` whose buffers point at live memory.
-        let r = unsafe {
-            WSASendMsg(
-                fd,
-                msg,
-                flags,
-                sent,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if r != 0 {
-            Err(wsa_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// `WSARecvMsg` (Windows). `received` gets the byte
-    /// count; the message flags come back in
-    /// `msg.flags` (there is no separate flags out-param —
-    /// unlike `WSASendMsg`, `WSARecvMsg` takes 5 args).
-    #[cfg(windows)]
-    pub(crate) fn sys_recvmsg(
-        fd: super::RawFd,
-        msg: *mut WsaMsg,
-        received: *mut u32,
-    ) -> Result<(), i32> {
-        ensure_winsock()?;
-        let r = unsafe {
-            WSARecvMsg(fd, msg, received, std::ptr::null_mut(), std::ptr::null_mut())
-        };
-        if r != 0 {
-            Err(wsa_error())
-        } else {
-            Ok(())
-        }
-    }
+/// A small int, infallible for socket fields (all fit the
+/// 62-bit window).
+fn small(n: i64) -> Value {
+    Value::small_int(n).expect("socket field fits the small-int window")
 }
 
-/// Raw address buffer (128 bytes, 8-aligned —
-/// `sockaddr_storage` on Linux/macOS/Windows). Addresses
-/// are read/written as raw bytes (family at offset 0,
-/// port/address at the `sockaddr_in` / `sockaddr_in6` /
-/// `sockaddr_un` offsets), so no per-family struct is
-/// needed — the offsets are identical on all three
-/// platforms, and the macOS `u8` family + pad byte reads
-/// back as the same `u16` value on little-endian.
-#[repr(C, align(8))]
-pub struct SockaddrStorage {
-    pub data: [u8; 128],
-}
-
-impl SockaddrStorage {
-    pub fn zeroed() -> Self {
-        Self { data: [0u8; 128] }
-    }
-}
-
-/// A socket address (this lane's local type — S1's
-/// `SockAddr` (§2.3) replaces it at merge; the variants
-/// and the conversion shapes match).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdvAddr {
-    /// IPv4 (`SocketAddr::V4`).
-    Inet(SocketAddr),
-    /// IPv6 (`SocketAddr::V6`).
-    Inet6(SocketAddr),
-    /// `AF_UNIX` path bytes: empty = unnamed, a leading
-    /// NUL byte = abstract-namespace name.
-    Unix(Vec<u8>),
-}
-
-/// `sockaddr_un` length for a path: family (2) + the path
-/// + its NUL terminator for filesystem paths; an abstract
-/// name (leading NUL) has no terminator; empty is unnamed.
-fn unix_sockaddr_len(path: &[u8]) -> u32 {
-    if path.is_empty() {
-        2
-    } else if path[0] == 0 {
-        2 + path.len() as u32
-    } else {
-        2 + path.len() as u32 + 1
-    }
-}
-
-impl AdvAddr {
-    /// Serialise to raw `sockaddr` bytes + length.
-    pub fn to_sockaddr(&self) -> (SockaddrStorage, u32) {
-        let mut st = SockaddrStorage::zeroed();
-        match self {
-            AdvAddr::Inet(a) => {
-                // sockaddr_in: family u16 @0, port BE u16 @2,
-                // addr 4 bytes @4.
-                let ip = match a.ip() {
-                    IpAddr::V4(v4) => v4,
-                    _ => unreachable!("AdvAddr::Inet holds an IPv4 address"),
-                };
-                st.data[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
-                st.data[2..4].copy_from_slice(&a.port().to_be_bytes());
-                st.data[4..8].copy_from_slice(&ip.octets());
-                (st, 16)
-            }
-            AdvAddr::Inet6(a) => {
-                // sockaddr_in6: family u16 @0, port BE u16 @2,
-                // flowinfo u32 @4 (0), addr 16 bytes @8,
-                // scope_id u32 @24 (0).
-                let ip = match a.ip() {
-                    IpAddr::V6(v6) => v6,
-                    _ => unreachable!("AdvAddr::Inet6 holds an IPv6 address"),
-                };
-                st.data[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
-                st.data[2..4].copy_from_slice(&a.port().to_be_bytes());
-                st.data[8..24].copy_from_slice(&ip.octets());
-                (st, 28)
-            }
-            AdvAddr::Unix(path) => {
-                // sockaddr_un: family u16 @0, path @2.
-                st.data[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
-                let len = unix_sockaddr_len(path);
-                st.data[2..2 + path.len()].copy_from_slice(path);
-                (st, len)
-            }
-        }
-    }
-
-    /// Parse raw `sockaddr` bytes (as returned by
-    /// `accept` / `recvmsg`). `None` for an unknown family
-    /// or a truncated address.
-    pub fn from_sockaddr(data: &[u8]) -> Option<AdvAddr> {
-        if data.len() < 2 {
-            return None;
-        }
-        let family = u16::from_ne_bytes([data[0], data[1]]) as i32;
-        match family {
-            AF_INET => {
-                if data.len() < 8 {
-                    return None;
-                }
-                let port = u16::from_be_bytes([data[2], data[3]]);
-                let ip = Ipv4Addr::new(data[4], data[5], data[6], data[7]);
-                Some(AdvAddr::Inet(SocketAddr::new(IpAddr::V4(ip), port)))
-            }
-            AF_INET6 => {
-                if data.len() < 24 {
-                    return None;
-                }
-                let port = u16::from_be_bytes([data[2], data[3]]);
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&data[8..24]);
-                Some(AdvAddr::Inet6(SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::from(octets)),
-                    port,
-                )))
-            }
-            AF_UNIX => {
-                let raw = &data[2..];
-                if raw.first() == Some(&0) {
-                    // Abstract name: the leading NUL is part
-                    // of the name, not a terminator.
-                    Some(AdvAddr::Unix(raw.to_vec()))
-                } else {
-                    let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-                    Some(AdvAddr::Unix(raw[..end].to_vec()))
-                }
-            }
-            _ => None,
-        }
-    }
-}
-
-/// Table-key conversions (`TableKey = i64`; S1's
-/// `FfiSocket` uses these at merge). On Unix an fd is a
-/// small non-negative `i32`; on Windows a `SOCKET` value
-/// is < 2^63 in practice, so the truncating cast is safe.
-#[allow(dead_code)] // Merge API (see module docs): called by the unit tests here and by S1's `FfiSocket` at merge.
+/// The `SOCKET` / fd value as a table key (a `SOCKET` value
+/// is < 2^63 in practice, so the truncating cast is safe).
+#[allow(dead_code)] // Merge API: called by the unit tests here.
 pub(crate) fn sock_key(fd: RawFd) -> i64 {
     fd as i64
 }
@@ -899,19 +137,21 @@ pub(crate) fn raw_fd_from_key(key: i64) -> RawFd {
 
 /// Create an FFI socket fd (used by the unit tests, the
 /// Windows AF_UNIX probe, and the Winsock `socketpair`;
-/// S1's `FfiSocket::new` is the production path at merge).
-#[allow(dead_code)] // Merge API (see module docs): called by the unit tests here and by S1's `FfiSocket` at merge.
+/// S1's `FfiSocket::new` is the production path).
+/// `domain` is Python-facing (`AF_INET6` 10); it is
+/// translated to the kernel value here.
+#[allow(dead_code)] // Merge API: production use is Windows-only (`winsock_socketpair`); Linux use is the unit tests here.
 pub(crate) fn ffi_socket(domain: i32, ty: i32, proto: i32) -> Result<RawFd, i32> {
-    ffi::sys_socket(domain, ty, proto)
+    ffi::sys_socket(translate_family(domain), ty, proto)
 }
 
 /// Close a raw fd (`close(2)` on Unix, `closesocket` on
 /// Windows — never the other one).
-#[allow(dead_code)] // Merge API (see module docs): called by the unit tests here and by S1's `FfiSocket` at merge.
+#[allow(dead_code)] // Merge API: production use is Windows-only (`winsock_socketpair`); Linux use is the unit tests here.
 pub(crate) fn close_raw(fd: RawFd) -> Result<(), i32> {
     #[cfg(unix)]
     {
-        crate::support::ffi::sys_close(fd)
+        ffi::sys_close(fd)
     }
     #[cfg(windows)]
     {
@@ -919,38 +159,38 @@ pub(crate) fn close_raw(fd: RawFd) -> Result<(), i32> {
     }
 }
 
-/// `sendmsg` (`FfiSocket::sendmsg` at merge): gather the
-/// plain buffers into one message. There is no ancillary
-/// data — the control buffer is always empty (CPython's
-/// `sendmsg` takes no ancillary parameter; the `modsocket`
-/// layer rejects `recvmsg` ancillary requests). `addr` is
-/// the destination for unconnected sockets (`None` sends
-/// to the connected peer). No `EINTR` retry (the existing
-/// `ffi.rs` wrappers do none either).
+/// `sendmsg`: gather the plain buffers into one message.
+/// There is no ancillary data — the control buffer is
+/// always empty (CPython's `sendmsg` takes no ancillary
+/// parameter; the `modsocket` layer rejects `recvmsg`
+/// ancillary requests). `addr` is the destination for
+/// unconnected sockets (`None` sends to the connected
+/// peer). No `EINTR` retry (the existing `ffi.rs` wrappers
+/// do none either).
 pub(crate) fn ffi_sendmsg(
     fd: RawFd,
     bufs: &[&[u8]],
     flags: i32,
-    addr: Option<&AdvAddr>,
+    addr: Option<&SockAddr>,
 ) -> Result<usize, i32> {
-    let (mut storage, addrlen) = match addr {
-        Some(a) => {
-            let (s, l) = a.to_sockaddr();
-            (Some(s), l)
-        }
-        None => (None, 0),
-    };
     #[cfg(unix)]
     {
         let mut iov: Vec<ffi::Iovec> = bufs
             .iter()
             .map(|b| ffi::Iovec {
-                iov_base: b.as_ptr() as *mut u8,
+                iov_base: b.as_ptr() as *mut std::os::raw::c_void,
                 iov_len: b.len(),
             })
             .collect();
-        let (name_ptr, name_len) = match &mut storage {
-            Some(s) => (s.data.as_mut_ptr(), addrlen),
+        let mut storage = ffi::SockaddrStorage::new();
+        let (name_ptr, name_len) = match addr {
+            Some(a) => {
+                let len = a.to_raw(&mut storage);
+                (
+                    storage._inner.as_mut_ptr() as *mut std::os::raw::c_void,
+                    len,
+                )
+            }
             None => (std::ptr::null_mut(), 0),
         };
         // FFI invariant: the `Msghdr` borrows `iov` and
@@ -976,8 +216,15 @@ pub(crate) fn ffi_sendmsg(
                 buf: b.as_ptr() as *mut u8,
             })
             .collect();
-        let (name_ptr, name_len) = match &mut storage {
-            Some(s) => (s.data.as_mut_ptr(), addrlen as i32),
+        let mut storage = ffi::SockaddrStorage::new();
+        let (name_ptr, name_len) = match addr {
+            Some(a) => {
+                let len = a.to_raw(&mut storage);
+                (
+                    storage._inner.as_mut_ptr() as *mut ffi::Sockaddr,
+                    len as i32,
+                )
+            }
             None => (std::ptr::null_mut(), 0),
         };
         // FFI invariant: the `WsaMsg` borrows `wsa_bufs`
@@ -985,7 +232,7 @@ pub(crate) fn ffi_sendmsg(
         let msg = ffi::WsaMsg {
             name: name_ptr,
             namelen: name_len,
-            lp_buffers: wsa_bufs.as_mut_ptr(),
+            buffers: wsa_bufs.as_mut_ptr(),
             buffer_count: wsa_bufs.len() as u32,
             control: ffi::WsaBuf {
                 len: 0,
@@ -993,37 +240,38 @@ pub(crate) fn ffi_sendmsg(
             },
             flags: 0,
         };
-        let mut sent: u32 = 0;
-        ffi::sys_sendmsg(fd, &msg, flags as u32, &mut sent)?;
-        Ok(sent as usize)
+        ffi::sys_sendmsg(fd, &msg, flags as u32)
     }
 }
 
-/// `recvmsg` (`FfiSocket::recvmsg` at merge): scatter one
-/// message into the buffers. Returns `(bytes, address,
-/// msg_flags)`; the address is `None` when the kernel
-/// left the name buffer empty. No ancillary buffer is
-/// requested, so none is ever returned.
+/// `recvmsg`: scatter one message into the buffers.
+/// Returns `(bytes, address, msg_flags)`; the address is
+/// `None` when the kernel left the name buffer empty. No
+/// ancillary buffer is requested, so none is ever returned.
+/// (`flags` is the `recvmsg` input flags on Unix;
+/// `WSARecvMsg` takes no input flags — the message flags
+/// come back in the `WSAMSG` — so it is ignored on
+/// Windows.)
 pub(crate) fn ffi_recvmsg(
     fd: RawFd,
     bufs: &mut [&mut [u8]],
     flags: i32,
-) -> Result<(usize, Option<AdvAddr>, i32), i32> {
+) -> Result<(usize, Option<SockAddr>, i32), i32> {
     #[cfg(unix)]
     {
         let mut iov: Vec<ffi::Iovec> = bufs
             .iter_mut()
             .map(|b| ffi::Iovec {
-                iov_base: b.as_mut_ptr(),
+                iov_base: b.as_mut_ptr() as *mut std::os::raw::c_void,
                 iov_len: b.len(),
             })
             .collect();
-        let mut storage = SockaddrStorage::zeroed();
-        let mut namelen: u32 = storage.data.len() as u32;
+        let mut storage = ffi::SockaddrStorage::new();
+        let mut namelen: u32 = std::mem::size_of::<ffi::SockaddrStorage>() as u32;
         // FFI invariant: the `Msghdr` borrows `iov` and
         // `storage`, which both outlive the call.
         let mut hdr = ffi::Msghdr {
-            msg_name: storage.data.as_mut_ptr(),
+            msg_name: storage._inner.as_mut_ptr() as *mut std::os::raw::c_void,
             msg_namelen: namelen,
             msg_iov: iov.as_mut_ptr(),
             msg_iovlen: iov.len(),
@@ -1034,7 +282,7 @@ pub(crate) fn ffi_recvmsg(
         let n = ffi::sys_recvmsg(fd, &mut hdr, flags)?;
         namelen = hdr.msg_namelen;
         let addr = if namelen > 0 {
-            AdvAddr::from_sockaddr(&storage.data[..namelen as usize])
+            SockAddr::from_raw(&storage, namelen)
         } else {
             None
         };
@@ -1042,6 +290,7 @@ pub(crate) fn ffi_recvmsg(
     }
     #[cfg(windows)]
     {
+        let _ = flags;
         let mut wsa_bufs: Vec<ffi::WsaBuf> = bufs
             .iter_mut()
             .map(|b| ffi::WsaBuf {
@@ -1049,15 +298,15 @@ pub(crate) fn ffi_recvmsg(
                 buf: b.as_mut_ptr(),
             })
             .collect();
-        let mut storage = SockaddrStorage::zeroed();
+        let mut storage = ffi::SockaddrStorage::new();
         // FFI invariant: the `WsaMsg` borrows `wsa_bufs`
         // and `storage`, which both outlive the call; the
         // flags come back in `msg.flags` (WSARecvMsg has
         // no separate flags out-param).
         let mut msg = ffi::WsaMsg {
-            name: storage.data.as_mut_ptr(),
-            namelen: storage.data.len() as i32,
-            lp_buffers: wsa_bufs.as_mut_ptr(),
+            name: storage._inner.as_mut_ptr() as *mut ffi::Sockaddr,
+            namelen: std::mem::size_of::<ffi::SockaddrStorage>() as i32,
+            buffers: wsa_bufs.as_mut_ptr(),
             buffer_count: wsa_bufs.len() as u32,
             control: ffi::WsaBuf {
                 len: 0,
@@ -1065,14 +314,13 @@ pub(crate) fn ffi_recvmsg(
             },
             flags: 0,
         };
-        let mut received: u32 = 0;
-        ffi::sys_recvmsg(fd, &mut msg, &mut received)?;
+        let n = ffi::sys_recvmsg(fd, &mut msg)?;
         let addr = if msg.namelen > 0 {
-            AdvAddr::from_sockaddr(&storage.data[..msg.namelen as usize])
+            SockAddr::from_raw(&storage, msg.namelen as u32)
         } else {
             None
         };
-        Ok((received as usize, addr, msg.flags as i32))
+        Ok((n, addr, msg.flags as i32))
     }
 }
 
@@ -1081,8 +329,8 @@ pub(crate) fn ffi_recvmsg(
 /// must be open; deliberately NO `SO_TYPE` check, so a
 /// non-socket fd (the integration test wraps `/dev/null`)
 /// is accepted. Windows: `getsockopt(SO_TYPE)` — a real
-/// socket is required there (no `/dev/null` equivalent
-/// in the test suite); a non-socket handle fails with
+/// socket is required there (no `/dev/null` equivalent in
+/// the test suite); a non-socket handle fails with
 /// `WSAENOTSOCK` → `ENOTSOCK`.
 pub(crate) fn check_fd_valid(fd: RawFd) -> Result<(), i32> {
     #[cfg(unix)]
@@ -1092,7 +340,7 @@ pub(crate) fn check_fd_valid(fd: RawFd) -> Result<(), i32> {
     #[cfg(windows)]
     {
         let mut val: i32 = 0;
-        let mut len: i32 = std::mem::size_of::<i32>() as i32;
+        let mut len: u32 = std::mem::size_of::<i32>() as u32;
         ffi::sys_getsockopt(
             fd,
             SOL_SOCKET,
@@ -1100,19 +348,19 @@ pub(crate) fn check_fd_valid(fd: RawFd) -> Result<(), i32> {
             &mut val as *mut i32 as *mut u8,
             &mut len,
         )
+        .map(|_| ())
     }
 }
 
-/// Wrap a raw fd in a `File` for the `makefile` FFI
-/// cooperation (the `makefile` FFI arm at merge).
+/// Wrap a raw fd in a `File` for the `makefile` FFI arm
+/// (called by `sock_makefile` in this file).
 ///
 /// # Safety
-/// The caller must have removed the fd from the sockets
-/// table first and must own it: this call transfers
+/// The caller must own the fd: this call transfers
 /// ownership to the returned `File` (closing the `File`
 /// closes the fd; the socket must NOT close it afterwards
 /// — otherwise the fd number is closed twice).
-#[allow(dead_code)] // Merge API (see module docs): called by the unit tests here and by S1's `FfiSocket` at merge.
+#[allow(dead_code)] // Merge API: the tested ownership primitive for the `makefile` FFI arm (`sock_makefile` dups instead, so the socket keeps its fd).
 pub(crate) unsafe fn makefile_file(fd: RawFd) -> File {
     #[cfg(unix)]
     {
@@ -1124,62 +372,54 @@ pub(crate) unsafe fn makefile_file(fd: RawFd) -> File {
     }
 }
 
-/// AF_UNIX `bind(2)` on an FFI fd (the AF_UNIX arm of
-/// `FfiSocket::bind` at merge). `path` is the filesystem
-/// path bytes (empty = unnamed; a leading NUL = abstract
-/// namespace, Linux only).
-#[allow(dead_code)] // Merge API (see module docs): called by the unit tests here and by S1's `FfiSocket` at merge.
+/// AF_UNIX `bind(2)` on an FFI fd. `path` is the
+/// filesystem path bytes (empty = unnamed; a leading NUL =
+/// abstract namespace, Linux only). (S1's `FfiSocket::bind`
+/// covers this for production sockets via the generic
+/// `SockAddr` machinery; this helper is the direct
+/// address-form used by the unit tests.)
+#[allow(dead_code)] // Merge API: unit tests only on Linux; the Windows `socketpair` probe path.
 pub(crate) fn ffi_unix_bind(fd: RawFd, path: &[u8]) -> Result<(), i32> {
-    let addr = AdvAddr::Unix(path.to_vec());
-    let (storage, len) = addr.to_sockaddr();
-    #[cfg(unix)]
-    {
-        ffi::sys_bind(fd, storage.data.as_ptr(), len)
-    }
-    #[cfg(windows)]
-    {
-        ffi::sys_bind(fd, storage.data.as_ptr(), len as i32)
-    }
+    let addr = SockAddr::Unix {
+        path: path.to_vec(),
+    };
+    let mut storage = ffi::SockaddrStorage::new();
+    let len = addr.to_raw(&mut storage);
+    ffi::sys_bind(
+        fd,
+        storage._inner.as_ptr() as *const ffi::Sockaddr,
+        len,
+    )
 }
 
-/// AF_UNIX `connect(2)` on an FFI fd (the AF_UNIX arm of
-/// `FfiSocket::connect` at merge).
-#[allow(dead_code)] // Merge API (see module docs): called by the unit tests here and by S1's `FfiSocket` at merge.
+/// AF_UNIX `connect(2)` on an FFI fd.
+#[allow(dead_code)] // Merge API: unit tests only on Linux.
 pub(crate) fn ffi_unix_connect(fd: RawFd, path: &[u8]) -> Result<(), i32> {
-    let addr = AdvAddr::Unix(path.to_vec());
-    let (storage, len) = addr.to_sockaddr();
-    #[cfg(unix)]
-    {
-        ffi::sys_connect(fd, storage.data.as_ptr(), len)
-    }
-    #[cfg(windows)]
-    {
-        ffi::sys_connect(fd, storage.data.as_ptr(), len as i32)
-    }
+    let addr = SockAddr::Unix {
+        path: path.to_vec(),
+    };
+    let mut storage = ffi::SockaddrStorage::new();
+    let len = addr.to_raw(&mut storage);
+    ffi::sys_connect(
+        fd,
+        storage._inner.as_ptr() as *const ffi::Sockaddr,
+        len,
+    )
 }
 
-/// AF_UNIX `accept(2)` on an FFI fd (the AF_UNIX arm of
-/// `FfiSocket::accept` at merge). Returns the new fd and
-/// the peer address (`Unix(vec![])` when unnamed).
-#[allow(dead_code)] // Merge API (see module docs): called by the unit tests here and by S1's `FfiSocket` at merge.
-pub(crate) fn ffi_unix_accept(fd: RawFd) -> Result<(RawFd, AdvAddr), i32> {
-    let mut storage = SockaddrStorage::zeroed();
-    #[cfg(unix)]
-    {
-        let mut len: u32 = storage.data.len() as u32;
-        let new_fd = ffi::sys_accept(fd, storage.data.as_mut_ptr(), &mut len)?;
-        let addr = AdvAddr::from_sockaddr(&storage.data[..len as usize])
-            .unwrap_or(AdvAddr::Unix(Vec::new()));
-        Ok((new_fd, addr))
-    }
-    #[cfg(windows)]
-    {
-        let mut len: i32 = storage.data.len() as i32;
-        let new_fd = ffi::sys_accept(fd, storage.data.as_mut_ptr(), &mut len)?;
-        let addr = AdvAddr::from_sockaddr(&storage.data[..len as usize])
-            .unwrap_or(AdvAddr::Unix(Vec::new()));
-        Ok((new_fd, addr))
-    }
+/// AF_UNIX `accept(2)` on an FFI fd. Returns the new fd
+/// and the peer address (`Unix { path: [] }` when unnamed).
+#[allow(dead_code)] // Merge API: unit tests only on Linux.
+pub(crate) fn ffi_unix_accept(fd: RawFd) -> Result<(RawFd, SockAddr), i32> {
+    let mut storage = ffi::SockaddrStorage::new();
+    let mut len: u32 = std::mem::size_of::<ffi::SockaddrStorage>() as u32;
+    let new_fd = ffi::sys_accept(
+        fd,
+        storage._inner.as_mut_ptr() as *mut ffi::Sockaddr,
+        &mut len,
+    )?;
+    let addr = SockAddr::from_raw(&storage, len).unwrap_or(SockAddr::Unix { path: Vec::new() });
+    Ok((new_fd, addr))
 }
 
 /// AF_UNIX support probe. Unix: always true (`AF_UNIX`
@@ -1187,7 +427,7 @@ pub(crate) fn ffi_unix_accept(fd: RawFd) -> Result<(RawFd, AdvAddr), i32> {
 /// `AF_UNIX` socket — success (Win10 1803+) means the
 /// Winsock AF_UNIX path works, failure means keep the
 /// existing `NotImplementedError`.
-#[allow(dead_code)] // Merge API (see module docs): called by the unit tests here and by S1's `FfiSocket` at merge.
+#[allow(dead_code)] // Merge API: called by the unit tests here.
 pub(crate) fn af_unix_supported() -> bool {
     #[cfg(unix)]
     {
@@ -1239,19 +479,27 @@ pub(crate) fn winsock_socketpair() -> Result<(RawFd, RawFd), i32> {
     // Listener on 127.0.0.1:0.
     let listener = ffi_socket(AF_INET, SOCK_STREAM, 0)?;
     let bind_res = (|| -> Result<u16, i32> {
-        let addr = AdvAddr::Inet(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            0,
-        ));
-        let (storage, len) = addr.to_sockaddr();
-        ffi::sys_bind(listener, storage.data.as_ptr(), len as i32)?;
-        let mut bound = SockaddrStorage::zeroed();
-        let mut bound_len: i32 = bound.data.len() as i32;
-        ffi::sys_getsockname(listener, bound.data.as_mut_ptr(), &mut bound_len)?;
-        let bound_addr = AdvAddr::from_sockaddr(&bound.data[..bound_len as usize])
-            .ok_or(22 /* EINVAL */)?;
+        let addr = SockAddr::Inet {
+            ip: Ipv4Addr::new(127, 0, 0, 1),
+            port: 0,
+        };
+        let mut storage = ffi::SockaddrStorage::new();
+        let len = addr.to_raw(&mut storage);
+        ffi::sys_bind(
+            listener,
+            storage._inner.as_ptr() as *const ffi::Sockaddr,
+            len,
+        )?;
+        let mut bound = ffi::SockaddrStorage::new();
+        let mut bound_len: u32 = std::mem::size_of::<ffi::SockaddrStorage>() as u32;
+        ffi::sys_getsockname(
+            listener,
+            bound._inner.as_mut_ptr() as *mut ffi::Sockaddr,
+            &mut bound_len,
+        )?;
+        let bound_addr = SockAddr::from_raw(&bound, bound_len).ok_or(22 /* EINVAL */)?;
         match bound_addr {
-            AdvAddr::Inet(a) => Ok(a.port()),
+            SockAddr::Inet { port, .. } => Ok(port),
             _ => Err(22 /* EINVAL */),
         }
     })();
@@ -1274,20 +522,25 @@ pub(crate) fn winsock_socketpair() -> Result<(RawFd, RawFd), i32> {
             return Err(e);
         }
     };
-    let peer = AdvAddr::Inet(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+    let peer = SockAddr::Inet {
+        ip: Ipv4Addr::new(127, 0, 0, 1),
         port,
-    ));
-    let (storage, len) = peer.to_sockaddr();
-    if let Err(e) = ffi::sys_connect(client, storage.data.as_ptr(), len as i32) {
+    };
+    let mut storage = ffi::SockaddrStorage::new();
+    let len = peer.to_raw(&mut storage);
+    if let Err(e) = ffi::sys_connect(
+        client,
+        storage._inner.as_ptr() as *const ffi::Sockaddr,
+        len,
+    ) {
         let _ = close_raw(client);
         let _ = close_raw(listener);
         return Err(e);
     }
     // Accept with a deadline: listener non-blocking, poll
     // with Winsock `select` until readable or 5 s pass.
-    let mut one: u32 = 1;
-    if let Err(e) = ffi::sys_ioctlsocket(listener, FIONBIO, &mut one) {
+    let one: u32 = 1;
+    if let Err(e) = ffi::sys_ioctlsocket(listener, FIONBIO, one) {
         let _ = close_raw(client);
         let _ = close_raw(listener);
         return Err(e);
@@ -1295,16 +548,13 @@ pub(crate) fn winsock_socketpair() -> Result<(RawFd, RawFd), i32> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let accepted = loop {
         let mut set = ffi::FdSet {
-            fd_count: 1,
-            fd_array: [0usize; 64],
+            count: 1,
+            sockets: [0usize; 64],
         };
-        set.fd_array[0] = listener;
-        let tv = ffi::Timeval {
-            tv_sec: 0,
-            tv_usec: 100_000,
-        };
-        match ffi::sys_select(&mut set, std::ptr::null_mut(), std::ptr::null_mut(), &tv) {
-            Ok(n) if n > 0 => break,
+        set.sockets[0] = listener;
+        match ffi::sys_select(Some(&mut set), None, None, Some(100)) {
+            // Readable: fall through to the `accept` below.
+            Ok(n) if n > 0 => {}
             Ok(_) => {
                 if Instant::now() >= deadline {
                     let _ = close_raw(client);
@@ -1318,15 +568,22 @@ pub(crate) fn winsock_socketpair() -> Result<(RawFd, RawFd), i32> {
                 return Err(e);
             }
         }
-        let mut storage = SockaddrStorage::zeroed();
-        let mut len: i32 = storage.data.len() as i32;
-        match ffi::sys_accept(listener, storage.data.as_mut_ptr(), &mut len) {
+        let mut storage = ffi::SockaddrStorage::new();
+        let mut len: u32 = std::mem::size_of::<ffi::SockaddrStorage>() as u32;
+        match ffi::sys_accept(
+            listener,
+            storage._inner.as_mut_ptr() as *mut ffi::Sockaddr,
+            &mut len,
+        ) {
             Ok(fd) => break fd,
             Err(e) => {
-                // EAGAIN while the connection is still
+                // `EAGAIN` while the connection is still
                 // being queued: keep polling until the
-                // deadline; any other error fails.
-                if e == 11 /* EAGAIN */ && Instant::now() < deadline {
+                // deadline; any other error fails. (The
+                // raw Winsock code is mapped first —
+                // `WSAEWOULDBLOCK` 10035 → `EAGAIN` 11.)
+                let e_posix = crate::runtime::modos::win32_to_errno(e);
+                if e_posix == 11 /* EAGAIN */ && Instant::now() < deadline {
                     continue;
                 }
                 let _ = close_raw(client);
@@ -1336,9 +593,9 @@ pub(crate) fn winsock_socketpair() -> Result<(RawFd, RawFd), i32> {
         }
     };
     // Both ends back to blocking.
-    let mut zero: u32 = 0;
-    if let Err(e) = ffi::sys_ioctlsocket(accepted, FIONBIO, &mut zero)
-        .and_then(|_| ffi::sys_ioctlsocket(client, FIONBIO, &mut zero))
+    let zero: u32 = 0;
+    if let Err(e) = ffi::sys_ioctlsocket(accepted, FIONBIO, zero)
+        .and_then(|_| ffi::sys_ioctlsocket(client, FIONBIO, zero))
     {
         let _ = close_raw(accepted);
         let _ = close_raw(client);
@@ -1347,6 +604,277 @@ pub(crate) fn winsock_socketpair() -> Result<(RawFd, RawFd), i32> {
     }
     let _ = close_raw(listener);
     Ok((client, accepted))
+}
+
+// ── Moved from `modsocket.rs` (merge split) ──────────────────────────
+// These live here so `modsocket.rs` stays under the 2500-line cap.
+// They use `modsocket.rs` / `modsocket_ffi.rs` internals (`pub(crate)`
+// there) and S1's `SockAddr` / `FfiSocket`.
+
+/// `socket.fromfd` under `unsafe-ffi` (S3). The fd is taken
+/// as-is — NOT dup'd (the integration test
+/// `socket_fromfd_wraps_fd` requires `fileno() == fd`) —
+/// and is NOT checked for socket-ness (the test wraps a
+/// `/dev/null` fd); only liveness is checked (`EBADF` for
+/// an invalid fd, via `check_fd_valid`). The fd is wrapped
+/// in S1's `FfiSocket` (real fd at construction, fileno
+/// stable), so the FFI method arms apply to it.
+pub(crate) fn socket_fromfd_ffi(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    let fd = int_arg(ctx, args[0])?;
+    let family = int_arg(ctx, args[1])? as i32;
+    let type_ = int_arg(ctx, args[2])? as i32;
+    let proto = match args.get(3) {
+        Some(v) => int_arg(ctx, *v)? as i32,
+        None => 0,
+    };
+    match family {
+        AF_UNIX | AF_INET | AF_INET6 => {}
+        _ => return Err(raise_os_error(ctx, EAFNOSUPPORT)),
+    }
+    match type_ {
+        SOCK_STREAM | SOCK_DGRAM => {}
+        _ => return Err(raise_os_error(ctx, EINVAL)),
+    }
+    #[cfg(windows)]
+    if family == AF_UNIX {
+        // The Winsock AF_UNIX path is probed at runtime
+        // (`af_unix_supported`); a fromfd AF_UNIX socket
+        // stays unimplemented there.
+        ctx.record_raise(
+            "NotImplementedError",
+            Some("socket.fromfd(AF_UNIX) is not implemented on Windows"),
+        );
+        return Err(PyError::PyRaise);
+    }
+    let raw = raw_fd_from_key(fd);
+    check_fd_valid(raw).map_err(|e| ffi_os_error(ctx, e))?;
+    let state = SocketState::Ffi(FfiSocket::from_raw(raw, family, type_, proto));
+    let key = sock_key_of(&state);
+    sockets().insert(key, state);
+    alloc_socket(ctx, key, family, type_, proto)
+}
+
+/// Resolve the real fd for `sendmsg`/`recvmsg` (FFI lane,
+/// S3). Bound/connected sockets use their stored fd; an
+/// unbound INET datagram uses the placeholder (CPython
+/// auto-binds an unbound UDP socket the same way); an
+/// unbound AF_UNIX datagram swaps in a real unbound
+/// `UnixDatagram` first — the placeholder is an AF_INET UDP
+/// socket, and sending a `sockaddr_un` to it is
+/// `EAFNOSUPPORT` (the kernel rejects the family). An
+/// unbound stream socket is `EINVAL`, a listener is
+/// `listener_err` (`ENOTCONN` for sends, `EINVAL` for
+/// receives — the `sock_send` / `sock_recv` shapes).
+fn msg_fd(
+    ctx: &mut CallCtx,
+    r: GcRef,
+    fd: TableKey,
+    fields: [i32; 3],
+    listener_err: i32,
+) -> PyResult<RawFd> {
+    if fd < 0 {
+        return Err(raise_os_error(ctx, EBADF));
+    }
+    let (family, type_) = (fields[0], fields[1]);
+    // Classify the stored state. The lock is released
+    // before any swap — `swap_in` re-locks the table.
+    enum Action {
+        Use(RawFd),
+        SwapUnixDgram,
+        Fail(i32),
+    }
+    let action = {
+        let table = sockets();
+        match table.get(&fd) {
+            None => Action::Fail(EBADF),
+            Some(s) if s.is_listener() => Action::Fail(listener_err),
+            Some(SocketState::Unbound(_)) if type_ == SOCK_STREAM => Action::Fail(EINVAL),
+            Some(SocketState::Unbound(_)) if family == AF_UNIX => {
+                #[cfg(unix)]
+                {
+                    Action::SwapUnixDgram
+                }
+                #[cfg(not(unix))]
+                {
+                    Action::Fail(EAFNOSUPPORT)
+                }
+            }
+            Some(SocketState::Unbound(_)) => Action::Use(raw_fd_from_key(fd)),
+            Some(s) => Action::Use(raw_fd_from_key(sock_key_of(s))),
+        }
+    };
+    match action {
+        Action::Fail(e) => Err(raise_os_error(ctx, e)),
+        Action::Use(raw) => Ok(raw),
+        Action::SwapUnixDgram => {
+            #[cfg(unix)]
+            {
+                let d = UnixDatagram::unbound().map_err(|e| io_os_error(ctx, e))?;
+                let new_key = swap_in(ctx, r, fd, SocketState::DatagramUnix(d));
+                Ok(raw_fd_from_key(new_key))
+            }
+            #[cfg(not(unix))]
+            {
+                Err(raise_os_error(ctx, EAFNOSUPPORT))
+            }
+        }
+    }
+}
+
+/// `sock.sendmsg(buffers[, flags[, address]]) -> int` (FFI
+/// lane, S3): gather-send via `sendmsg(2)`. `buffers` is a
+/// list/tuple of bytes-like; `flags` defaults to 0;
+/// `address` is an `(host, port)` tuple for INET or a path
+/// for UNIX. No ancillary data (CPython's `sendmsg` takes
+/// none — the control buffer is always empty).
+pub(crate) fn sock_sendmsg(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    let (r, fd, fields) = self_socket(ctx, args)?;
+    if fd < 0 {
+        return Err(raise_os_error(ctx, EBADF));
+    }
+    // Copy the buffer values out first: `list_items` /
+    // `tuple_items` borrow `ctx` and `str_arg` needs `&mut ctx`.
+    let items: Vec<Value> = match list_items(ctx, args[1]) {
+        Some(items) => items.to_vec(),
+        None => match tuple_items(ctx, args[1]) {
+            Some(items) => items.to_vec(),
+            None => {
+                ctx.record_raise(
+                    "TypeError",
+                    Some("sendmsg buffers must be a list or tuple"),
+                );
+                return Err(PyError::PyRaise);
+            }
+        },
+    };
+    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+    for v in items {
+        bufs.push(str_arg(ctx, v)?);
+    }
+    let bufs_ref: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
+    let flags = match args.get(2) {
+        Some(v) => int_arg(ctx, *v)? as i32,
+        None => 0,
+    };
+    let addr = match args.get(3) {
+        Some(v) if *v != Value::None => Some(parse_target(ctx, *v, fields[0])?),
+        _ => None,
+    };
+    let raw = msg_fd(ctx, r, fd, fields, ENOTCONN)?;
+    let n = ffi_sendmsg(raw, &bufs_ref, flags, addr.as_ref())
+        .map_err(|e| ffi_os_error(ctx, e))?;
+    Ok(small(n as i64))
+}
+
+/// `sock.recvmsg(bufsize[, ancbufsize[, flags]]) ->
+/// (bytes, ancdata, msg_flags, address)` (FFI lane, S3).
+/// `ancbufsize != 0` is `NotImplementedError` (no ancillary
+/// data support — never silently dropped); the returned
+/// ancillary list is always empty.
+pub(crate) fn sock_recvmsg(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    let (r, fd, fields) = self_socket(ctx, args)?;
+    let n_signed = int_arg(ctx, args[1])?;
+    if fd < 0 {
+        return Err(raise_os_error(ctx, EBADF));
+    }
+    if n_signed < 0 {
+        return Err(raise_os_error(ctx, EINVAL));
+    }
+    if n_signed > MAX_RECV {
+        return Err(malloc_fail(ctx));
+    }
+    let ancbufsize = match args.get(2) {
+        Some(v) => int_arg(ctx, *v)?,
+        None => 0,
+    };
+    if ancbufsize != 0 {
+        ctx.record_raise(
+            "NotImplementedError",
+            Some("recvmsg ancillary data is not implemented"),
+        );
+        return Err(PyError::PyRaise);
+    }
+    let flags = match args.get(3) {
+        Some(v) => int_arg(ctx, *v)? as i32,
+        None => 0,
+    };
+    let mut buf = vec![0u8; n_signed as usize];
+    let raw = msg_fd(ctx, r, fd, fields, EINVAL)?;
+    let (got, addr, msg_flags) =
+        ffi_recvmsg(raw, &mut [&mut buf[..]], flags).map_err(|e| ffi_os_error(ctx, e))?;
+    buf.truncate(got);
+    let data = new_bytes(ctx, ctx.types, &buf);
+    let ancdata = Value::Heap(new_list(ctx, ctx.types.list, &[]));
+    let addr_v = match addr {
+        Some(a) => sockaddr_value(ctx, &a),
+        None => Value::None,
+    };
+    let tuple = new_tuple(
+        ctx,
+        ctx.types.tuple,
+        &[data, ancdata, small(msg_flags as i64), addr_v],
+    );
+    Ok(Value::Heap(tuple))
+}
+
+/// `sock.detach() -> int` (FFI lane, S3): remove the socket
+/// from the table WITHOUT closing it and return the raw fd;
+/// the instance's fd becomes -1 (CPython). The caller owns
+/// the fd afterwards.
+pub(crate) fn sock_detach(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
+    let (r, fd, _fields) = self_socket(ctx, args)?;
+    if fd < 0 {
+        return Err(raise_os_error(ctx, EBADF));
+    }
+    // `IntoRawFd` / `IntoRawSocket` are safe: they transfer
+    // ownership of the number out of the owned object without
+    // closing it. (Dropping the state instead would CLOSE the
+    // fd — exactly what `detach` must not do.) The FFI arm
+    // sets `closed` so the `FfiSocket` drop skips its close.
+    let raw: TableKey = {
+        let mut table = sockets();
+        let Some(state) = table.remove(&fd) else {
+            return Err(raise_os_error(ctx, EBADF));
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::IntoRawFd;
+            match state {
+                SocketState::Unbound(u) | SocketState::Datagram(u) => {
+                    u.into_raw_fd() as TableKey
+                }
+                SocketState::ListenerTcp(l) => l.into_raw_fd() as TableKey,
+                SocketState::ListenerUnix(l) => l.into_raw_fd() as TableKey,
+                SocketState::StreamTcp(s) => s.into_raw_fd() as TableKey,
+                SocketState::StreamUnix(s) => s.into_raw_fd() as TableKey,
+                SocketState::DatagramUnix(d) => d.into_raw_fd() as TableKey,
+                SocketState::Ffi(mut f) => {
+                    let raw = f.fd as TableKey;
+                    f.closed = true;
+                    raw
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::IntoRawSocket;
+            match state {
+                SocketState::Unbound(u) | SocketState::Datagram(u) => {
+                    u.into_raw_socket() as TableKey
+                }
+                SocketState::ListenerTcp(l) => l.into_raw_socket() as TableKey,
+                SocketState::StreamTcp(s) => s.into_raw_socket() as TableKey,
+                SocketState::Ffi(mut f) => {
+                    let raw = f.fd as TableKey;
+                    f.closed = true;
+                    raw
+                }
+            }
+        }
+    };
+    settings().remove(&fd);
+    set_fd(ctx, r, -1);
+    Ok(small(raw))
 }
 
 #[cfg(test)]
@@ -1401,7 +929,9 @@ mod tests {
         let client_path_bytes = client_path.as_os_str().as_encoded_bytes();
         let client = ffi_socket(AF_UNIX, SOCK_DGRAM, 0).expect("socket");
         ffi_unix_bind(client, client_path_bytes).expect("bind client");
-        let dest = AdvAddr::Unix(path_bytes.to_vec());
+        let dest = SockAddr::Unix {
+            path: path_bytes.to_vec(),
+        };
         let n = ffi_sendmsg(client, &[b"hi"], 0, Some(&dest)).expect("sendmsg");
         assert_eq!(n, 2);
         let mut buf = [0u8; 2];
@@ -1410,7 +940,12 @@ mod tests {
         assert_eq!(got, 2);
         assert_eq!(&buf, b"hi");
         // The sender is the bound client datagram socket.
-        assert_eq!(addr, Some(AdvAddr::Unix(client_path_bytes.to_vec())));
+        assert_eq!(
+            addr,
+            Some(SockAddr::Unix {
+                path: client_path_bytes.to_vec()
+            })
+        );
         close_raw(client).expect("close client");
         close_raw(server).expect("close server");
         std::fs::remove_file(&path).expect("remove socket file");
@@ -1511,31 +1046,41 @@ mod tests {
         assert_eq!(check_fd_valid(fd), Err(9 /* EBADF */));
     }
 
-    /// `AdvAddr` round-trips through raw `sockaddr` bytes.
+    /// `SockAddr` round-trips through raw `sockaddr` bytes.
     #[test]
-    fn adv_addr_roundtrip() {
-        let v4 = AdvAddr::Inet(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            8080,
-        ));
-        let (st, len) = v4.to_sockaddr();
-        assert_eq!(AdvAddr::from_sockaddr(&st.data[..len as usize]), Some(v4));
-        let v6 = AdvAddr::Inet6(SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
-            443,
-        ));
-        let (st, len) = v6.to_sockaddr();
-        assert_eq!(AdvAddr::from_sockaddr(&st.data[..len as usize]), Some(v6));
-        let un = AdvAddr::Unix(b"/tmp/x.sock".to_vec());
-        let (st, len) = un.to_sockaddr();
-        assert_eq!(AdvAddr::from_sockaddr(&st.data[..len as usize]), Some(un));
-        let unnamed = AdvAddr::Unix(Vec::new());
-        let (st, len) = unnamed.to_sockaddr();
-        assert_eq!(len, 2);
-        assert_eq!(
-            AdvAddr::from_sockaddr(&st.data[..len as usize]),
-            Some(unnamed)
-        );
+    fn sockaddr_roundtrip() {
+        let v4 = SockAddr::Inet {
+            ip: Ipv4Addr::new(127, 0, 0, 1),
+            port: 8080,
+        };
+        let mut st = ffi::SockaddrStorage::new();
+        let len = v4.to_raw(&mut st);
+        assert_eq!(SockAddr::from_raw(&st, len), Some(v4));
+        let v6 = SockAddr::Inet6 {
+            ip: Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1),
+            port: 443,
+            flowinfo: 0,
+            scope_id: 0,
+        };
+        let mut st = ffi::SockaddrStorage::new();
+        let len = v6.to_raw(&mut st);
+        assert_eq!(SockAddr::from_raw(&st, len), Some(v6));
+        let un = SockAddr::Unix {
+            path: b"/tmp/x.sock".to_vec(),
+        };
+        let mut st = ffi::SockaddrStorage::new();
+        let len = un.to_raw(&mut st);
+        assert_eq!(SockAddr::from_raw(&st, len), Some(un));
+        let unnamed = SockAddr::Unix { path: Vec::new() };
+        let mut st = ffi::SockaddrStorage::new();
+        let len = unnamed.to_raw(&mut st);
+        // S1's `len_for` counts family + path + NUL
+        // terminator, so an unnamed address serialises to
+        // 3 bytes (it is never passed to `bind` / `connect`
+        // in production — there is nothing to bind to).
+        assert_eq!(len, 3);
+        // The kernel reports an unnamed peer with `len` 0.
+        assert_eq!(SockAddr::from_raw(&st, 0), Some(unnamed));
     }
 
     /// `sock_key` / `raw_fd_from_key` round-trip.

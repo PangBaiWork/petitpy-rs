@@ -540,6 +540,11 @@ fn h_select_socket_object_never_ready() {
     // `fileno()` (the `self_socket` shape) — and, like any
     // socket fd, is never ready in pure `std` (see the
     // module docs). Both the object and the bare fd.
+    // Under `unsafe-ffi` (S3) the socket probe is a real
+    // `poll(2)`, which reports an unconnected stream
+    // socket as readable — the CPython answer (verified:
+    // CPython `select` on an unbound `AF_UNIX` stream
+    // socket returns it) — so the feature build expects 1.
     let mut fx = Fx::new();
     fx.run_ok(
         "import socket, select\n\
@@ -550,8 +555,11 @@ fn h_select_socket_object_never_ready() {
          b = len(r)\n\
          s.close()\n",
     );
-    assert_eq!(fx.g_int("a"), 0);
-    assert_eq!(fx.g_int("b"), 0);
+    // Default: never ready (0). Feature (`unsafe-ffi`):
+    // `poll(2)` reports the unconnected socket (1).
+    let expected = if cfg!(feature = "unsafe-ffi") { 1 } else { 0 };
+    assert_eq!(fx.g_int("a"), expected);
+    assert_eq!(fx.g_int("b"), expected);
 }
 
 #[test]

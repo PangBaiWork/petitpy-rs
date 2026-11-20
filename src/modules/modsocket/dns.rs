@@ -182,6 +182,33 @@ const EAI_MEMORY: i32 = 10055;
 #[cfg(unix)]
 const EAI_SYSTEM: i32 = -11;
 
+/// Raw `getaddrinfo` return codes, per platform — used
+/// ONLY to match the C library's return in
+/// `ffi_getaddrinfo` (below). glibc / bionic return the
+/// negative values (the `EAI_*` consts above); Darwin
+/// returns the BSD values (`EAI_NONAME` 2, `EAI_SERVICE`
+/// 8 — Build #22: an unknown service came back as `8`
+/// on macOS, which matched neither `-2` nor `-8`, so
+/// the retry below never fired); Winsock returns its own
+/// codes (already the `EAI_*` consts above). The RAISED
+/// error is the canonical `-2` (`EAI_NONAME_CANON`),
+/// not the raw code — the pinned contract
+/// (`socket_getaddrinfo`: unknown service is
+/// `OSError(-2)` on every platform, like the hardcoded
+/// `EAFNOSUPPORT` 97). (`modsocket.rs` has its own
+/// `EAI_NONAME` const, but it is feature-off only, so
+/// this module defines the canonical value here.)
+#[cfg(all(feature = "unsafe-ffi", target_os = "macos"))]
+const EAI_NONAME_RAW: i32 = 2;
+#[cfg(all(feature = "unsafe-ffi", target_os = "macos"))]
+const EAI_SERVICE_RAW: i32 = 8;
+#[cfg(all(feature = "unsafe-ffi", not(target_os = "macos")))]
+const EAI_NONAME_RAW: i32 = EAI_NONAME;
+#[cfg(all(feature = "unsafe-ffi", not(target_os = "macos")))]
+const EAI_SERVICE_RAW: i32 = EAI_SERVICE;
+#[cfg(feature = "unsafe-ffi")]
+const EAI_NONAME_CANON: i32 = -2;
+
 /// `SOMAXCONN` (the `listen` backlog default):
 /// 128 on Unix, `0x7fffffff` on Windows (Winsock).
 #[cfg(unix)]
@@ -474,9 +501,15 @@ fn ffi_getaddrinfo(
     // the other `getaddrinfo_owned` call sites that pass
     // only those need no translation.)
     let kernel_family = translate_family(family);
-    match getaddrinfo_owned(node, service, kernel_family, socktype, proto, flags) {
+    // Build #22: the retry below matches the RAW return
+    // codes (`EAI_*_RAW` — Darwin 2/8, glibc -2/-8,
+    // Winsock 11001/10109), and the raised error is the
+    // canonical `-2` (`EAI_NONAME_CANON`) on every
+    // platform — not the raw code (macOS returned `8`,
+    // Windows would return `11001`).
+    let r = match getaddrinfo_owned(node, service, kernel_family, socktype, proto, flags) {
         Ok(v) => Ok(v),
-        Err(e) if service_is_name && (e == EAI_NONAME || e == EAI_SERVICE) => {
+        Err(e) if service_is_name && (e == EAI_NONAME_RAW || e == EAI_SERVICE_RAW) => {
             // The C resolver does not know this service
             // name (or not for this socktype); retry
             // through the built-in 9-entry table (the
@@ -490,11 +523,22 @@ fn ffi_getaddrinfo(
                     proto,
                     flags,
                 ),
-                None => Err(EAI_NONAME),
+                None => Err(EAI_NONAME_CANON),
             }
         }
         Err(e) => Err(e),
-    }
+    };
+    // An unknown host (numeric service) surfaces the raw
+    // `EAI_NONAME` too — canonicalize it to the same
+    // `-2` at this boundary, so the raised error is
+    // uniform on every platform.
+    r.map_err(|e| {
+        if e == EAI_NONAME_RAW {
+            EAI_NONAME_CANON
+        } else {
+            e
+        }
+    })
 }
 
 /// `socket.getaddrinfo(host, port[, family[, type[,

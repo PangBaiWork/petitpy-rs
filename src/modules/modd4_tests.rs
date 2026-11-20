@@ -417,8 +417,23 @@ fn h_select_listener_never_ready() {
     let _ = std::fs::remove_file(&path);
     let client_path = path.clone();
     let handle = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        let _ = UnixStream::connect(&client_path);
+        // Retry until connected (the `socketpair` pattern
+        // in `modsocket_tests.rs`): the main thread may
+        // take >100ms to reach `bind`/`listen` (VM
+        // creation + compile) on a slow runner, and a
+        // single connect at a fixed 100ms then fails with
+        // ENOENT before the listener exists — Build #22,
+        // macOS aarch64 (the one-shot connect raced
+        // `Fx::new`, so no connection ever arrived and
+        // the select saw 0). The stream is dropped on
+        // connect, as before — the pending connection
+        // still reports readable.
+        for _ in 0..200 {
+            match UnixStream::connect(&client_path) {
+                Ok(_) => break,
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
     });
     let mut fx = Fx::new();
     // No `accept()` here: the listener is non-blocking and the

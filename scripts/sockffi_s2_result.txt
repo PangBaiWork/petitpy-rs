@@ -1,0 +1,263 @@
+Lane S2 — socket FFI: DNS / service / address tools — RESULT
+==============================================================
+Worktree: /home/hatch/workspace/petitpy-rs-sock-s2
+Branch:   lane/socket-ffi-s2 (base b12c2d2)
+Date:     2026-11-20
+Status:   DONE — one commit, not pushed (per brief).
+
+§1 Files changed
+----------------
+NEW  src/support/ffi_dns.rs          (878 lines)
+NEW  src/modules/modsocket/dns.rs    (2275 lines)
+NEW  tests/sockffi_dns.rs            (398 lines)
+MOD  src/modules/modsocket.rs        (2463 -> 2421 lines, under the 2500 cap)
+MOD  src/modules/modsocket_tests.rs  (socket_no_unshipped -> socket_dns_shipped)
+MOD  src/runtime/modos.rs            (win32_to_errno made pub(crate), 1 word)
+MOD  src/support/mod.rs              (pub mod ffi_dns, 1 line)
+
+What each file does
+-------------------
+- ffi_dns.rs (§2.2): raw `extern "C"` declarations (cfg'd Unix /
+  Windows) + safe wrappers returning `Result<_, i32>`:
+  sys_getaddrinfo / sys_freeaddrinfo / sys_getnameinfo /
+  sys_gethostname / sys_getservbyname / sys_getservbyport /
+  sys_inet_pton / sys_inet_ntop / sys_inet_aton (Unix only) /
+  sys_inet_ntoa; plus owned helpers (AddrInfoList RAII Drop
+  guard freeing the getaddrinfo list; getaddrinfo_owned,
+  getnameinfo_owned, gethostname_owned, getservbyname_owned,
+  getservbyport_owned, inet_pton_owned / inet_ntop_owned /
+  inet_aton_owned / inet_ntoa_owned). 24 `unsafe {` blocks,
+  ALL inside these FFI wrappers. hton* are pure-Rust
+  byte swaps (no FFI). `Err(0)` sentinel for "invalid
+  string" from inet_pton / inet_aton (they return 0
+  without setting errno).
+- dns.rs (§3 S2): the module functions + constants, as a
+  child module of modsocket so it uses modsocket.rs's
+  private helpers via `super::` (avoids ~30 pub(crate)
+  changes and keeps modsocket.rs under the cap):
+  getaddrinfo (FFI path; 5-tuple, canonname '', type/proto
+  echoed), gethostbyname / gethostbyname_ex / gethostbyaddr /
+  getnameinfo / gethostname / getfqdn, getservbyname /
+  getservbyport (FFI first, then the 9-entry built-in
+  table, then error — table NOT deleted),
+  create_connection / create_server (+ kw adapters),
+  getdefaulttimeout / setdefaulttimeout, socketpair,
+  htonl/htons/ntohl/ntohs, inet_aton/inet_ntoa/inet_pton/
+  inet_ntop; AI_*/NI_*/EAI_*/SOMAXCONN/SO_REUSEPORT/
+  IPPROTO_IPV6/IPV6_V6ONLY constants (cfg-correct).
+  Also holds the moved feature-off `socket_getaddrinfo_std`
+  and the new `sock_getsockname` / `sock_getpeername`
+  methods (see §4) so modsocket.rs stays under 2500.
+- modsocket.rs: `mod dns;` + getaddrinfo dispatch
+  (feature on -> dns::socket_getaddrinfo_ffi, off ->
+  dns::socket_getaddrinfo_std) + register_dns_functions
+  call in build_socket_module + socket_ctor applies the
+  module default timeout (dns::apply_default_timeout) +
+  migrate_settings deadlock fix (see §4) + getsockname/
+  getpeername registrations (pointing at dns::).
+- modsocket_tests.rs: `socket_no_unshipped` (pinned
+  gethostname/gethostbyname ABSENT) replaced by
+  `socket_dns_shipped` (pins the S2 surface PRESENT) —
+  the old test is obsolete now that S2 ships them.
+- modos.rs: `win32_to_errno` made `pub(crate)` (brief
+  §1.2: reuse it for the Windows errno mapping).
+- tests/sockffi_dns.rs (`#![cfg(feature = "unsafe-ffi")]`):
+  10 tests, localhost only, Rust std thread as peer.
+
+§2 Test commands + counts (all on this VM, release unless noted)
+---------------------------------------------------------------
+cargo check --all-targets (both builds): 0 errors, 0 new
+  warnings (only the 2 pre-existing tests/h_subprocess.rs
+  unused-`mut` warnings).
+
+DEFAULT build (feature OFF) — zero regression:
+  cargo test --release --lib
+      1771 passed, 0 failed, 2 ignored  (= baseline)
+  cargo test --lib (debug)
+      1761 passed, 10 failed, 2 ignored (= baseline;
+      the 10 are the known debug_assert set: dict x2,
+      primitives x2, round_builtin, mpz_ops x4, probe x1)
+  cargo test --release --test entry_cli --test h_socket
+      --test h_subprocess --test h_select --test g6b_socksub
+      --test p14_stdout
+      entry_cli 45/45, h_select 10/10, h_socket 7/1
+      (1 ignored, pre-existing UDP), h_subprocess 8/8,
+      p14_stdout 3/3, g6b_socksub 1/1 — all green
+  scripts/run_full_gate.py        545/552 GREEN
+  scripts/run_integration.py      201/202 (only
+      socket_fromfd_wraps_fd — the intentional fromfd
+      drop, S3's scope)
+  scripts/run_golden.py           585/585
+  scripts/run_capability.py       GREEN (baseline)
+  scripts/run_stdlib.py           8/8
+  scripts/run_nano.py             454/541 (baseline, report-only)
+  scripts/check_compile_mpy.py    PASS (0 failures, 0 mismatches)
+  scripts/check_frozen.py         PASS (23/23 identical)
+
+FEATURE build (unsafe-ffi ON):
+  cargo test --release --features unsafe-ffi --lib
+      1771 passed, 0 failed, 2 ignored (= baseline)
+  cargo test --release --features unsafe-ffi --test sockffi_dns
+      10 passed, 0 failed
+  cargo test --release --features unsafe-ffi --test entry_cli
+      --test h_socket --test h_subprocess --test h_select
+      --test g6b_socksub --test p14_stdout
+      entry_cli 45/45, h_select 10/10, h_socket 7/1,
+      h_subprocess 8/8, p14_stdout 3/3, g6b_socksub 1/1
+  scripts/run_full_gate.py        545/552 GREEN
+  scripts/run_integration.py      201/202 (only
+      socket_fromfd_wraps_fd; S3's fromfd fixes it to
+      202/202 — NOT in this lane)
+  scripts/run_golden.py           585/585
+  scripts/run_capability.py       GREEN (baseline)
+  scripts/run_stdlib.py           8/8
+  scripts/run_nano.py             454/541 (baseline, report-only)
+
+Diff vs baseline: default build zero regression (lib,
+debug lib, all six gates, all integration suites match
+baseline exactly). Feature build matches baseline on
+every gate; integration is 201/202 for S2 alone
+(202/202 needs S3's fromfd).
+
+§3 Leftover issues / interface gaps vs brief §2.3
+--------------------------------------------------
+(a) NO FfiSocket use. `modsocket_ffi.rs` does not exist
+    in this worktree (S1 builds it in parallel).
+    create_connection / create_server / socketpair go
+    through the existing `socket_ctor` + method dispatch
+    (they compile without S1's file and dispatch to FFI
+    once S1 lands). No method I needed was missing from
+    §2.3 for the S2 surface — but see (b) and (f).
+(b) socketpair is std emulation, NOT `socketpair(2)`:
+    INET/INET6 = loopback TCP pair via std TcpListener;
+    AF_UNIX (Unix) = temp-path emulation
+    (`temp_dir()/petitpy-sp-{pid}-{counter}`, bind ->
+    connect -> accept -> unlink) because
+    `SocketAddr::from_abstract_name` is unstable on
+    rustc 1.99.1 and S1's `sys_socketpair` /
+    `FfiSocket::from_raw` are not in this worktree.
+    Functionally identical; replace with the real call
+    when those land. AF_UNIX on Windows =
+    NotImplementedError.
+(c) Duplicates to dedup at merge (marked in the code):
+    `ffi_dns.rs` redefines `Sockaddr` / `SockaddrIn` /
+    `SockaddrIn6` / `SockaddrStorage` / `Addrinfo` /
+    `Servent`, plus `errno()` and `ensure_winsock()` —
+    S1's `ffi.rs` §2.1 has the canonical ones; delete
+    the `ffi_dns.rs` copies at merge and use S1's.
+    (`AddrInfoEntry` / `ResolvedAddr` / `NameInfoAddr`
+    and the `*_owned` helpers are S2's own and stay.)
+(d) Windows / macOS / Android branches are UNVERIFIED
+    locally (local cross-compile is forbidden by the CI
+    constraint). The cfg'd code follows the brief §2.2 /
+    §6 tables (Windows `Addrinfo` layout, WSA codes,
+    `inet_aton` absent on Windows, `SO_RCVTIMEO` DWORD
+    vs timeval); CI must compile them.
+(e) Deliberate divergences (functional equivalence, not
+    byte-for-byte, per the user's 2026-11-20 verdict):
+    - getaddrinfo 5-tuple echoes the REQUESTED type/proto
+      (CPython returns the resolved ai_protocol, e.g. 6).
+      Pinned by modsocket_tests (type defaults to
+      SOCK_STREAM when omitted).
+    - IPv6 addresses are 2-tuples (host, port); CPython
+      returns 4-tuples (flowinfo, scopeid dropped).
+    - gethostbyname_ex / gethostbyaddr alias lists are
+      always empty (getaddrinfo/getnameinfo have no
+      aliases).
+    - create_connection/create_server `all_errors`:
+      raises the FIRST error (CPython 3.12 raises an
+      ExceptionGroup, which this VM has no support for).
+    - inet_aton/inet_pton/inet_ntop/inet_ntoa accept str
+      as well as bytes (lenient vs CPython's bytes-only
+      for packed forms).
+    - htonl/htons mask to width (Linux truncation;
+      Windows raises for out-of-range).
+    - getaddrinfo unknown service is OSError(-2)
+      (EAI_NONAME) per the pinned test; glibc/CPython
+      report -8 (EAI_SERVICE) for an unknown service
+      name (verified directly). `ffi_getaddrinfo`
+      maps EAI_SERVICE -> table retry -> EAI_NONAME
+      when the name is unknown.
+    - getaddrinfo accepts 2-5 args only (no `flags`
+      parameter) — pre-existing H-socket limitation,
+      unchanged.
+(f) `getsockname` / `getpeername` did NOT exist (the
+    brief §2.4 lists them among the "existing" methods,
+    but grep shows zero references — same for
+    `shutdown`, which I did NOT add). I implemented
+    them on the pure-std path in dns.rs (local_addr /
+    peer_addr; INET -> 2-tuple, UNIX -> path str;
+    unconnected getpeername -> ENOTCONN) and registered
+    them; `create_server`'s test needs `getsockname`
+    to learn the ephemeral port. S1 must add the
+    `SocketState::Ffi` arm to both at merge (the
+    variants are listed explicitly, so the match goes
+    non-exhaustive when `Ffi` lands — a compile error
+    will force the addition). `shutdown` is still
+    absent (S1/S3 scope).
+(g) `migrate_settings` deadlock (pre-existing H-socket
+    bug, FIXED in this lane — modsocket.rs): the old
+    code did `if let Some(s) = settings().remove(&old)`
+    then `settings().insert(new, s)` inside the body,
+    re-locking the same non-reentrant Mutex while the
+    temporary guard was held. It hung forever whenever
+    a settings entry existed (setsockopt / settimeout /
+    setblocking / setdefaulttimeout) and bind/connect/
+    dup changed the fd. Proved by probe:
+    setsockopt-then-bind and settimeout-then-bind both
+    hung; plain bind worked (no entry -> remove returns
+    None -> no second lock). This blocked
+    `create_server` (which must set SO_REUSEADDR
+    before bind). Fix holds ONE guard for the move.
+(h) `h_select_dup_fd` (lib) and
+    `select_readable_fd_is_ready` (integration) are
+    LOAD-DEPENDENT flakes in the readiness monitor
+    (select with timeout 0 before the monitor thread
+    reports the fd): each failed once under full-suite
+    load and passed on retry / 5x in isolation. Pre-
+    existing, unrelated to this lane (no sockets in
+    the first; the second is /dev/null + select).
+    Not fixed here.
+(i) `cargo test --release --tests` (all targets at
+    once) hit the known LTO stale-object link flake
+    twice when switching features in one target dir;
+    plain rerun fixed it both times (documented
+    behaviour, not a code issue).
+(j) The feature DEBUG full lib suite still aborts
+    with the pre-existing "IO Safety violation"
+    (baseline issue, unchanged by this lane); release
+    lib is clean on both builds.
+(k) `create_server` with AF_UNIX: address is a path
+    (str/bytes), not a tuple — implemented
+    (`create_server_unix_impl`, Unix only; Windows ->
+    NotImplementedError). Not in the brief's text but
+    CPython accepts it, so it is supported.
+(l) `getaddrinfo` flags: the module function takes no
+    `flags` arg (see (e)); `resolve_addrs` (for
+    create_connection/create_server) passes AI_PASSIVE
+    internally where needed.
+
+§4 Notes for the merge (main agent)
+------------------------------------
+- S1 merges first. At S2's merge, the `Ffi` variant
+  will exist: `sock_getsockname` / `sock_getpeername`
+  (dns.rs) need a `SocketState::Ffi(f)` arm each
+  (delegate to f.getsockname()/f.getpeername(), convert
+  the SockAddr via the same shapes); the match is
+  exhaustive over the current variants, so the
+  compiler will flag the missing arm.
+- Dedup (c) at merge: delete the ffi_dns.rs struct /
+  errno / ensure_winsock duplicates, use S1's.
+- Replace the socketpair emulation (b) with the real
+  `socketpair(2)` + `FfiSocket::from_raw` when S1's
+  land (or keep the emulation — it is functionally
+  identical and already tested).
+- The `socket_no_unshipped` -> `socket_dns_shipped`
+  test change is INTENTIONAL (the old test pinned the
+  absence of APIs this lane ships).
+- Windows/macOS/Android need CI compile coverage (d).
+- Verification logs: ~/workspace/sockffi_s2_verify/
+  (default_lib, debug_lib_default, default_tests,
+  default_integration, feature_lib,
+  feature_integration, gate_*_{default,feature},
+  check_mpy, check_frozen, rebuild_default).

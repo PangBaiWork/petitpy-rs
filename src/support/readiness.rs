@@ -667,6 +667,13 @@ mod tests {
         let b = ensure_monitor(fd, &file).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert!(poll_until(2000, || a.is_eof()));
+        // Invalidate the monitor: without this it lingers in
+        // the process-global table (dead, 6 bytes buffered) and
+        // a later test whose temp file reuses this fd number
+        // and inode would inherit it — this broke
+        // `monitor_reads_file_in_order_then_eof` on CI (it saw
+        // 6 buffered bytes instead of 15).
+        note_closed(fd);
         let _ = std::fs::remove_file(path);
     }
 
@@ -751,6 +758,12 @@ mod tests {
         // returns true — never a false EOF.
         assert!(wait_buffered(fd));
         assert!(mon.buffered_len() > 0 || mon.is_eof());
+        // Invalidate the monitor (see
+        // `ensure_monitor_reuses_live_monitor`): without this
+        // it lingers (dead, bytes buffered) and a later test
+        // whose temp file reuses this fd number and inode
+        // would inherit it.
+        note_closed(fd);
         let _ = std::fs::remove_file(path);
     }
 
@@ -822,6 +835,9 @@ mod tests {
         let mut out = [0u8; 9];
         assert!(poll_until(2000, || take_buffered(fd, &mut out) == 9));
         assert_eq!(&out, b"fifo-data");
+        // Invalidate the monitor (see
+        // `ensure_monitor_reuses_live_monitor`).
+        note_closed(fd);
         let _ = std::fs::remove_file(&fifo);
         let _ = std::fs::remove_dir(&dir);
     }

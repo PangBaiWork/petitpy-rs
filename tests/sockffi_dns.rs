@@ -335,7 +335,7 @@ print("DNS_CREATE_SERVER_OK")
 "#
         ),
     );
-    let child = Command::new(bin_petitpy())
+    let mut child = Command::new(bin_petitpy())
         .arg(&script)
         .env_remove("PYTHONPATH")
         .env_remove("PETITPY_LIB")
@@ -360,11 +360,17 @@ print("DNS_CREATE_SERVER_OK")
     // + `accept`, so a single connect can race the
     // listener setup on a slow runner (the same class as
     // the Build #22 `h_select_listener_never_ready` race):
-    // retry the connect (200×10ms, the 72eef1f pattern),
-    // then fail with the last error.
+    // retry the connect (500×10ms, the 72eef1f pattern
+    // widened in Build #26 — the 200×10ms budget expired
+    // on macos-aarch64 with plain ECONNREFUSED), then
+    // fail with the last error. If the child has exited
+    // meanwhile, the listener is gone for good: fail fast
+    // with the child's output instead, so a child-side
+    // failure (e.g. `setblocking` / `accept` raising)
+    // does not masquerade as a refused connection.
     let mut stream = None;
     let mut last_err = None;
-    for _ in 0..200 {
+    for _ in 0..500 {
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(s) => {
                 stream = Some(s);
@@ -372,6 +378,15 @@ print("DNS_CREATE_SERVER_OK")
             }
             Err(e) => {
                 last_err = Some(e);
+                if let Ok(Some(status)) = child.try_wait() {
+                    let out = child.wait_with_output().expect("wait for petitpy");
+                    panic!(
+                        "server child exited ({}) before accept; stdout: {}; stderr: {}",
+                        status,
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
         }

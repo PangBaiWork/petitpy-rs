@@ -258,16 +258,25 @@ fn io_exc(ctx: &mut CallCtx, state: &VmState, e: std::io::Error) -> Value {
 
 /// `py_os_close` (`modos.zig:311-315`): `close(fd)` straight
 /// through, errno on failure. Under `--features unsafe-ffi`
-/// (G6a) the real `close(2)` runs for every fd — an unregistered
-/// fd (e.g. an `open()` file's fd) and stdio 0–2 included. On
-/// the default build the old shape stays: stdio is only
-/// recorded in `os_closed_stdio` (the fd number is NOT freed
-/// for reuse) and an unregistered fd is EBADF.
-/// Windows exception (Build #24): a registered fd there is a
+/// (G6a) the real `close(2)` runs for every fd on Unix — an
+/// unregistered fd (e.g. an `open()` file's fd) and stdio
+/// 0–2 included. On the default build the old shape stays:
+/// stdio is only recorded in `os_closed_stdio` (the fd
+/// number is NOT freed for reuse) and an unregistered fd is
+/// EBADF.
+/// Windows exception (Build #24, #26): a fd there is a
 /// SYNTHETIC id, not a CRT fd, so the feature build drops
 /// the table `File` instead of calling `_close` (which would
-/// fail EBADF); an unregistered fd is EBADF, as on the
-/// default build.
+/// fail EBADF); an unregistered fd is EBADF on both builds.
+/// The 3bfe78b attempt to `_close` an unregistered fd
+/// (assuming a builtin `open()` file's fd was a real CRT
+/// fd) crashed the Windows test process
+/// (STATUS_STACK_BUFFER_OVERRUN) — the port's Windows file
+/// objects hold a `std::fs::File` (HANDLE) plus a synthetic
+/// number, while only the original's C `FILE*` gives a real
+/// CRT fd; `os.close(f.fileno())` succeeding on Windows
+/// would need a real-CRT-fd `open()` (see the `None` arm
+/// below), a separate design change.
 pub fn os_close_ctx(
     ctx: &mut CallCtx,
     state: &mut VmState,
@@ -320,11 +329,12 @@ pub fn os_close_ctx(
         // Windows feature build). Skip the real close for
         // registered fds there and drop the table `File`
         // instead — the default-build behavior. An
-        // unregistered fd falls through to the real CRT
-        // `_close(fd)` (Build #25): a builtin `open()`
-        // file's fd is a real CRT fd, not in `os_fds`,
-        // and `os.close` must close it — a bad number
-        // still fails EBADF there.
+        // unregistered fd is EBADF there too (Build #26):
+        // a builtin `open()` file's fd is ALSO a
+        // synthetic id, not a CRT fd, so `_close` on it
+        // is a category error — the 3bfe78b attempt
+        // crashed the Windows test process
+        // (STATUS_STACK_BUFFER_OVERRUN).
         // Unix keeps the real `close(2)` by number
         // (the reference closes by number, so an
         // unregistered fd is closed too — or EBADF).
@@ -362,17 +372,26 @@ pub fn os_close_ctx(
                     drop(f);
                     Ok(Value::None)
                 }
-                // Build #25: unregistered is NOT EBADF
-                // outright — a builtin `open()` file's fd
-                // is a real CRT fd (not in `os_fds`), so
-                // close it by number like Unix does. A
-                // synthetic id (>=100) that is not
-                // registered fails EBADF in `_close`
-                // anyway, so the error result is unchanged.
-                None => match crate::support::ffi::sys_close(fd) {
-                    Ok(()) => Ok(Value::None),
-                    Err(e) => Err(errno_exc(ctx, state, e)),
-                },
+                // Build #26: an unregistered fd is EBADF
+                // here, NOT passed to the CRT `_close`
+                // (the 3bfe78b attempt did exactly that
+                // and crashed the Windows test process
+                // with STATUS_STACK_BUFFER_OVERRUN in
+                // `os_close_open_file_fd`). A builtin
+                // `open()` file's fd on Windows is a
+                // SYNTHETIC id (`alloc_win_fd`, >=100 —
+                // see `objfileio.rs`), not a CRT fd: the
+                // original's `fileno()` is a real CRT fd
+                // because it uses a C `FILE*`, while this
+                // port's Windows file objects hold a
+                // `std::fs::File` (a Win32 HANDLE) plus a
+                // synthetic number. Passing that number to
+                // `_close` is a category error — the CRT
+                // may treat it as one of its own fds. A
+                // real-CRT-fd `open()` (via
+                // `_open_osfhandle`) is a separate design
+                // change, not a CI fix.
+                None => Err(errno_exc(ctx, state, EBADF)),
             };
         }
     }

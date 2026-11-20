@@ -316,15 +316,24 @@ os.rmdir(d)
 
 /// `os.close` on an `open()` file's fd (G6a U3): the fd is
 /// not in `os_fds`, so the default build raises EBADF; under
-/// `--features unsafe-ffi` the real `close(2)` runs and the
-/// close succeeds.
+/// `--features unsafe-ffi` the real `close(2)` runs on Unix
+/// and the close succeeds. On Windows both builds raise
+/// EBADF (Build #26): the fd there is a SYNTHETIC id
+/// (`alloc_win_fd`), not a CRT fd, so there is nothing
+/// `os.close` can close by number — passing it to the CRT
+/// `_close` (the 3bfe78b attempt) crashed the Windows test
+/// process (STATUS_STACK_BUFFER_OVERRUN). The original's
+/// `fileno()` is a real CRT fd (C `FILE*`); making the
+/// port's Windows `open()` return one is a separate design
+/// change, not a CI fix.
 #[test]
 fn os_close_open_file_fd() {
     // A real file to open: /dev/null does not exist on Windows.
     let path = std::env::temp_dir().join(format!("petitpy_devnull_{}", std::process::id()));
     std::fs::write(&path, b"x").unwrap();
     let p = path.to_string_lossy().replace('\\', "/");
-    #[cfg(not(feature = "unsafe-ffi"))]
+    // Windows: synthetic fd — EBADF on both builds.
+    #[cfg(windows)]
     {
         let (name, value) = fx_run_err_new(&format!(
             "f = open({p:?}, 'r')\nimport os\nos.close(f.fileno())\n"
@@ -332,7 +341,15 @@ fn os_close_open_file_fd() {
         assert_eq!(name, "OSError");
         assert_eq!(value, "9");
     }
-    #[cfg(feature = "unsafe-ffi")]
+    #[cfg(all(not(windows), not(feature = "unsafe-ffi")))]
+    {
+        let (name, value) = fx_run_err_new(&format!(
+            "f = open({p:?}, 'r')\nimport os\nos.close(f.fileno())\n"
+        ));
+        assert_eq!(name, "OSError");
+        assert_eq!(value, "9");
+    }
+    #[cfg(all(not(windows), feature = "unsafe-ffi"))]
     {
         let mut fx = Sx::new();
         fx.run_ok(&format!(

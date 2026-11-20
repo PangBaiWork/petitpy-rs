@@ -33,8 +33,9 @@
 //!   path removes it at once when the buffer is already
 //!   empty. A later `ensure_monitor` for a reused fd number
 //!   reuses a dead monitor's bytes only when the number
-//!   still refers to the same description (the `(dev, ino)`
-//!   identity check) — otherwise it starts fresh.
+//!   still refers to the same description (the identity
+//!   check — `(dev, ino)` on Unix, `(creation time, size)`
+//!   on Windows) — otherwise it starts fresh.
 //!
 //! Bounds: at most one thread per distinct fd ever probed,
 //! at most `BUFFER_CAP` bytes buffered per fd. A monitor
@@ -226,8 +227,23 @@ fn file_identity(file: &File) -> Option<(u64, u64)> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        Some((md.file_index(), 0))
+        // `MetadataExt::file_index` is UNSTABLE (`windows_by_handle`,
+        // rust-lang/rust#63010) and returns `Option<u64>` — it does
+        // not compile on stable rustc (broke the CI Windows job,
+        // 2026-11-20). Stable proxy: (creation time, size), both
+        // inherent `Metadata` methods (`created` + `len` — the
+        // Windows-only `creation_time`/`file_size` are trait
+        // methods, not inherent). A false match needs two files
+        // created in the same 100ns tick with the same size on the
+        // same reused fd — far narrower than no check at all
+        // (`None` skips the check entirely).
+        let created = md
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        Some((created, md.len()))
     }
     #[cfg(not(any(unix, windows)))]
     {

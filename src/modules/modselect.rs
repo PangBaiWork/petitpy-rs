@@ -166,6 +166,11 @@ fn int_item(ctx: &mut CallCtx, state: &VmState, v: Value) -> Result<Option<i64>,
 /// read resolution). `File` carries a cloned `File` for the
 /// monitor start; `Socket` is just the fd number.
 enum ResolvedFd {
+    // Only constructed on Unix: the `socket_probe` block in
+    // `resolve_fd_number` is `#[cfg(unix)]`, so on Windows
+    // this variant is never constructed (allowed, not deleted
+    // — the `resolve_read` match below stays uniform).
+    #[allow(dead_code)]
     Socket,
     File { fd: i32, file: std::fs::File },
 }

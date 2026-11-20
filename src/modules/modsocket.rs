@@ -509,10 +509,16 @@ fn sock_key_of(state: &SocketState) -> TableKey {
 /// `modsocket.rs` addition this lane makes (the brief's peek
 /// design assumed a stable `UnixStream::peek`, which does
 /// not exist).
+///
+/// Unix-only: the only caller is `modselect`'s `#[cfg(unix)]`
+/// probe block, so on Windows this (and `socket_probe`) is
+/// compiled out — without the gate they warn as dead code.
+#[cfg(unix)]
 pub(crate) enum SocketProbe {
     Unprobable,
 }
 
+#[cfg(unix)]
 pub(crate) fn socket_probe(fd: i32) -> Option<SocketProbe> {
     // The table is keyed by the OS fd (`TableKey = i64`).
     if sockets().contains_key(&(fd as TableKey)) {

@@ -416,14 +416,19 @@ fn h_select_listener_never_ready() {
         let _ = UnixStream::connect(&client_path);
     });
     let mut fx = Fx::new();
+    // No `accept()` here: the listener is non-blocking and the
+    // client may not have connected yet when `select` returns,
+    // so `accept()` would raise EAGAIN (35) on a slow runner
+    // — a race, not a select result. Closing the listener
+    // with a pending connection just resets it; the client
+    // thread ignores its connect result.
     let src = format!(
         "import socket, select, os\n\
          s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
          s.bind({path:?}); s.listen(1); s.setblocking(False)\n\
          r, _, _ = select.select([s.fileno()], [], [], 0.2)\n\
          a = len(r)\n\
-         c, _ = s.accept()\n\
-         c.close(); s.close(); os.remove({path:?})\n"
+         s.close(); os.remove({path:?})\n"
     );
     fx.run_ok(&src);
     let _ = handle.join();
@@ -651,8 +656,15 @@ fn d4_pwd_root() {
     assert_eq!(fx.g_str("n"), "root");
     assert_eq!(fx.g_int("u"), 0);
     assert_eq!(fx.g_int("g"), 0);
-    assert_eq!(fx.g_str("d"), "/root");
-    assert_eq!(fx.g_str("s"), "/bin/bash");
+    // The home directory and shell are OS-specific
+    // (`/etc/passwd`): Linux `/root` + `/bin/bash`, macOS
+    // `/var/root` + `/bin/sh`.
+    #[cfg(target_os = "macos")]
+    let (home, shell) = ("/var/root", "/bin/sh");
+    #[cfg(not(target_os = "macos"))]
+    let (home, shell) = ("/root", "/bin/bash");
+    assert_eq!(fx.g_str("d"), home);
+    assert_eq!(fx.g_str("s"), shell);
 }
 
 #[cfg(unix)]
@@ -685,15 +697,25 @@ fn d4_pwd_getpwuid_root() {
 #[test]
 fn d4_grp_root() {
     let mut fx = Fx::new();
-    fx.run_ok(
+    // The gid-0 group is OS-specific (`/etc/group`): "root"
+    // on Linux, "wheel" on macOS (there is no "root" group
+    // there — `getgrnam('root')` raises KeyError). The member
+    // list is only asserted on Linux (the macOS wheel members
+    // depend on the machine's `/etc/group`).
+    #[cfg(target_os = "macos")]
+    let group = "wheel";
+    #[cfg(not(target_os = "macos"))]
+    let group = "root";
+    fx.run_ok(&format!(
         "import grp\n\
-         gr = grp.getgrnam('root')\n\
+         gr = grp.getgrnam('{group}')\n\
          n = gr[0]\n\
          g = gr[2]\n\
          m = gr[3]\n",
-    );
-    assert_eq!(fx.g_str("n"), "root");
+    ));
+    assert_eq!(fx.g_str("n"), group);
     assert_eq!(fx.g_int("g"), 0);
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(fx.g_str("m"), "[0]");
 }
 

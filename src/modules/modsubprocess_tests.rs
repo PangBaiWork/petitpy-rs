@@ -162,17 +162,21 @@ fn setup_subprocess(vm: &mut Vm) {
 #[test]
 fn subprocess_true_false() {
     let mut fx = Fx::new();
+    // Exit codes 0 and 1 via `/bin/sh -c "exit N"`:
+    // `/bin/true` and `/bin/false` are not spawnable on the
+    // macOS runners (the spawn fails → returncode 127), and
+    // `sh` is the portable way to produce a chosen exit code.
     fx.run_ok(
         r#"
 import _subprocess
-r = _subprocess._spawn_and_wait(["/bin/true"], None, -1.0, None, None, -4, -4, -4)
+r = _subprocess._spawn_and_wait(["/bin/sh", "-c", "exit 0"], None, -1.0, None, None, -4, -4, -4)
 "#,
     );
     assert_eq!(fx.g_result("r"), (0, None, None, false));
     fx.run_ok(
         r#"
 import _subprocess
-r = _subprocess._spawn_and_wait(["/bin/false"], None, -1.0, None, None, -4, -4, -4)
+r = _subprocess._spawn_and_wait(["/bin/sh", "-c", "exit 1"], None, -1.0, None, None, -4, -4, -4)
 "#,
     );
     assert_eq!(fx.g_result("r"), (1, None, None, false));
@@ -311,7 +315,17 @@ import _subprocess
 r = _subprocess._spawn_and_wait(["/bin/pwd"], None, -1.0, None, "/tmp", -4, -1, -4)
 "#,
     );
-    assert_eq!(fx.g_result("r"), (0, Some(b"/tmp\n".to_vec()), None, false));
+    // `/bin/pwd` prints the canonical working directory:
+    // on macOS `/tmp` is a symlink to `/private/tmp`, so
+    // the child reports `/private/tmp`.
+    #[cfg(target_os = "macos")]
+    let expected_pwd = b"/private/tmp\n".to_vec();
+    #[cfg(not(target_os = "macos"))]
+    let expected_pwd = b"/tmp\n".to_vec();
+    assert_eq!(
+        fx.g_result("r"),
+        (0, Some(expected_pwd), None, false)
+    );
 }
 
 #[test]

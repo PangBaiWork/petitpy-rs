@@ -191,6 +191,32 @@ pub fn os_open_ctx(
     opts.custom_flags(flags as i32);
     #[cfg(unix)]
     opts.mode(mode);
+    // `O_CREAT` / `O_TRUNC` / `O_APPEND` / `O_EXCL` reach the
+    // kernel only through `custom_flags`, which does not exist
+    // on Windows — without them `os.open` never creates a file
+    // there (a missing file raises ENOENT instead of being
+    // created). Map them explicitly on every platform; on Unix
+    // this duplicates the raw flags `custom_flags` already
+    // passes. Truncate/append only apply when the file is
+    // opened for writing (the kernel ignores them for
+    // O_RDONLY, and `OpenOptions` errors otherwise).
+    // Constants are the Linux values (`modos.rs`).
+    const O_CREAT: i64 = 64;
+    const O_EXCL: i64 = 128;
+    const O_TRUNC: i64 = 512;
+    const O_APPEND: i64 = 1024;
+    let writable = flags & 0b11 != 0;
+    if flags & O_EXCL != 0 && flags & O_CREAT != 0 {
+        opts.create_new(true);
+    } else if flags & O_CREAT != 0 {
+        opts.create(true);
+    }
+    if writable && flags & O_TRUNC != 0 {
+        opts.truncate(true);
+    }
+    if writable && flags & O_APPEND != 0 {
+        opts.append(true);
+    }
     let file = opts
         .open(crate::support::os_str::os_string_from_bytes(&path))
         .map_err(|e| io_exc(ctx, state, e))?;

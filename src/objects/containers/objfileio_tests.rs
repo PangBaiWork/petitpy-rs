@@ -142,8 +142,11 @@ fn open_binary_roundtrip() {
 #[test]
 fn open_missing_raises_enoent() {
     let mut fx = Fx::new();
+    // The missing file must sit in an EXISTING directory: a
+    // path whose parent is also missing reports "path not
+    // found" (3) on Windows instead of ENOENT (2).
     let path = std::env::temp_dir().join(format!(
-        "petitpy_d2_fileio_{}/nope.txt",
+        "petitpy_d2_fileio_{}_nope.txt",
         std::process::id()
     ));
     let (mut ctx, _state) = fx.vm.split();

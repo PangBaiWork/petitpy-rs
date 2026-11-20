@@ -24,9 +24,20 @@ use crate::runtime::vm::{Vm, VmError};
 /// string literal, forward slashes work with `std::fs` on all
 /// platforms.
 fn tmpdir_str() -> String {
-    std::env::temp_dir()
-        .to_string_lossy()
-        .replace('\\', "/")
+    let p = std::env::temp_dir();
+    // Canonicalize on Unix: resolves the macOS symlinks
+    // (`/var` → `/private/var`, `/tmp` → `/private/tmp`) so
+    // every `os.*` call sees the real path. Drop any trailing
+    // separator so callers get exactly one `/` when joining
+    // (the raw `temp_dir()` ends in `/` on macOS and `\` on
+    // Windows, which produced `//` in joined paths).
+    #[cfg(unix)]
+    let p = std::fs::canonicalize(&p).unwrap_or(p);
+    let mut s = p.to_string_lossy().replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    s
 }
 
 #[test]

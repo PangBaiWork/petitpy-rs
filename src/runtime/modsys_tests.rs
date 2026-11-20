@@ -21,12 +21,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[test]
 fn sys_constants() {
     let mut fx = Sx::new();
-    fx.run_ok(
+    // `sys.platform` is the OS tag (`modsys.rs`): "linux" on
+    // Linux, "darwin" on macOS, "windows" on Windows.
+    #[cfg(target_os = "linux")]
+    let platform = "linux";
+    #[cfg(target_os = "macos")]
+    let platform = "darwin";
+    #[cfg(target_os = "windows")]
+    let platform = "windows";
+    fx.run_ok(&format!(
         r#"
 import sys
 assert sys.version == "3.4.0; MicroPython (with v2.0 preview) v1.28.0-preview.80.gb14d129a16 on 2026-06-04"
 assert sys.version_info == (3, 4, 0)
-assert sys.platform == "linux"
+assert sys.platform == "{platform}"
 assert sys.byteorder == "little"
 assert sys.maxsize == 9223372036854775807
 assert sys.implementation.name == "micropython"
@@ -39,7 +47,7 @@ assert "sys" not in sys.modules
 assert "os" not in sys.modules
 assert type(sys.path) is list
 "#,
-    );
+    ));
 }
 
 #[test]

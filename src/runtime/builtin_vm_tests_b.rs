@@ -370,7 +370,10 @@ fn open_e2e_write_read() {
     // missing-file error.
     let path = std::env::temp_dir()
         .join(format!("petitpy-rs-open-e2e-{}-x.txt", std::process::id()));
-    let p = path.to_string_lossy().into_owned();
+    // Forward slashes only: a Windows path's backslashes
+    // would be escape sequences in the interpolated script
+    // (`\U` in `\Users` → SyntaxError at compile time).
+    let p = path.to_string_lossy().replace('\\', "/");
     let mut fx = Fx::new();
     fx.run_ok(&format!(
         "f = open('{p}', 'w')\nf.write('hi')\nf.close()\ng = open('{p}', 'r')\na = g.read()\ng.close()\n"

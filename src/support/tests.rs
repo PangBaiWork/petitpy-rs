@@ -47,15 +47,19 @@ fn smallint_matches_python_semantics() {
 
 #[test]
 fn errno_reads_last_os_error() {
-    // A failed open sets ENOENT (2) on Linux; `errno()` reads it
+    // A failed open sets ENOENT (2); `errno()` reads it
     // back immediately (no intervening libc call in between).
-    let _ = std::fs::File::open("/definitely/not/a/real/path/xyz");
+    // The missing file must sit in an EXISTING directory:
+    // a path whose parent is also missing reports
+    // "path not found" (3) on Windows instead of ENOENT.
+    let missing = std::env::temp_dir().join("petitpy-errno-definitely-not-a-real-file-xyz");
+    let _ = std::fs::File::open(&missing);
     assert_eq!(errno(), 2);
     // A successful call does not clear errno, but a fresh failure
     // overwrites it: EACCES (13) vs ENOENT (2) differ, so open a
     // directory as a file for writing... instead check the error
     // object itself carries the same code.
-    let e = std::fs::File::open("/definitely/not/a/real/path/xyz").unwrap_err();
+    let e = std::fs::File::open(&missing).unwrap_err();
     assert_eq!(e.raw_os_error(), Some(2));
     assert_eq!(errno(), 2);
 }

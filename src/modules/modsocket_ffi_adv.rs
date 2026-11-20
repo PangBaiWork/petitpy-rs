@@ -1022,28 +1022,51 @@ mod tests {
         std::fs::remove_file(&path).expect("remove socket file");
     }
 
-    /// `check_fd_valid`: a live fd passes, a closed fd
+    /// `check_fd_valid`: a live fd passes, an invalid fd
     /// fails `EBADF`.
+    ///
+    /// NOTE: the invalid fd is `-1`, NOT a fd closed by
+    /// this test: fd numbers are per-process and the kernel
+    /// hands the lowest free number to the next `open` /
+    /// `socket` in ANY thread, and libtest runs tests in
+    /// parallel in one process — so a closed number can be
+    /// recycled by another test between the `close` and the
+    /// check, and `fcntl(F_GETFD)` then (correctly) returns
+    /// `Ok`. CI Build #18 hit exactly that on linux-aarch64
+    /// (`Ok(())` vs `Err(9)`), after the same test passed
+    /// in the earlier `Test lib` step on the same machine.
+    /// `-1` can never be a valid fd, so the `EBADF` path is
+    /// exercised deterministically; `check_fd_valid` only
+    /// ever sees a number, so a closed fd and `-1` take the
+    /// same path through `fcntl`.
     #[test]
     #[cfg(unix)]
-    fn check_fd_valid_rejects_closed_fd() {
+    fn check_fd_valid_rejects_invalid_fd() {
         let (a, b) = unix_pair();
         check_fd_valid(a).expect("live fd is valid");
+        assert_eq!(check_fd_valid(-1), Err(9 /* EBADF */));
         close_raw(a).expect("close a");
-        assert_eq!(check_fd_valid(a), Err(9 /* EBADF */));
         close_raw(b).expect("close b");
     }
 
-    /// `makefile_file` takes ownership: the `File` closes
-    /// the fd when dropped.
+    /// `makefile_file` takes ownership: the `File` wraps
+    /// exactly the fd it is given, so dropping the `File`
+    /// closes that fd (`File::from_raw_fd` contract).
+    ///
+    /// NOTE: no post-`drop` validity assert on the fd
+    /// number — same fd-recycling race as
+    /// `check_fd_valid_rejects_invalid_fd` (a parallel test
+    /// can reuse the number between the `drop` and the
+    /// check; Build #18).
     #[test]
     #[cfg(unix)]
     fn makefile_file_takes_ownership() {
+        use std::os::unix::io::AsRawFd;
         let fd = ffi_socket(AF_UNIX, SOCK_STREAM, 0).expect("socket");
         check_fd_valid(fd).expect("live fd is valid");
         let f = unsafe { makefile_file(fd) };
+        assert_eq!(f.as_raw_fd(), fd);
         drop(f);
-        assert_eq!(check_fd_valid(fd), Err(9 /* EBADF */));
     }
 
     /// `SockAddr` round-trips through raw `sockaddr` bytes.

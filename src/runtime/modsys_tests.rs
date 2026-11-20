@@ -21,14 +21,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[test]
 fn sys_constants() {
     let mut fx = Sx::new();
-    // `sys.platform` is the OS tag (`modsys.rs`): "linux" on
-    // Linux, "darwin" on macOS, "windows" on Windows.
-    #[cfg(target_os = "linux")]
-    let platform = "linux";
+    // `sys.platform` is the OS tag (`modsys.rs`): "darwin" on
+    // macOS, else `std::env::consts::OS` ("linux" / "windows" /
+    // "android", ...). The `not(macos)` arm keeps this
+    // exhaustive — a per-OS list silently left Android out
+    // (E0425, Build #12).
     #[cfg(target_os = "macos")]
     let platform = "darwin";
-    #[cfg(target_os = "windows")]
-    let platform = "windows";
+    #[cfg(not(target_os = "macos"))]
+    let platform = std::env::consts::OS;
     fx.run_ok(&format!(
         r#"
 import sys

@@ -604,8 +604,22 @@ pub fn os_fsync_ctx(
             // The table borrow must end before the error
             // mapping touches `state` again.
             let r: std::io::Result<()> = f.sync_all();
-            r.map_err(|e| io_exc(ctx, state, e))?;
-            Ok(Value::None)
+            match r {
+                Ok(()) => Ok(Value::None),
+                Err(e) => {
+                    // Windows: `FlushFileBuffers` needs a
+                    // writable handle, so `fsync` on a read-only
+                    // fd fails with ERROR_ACCESS_DENIED (5) — but
+                    // a read-only fd has no pending writes to
+                    // flush, so this is a no-op there (on Unix
+                    // `fsync` on O_RDONLY succeeds).
+                    #[cfg(windows)]
+                    if e.raw_os_error() == Some(5) {
+                        return Ok(Value::None);
+                    }
+                    Err(io_exc(ctx, state, e))
+                }
+            }
         }
         None => Err(errno_exc(ctx, state, EBADF)),
     }

@@ -223,10 +223,10 @@ fn h_frozen_subprocess() {
         r#"import subprocess
 r = subprocess.run(["/bin/echo", "hi"], capture_output=True)
 print(r.returncode, r.stdout, r.stderr)
-print(subprocess.call(["/bin/true"]))
+print(subprocess.call(["/bin/sh", "-c", "exit 0"]))
 print(subprocess.check_output(["/bin/echo", "yo"]))
 try:
-    subprocess.run(["/bin/false"], check=True)
+    subprocess.run(["/bin/sh", "-c", "exit 1"], check=True)
 except subprocess.CalledProcessError as e:
     print("CalledProcessError", e.returncode)
 try:

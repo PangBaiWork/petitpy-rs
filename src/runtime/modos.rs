@@ -76,7 +76,29 @@ const EIO: i32 = 5;
 /// none (e.g. a NUL byte in a path — unreachable here since
 /// `path_arg` truncates at NUL first).
 pub(crate) fn os_err(ctx: &mut CallCtx, e: &std::io::Error) -> PyError {
-    raise_os_error(ctx, e.raw_os_error().unwrap_or(EIO))
+    let code = e.raw_os_error().unwrap_or(EIO);
+    // Windows reports Win32 error codes, not POSIX errnos —
+    // map the common ones so the `os` module reports the same
+    // errno on every platform.
+    #[cfg(windows)]
+    let code = win32_to_errno(code);
+    raise_os_error(ctx, code)
+}
+
+/// Map a Win32 error code to the POSIX errno the `os` module
+/// reports (`ERROR_*` → `E*`).
+#[cfg(windows)]
+fn win32_to_errno(code: i32) -> i32 {
+    match code {
+        2 => 2,   // ERROR_FILE_NOT_FOUND → ENOENT
+        3 => 2,   // ERROR_PATH_NOT_FOUND → ENOENT
+        5 => 13,  // ERROR_ACCESS_DENIED → EACCES
+        6 => 9,   // ERROR_INVALID_HANDLE → EBADF
+        32 => 13, // ERROR_SHARING_VIOLATION → EACCES
+        87 => 22, // ERROR_INVALID_PARAMETER → EINVAL
+        183 => 17, // ERROR_ALREADY_EXISTS → EEXIST
+        _ => code,
+    }
 }
 
 /// `pathArg` (`modos.zig:247-261`): str/bytes fast path, else

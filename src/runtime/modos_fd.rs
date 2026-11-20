@@ -276,7 +276,7 @@ pub fn os_close_ctx(
         if state.os_closed_stdio.contains(&fd) {
             return Err(errno_exc(ctx, state, EBADF));
         }
-        #[cfg(all(feature = "unsafe-ffi", unix))]
+        #[cfg(feature = "unsafe-ffi")]
         {
             // FFI invariant: `close` takes any i32 fd number;
             // the kernel fails EBADF on an already-closed fd, it
@@ -296,7 +296,7 @@ pub fn os_close_ctx(
     // alone would return Ok, so run the real close first: on
     // failure raise the errno (the dead entry stays in the
     // table).
-    #[cfg(all(feature = "unsafe-ffi", unix))]
+    #[cfg(feature = "unsafe-ffi")]
     {
         // H-select: invalidate the monitor BEFORE `sys_close`
         // frees the number — a `note_closed` after the close
@@ -338,7 +338,7 @@ pub fn os_close_ctx(
         }
         return Ok(Value::None);
     }
-    #[cfg(not(all(feature = "unsafe-ffi", unix)))]
+    #[cfg(not(feature = "unsafe-ffi"))]
     {
         match state.os_fds.remove(&fd) {
             Some(f) => {
@@ -519,7 +519,7 @@ pub fn os_lseek_ctx(
         return Err(errno_exc(ctx, state, EBADF));
     }
     if (0..=2).contains(&fd) {
-        #[cfg(all(feature = "unsafe-ffi", unix))]
+        #[cfg(feature = "unsafe-ffi")]
         {
             // FFI invariant: `lseek` takes an fd number and plain
             // integers; a bad fd fails EBADF, a bad whence fails
@@ -529,7 +529,7 @@ pub fn os_lseek_ctx(
                 Err(e) => Err(errno_exc(ctx, state, e)),
             };
         }
-        #[cfg(not(all(feature = "unsafe-ffi", unix)))]
+        #[cfg(not(feature = "unsafe-ffi"))]
         {
             // No `Seek` on `std::io::Stdin`/`Stdout`/`Stderr` —
             // always ESPIPE (the `sys.stdin.seek` divergence).
@@ -583,7 +583,7 @@ pub fn os_fsync_ctx(
         return Err(errno_exc(ctx, state, EBADF));
     }
     if (0..=2).contains(&fd) {
-        #[cfg(all(feature = "unsafe-ffi", unix))]
+        #[cfg(feature = "unsafe-ffi")]
         {
             // FFI invariant: `fsync` takes any i32 fd number; the
             // kernel fails EBADF on a bad fd, it cannot fault.
@@ -592,7 +592,7 @@ pub fn os_fsync_ctx(
                 Err(e) => Err(errno_exc(ctx, state, e)),
             };
         }
-        #[cfg(not(all(feature = "unsafe-ffi", unix)))]
+        #[cfg(not(feature = "unsafe-ffi"))]
         {
             // No safe std `fsync` for fd 0/1/2 — EINVAL, the
             // reference's answer on pipes/ttys (see the module docs).

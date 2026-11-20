@@ -74,10 +74,15 @@ fn run_script(script: &Path, stdin_file: Option<&File>, stdout_file: Option<&Fil
 #[test]
 fn g6a_close_stdin_ebadf() {
     let dir = scratch("close_stdin");
+    // Any readable file gives a valid fd; /dev/null does not
+    // exist on Windows, so open the script itself.
+    let path = dir.join("t.py").to_string_lossy().replace('\\', "/");
     let script = write_script(
         &dir,
         "t.py",
-        "import os\nos.close(0)\ntry:\n    os.read(0, 5)\nexcept OSError as e:\n    print('read 0:', e.args[0])\nfd = os.open('/dev/null', os.O_RDONLY)\nprint('reused fd:', fd)\n",
+        &format!(
+            "import os\nos.close(0)\ntry:\n    os.read(0, 5)\nexcept OSError as e:\n    print('read 0:', e.args[0])\nfd = os.open({path:?}, os.O_RDONLY)\nprint('reused fd:', fd)\n",
+        ),
     );
     let r = run_script(&script, None, None);
     assert_eq!(r.code, 0, "stderr: {}", String::from_utf8_lossy(&r.stderr));
@@ -92,10 +97,15 @@ fn g6a_close_stdin_ebadf() {
 fn g6a_close_stdio_reuses_fd() {
     let dir = scratch("close_stdio");
     let out_path = dir.join("reused.txt");
+    // /dev/null does not exist on Windows: open the script
+    // itself. Backslashes in the interpolated paths are
+    // escapes inside the petitpy string literals — use
+    // forward slashes.
+    let self_path = dir.join("t.py").to_string_lossy().replace('\\', "/");
+    let out = out_path.to_string_lossy().replace('\\', "/");
     let src = format!(
-        "import os\nos.close(1)\nfd = os.open('/dev/null', os.O_RDONLY)\n\
-         f = open('{}', 'w')\nf.write('reused fd: %d\\n' % fd)\nf.close()\n",
-        out_path.display()
+        "import os\nos.close(1)\nfd = os.open('{self_path}', os.O_RDONLY)\n\
+         f = open('{out}', 'w')\nf.write('reused fd: %d\\n' % fd)\nf.close()\n",
     );
     let script = write_script(&dir, "t.py", &src);
     let r = run_script(&script, None, None);
@@ -112,10 +122,14 @@ fn g6a_close_stdio_reuses_fd() {
 #[test]
 fn g6a_close_open_file_fd() {
     let dir = scratch("close_openfd");
+    // /dev/null does not exist on Windows: open the script itself.
+    let path = dir.join("t.py").to_string_lossy().replace('\\', "/");
     let script = write_script(
         &dir,
         "t.py",
-        "f = open('/dev/null', 'r')\nimport os\nos.close(f.fileno())\nprint('os.close done')\n",
+        &format!(
+            "f = open({path:?}, 'r')\nimport os\nos.close(f.fileno())\nprint('os.close done')\n",
+        ),
     );
     let r = run_script(&script, None, None);
     assert_eq!(r.code, 0, "stderr: {}", String::from_utf8_lossy(&r.stderr));
@@ -194,13 +208,17 @@ fn g6a_stale_fd_reuse() {
     let dir = scratch("stale_fd");
     let a = dir.join("a.txt");
     let b = dir.join("b.txt");
+    // Backslashes in the interpolated paths are escapes
+    // inside the petitpy string literals — use forward slashes.
+    let a_path = a.to_string_lossy().replace('\\', "/");
+    let b_path = b.to_string_lossy().replace('\\', "/");
     let src = format!(
         "import os\nf = open('{}', 'w')\nfd = f.fileno()\nos.close(fd)\n\
          g = os.open('{}', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)\n\
          print('g fd', g)\nf.write('HELLO')\nf.flush()\nprint('flush ok')\nf.close()\nprint('close ok')\n\
          try:\n    os.close(g)\nexcept OSError as e:\n    print('close g:', e.args[0])\n",
-        a.display(),
-        b.display()
+        a_path,
+        b_path
     );
     let script = write_script(&dir, "t.py", &src);
     let r = run_script(&script, None, None);

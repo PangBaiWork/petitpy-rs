@@ -109,9 +109,9 @@ mod ffi {
     // argument is the caller's responsibility (the kernel
     // masks it to 0777).
     //
-    // Unix only: the MSVC CRT has no `umask` symbol (it is
-    // `_umask`), so these four os declarations are
-    // `cfg(unix)`.
+    // Unix only for the plain names — on Windows the CRT
+    // symbols are underscore-prefixed (`_umask` etc., see
+    // the Windows block below).
     #[cfg(unix)]
     extern "C" {
         pub fn umask(mask: c_uint) -> c_uint;
@@ -133,6 +133,34 @@ mod ffi {
     extern "C" {
         pub fn fsync(fd: c_int) -> c_int;
         pub fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
+    }
+
+    // FFI invariant (Windows CRT, RustPython `crt_fd` /
+    // `host_env::nt` pattern): on Windows the fds are CRT
+    // fds (`c_int`, the same `RawFd` Rust std uses), and
+    // the CRT functions are the underscore-prefixed names:
+    // `_close` for `close`, `_commit` for `fsync`
+    // (RustPython aliases `libc::commit as fsync`), `_umask`
+    // for `umask`. `_lseeki64` is the 64-bit `lseek`
+    // (plain `_lseek` returns a 32-bit `long`); RustPython
+    // instead uses `SetFilePointerEx` via `_get_osfhandle`,
+    // but `_lseeki64` is the direct CRT equivalent with the
+    // same observable behavior — including ESPIPE on pipes,
+    // which `SetFilePointerEx` would report as
+    // ERROR_INVALID_HANDLE (EBADF), the wrong errno here.
+    // `_get_errno` reads the calling thread's CRT errno
+    // cell (RustPython `host_env::os::get_errno`);
+    // `WSAGetLastError` is Winsock-only and does NOT see
+    // CRT failures. MSVC CRT errno values are the POSIX
+    // numbers (EBADF 9, EINVAL 22, ESPIPE 29), so no
+    // mapping is needed.
+    #[cfg(windows)]
+    extern "C" {
+        pub fn _umask(mask: c_int) -> c_int;
+        pub fn _close(fd: c_int) -> c_int;
+        pub fn _commit(fd: c_int) -> c_int;
+        pub fn _lseeki64(fd: c_int, offset: i64, whence: c_int) -> i64;
+        pub fn _get_errno(p_value: *mut c_int) -> c_int;
     }
 
     // FFI invariant (Unix socket calls): every function
@@ -352,6 +380,25 @@ pub(crate) fn errno() -> i32 {
         // immediately after a failed Winsock call.
         unsafe { ffi::WSAGetLastError() }
     }
+}
+
+/// Read the calling thread's CRT errno cell (Windows
+/// only). The CRT functions (`_close` / `_commit` /
+/// `_umask` / `_lseeki64`) set CRT errno, NOT the Winsock
+/// error — `errno()` above would read the wrong cell.
+/// RustPython `host_env::os::get_errno` pattern: `_get_errno`
+/// fills the caller's cell. The value is already a POSIX
+/// errno number, no mapping needed.
+#[cfg(all(feature = "unsafe-ffi", windows))]
+pub(crate) fn crt_errno() -> i32 {
+    // FFI invariant: `_get_errno` writes one `c_int`
+    // through the caller's pointer; it cannot fail in a
+    // way that matters here (it returns 0 on success).
+    let mut value: i32 = 0;
+    unsafe {
+        ffi::_get_errno(&mut value);
+    }
+    value
 }
 
 /// Run `WSAStartup(MAKEWORD(2,2))` once (Windows only).
@@ -1233,7 +1280,8 @@ pub const ETIMEDOUT: i32 = 10060;
 /// `umask(2)` — set the process file-creation mask, return
 /// the previous mask (`modos.zig:382-388`). Infallible: the
 /// kernel masks the argument to 0777 and always succeeds.
-/// Unix only (the MSVC CRT has no `umask` symbol).
+/// Unix variant (plain `umask` symbol); the Windows
+/// variant below uses the CRT `_umask`.
 #[cfg(all(feature = "unsafe-ffi", unix))]
 pub fn sys_umask(mask: u32) -> u32 {
     // FFI invariant: `umask` cannot fail and takes any u32
@@ -1241,9 +1289,23 @@ pub fn sys_umask(mask: u32) -> u32 {
     unsafe { ffi::umask(mask) }
 }
 
+/// `umask` on Windows — the MSVC CRT `_umask`
+/// (RustPython `host_env::nt::umask`). Infallible like the
+/// Unix call: the CRT masks the argument to 0777 and
+/// always succeeds, returning the previous mask.
+#[cfg(all(feature = "unsafe-ffi", windows))]
+pub fn sys_umask(mask: u32) -> u32 {
+    // FFI invariant: `_umask` cannot fail and takes any
+    // `c_int` (the CRT masks to 0777); no errno read is
+    // needed.
+    unsafe { ffi::_umask(mask as i32) as u32 }
+}
+
 /// `close(2)` (`modos.zig:308-313`). No EINTR retry (the
-/// original has none). Unix only (the socket close on
-/// Windows is `closesocket`, see `sys_closesocket`).
+/// original has none). Unix variant (plain `close`
+/// symbol); the Windows variant below uses the CRT
+/// `_close` — NOT `closesocket`, which is only for
+/// SOCKET handles (see `sys_closesocket`).
 #[cfg(all(feature = "unsafe-ffi", unix))]
 pub fn sys_close(fd: i32) -> Result<(), i32> {
     // FFI invariant: `close` takes any i32 fd number; the
@@ -1259,8 +1321,30 @@ pub fn sys_close(fd: i32) -> Result<(), i32> {
     }
 }
 
+/// `close` on Windows — the MSVC CRT `_close`
+/// (RustPython `crt_fd::_close`). Same contract as the
+/// Unix variant: any i32 CRT fd number, EBADF on a bad
+/// fd. The error comes from the CRT errno cell
+/// (`crt_errno`), not `WSAGetLastError`.
+#[cfg(all(feature = "unsafe-ffi", windows))]
+pub fn sys_close(fd: i32) -> Result<(), i32> {
+    // FFI invariant: `_close` takes any i32 fd number;
+    // the CRT fails EBADF on a bad fd, it cannot fault.
+    let r = unsafe { ffi::_close(fd) };
+    if r < 0 {
+        // FFI invariant: CRT errno is read immediately
+        // after the failed call, before any other call can
+        // touch this thread's CRT errno cell.
+        Err(crt_errno())
+    } else {
+        Ok(())
+    }
+}
+
 /// `fsync(2)` (`modos.zig:352-356`). No EINTR retry (the
-/// original has none). Unix only.
+/// original has none). Unix variant (plain `fsync`
+/// symbol); the Windows variant below uses the CRT
+/// `_commit`.
 #[cfg(all(feature = "unsafe-ffi", unix))]
 pub fn sys_fsync(fd: i32) -> Result<(), i32> {
     // FFI invariant: `fsync` takes any i32 fd number; the
@@ -1276,10 +1360,31 @@ pub fn sys_fsync(fd: i32) -> Result<(), i32> {
     }
 }
 
+/// `fsync` on Windows — the MSVC CRT `_commit`
+/// (RustPython `crt_fd::fsync`, aliased there as
+/// `libc::commit`). Same contract as the Unix variant:
+/// any i32 CRT fd number, EBADF on a bad fd. The error
+/// comes from the CRT errno cell (`crt_errno`).
+#[cfg(all(feature = "unsafe-ffi", windows))]
+pub fn sys_fsync(fd: i32) -> Result<(), i32> {
+    // FFI invariant: `_commit` takes any i32 fd number;
+    // the CRT fails EBADF on a bad fd, it cannot fault.
+    let r = unsafe { ffi::_commit(fd) };
+    if r < 0 {
+        // FFI invariant: CRT errno is read immediately
+        // after the failed call, before any other call can
+        // touch this thread's CRT errno cell.
+        Err(crt_errno())
+    } else {
+        Ok(())
+    }
+}
+
 /// `lseek(2)` (`modos.zig:345-350`). No EINTR retry (the
 /// original has none). The kernel is the authority on a bad
 /// whence / negative offset — both fail EINVAL there.
-/// Unix only.
+/// Unix variant (plain `lseek` symbol); the Windows
+/// variant below uses the CRT `_lseeki64`.
 #[cfg(all(feature = "unsafe-ffi", unix))]
 pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> Result<i64, i32> {
     // FFI invariant: `lseek` takes an fd number and plain
@@ -1291,6 +1396,33 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> Result<i64, i32> {
         // the failed call, before any other call can touch
         // this thread's errno cell.
         Err(errno())
+    } else {
+        Ok(r)
+    }
+}
+
+/// `lseek` on Windows — the MSVC CRT `_lseeki64`
+/// (64-bit offsets; plain `_lseek` returns a 32-bit
+/// `long`). Same contract as the Unix variant: a bad fd
+/// fails EBADF, a bad whence fails EINVAL, a pipe fails
+/// ESPIPE. RustPython instead seeks via `SetFilePointerEx`
+/// on the `_get_osfhandle` HANDLE, but `_lseeki64` is the
+/// direct CRT equivalent — and the better match here, since
+/// `SetFilePointerEx` on a pipe reports
+/// ERROR_INVALID_HANDLE (EBADF) while the tests expect
+/// ESPIPE. The error comes from the CRT errno cell
+/// (`crt_errno`).
+#[cfg(all(feature = "unsafe-ffi", windows))]
+pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> Result<i64, i32> {
+    // FFI invariant: `_lseeki64` takes an fd number and
+    // plain integers; a bad fd fails EBADF, a bad whence
+    // fails EINVAL, neither can fault.
+    let r = unsafe { ffi::_lseeki64(fd, offset, whence) };
+    if r < 0 {
+        // FFI invariant: CRT errno is read immediately
+        // after the failed call, before any other call can
+        // touch this thread's CRT errno cell.
+        Err(crt_errno())
     } else {
         Ok(r)
     }

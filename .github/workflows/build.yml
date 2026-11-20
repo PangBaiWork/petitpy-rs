@@ -25,11 +25,18 @@
 #   That proves the suite builds for Android; execution there
 #   needs an emulator step, not added here.
 #
-# The `unsafe-ffi` feature is Linux-only: it declares glibc's
-# `__errno_location` and POSIX `select(2)` via `extern "C"`,
-# neither of which exists on macOS (libc uses `__error()`),
-# Windows (no POSIX syscalls) or Android (bionic uses
-# `__errno()`). So the Linux rows build a second,
+# The `unsafe-ffi` feature runs on Linux, macOS and
+# Windows: `errno()` is portable (Linux
+# `__errno_location`, macOS `__error`, Windows
+# `WSAGetLastError`), the socket wrappers have
+# per-platform arms, and the os wrappers (`umask` /
+# `close` / `fsync` / `lseek`) use the Unix syscalls on
+# Unix and the MSVC CRT (`_umask` / `_close` / `_commit` /
+# `_lseeki64`, CRT errno via `_get_errno`) on Windows —
+# the RustPython `crt_fd` pattern. Android stays out: its
+# rows only compile the tests (`--no-run`, no device to
+# execute them on), so the feature is not exercised
+# there. Rows with `ffi: true` build a second,
 # `petitpy-rs-<platform>-unsafe-ffi` artifact; the other
 # platforms ship the default (pure-std) build only.
 #
@@ -79,7 +86,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: windows-x86_64
             exe: ".exe"
-            ffi: false
+            ffi: true
             test_mode: run
             no_run: ""
             zig: false
@@ -88,7 +95,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact: macos-aarch64
             exe: ""
-            ffi: false
+            ffi: true
             test_mode: run
             no_run: ""
             zig: false
@@ -97,7 +104,7 @@ jobs:
             target: x86_64-apple-darwin
             artifact: macos-x86_64
             exe: ""
-            ffi: false
+            ffi: true
             test_mode: run
             no_run: ""
             zig: false

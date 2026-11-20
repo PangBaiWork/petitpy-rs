@@ -827,12 +827,12 @@ pub fn os_kill_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
 /// `os.umask(-1)` (Zig `@intCast` panic, rc=134), N1, not
 /// reproduced.
 pub fn os_umask_builtin(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    #[cfg(all(feature = "unsafe-ffi", unix))]
+    #[cfg(feature = "unsafe-ffi")]
     {
         let mask = arg_int(ctx, args[0])? as u32;
         Ok(Value::SmallInt(crate::support::ffi::sys_umask(mask) as i64))
     }
-    #[cfg(not(all(feature = "unsafe-ffi", unix)))]
+    #[cfg(not(feature = "unsafe-ffi"))]
     {
         let _ = args;
         Err(not_impl(ctx, "os.umask is not implemented (no std umask API)"))

@@ -1,8 +1,30 @@
-# Build petitpy-rs for Linux, macOS, Windows and Android on every push.
+# Build petitpy-rs for Linux, macOS, Windows and Android on every push,
+# and run its generic test suite on every platform.
 #
 # Each job builds the three binaries (`petitpy-rs`, `petitpy-vm`,
 # `zigpy-compile`) plus the shared library, and uploads them as an
-# artifact named `petitpy-rs-<platform>`.
+# artifact named `petitpy-rs-<platform>`. Each job then runs the
+# generic tests — `cargo test --release --lib` plus
+# `cargo test --release --tests` — on the default build, and again
+# with `--features unsafe-ffi` where the feature applies. Tests run
+# in release mode: the debug lib suite has 10 known debug-assert
+# failures, while the release suite is green. Lib and integration
+# suites run as separate `cargo test` invocations: a combined
+# `cargo test --lib --tests` hits an intermittent panic-strategy
+# race (cargo, `abort` vs `unwind`).
+#
+# How each platform runs the tests (`matrix.test_mode`):
+# - `run`: the test binaries execute natively (linux-x86_64,
+#   windows-x86_64, macos-aarch64, macos-x86_64).
+# - `qemu`: linux-aarch64 runs the test binaries under
+#   qemu-user-static with the aarch64 sysroot (`gcc-aarch64-
+#   linux-gnu`); the package also registers binfmt_misc, so
+#   the aarch64 binaries the integration tests spawn run too.
+# - `norun`: Android cannot execute test binaries on the
+#   runner (they need a device/emulator), so the Android rows
+#   compile the tests without running them (`--no-run`).
+#   That proves the suite builds for Android; execution there
+#   needs an emulator step, not added here.
 #
 # The `unsafe-ffi` feature is Linux-only: it declares glibc's
 # `__errno_location` and POSIX `select(2)` via `extern "C"`,
@@ -41,6 +63,8 @@ jobs:
             artifact: linux-x86_64
             exe: ""
             ffi: true
+            test_mode: run
+            no_run: ""
             zig: false
             android: false
           - os: ubuntu-latest
@@ -48,6 +72,8 @@ jobs:
             artifact: linux-aarch64
             exe: ""
             ffi: true
+            test_mode: qemu
+            no_run: ""
             zig: true
             android: false
           - os: windows-latest
@@ -55,6 +81,8 @@ jobs:
             artifact: windows-x86_64
             exe: ".exe"
             ffi: false
+            test_mode: run
+            no_run: ""
             zig: false
             android: false
           - os: macos-latest
@@ -62,6 +90,8 @@ jobs:
             artifact: macos-aarch64
             exe: ""
             ffi: false
+            test_mode: run
+            no_run: ""
             zig: false
             android: false
           - os: macos-latest
@@ -69,6 +99,8 @@ jobs:
             artifact: macos-x86_64
             exe: ""
             ffi: false
+            test_mode: run
+            no_run: ""
             zig: false
             android: false
           - os: ubuntu-latest
@@ -76,6 +108,8 @@ jobs:
             artifact: android-aarch64
             exe: ""
             ffi: false
+            test_mode: norun
+            no_run: "--no-run"
             zig: false
             android: true
             android_linker: aarch64-linux-android33-clang
@@ -85,6 +119,8 @@ jobs:
             artifact: android-x86_64
             exe: ""
             ffi: false
+            test_mode: norun
+            no_run: "--no-run"
             zig: false
             android: true
             android_linker: x86_64-linux-android33-clang
@@ -119,6 +155,24 @@ jobs:
       - name: Build (default)
         run: cargo build --release --target ${{ matrix.target }}
 
+      # aarch64 test binaries run under qemu-user-static with
+      # the aarch64 sysroot. Installing qemu-user-static also
+      # registers binfmt_misc, so aarch64 binaries spawned by
+      # the integration tests execute as well.
+      - name: Install qemu (aarch64)
+        if: matrix.test_mode == 'qemu'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=qemu-aarch64-static -L /usr/aarch64-linux-gnu" >> "$GITHUB_ENV"
+
+      - name: Test lib (default)
+        run: cargo test --release --lib --target ${{ matrix.target }} ${{ matrix.no_run }}
+
+      - name: Test integration (default)
+        run: cargo test --release --tests --target ${{ matrix.target }} ${{ matrix.no_run }}
+
       - name: Collect (default)
         shell: bash
         run: |
@@ -142,6 +196,17 @@ jobs:
       - name: Build (unsafe-ffi)
         if: matrix.ffi
         run: cargo build --release --target ${{ matrix.target }} --features unsafe-ffi
+
+      # Feature tests run the same generic suites against the
+      # feature build (this also exercises tests/g6a_os.rs,
+      # which is feature-gated and otherwise never compiles).
+      - name: Test lib (unsafe-ffi)
+        if: matrix.ffi
+        run: cargo test --release --lib --target ${{ matrix.target }} --features unsafe-ffi ${{ matrix.no_run }}
+
+      - name: Test integration (unsafe-ffi)
+        if: matrix.ffi
+        run: cargo test --release --tests --target ${{ matrix.target }} --features unsafe-ffi ${{ matrix.no_run }}
 
       - name: Collect (unsafe-ffi)
         if: matrix.ffi

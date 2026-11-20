@@ -236,27 +236,38 @@ assert s.fileno() == -1
     );
 }
 
-/// Only `gethostname` / `gethostbyname` are unshipped now
-/// (brief §4): `connect`, `sendto`, `recvfrom`,
-/// `setsockopt`, `makefile` all ship in H-socket.
+/// The S2 DNS / service / address module functions are
+/// shipped now (Lane S2): `gethostname` /
+/// `gethostbyname` (the two this test used to pin as
+/// absent) plus the rest of the S2 surface. Accessing
+/// any of them must not raise `AttributeError`.
 #[test]
-fn socket_no_unshipped() {
+fn socket_dns_shipped() {
     let mut fx = Fx::new();
     fx.run_ok(
         r#"
 import socket
-ok = True
-try:
-    socket.gethostname
-    ok = False
-except AttributeError:
-    pass
-try:
-    socket.gethostbyname
-    ok = False
-except AttributeError:
-    pass
-assert ok
+socket.gethostname
+socket.gethostbyname
+socket.gethostbyname_ex
+socket.gethostbyaddr
+socket.getnameinfo
+socket.getfqdn
+socket.getservbyname
+socket.getservbyport
+socket.create_connection
+socket.create_server
+socket.socketpair
+socket.getdefaulttimeout
+socket.setdefaulttimeout
+socket.htonl
+socket.htons
+socket.ntohl
+socket.ntohs
+socket.inet_aton
+socket.inet_ntoa
+socket.inet_pton
+socket.inet_ntop
 "#,
     );
 }

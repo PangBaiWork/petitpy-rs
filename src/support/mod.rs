@@ -19,6 +19,7 @@
 
 pub mod errno;
 pub mod ffi;
+pub mod ffi_dns;
 pub mod os_str;
 pub mod output;
 pub mod readline;

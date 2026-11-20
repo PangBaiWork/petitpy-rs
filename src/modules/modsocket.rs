@@ -106,7 +106,6 @@ use std::time::Duration;
 
 use crate::memory::gc::CallCtx;
 use crate::objects::containers::objdict::{dict_get_value, dict_store};
-use crate::objects::containers::objlist::new_list;
 use crate::objects::containers::objtuple::{new_tuple, tuple_items};
 use crate::objects::obj::{obj_get_float, obj_get_int, obj_get_int_maybe};
 use crate::objects::primitives::objfloat::new_float;
@@ -120,6 +119,12 @@ use crate::objects::value::{
 use crate::objects::objtype::objmodule::new_module;
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::raise::{malloc_fail, raise_os_error};
+
+/// DNS / service / address module functions (Lane S2):
+/// a child module (`src/modules/modsocket/dns.rs`) so it
+/// can use this module's private helpers directly; see
+/// its header for the feature-on / feature-off split.
+mod dns;
 
 /// Linux errno values used below.
 pub(crate) const EINVAL: i32 = 22;
@@ -336,13 +341,25 @@ pub(crate) fn get_settings(key: TableKey) -> SockSettings {
 }
 
 /// Move a settings entry to a new key (bind/connect/dup
-/// change the fd); the old entry is removed.
+/// change the fd); the old entry is removed. One guard
+/// for the whole move: the old code did
+/// `if let Some(s) = settings().remove(&old)` and then
+/// `settings().insert(new, s)` inside the body, which
+/// re-locked the same non-reentrant `Mutex` while the
+/// temporary guard from `remove` was still held — a
+/// deadlock whenever a settings entry existed
+/// (`setsockopt` / `settimeout` / `setblocking` /
+/// `setdefaulttimeout`) and the fd changed. Found by
+/// Lane S2: `setsockopt` (or `settimeout`) before
+/// `bind` hung forever; a plain `bind` worked because
+/// no entry existed and `remove` returned `None`.
 fn migrate_settings(old: TableKey, new: TableKey) {
     if old == new {
         return;
     }
-    if let Some(s) = settings().remove(&old) {
-        settings().insert(new, s);
+    let mut table = settings();
+    if let Some(s) = table.remove(&old) {
+        table.insert(new, s);
     }
 }
 
@@ -954,6 +971,12 @@ fn socket_ctor(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
             .map_err(|e| crate::modules::modsocket_ffi::ffi_os_error(ctx, e))?;
         let key = f.fileno();
         sockets().insert(key, SocketState::Ffi(f));
+        // Apply the module default timeout (Lane S2; a
+        // no-op while it is `None`, so the default build's
+        // behaviour is untouched).
+        if let Some(d) = dns::default_timeout() {
+            dns::apply_default_timeout(key, d);
+        }
         alloc_socket(ctx, key, family, type_, proto)
     }
     #[cfg(not(feature = "unsafe-ffi"))]
@@ -961,6 +984,12 @@ fn socket_ctor(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
         let placeholder = UdpSocket::bind("127.0.0.1:0").map_err(|e| io_os_error(ctx, e))?;
         let key = sock_key(&placeholder);
         sockets().insert(key, SocketState::Unbound(placeholder));
+        // Apply the module default timeout (Lane S2; a
+        // no-op while it is `None`, so the default build's
+        // behaviour is untouched).
+        if let Some(d) = dns::default_timeout() {
+            dns::apply_default_timeout(key, d);
+        }
         alloc_socket(ctx, key, family, type_, proto)
     }
 }
@@ -991,6 +1020,8 @@ fn socket_fromfd(ctx: &mut CallCtx, _args: &[Value]) -> PyResult<Value> {
 /// type); a family with no address is `EAFNOSUPPORT`.
 /// `getaddrinfo`'s `EAI_NONAME` (-2, CPython's
 /// `gaierror` errno for an unknown host or service).
+/// Only used by the feature-off `getaddrinfo` below.
+#[cfg(not(feature = "unsafe-ffi"))]
 const EAI_NONAME: i32 = -2;
 
 /// Resolve a service name to a port number: a numeric
@@ -1017,95 +1048,22 @@ fn resolve_service(service: &str) -> Option<u16> {
     })
 }
 
+/// `socket.getaddrinfo` dispatch: the FFI path with
+/// `unsafe-ffi` on (Lane S2, `modsocket::dns`), the
+/// existing pure-`std` path below with it off. The two
+/// cfg'd arms both return, so there is no unreachable
+/// fallthrough on either build.
 fn socket_getaddrinfo(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
-    let host_bytes: Option<Vec<u8>> = match args[0] {
-        Value::None => None,
-        v => Some(str_arg(ctx, v)?),
-    };
-    let family = match args.get(2) {
-        Some(v) => int_arg(ctx, *v)? as i32,
-        None => AF_UNSPEC,
-    };
-    let type_ = match args.get(3) {
-        Some(v) => int_arg(ctx, *v)? as i32,
-        None => SOCK_STREAM,
-    };
-    let proto = match args.get(4) {
-        Some(v) => int_arg(ctx, *v)? as i32,
-        None => 0,
-    };
-    match family {
-        AF_UNSPEC | AF_INET | AF_INET6 => {}
-        _ => return Err(raise_os_error(ctx, EAFNOSUPPORT)),
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        return dns::socket_getaddrinfo_ffi(ctx, args);
     }
-    let host = match &host_bytes {
-        None => "localhost".to_string(),
-        Some(b) if b.is_empty() => {
-            if family == AF_INET6 {
-                "::".to_string()
-            } else {
-                "0.0.0.0".to_string()
-            }
-        }
-        Some(b) => String::from_utf8_lossy(b).into_owned(),
-    };
-    // Resolve: an int port goes through as a number, a str
-    // port as a service name (`resolve_service` handles
-    // numeric strings and well-known names).
-    let mut out: Vec<Value> = Vec::new();
-    let resolved: Vec<SocketAddr> = match args[1] {
-        Value::None => {
-            ctx.record_raise("TypeError", Some("getaddrinfo port must be int or str"));
-            return Err(PyError::PyRaise);
-        }
-        v => {
-            let port_int = obj_get_int_maybe(ctx, ctx.types, v);
-            match port_int {
-                Ok(Some(p)) => {
-                    if !(0..=65535).contains(&p) {
-                        ctx.record_raise("OverflowError", Some("port must be 0-65535"));
-                        return Err(PyError::PyRaise);
-                    }
-                    (host.as_str(), p as u16).to_socket_addrs()
-                        .map_err(|e| io_os_error(ctx, e))?
-                        .collect()
-                }
-                _ => {
-                    let service = str_arg(ctx, v)?;
-                    let service = String::from_utf8_lossy(&service);
-                    let port = match resolve_service(&service) {
-                        Some(p) => p,
-                        None => return Err(raise_os_error(ctx, EAI_NONAME)),
-                    };
-                    (host.as_str(), port)
-                        .to_socket_addrs()
-                        .map_err(|e| io_os_error(ctx, e))?
-                        .collect()
-                }
-            }
-        }
-    };
-    let types = ctx.types;
-    for a in resolved {
-        let fam = match a {
-            SocketAddr::V4(_) => AF_INET,
-            SocketAddr::V6(_) => AF_INET6,
-        };
-        match (family, fam) {
-            (AF_INET, AF_INET) | (AF_INET6, AF_INET6) | (AF_UNSPEC, _) => {}
-            _ => continue,
-        }
-        let canon = new_str(ctx, types, b"");
-        let sockaddr = inet_addr_tuple(ctx, a);
-        let item = new_tuple(
-            ctx,
-            types.tuple,
-            &[small(fam as i64), small(type_ as i64), small(proto as i64), canon, sockaddr],
-        );
-        out.push(Value::Heap(item));
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        return dns::socket_getaddrinfo_std(ctx, args);
     }
-    Ok(Value::Heap(new_list(ctx, types.list, &out)))
 }
+
 
 // ── Methods (self = args[0] via type-method dispatch) ───────────────
 
@@ -2023,6 +1981,7 @@ fn sock_fileno(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     Ok(small(fd))
 }
 
+
 /// `sock.close() -> None` (also `__del__`): idempotent;
 /// drops the table entry (closing the fd) and the
 /// settings entry (so a reused fd never inherits stale
@@ -2356,6 +2315,15 @@ pub const SOCKET_LOCALS: &[MethodEntry] = &[
     MethodEntry { name: "getsockopt", func: sock_getsockopt, min: 4, max: 4, kw_func: None },
     MethodEntry { name: "setsockopt", func: sock_setsockopt, min: 4, max: 4, kw_func: None },
     MethodEntry { name: "fileno", func: sock_fileno, min: 1, max: 1, kw_func: None },
+    // Default build only (Lane S2): the pure-std path.
+    // Under the feature build the FFI versions below
+    // (S1's `modsocket_ffi::sock_getsockname` /
+    // `sock_getpeername`) are registered instead — one
+    // entry per name in each build, no duplicates.
+    #[cfg(not(feature = "unsafe-ffi"))]
+    MethodEntry { name: "getsockname", func: dns::sock_getsockname, min: 1, max: 1, kw_func: None },
+    #[cfg(not(feature = "unsafe-ffi"))]
+    MethodEntry { name: "getpeername", func: dns::sock_getpeername, min: 1, max: 1, kw_func: None },
     MethodEntry { name: "close", func: sock_close, min: 1, max: 1, kw_func: None },
     MethodEntry { name: "dup", func: sock_dup, min: 1, max: 1, kw_func: None },
     MethodEntry { name: "makefile", func: sock_makefile, min: 1, max: 2, kw_func: None },
@@ -2468,6 +2436,9 @@ pub fn build_socket_module(
         .map_err(|e| ctx.record_typed(e))?;
     dict_store(ctx, dict_v, Value::Qstr(gai_id), Value::Heap(getaddrinfo))
         .map_err(|e| ctx.record_typed(e))?;
+    // Lane S2's module functions + constants (DNS /
+    // service / address tools, `modsocket::dns`).
+    dns::register_dns_functions(ctx, fun_builtin_var, dict_v)?;
     for (name, v) in [
         (b"AF_UNSPEC".as_slice(), 0i64),
         (b"AF_UNIX".as_slice(), 1),

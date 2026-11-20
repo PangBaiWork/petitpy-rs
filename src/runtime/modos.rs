@@ -90,7 +90,9 @@ pub(crate) fn os_err(ctx: &mut CallCtx, e: &std::io::Error) -> PyError {
 /// `WSAE*` → `E*`). Winsock codes are in the same `i32`
 /// space (10000+); the socket FFI layer returns them raw
 /// and the caller maps them here, so Python sees one
-/// errno numbering on every platform.
+/// errno numbering on every platform. Also reused by the
+/// socket FFI DNS layer (`modsocket::dns`); unknown codes
+/// pass through unchanged.
 #[cfg(windows)]
 pub(crate) fn win32_to_errno(code: i32) -> i32 {
     match code {

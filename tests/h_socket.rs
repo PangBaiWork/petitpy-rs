@@ -272,7 +272,9 @@ fn h_socket_makefile_dup() {
     client.join().expect("client thread");
 }
 
-/// `fromfd` raises `NotImplementedError` on both builds.
+/// `fromfd` raises `NotImplementedError` on the default
+/// build (H-socket cut). Under `unsafe-ffi` (S3) it wraps
+/// the fd as-is and succeeds.
 #[test]
 fn h_socket_fromfd() {
     let dir = scratch("fromfd");
@@ -290,5 +292,9 @@ fn h_socket_fromfd() {
         ),
     );
     let r = run_script(&script);
-    assert_ok(&r, b"fromfd: socket.fromfd is not implemented\n");
+    #[cfg(feature = "unsafe-ffi")]
+    let expected = b"fromfd: no error\n";
+    #[cfg(not(feature = "unsafe-ffi"))]
+    let expected = b"fromfd: socket.fromfd is not implemented\n";
+    assert_ok(&r, expected);
 }

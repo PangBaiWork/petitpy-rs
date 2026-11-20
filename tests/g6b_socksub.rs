@@ -1,9 +1,11 @@
 //! G6b subprocess tests: `socket`/`subprocess` behaviors
-//! that need the real binary. `fromfd` is CUT in H-socket
+//! that need the real binary. `fromfd` was CUT in H-socket
 //! (safe Rust cannot take ownership of a raw fd): the name
-//! stays, every call raises `NotImplementedError` on both
-//! builds. This test runs the built `petitpy-rs` binary as
-//! a subprocess and asserts exactly that.
+//! stays, every call raises `NotImplementedError` on the
+//! default build. Under `unsafe-ffi` (S3) it wraps the fd
+//! as-is (no dup — `fileno() == fd`) and succeeds. This
+//! test runs the built `petitpy-rs` binary as a subprocess
+//! and asserts exactly that, on both builds.
 //!
 //! Binaries are located through the `CARGO_BIN_EXE_*`
 //! variables Cargo sets for integration tests.
@@ -51,14 +53,15 @@ fn run_script(script: &Path) -> Run {
     }
 }
 
-/// `socket.fromfd` is CUT in H-socket: every call raises
-/// `NotImplementedError`, on both builds (the old G6b U4
+/// `socket.fromfd` is CUT in H-socket on the default build:
+/// every call raises `NotImplementedError` (the old G6b U4
 /// behavior — the socket taking ownership of the fd and
 /// `close()` really closing it — is gone with the FFI
-/// implementation).
+/// implementation). Under `unsafe-ffi` (S3) it wraps the fd
+/// as-is and succeeds.
 #[test]
-fn g6b_fromfd_not_implemented() {
-    let dir = scratch("fromfd_notimpl");
+fn g6b_fromfd() {
+    let dir = scratch("fromfd");
     // Any readable file gives a valid fd for fromfd; /dev/null
     // does not exist on Windows, so open the script itself.
     let path = dir
@@ -74,6 +77,10 @@ fn g6b_fromfd_not_implemented() {
     );
     let r = run_script(&script);
     assert_eq!(r.code, 0, "stderr: {}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(r.stdout, b"fromfd: socket.fromfd is not implemented\n");
+    #[cfg(feature = "unsafe-ffi")]
+    let expected = b"fromfd: no error\n";
+    #[cfg(not(feature = "unsafe-ffi"))]
+    let expected = b"fromfd: socket.fromfd is not implemented\n";
+    assert_eq!(r.stdout, expected);
     assert!(r.stderr.is_empty());
 }

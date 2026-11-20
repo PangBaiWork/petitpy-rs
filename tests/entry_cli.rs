@@ -486,6 +486,11 @@ fn env_pythonpath() {
     let dir = scratch("env_pythonpath");
     let home = dir.to_str().unwrap().to_string();
     let lib = format!("{home}/.petitpy/lib");
+    // `print(sys.path)` shows each entry via `repr`, which
+    // doubles backslashes — on Windows the temp path's `\`
+    // become `\\` in the output (CI Build #14).
+    #[cfg(windows)]
+    let lib = lib.replace('\\', "\\\\");
     // PYTHONPATH's list separator is platform-specific
     // (`;` on Windows, `:` on Unix) — the entries must be
     // split by `append_path_entries` on every platform.

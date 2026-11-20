@@ -14,12 +14,11 @@
 # race (cargo, `abort` vs `unwind`).
 #
 # How each platform runs the tests (`matrix.test_mode`):
-# - `run`: the test binaries execute natively (linux-x86_64,
-#   windows-x86_64, macos-aarch64, macos-x86_64).
-# - `qemu`: linux-aarch64 runs the test binaries under
-#   qemu-user-static with the aarch64 sysroot (`gcc-aarch64-
-#   linux-gnu`); the package also registers binfmt_misc, so
-#   the aarch64 binaries the integration tests spawn run too.
+# - `run`: the test binaries execute natively. linux-aarch64
+#   runs on GitHub's native arm64 runner (`ubuntu-24.04-arm`,
+#   available for private repos since Jan 2026) — no qemu, no
+#   cross-linker: the job overrides the repo's Zig aarch64
+#   linker with the system `cc`.
 # - `norun`: Android cannot execute test binaries on the
 #   runner (they need a device/emulator), so the Android rows
 #   compile the tests without running them (`--no-run`).
@@ -67,14 +66,14 @@ jobs:
             no_run: ""
             zig: false
             android: false
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: linux-aarch64
             exe: ""
             ffi: true
-            test_mode: qemu
+            test_mode: run
             no_run: ""
-            zig: true
+            zig: false
             android: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -152,20 +151,18 @@ jobs:
         run: |
           echo "CARGO_TARGET_${{ matrix.target_env }}_LINKER=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.android_linker }}" >> "$GITHUB_ENV"
 
+      # The repo's .cargo/config.toml points the aarch64 target
+      # at the Zig cross-linker wrapper (needed when building
+      # aarch64 on an x86_64 host). On the native arm64 runner
+      # the system linker is the right one; the env var
+      # overrides the config file.
+      - name: Use system linker (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=cc" >> "$GITHUB_ENV"
+
       - name: Build (default)
         run: cargo build --release --target ${{ matrix.target }}
-
-      # aarch64 test binaries run under qemu-user-static with
-      # the aarch64 sysroot. Installing qemu-user-static also
-      # registers binfmt_misc, so aarch64 binaries spawned by
-      # the integration tests execute as well.
-      - name: Install qemu (aarch64)
-        if: matrix.test_mode == 'qemu'
-        shell: bash
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-user-static gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=qemu-aarch64-static -L /usr/aarch64-linux-gnu" >> "$GITHUB_ENV"
 
       - name: Test lib (default)
         run: cargo test --release --lib --target ${{ matrix.target }} ${{ matrix.no_run }}

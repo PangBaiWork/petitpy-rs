@@ -391,9 +391,28 @@ fn os_unimplemented_stubs() {
         let mut fx = Sx::new();
         fx.run_ok("import os\nprev = os.umask(0o022)\ncur = os.umask(-1)\nassert cur == 0o022\nos.umask(prev)\n");
     }
-    let mut fx = Sx::new();
-    // `run_ok` panics if either call raises.
-    fx.run_ok("import os\nos.kill(1, 0)\nos.chown(\"/tmp\", 0, 0)\n");
+    // `run_ok` panics if either call raises. Unix only: `kill` and
+    // `chown` shell out to /bin helpers. `chown` targets a temp
+    // file owned by this process, chowned to its own uid/gid —
+    // that succeeds without privileges. The old
+    // `chown("/tmp", 0, 0)` assumed root and failed on CI
+    // runners (EPERM).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir()
+            .join(format!("petitpy_chown_{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let md = std::fs::metadata(&path).unwrap();
+        let (uid, gid) = (md.uid(), md.gid());
+        let src = format!(
+            "import os\nos.kill(1, 0)\nos.chown({path:?}, {uid}, {gid})\n",
+            path = path.to_string_lossy()
+        );
+        let mut fx = Sx::new();
+        fx.run_ok(&src);
+        std::fs::remove_file(&path).unwrap();
+    }
 }
 
 /// `run_err` on a fresh `Sx` (each stub test gets its own VM

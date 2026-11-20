@@ -506,9 +506,14 @@ pub(crate) mod tests {
     /// Locate the original's frozen .mpy fixtures. Same rule as the
     /// qstr tests use for the vendored header: `PETITPY_ORIG` wins,
     /// otherwise `../petitpy-orig` next to the worktree, otherwise
-    /// `$HOME/workspace/petitpy-orig`. Panics with a clear message if
-    /// none exists — a missing fixture dir is a setup failure, not a
-    /// passing test.
+    /// `$HOME/workspace/petitpy-orig`. Last resort is the 23 frozen
+    /// .mpy files committed in this repo (`frozen/`), byte-identical
+    /// to the original's build-frozen output (see
+    /// scripts/check_frozen.py) — that makes the tests
+    /// self-contained, so they run on any checkout (CI included)
+    /// without a sibling petitpy-orig. Panics with a clear message
+    /// if none exists — a missing fixture dir is a setup failure,
+    /// not a passing test.
     pub(crate) fn fixture_dir() -> std::path::PathBuf {
         if let Ok(p) = std::env::var("PETITPY_ORIG") {
             let d = std::path::PathBuf::from(p).join("build-frozen");
@@ -526,6 +531,10 @@ pub(crate) mod tests {
             if d.is_dir() {
                 return d;
             }
+        }
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("frozen");
+        if d.is_dir() {
+            return d;
         }
         panic!("cannot locate petitpy-orig/build-frozen fixtures (set PETITPY_ORIG)");
     }

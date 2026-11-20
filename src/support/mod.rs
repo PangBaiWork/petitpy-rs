@@ -8,6 +8,8 @@
 //! - `errno` — portable `errno` access (`errno_compat.zig`)
 //! - `smallint` — `mp_small_int_modulo` / `mp_small_int_floor_divide`
 //!   (`smallint.zig`)
+//! - `readiness` — `select.select` monitor threads + shared
+//!   read buffers (H-select; pure `std`, no `select(2)` API)
 //!
 //! Already ported elsewhere (mapped here, not duplicated):
 //! - `qstr_hash.zig` → `crate::qstr_table::qstr_compute_hash` (C1)
@@ -20,6 +22,7 @@ pub mod ffi;
 pub mod os_str;
 pub mod output;
 pub mod readline;
+pub mod readiness;
 pub mod smallint;
 pub mod stream;
 pub mod stream_methods;

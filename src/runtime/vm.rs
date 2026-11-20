@@ -207,6 +207,13 @@ pub struct VmState {
     /// to materialise a `__del__` raise for the protected print,
     /// which the ctx-only `gc_collect_builtin` cannot do.
     pub gc_collect_builtin: Value,
+    /// The `select.select` builtin (H-select): the plain
+    /// `FunBuiltin` from the select module dict. Intercepted
+    /// by GcRef identity in `call_function_ctx` (see
+    /// `call_select_ctx` in `modselect.rs`) — it needs
+    /// `state.os_fds` (and the socket table), which a
+    /// `FunBuiltin` slot cannot see.
+    pub select_builtin: Value,
     /// The `dict.get` / `dict.pop` / `dict.setdefault` method
     /// builtins (G3/H3): the three `FunBuiltin`s from the dict
     /// type dict. Intercepted by GcRef identity in
@@ -545,6 +552,7 @@ impl Vm {
                 str_format_builtin: Value::None,
                 format_builtin: Value::None,
                 gc_collect_builtin: Value::None,
+                select_builtin: Value::None,
                 dict_get_builtin: Value::None,
                 dict_pop_builtin: Value::None,
                 dict_setdefault_builtin: Value::None,

@@ -327,6 +327,14 @@ pub(crate) fn intercept_builtin_call(
     if fun == state.os_fd_builtins.fsync {
         return Some(crate::runtime::modos_fd::os_fsync_ctx(ctx, state, n_args, n_kw, args));
     }
+    // `select.select` is intercepted the same way (H-select):
+    // it needs `state.os_fds` (and the socket table), which a
+    // `FunBuiltin` slot cannot see.
+    if fun == state.select_builtin {
+        return Some(crate::modules::modselect::call_select_ctx(
+            ctx, state, n_args, n_kw, args,
+        ));
+    }
     // `os.__getattr__` is intercepted the same way (D2): it
     // imports `os_path` / `os_ext` through the VM's import
     // machinery, which a `FunBuiltin` slot cannot see.

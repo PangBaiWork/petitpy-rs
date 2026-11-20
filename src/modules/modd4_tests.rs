@@ -9,9 +9,7 @@
 //! every assertion was probed on the reference binary
 //! 2026-11-18 (see `scripts/d4_result.txt` §2).
 
-#[cfg(feature = "unsafe-ffi")]
 use std::os::unix::net::UnixStream;
-#[cfg(feature = "unsafe-ffi")]
 use std::time::Duration;
 
 use crate::compiler::bridge::compile_to_mpy_named;
@@ -359,23 +357,20 @@ fn d4_select_negative_timeout() {
 }
 
 #[test]
-#[cfg(not(feature = "unsafe-ffi"))]
-fn d4_select_nonempty_not_implemented() {
+fn h_select_stdio_fd_ebadf() {
+    // H-select: fd 0 (stdin) is not resolvable in pure `std`
+    // (no safe `File` for stdio) — `EBADF`, on both builds.
     let mut fx = Fx::new();
     assert_eq!(
         fx.raised_msg("import select\nselect.select([0], [], [], 0)\n"),
-        (
-            "NotImplementedError".to_string(),
-            "select.select is not implemented (no std select API)".to_string()
-        )
+        ("OSError".to_string(), "9".to_string())
     );
 }
 
-// ── select, real select(2) (`unsafe-ffi` only, G0) ────────────────
+// ── select, pure-`std` probes (H-select; both builds) ───────────────
 
 #[test]
-#[cfg(feature = "unsafe-ffi")]
-fn g0_select_devnull_readable() {
+fn h_select_devnull_readable() {
     let mut fx = Fx::new();
     fx.run_ok(
         "import os, select\n\
@@ -391,13 +386,16 @@ fn g0_select_devnull_readable() {
 }
 
 #[test]
-#[cfg(feature = "unsafe-ffi")]
-fn g0_select_listener_readable_then_drained() {
-    // No `os.pipe` in the VM's os module (D2 never exposed it), so
-    // the readable → drained transition is driven through a Unix
-    // listener: a Rust std thread connects shortly after the script
-    // starts blocking in select (the modsocket_tests.rs pattern).
-    let path = format!("/tmp/g0_sel_listen_{}", std::process::id());
+fn h_select_listener_never_ready() {
+    // H-select: a listener is never ready — pure `std` has no
+    // non-destructive probe for it (`UnixStream::peek` is
+    // unstable; `accept` would consume the pending
+    // connection). The connect thread still runs, so this
+    // pins the limitation even WITH a pending connection
+    // (the old G0 test asserted ready here via real
+    // `select(2)`). Timeout 0.2s, not 5s — nothing will ever
+    // make it ready.
+    let path = format!("/tmp/h_sel_listen_{}", std::process::id());
     let _ = std::fs::remove_file(&path);
     let client_path = path.clone();
     let handle = std::thread::spawn(move || {
@@ -409,23 +407,19 @@ fn g0_select_listener_readable_then_drained() {
         "import socket, select, os\n\
          s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
          s.bind({path:?}); s.listen(1); s.setblocking(False)\n\
-         r, _, _ = select.select([s.fileno()], [], [], 5)\n\
+         r, _, _ = select.select([s.fileno()], [], [], 0.2)\n\
          a = len(r)\n\
          c, _ = s.accept()\n\
-         r, _, _ = select.select([s.fileno()], [], [], 0)\n\
-         b = len(r)\n\
          c.close(); s.close(); os.remove({path:?})\n"
     );
     fx.run_ok(&src);
     let _ = handle.join();
     let _ = std::fs::remove_file(&path);
-    assert_eq!(fx.g_int("a"), 1);
-    assert_eq!(fx.g_int("b"), 0);
+    assert_eq!(fx.g_int("a"), 0);
 }
 
 #[test]
-#[cfg(feature = "unsafe-ffi")]
-fn g0_select_write_ready() {
+fn h_select_write_ready() {
     let mut fx = Fx::new();
     fx.run_ok(
         "import os, select\n\
@@ -438,8 +432,7 @@ fn g0_select_write_ready() {
 }
 
 #[test]
-#[cfg(feature = "unsafe-ffi")]
-fn g0_select_ebadf() {
+fn h_select_ebadf() {
     let mut fx = Fx::new();
     assert_eq!(
         fx.raised_msg(
@@ -453,20 +446,19 @@ fn g0_select_ebadf() {
 }
 
 #[test]
-#[cfg(feature = "unsafe-ffi")]
-fn g0_select_fd_over_1024_skipped() {
+fn h_select_high_fd_ebadf() {
+    // H-select: Python has no FD_SETSIZE cap, and an unknown
+    // fd is `EBADF` — the old feature path silently skipped
+    // fd >= 1024 (and returned three empty lists).
     let mut fx = Fx::new();
-    fx.run_ok(
-        "import select\n\
-         r, w, x = select.select([2000], [], [], 0)\n\
-         a = len(r) + len(w) + len(x)\n",
+    assert_eq!(
+        fx.raised_msg("import select\nselect.select([2000], [], [], 0)\n"),
+        ("OSError".to_string(), "9".to_string())
     );
-    assert_eq!(fx.g_int("a"), 0);
 }
 
 #[test]
-#[cfg(feature = "unsafe-ffi")]
-fn g0_select_dup_fd() {
+fn h_select_dup_fd() {
     let mut fx = Fx::new();
     fx.run_ok(
         "import os, select\n\
@@ -480,8 +472,7 @@ fn g0_select_dup_fd() {
 }
 
 #[test]
-#[cfg(feature = "unsafe-ffi")]
-fn g0_select_xlist_not_ready() {
+fn h_select_xlist_not_ready() {
     let mut fx = Fx::new();
     fx.run_ok(
         "import os, select\n\
@@ -491,6 +482,44 @@ fn g0_select_xlist_not_ready() {
          os.close(fd)\n",
     );
     assert_eq!(fx.g_int("a"), 0);
+}
+
+#[test]
+fn h_select_file_object_ready() {
+    // H-select: a file object is accepted (its own `File`),
+    // `/dev/null` is ready at once (EOF counts as ready),
+    // and the result keeps the ORIGINAL object (identity).
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "import select\n\
+         f = open('/dev/null', 'rb')\n\
+         r, w, x = select.select([f], [], [], 0)\n\
+         a = len(r)\n\
+         b = r[0] is f\n\
+         f.close()\n",
+    );
+    assert_eq!(fx.g_int("a"), 1);
+    assert!(fx.g_bool("b"));
+}
+
+#[test]
+fn h_select_socket_object_never_ready() {
+    // H-select: a socket object resolves through its
+    // `fileno()` (the `self_socket` shape) — and, like any
+    // socket fd, is never ready in pure `std` (see the
+    // module docs). Both the object and the bare fd.
+    let mut fx = Fx::new();
+    fx.run_ok(
+        "import socket, select\n\
+         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         r, _, _ = select.select([s], [], [], 0)\n\
+         a = len(r)\n\
+         r, _, _ = select.select([s.fileno()], [], [], 0)\n\
+         b = len(r)\n\
+         s.close()\n",
+    );
+    assert_eq!(fx.g_int("a"), 0);
+    assert_eq!(fx.g_int("b"), 0);
 }
 
 #[test]

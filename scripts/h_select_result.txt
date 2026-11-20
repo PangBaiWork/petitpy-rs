@@ -1,0 +1,299 @@
+# H-select 结果（lane/h-select，基线 master 36f537c，rebase 后）
+
+## §1 改了什么
+
+目标：`select.select` 按 Python API 统一行为、纯 Rust std、双构建一致；
+默认构建 integration 200/202 → 202/202（`select_readable_fd_is_ready`、
+`select_timeout_zero_returns_promptly` 两红变绿）。
+
+### 新文件
+
+- `src/support/readiness.rs`（新增，812 行）：每 fd 一个 monitor 线程 +
+  共享读缓冲。`ensure_monitor(fd, file)`（`File::try_clone`，共享
+  description/offset）；`take_buffered` / `wait_buffered` /
+  `drain_into(fd, buf) -> (usize, bool)`（两条读路径共用）；`note_closed`
+  （标记 stale + 清缓冲，防 fd 号复用继承旧字节）/ `note_seek`
+  （seek 后缓冲失效）；`wait_settled`（新 monitor 首读有界 10ms 握手，
+  见下）；`reusable()` + `(dev, ino)` identity（fd 号复用时死 monitor
+  的缓冲只在同一 description 时复用）；`BUFFER_CAP` 64 KiB 背压。
+  只有一个文件放 monitor 表（`SOCKETS` 不动）。
+- `tests/h_select.rs`（新增，10 个二进制探针，NO cfg 门控，双构建都跑；
+  精确 stdout 断言，所以双构建 diff 天然为空）：FIFO 有数据 / 无数据
+  （writer 全程持有）/ timeout=None；accepted socket 有数据仍 not-ready
+  （pinned limitation，后续 recv 证明数据在）/ 无数据 not-ready；坏 fd -1
+  与坏 wlist/xlist → OSError 9；`/dev/null` 文件对象 identity（`r[0] is f`）；
+  fd ≥ 1024 接受且就绪；devnull + listener sanity。所有等待都有 deadline
+  （子进程 15s、writer open / connect 5s，超时 kill）。
+
+### 改写：`src/modules/modselect.rs`（503 行，FFI 路径全删）
+
+- 删：`ffi` mod、`FdSet`、`select_real`、`timeval_from_secs`、
+  `list_len`、全部 `#[cfg(feature = "unsafe-ffi")]` 分支。
+- `select.select(r, w, x[, timeout])` 新逻辑（见模块头文档）：
+  入口一次性解析（CPython 入口校验所有 fd）；解析：int/bool 即 fd
+  本身（堆 int 只认 exact int——float 不认，`obj_get_int_maybe` 会走
+  `__int__` 把 3.5 读成 3，CPython 的 select 拒绝非整数）、文件对象
+  （自己的 `File`，Owned 才可 monitor）、socket 实例（`self_socket`
+  形：4 个 small-int subobj，[0] 为 fd）、其他对象走 `fileno()` 方法；
+  再无则 TypeError。裸 fd 号：0/1/2（stdio）与越界 → EBADF；
+  socket fd 经 `modsocket::socket_probe`（见下）；否则必须在
+  `state.os_fds`（取 clone 的 `File` 供 monitor），未知 → EBADF。
+- 探针循环 2ms quantum：文件 fd 由 monitor 判定（缓冲非空 / EOF /
+  monitor 已死——死表示下一次读是 OS 读，会 surface 错误或 seek 后的
+  新数据，所以报 ready 是对的）；socket fd 永不 ready；wlist 恒 ready
+  （已校验，纯 std 无写就绪探针——文档化的近似）；xlist 恒空（已校验）；
+  三表全空时 sleep timeout 后返回三个空表（`select(0, NULL, NULL, NULL, tv)`
+  行为）；`timeout=None`/无穷循环等；有限 timeout 是 deadline（超大值在
+  ~95 年处饱和——`Duration::from_secs_f64` 会在溢出时 panic，旧代码在
+  同处也会 panic）。
+- 保留的旧行为（2026-11-18 在 reference 上探过）：负/NaN timeout →
+  OSError(22)；非 list 参数 → TypeError（"select() argument must be a list"）；
+  少于 3 个参数（或任何关键字）→ TypeError（"argument num/types mismatch"，
+  拦截绕过了 call machinery 的 arity 检查，所以检查移到 `select_ctx` 里）；
+  三个结果表是 DISTINCT 的表。
+- 与 reference 的分歧（沿用旧版）：非 list 参数 reference 会 ABORT
+  （`incorrect alignment` panic，rc=134），Rust 抛 TypeError；无穷 timeout
+  reference 会 ABORT（`@intFromFloat` panic），Rust 永久循环。旧 feature
+  路径的真 `select(2)`（FD_SETSIZE 1024 上限、fd < 0 / ≥ 1024 静默跳过）
+  已删：Python 没有 fd 上限，未知 fd 现在是 EBADF 而不是静默跳过。旧默认
+  路径的非空表 → NotImplementedError 已删——这就是本 lane 的目的。
+- `FunBuiltin` 槽是 stub（直接调用时抛 NotImplementedError "select.select
+  called without VM state"）；真正入口是 `call_select_ctx`（拦截用）；
+  `build_select_module` 返回 `(module, select_fn)`（`build_gc_module` 形）。
+
+### 接线（brief 文件清单之外，必需——见 §4(4)）
+
+- `src/runtime/vm.rs`：`VmState.select_builtin: Value`（init `Value::None`）。
+- `src/runtime/vm_modules.rs`：`build_select_module` 解构出 `select_fn`，
+  存入 `state.select_builtin`。
+- `src/runtime/vm_call_intercept.rs`：`fun == state.select_builtin` 时调
+  `modselect::call_select_ctx`（os fd builtins 同形——`FunBuiltin` 槽看
+  不到 `state.os_fds`）。
+- `src/modules/modsocket.rs`（+36 行，唯一新增）：`socket_probe(fd) ->
+  Option<SocketProbe>`（`Unprobable`：stream/listener/未绑定/他人所有；
+  `Bare`：`fromfd` 且无自有对象 → EBADF，与已有“他人 fd 上 I/O”规则一致）。
+  除此之外不碰 modsocket（H-socket 的文件）。
+  **Rebase 到 master 36f537c（H-socket 已合入）后重写**：H-socket 把
+  modsocket.rs 整个重写了（2422 行，`SOCKETS` 表改为 `HashMap<TableKey,
+  SocketState>`，`TableKey = i64` 即 OS fd 本身；`SocketState` 为
+  `Unbound`/`ListenerTcp`/`ListenerUnix`/`StreamTcp`/`StreamUnix`/
+  `Datagram`/`DatagramUnix`，无旧版的 `Stream`/`Listener`/`Foreign`；
+  `fromfd` 已删，改为抛 NotImplementedError）。旧 `socket_probe` 在
+  rebase 时文本上合入了，但引用了不存在的变体（编不过）。新版：
+  `socket_probe(fd: i32)` 只查表——fd 在 `SOCKETS` 里即
+  `Some(Unprobable)`，否则 `None`。`Bare` 变体已删（新版不存在无自有
+  对象的 socket fd；未知 fd 落到 os fd 表 / EBADF）。`subobj` 形状未变
+  （4 个 small-int，[0]=fd），所以 modselect 的 socket 实例判定不用改。
+
+### 读路径（防数据丢失——select 启动 monitor 后，读必须先排空缓冲）
+
+- `src/objects/containers/objfileio.rs`：`fileio_read` 先 `drain_into`，
+  只有无活 monitor 时才读 OS 剩余部分（活 monitor + 空缓冲时 BLOCK，
+  绝不返回 0——`stream_rw_loop` 会把 0 读成 EOF）；SEEK 成功 →
+  `note_seek`；CLOSE → `note_closed`。
+- `src/runtime/modos_fd.rs`：`os_read_ctx` 同样先排空（`os.read` 返回一次
+  读到的量，排出的缓冲即算一次读）；`os_lseek_ctx` 成功 → `note_seek`；
+  `os_close_ctx`（双臂）→ `note_closed`。
+- `readiness::drain_into` 是两条读路径的共享实现（原先 objfileio 的私有
+  `drain_buffered` 已删）。
+
+### 关键修复（测试中发现的真 bug）
+
+1. **首读竞态（settle 握手）**：新 monitor 的首次 read 还没发生时，
+   timeout=0 的第一次 probe 已跑完，`/dev/null`（已 EOF）被误报 not-ready
+   （lib 3 个测试失败）。修法：`ensure_monitor` 对新 monitor 做一次有界
+   等待（`wait_settled`，`data` condvar + 10ms deadline——monitor 每次 read
+   完成都会通知；空管道的阻塞 read 永不通知，deadline 到即返回，不会挂住）。
+   只对新 monitor 等（复用的早已 settled），每 fd 只付一次（空管道首 select
+   最多 10ms）。回归测试 `fresh_monitor_settled_on_eof`。
+2. **fd 号复用挂住**：FIFO 测试的 O_RDWR monitor 靠自己的 dup 持有写端，
+   read 永不回 EOF，monitor 活过测试；下一测试复用同一 fd 号时
+   `ensure_monitor` 返回了残留的活 FIFO monitor。修法：`reusable()`——
+   仅当非 stale、identity 匹配（双已知时）、且（活着 或 死而有字节）才复用；
+   不可复用的标 stale 并替换；`note_closed` 同时清缓冲（已关闭 description
+   的预读字节不可达，否则同文件重开会继承——`(dev, ino)` 分不出来）。
+3. **feature `os.close` 双重 close（pre-existing G6a bug，本 lane 修）**：
+   feature 分支先 `sys_close(fd)` 再 drop 表里的 `File`，fd 被关两次；
+   debug 直接 abort（"IO Safety violation: owned file descriptor already
+   closed"，rc=134；不经过 select 的 `os.open` + `os.close` 最小复现亦然），
+   release 下第二次 close 可能落在复用的 fd 号上。G6a 注释以为重关的
+   EBADF 会被忽略——debug 下不是。修法：`sys_close` 成功后用
+   `into_raw_fd()`（safe，只转移所有权不关闭）消费掉表里的 `File`。
+   `stdio` 分支不受影响（无 File 可 drop）。另见 §4(9)：`os.close(f.fileno())`
+   （f 为 `open()` 文件对象）仍是同类隐患，未修。
+
+### lib 测试更新（`src/modules/modd4_tests.rs`）
+
+- `d4_select_nonempty_not_implemented` → `h_select_stdio_fd_ebadf`：
+  `[0]` → OSError(9)，去 cfg 门控。
+- `g0_select_listener_readable_then_drained` →
+  `h_select_listener_never_ready`：listener 永不 ready（即使已有 pending
+  连接——connect 线程仍跑，timeout 0.2s 而非 5s），去 cfg 门控。
+- `g0_select_fd_over_1024_skipped` → `h_select_high_fd_ebadf`：
+  `[2000]` → OSError(9)，去 cfg 门控。
+- `g0_select_devnull_readable` / `g0_select_dup_fd` /
+  `g0_select_xlist_not_ready` / `g0_select_write_ready` /
+  `g0_select_ebadf` → 去 `#[cfg(feature = "unsafe-ffi")]`（双构建都跑），
+  重命名为 `h_select_*`（`g0_` 前缀已过时）；`UnixStream`/`Duration`
+  导入解开门控。行为未变（dup 两项都上报，len 2；xlist 恒空；wlist 恒 ready）。
+- 新增：`h_select_file_object_ready`（文件对象就绪 + `r[0] is f` 身份）、
+  `h_select_socket_object_never_ready`（socket 对象经 fileno 解析，对象与
+  裸 fd 都永不 ready）。
+- 未变：`d4_select_empty` / `d4_select_empty_timeout` /
+  `d4_select_negative_timeout` / `d4_select_bad_arg` /
+  `d4_select_too_few_args`。
+
+### 提交（分支 lane/h-select，基线 d316394 → rebase 到 master 36f537c）
+
+- `38e8a06` readiness 数据信号 + seek 失效 + fd 复用 guard
+- `b8c03a9` fileio 读先排空缓冲
+- `76b1892` socket_probe() 分类器
+- `0c076ad` 共享 drain helper；os.read/os.close/os.lseek 接入
+- `7234c89` 纯 std select 重写 + VmState 拦截 + settle 握手
+- `52f77c8` 二进制探针 + 修 feature os.close 双重 close
+- `e6139cd` 结果文件（§2/§3，rebase 前的数）
+- rebase 到 master `36f537c`（H-socket + H-subprocess 已合入）：
+  8 个提交全部干净合入（0 冲突——但 `socket_probe` 文本合入后引用了
+  新版不存在的变体，见上），随后：
+- `2b3155d` socket_probe 按新版 modsocket 重写 + 删 Bare
+
+**下文 §2/§3 是 rebase 后（HEAD 2b3155d，基线 master 36f537c）的实测数。
+旧基线 d316394 下的 integration 202/202 已失效（见 §2 说明）。**
+
+## §2 验证数字
+
+HEAD `2b3155d`（分支 lane/h-select，基线 master `36f537c`；release 构建，
+除非注明）。验证脚本 `~/workspace/h_select_verify.sh`（checkpointed，
+输出在 `~/workspace/h_select_verify/`，每节独立文件）；基线数在临时
+worktree `/tmp/petitpy-base-36f537c`（HEAD `36f537c07a30d801b2491a8532543108373cded1`，
+输出在 `~/workspace/h_select_verify/base_36f537c/`）实测。
+
+**注意——旧数已失效**：本节旧版写的 integration 202/202 是旧基线
+d316394（H-socket 合入前）的数。rebase 到 36f537c 后，H-socket 砍了
+`socket.fromfd`，integration 上限变为 201/202：唯一失败是
+`socket_fromfd_wraps_fd`（`NotImplementedError: socket.fromfd is not
+implemented`，故意的），select 两项已变绿。默认构建 199/202 → 201/202
+（恰好修掉 2 个 select 测试）；feature 构建 201/202 不变（select 测试
+在基线已通过真 `select(2)`，fromfd 在基线与 lane 都失败）。
+
+| 门 | 默认构建 | feature 构建（`--features unsafe-ffi`） | 基线（36f537c 实测） |
+|---|---|---|---|
+| lib（`cargo test --release --lib`） | 1771 passed / 0 failed / 2 ignored | 1771 passed / 0 failed / 2 ignored | 默认 1753 / feature 1761（0 failed / 2 ignored） |
+| bins（`cargo test --release --bins`） | 9 passed | 9 passed | 9 |
+| entry_cli | 45 passed | 45 passed | 45 |
+| h_select（release） | 10/10 | 10/10 | —（新增） |
+| h_select（debug） | 10/10 | 10/10 | —（新增） |
+| integration | **201/202**（唯一失败 `socket_fromfd_wraps_fd`） | **201/202**（同左） | 默认 199/202（fromfd + 2 select）、feature 201/202（仅 fromfd） |
+| full | 545/552 GREEN（恰为 7 个 known-fails） | 545/552 GREEN | 545/552 GREEN |
+| golden | 585/585 | 585/585 | 585/585 |
+| capability | 67/67 GREEN（1 CPYTHON DIFF `async_def`——基线行为） | 67/67 GREEN | 67/67 GREEN |
+| stdlib | 8/8 | 8/8 | 8/8 |
+| nano（report-only） | 454/541 | 454/541 | 454/541（runner `--strict` rc=1，两构建皆然，与基线一致） |
+| check_compile_mpy + check_frozen | PASS / PASS | PASS / PASS | PASS |
+| warnings（强制重编） | 0 | 0 | 0 |
+
+lib 增量对账（实测，`cargo test --release --lib -- --list` diff，输出在
+`~/workspace/h_select_verify/debug_check/`）：默认 +18 = lane-only 19 −
+base-only 1（lane-only：10 个 `h_select_*` modd4 测试 + 9 个 readiness
+测试；base-only：`d4_select_nonempty_not_implemented` 改名）；即新增 11
+（readiness 9 + modd4 2）+ 解门控 7（g0_ 测试原只在 feature 编）。
+feature +10 = lane-only 19 − base-only 9（base-only：7 个 `g0_select_*` +
+2 个已删的 modselect feature 测试 `fd_set_bits` / `timeval_conversion`）。
+0 failed、2 ignored 与基线相同。
+
+`unsafe`：lane 模块（modselect.rs、readiness.rs、modos_fd.rs、
+objfileio.rs）中无任何 `unsafe` 代码块（`grep -E "unsafe\s*\{|
+unsafe\s+fn|unsafe\s+extern"` 为空，rc=1）。"unsafe" 一词仅出现在：
+readiness.rs:70 的一条 doc 注释，以及 modos_fd.rs 里 pre-existing 的
+注释与 `#[cfg(feature = "unsafe-ffi")]` 属性（G6a 的 FFI 调用在
+ffi.rs，不在本 lane 改动内）。文件行数：modselect.rs 503、
+readiness.rs 812、modos_fd.rs 575、objfileio.rs 800、h_select.rs 466，
+均 < 2500。lane diff（vs 36f537c）：11 文件，+2210/−346。
+
+## §3 探针（含双构建 diff）
+
+### 双构建 diff：空
+
+`tests/h_select.rs` 的 10 个探针都断言精确 stdout；它们在默认与
+feature 构建上（debug 与 release）全部通过，所以双构建输出天然一致，
+diff 为空。release 版：A05/B05 各 10/10；debug 版：10/10、10/10。
+
+### 探针表（输出在双构建上完全相同）
+
+| 探针 | 脚本要点 | 输出 |
+|---|---|---|
+| `h_select_fifo_data_ready` | FIFO，writer 写 `b'hello'` 后关闭；select 2s | `1\n5\nTrue\n`（ready，读到 5 字节，内容一致——drain 路径无丢字节） |
+| `h_select_fifo_no_data_not_ready` | FIFO，writer 全程持有、不写；select 0.2s | `0\n`（无数据 → not-ready；无 writer 时 read 直接回 EOF 会误报 ready，故 writer 必须在场） |
+| `h_select_fifo_timeout_none_ready` | FIFO + 数据；select timeout=None | `1\n`（阻塞到就绪后返回） |
+| `h_select_socket_with_data_not_ready` | AF_UNIX accepted socket，harness 发 5 字节；select 0.5s | `0\n5\n`（pinned limitation：select 报 not-ready，但随后 recv 拿到 5 字节，证明数据在） |
+| `h_select_socket_no_data_not_ready` | AF_UNIX accepted socket，无数据；select 0.2s | `0\n` |
+| `h_select_bad_fd_minus_one` | `select([-1], [], [], 0)` | `9\n`（OSError EBADF） |
+| `h_select_bad_fd_wlist_xlist` | `select([], [9999], [], 0)` 与 `select([], [], [9999], 0)` | `9\n9\n`（wlist/xlist 也校验 fd） |
+| `h_select_devnull_file_object_identity` | `open('/dev/null','rb')`，三表同传 | `1\n1\n0\nTrue\n`（r/w/x 长度 + `r[0] is f`） |
+| `h_select_high_fd_over_1024` | 循环开 `/dev/null` 直到 fd ≥ 1024，再 select | `1\n`（无 FD_SETSIZE 上限） |
+| `h_select_devnull_and_listener_sanity` | `/dev/null` 与 listener（无连接，0.2s） | `1\n0\n` |
+
+### 与 reference 的对照（integration 门）
+
+integration 门 201/202（双构建；唯一失败是 `socket_fromfd_wraps_fd`，
+fromfd 被 H-socket 砍掉，故意的）中，之前两红的 select 测试现在
+PASS（`tests/test_integration_os.py` 的期望值即 reference 行为）：
+`select_timeout_zero_returns_promptly`（AF_UNIX listener，timeout 0 →
+`r == []`）、`select_readable_fd_is_ready`（`os.open('/dev/null')` →
+fd 在 r 中，EOF 计为 ready）、`select_empty_returns_empty_lists`。
+
+开发期手动探针（debug 默认二进制，h_select 测试已覆盖，双构建）：
+FIFO 有数据 `1/5/True`；FIFO 无数据（writer 在场）`0`；accepted
+socket 有数据时 select `0`、随后 `recv` 得 5 字节。
+
+## §4 遗留项
+
+1. **Socket（stream/listener/未绑定/datagram，INET 或 UNIX）永不 ready**——
+   `UnixStream::peek` 仍是 unstable（stable rustc 1.99.1 上不可用），
+   monitor `recv` 会消费 socket `recv` 路径不排空的字节。解开办法：
+   socket monitor + `recv` 排空进 `modsocket.rs`，在 H-socket 重写落地后做
+   （会碰 H-socket 的 `recv` 路径）。H-socket 现已合入 master（36f537c），
+   所以解开的前提已满足，但仍不在本 lane 做（超出 select 范围；INET
+   stream/datagram 理论上可用稳定的 `TcpStream::peek`/`UdpSocket::peek`
+   探，UNIX stream 仍无稳定 peek——实现时需按 family 区分）。
+   后果：brief 里的 socket-pair 探针（accepted socket 有数据 → ready）
+   无法通过，现作为 pinned-limitation 探针（assert not-ready + 注释）。
+   Listener 同类：`accept` 会消费 pending 连接，故同样 not-ready；
+   `g0_select_listener_readable_then_drained`（feature 原先经真 `select(2)`
+   通过）已改为 assert 该 limitation。
+2. **Brief 的 "clone 保护原 blocking 状态" 在 OS 层面是错的**——`O_NONBLOCK`
+   是 per-description 的，dup 共享它（已有的 `setblocking` 行为亦然）。
+   peek 取消后此点已无关，记于此。
+3. **fd 0/1/2（stdio）→ EBADF**——std 里没有 stdio 的安全 `File`；
+   `/proc/self/fd` 重开是 Linux-only，且对常规文件是错的（独立 offset）。
+4. **brief 文件清单之外的改动**：`modos_fd.rs`（os.read/os.close/os.lseek
+   接入 monitor）与 VmState/拦截接线是必需的——没有它们，`select([os_fd])`
+   启动 monitor 后，后续 `os.read(fd)` 会跳过已缓冲的字节（数据丢失）；
+   同理 `VmState.select_builtin` + 拦截（`FunBuiltin` 看不到 `os_fds` 与
+   socket 表）。
+5. **同文件重开的残留口子**：旧 monitor 还活着、且 `note_closed` 从未被调
+   用时，同文件重开可能复用旧 monitor。所有 close 路径都已接线，所以这
+   需要一次未接线的 close 才会发生。
+6. **`__index__` 对象不接受**：只认 exact int 与 `fileno()`。CPython 的
+   select 还接受带 `__index__` 的对象（无 `fileno()` 时）；petitpy 里
+   `__index__` 罕见，未做。
+7. **wlist 恒 ready、xlist 恒空是近似**：纯 std 没有写/异常就绪探针。
+   对常规文件/管道写端恒 ready 是对的；对满的管道写端会误报（调用方
+   write 会阻塞）。xlist 在 Linux 上几乎恒空，与 CPython 一致。
+8. **`poll` 未做**：原项目没有 `poll`（brief 亦然）；可作后续。
+9. **feature `os.close(f.fileno())`（f 为 `open()` 文件对象）仍双重 close**：
+   `sys_close` 关掉 f 的 fd 后，f 的 `File` Drop 会再关一次（debug abort，
+   release 可能关到复用的号）。与 §1 修复的同类问题，但涉及 `open()` 文件
+   对象的关闭路径，未在本 lane 修（超出 select 范围；需让 File 对象释放
+   所有权）。
+10. **集成探针只放在 `tests/h_select.rs`**：brief 让往
+    `tests/test_integration_os.py`（orig 仓库）的 select 节加探针，但 orig
+    仓库只读；`tests/h_select.rs` 覆盖了同等场景。
+11. **Settle 等待的代价**：空管道的首个 select 最多等 10ms（每 fd 一次，
+    复用不付）。`select_timeout_zero_returns_promptly`（listener，0.2s
+    量级）不受影响（socket 无 monitor）。
+12. **Monitor 线程残留泄漏**（readiness.rs 模块文档已有）：fd 被从外部
+    关闭后，阻塞在 `read` 里的 monitor 要等下一次 read 事件才退出；每
+    个被丢弃的 description 最多一个阻塞线程。
+13. **超大有限 timeout 在 ~95 年处饱和**（`Duration::from_secs_f64` 溢出
+    panic，旧代码同处也会 panic；无穷 timeout 仍永久循环，与旧默认路径一致）。

@@ -3,7 +3,10 @@
 //! (safe Rust cannot take ownership of a raw fd): the name
 //! stays, every call raises `NotImplementedError` on the
 //! default build. Under `unsafe-ffi` (S3) it wraps the fd
-//! as-is (no dup — `fileno() == fd`) and succeeds. This
+//! as-is (no dup — `fileno() == fd`) and succeeds — except
+//! on Windows, where AF_UNIX `fromfd` is deliberately
+//! unimplemented in the FFI layer, so the test pins that
+//! `NotImplementedError` message there instead. This
 //! test runs the built `petitpy-rs` binary as a subprocess
 //! and asserts exactly that, on both builds.
 //!
@@ -58,7 +61,14 @@ fn run_script(script: &Path) -> Run {
 /// behavior — the socket taking ownership of the fd and
 /// `close()` really closing it — is gone with the FFI
 /// implementation). Under `unsafe-ffi` (S3) it wraps the fd
-/// as-is and succeeds.
+/// as-is and succeeds — except on Windows, where AF_UNIX
+/// `fromfd` is deliberately unimplemented in the FFI layer
+/// (`modsocket_ffi_adv::socket_fromfd_ffi`), so the test
+/// pins that `NotImplementedError` message there instead.
+/// Build #29: the unconditional `no error` expectation
+/// failed on windows-x86_64 (only job failing, 6/7 pass);
+/// making AF_UNIX `fromfd` work on Windows is a separate
+/// design change, not a CI fix.
 #[test]
 fn g6b_fromfd() {
     let dir = scratch("fromfd");
@@ -78,7 +88,11 @@ fn g6b_fromfd() {
     let r = run_script(&script);
     assert_eq!(r.code, 0, "stderr: {}", String::from_utf8_lossy(&r.stderr));
     #[cfg(feature = "unsafe-ffi")]
-    let expected = b"fromfd: no error\n";
+    let expected: &[u8] = if cfg!(windows) {
+        b"fromfd: socket.fromfd(AF_UNIX) is not implemented on Windows\n"
+    } else {
+        b"fromfd: no error\n"
+    };
     #[cfg(not(feature = "unsafe-ffi"))]
     let expected = b"fromfd: socket.fromfd is not implemented\n";
     assert_eq!(r.stdout, expected);

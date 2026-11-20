@@ -486,12 +486,19 @@ fn env_pythonpath() {
     let dir = scratch("env_pythonpath");
     let home = dir.to_str().unwrap().to_string();
     let lib = format!("{home}/.petitpy/lib");
+    // PYTHONPATH's list separator is platform-specific
+    // (`;` on Windows, `:` on Unix) — the entries must be
+    // split by `append_path_entries` on every platform.
+    #[cfg(windows)]
+    let py_path = "/foo;/bar";
+    #[cfg(not(windows))]
+    let py_path = "/foo:/bar";
     let r = run_env(
         &bin_petitpy(),
         &["-c", "import sys; print(sys.path)"],
         "",
         None,
-        &[("HOME", Some(&home)), ("PYTHONPATH", Some("/foo:/bar"))],
+        &[("HOME", Some(&home)), ("PYTHONPATH", Some(py_path))],
     );
     assert_eq!(r.code, 0);
     assert_eq!(r.stdout, format!("['', '/foo', '/bar', '{lib}']\n"));

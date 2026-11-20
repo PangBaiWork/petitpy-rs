@@ -176,10 +176,19 @@ fn real_main() -> ExitCode {
         Err(e) => {
             // Byte-exact error line: the file name is raw
             // argv bytes (the reference prints them as-is).
+            // On Windows, reading a directory fails with
+            // access denied (5), not EISDIR — detect the
+            // directory directly so the message is "IsDir"
+            // on every platform (CI Build #13 `script_is_dir`).
+            let name = if std::path::Path::new(script).is_dir() {
+                "IsDir".to_string()
+            } else {
+                io_error_name(&e)
+            };
             let mut msg = b"petitpy: can't open file '".to_vec();
             msg.extend_from_slice(script.as_encoded_bytes());
             msg.extend_from_slice(b"': ");
-            msg.extend_from_slice(io_error_name(&e).as_bytes());
+            msg.extend_from_slice(name.as_bytes());
             msg.push(b'\n');
             let _ = std::io::stderr().write_all(&msg);
             return ExitCode::from(2);

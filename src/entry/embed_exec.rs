@@ -135,11 +135,18 @@ pub fn wire_env_sys_path(vm: &mut Vm) {
 }
 
 /// `appendPathEntries` (`main.zig`): append each
-/// colon-separated entry, skipping empties (CPython behavior
+/// path-list entry, skipping empties (CPython behavior
 /// — an empty entry would mean CWD, which `sys.path[0]`
-/// already covers).
+/// already covers). The separator is platform-specific:
+/// `:` on Unix, `;` on Windows — a `:` on Windows is the
+/// drive letter, so splitting on it would break `C:\...`
+/// into `C` + `\...` (CI Build #13 `env_pythonpath`).
 fn append_path_entries(paths: &mut Vec<Vec<u8>>, value: &str) {
-    for entry in value.split(':') {
+    #[cfg(windows)]
+    const SEP: char = ';';
+    #[cfg(not(windows))]
+    const SEP: char = ':';
+    for entry in value.split(SEP) {
         if !entry.is_empty() {
             paths.push(entry.as_bytes().to_vec());
         }

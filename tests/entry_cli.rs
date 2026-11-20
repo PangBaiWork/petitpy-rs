@@ -630,15 +630,14 @@ fn vm_systemexit() {
 }
 
 #[test]
-fn vm_eval_not_linked() {
-    let dir = scratch("vm_eval_not_linked");
-    let mpy = emit_mpy(&dir, "eval(\"1+1\")\n", "eval.mpy");
+fn vm_eval_linked() {
+    // The compiler separation was removed (it saved only ~14KB
+    // of ~2.1MB): `eval` works under `petitpy-vm` now.
+    let dir = scratch("vm_eval_linked");
+    let mpy = emit_mpy(&dir, "print(eval(\"1+1\"))\n", "eval.mpy");
     let r = run(&bin_vm(), &[mpy.to_str().unwrap()], "", Some(&dir));
-    assert_eq!(r.code, 1);
-    assert_eq!(
-        r.stdout,
-        "Traceback (most recent call last):\n  File \"<emit-mpy>\", in <module>\nNotImplementedError: compiler not linked in petitpy-vm\n"
-    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "2\n");
     assert_eq!(r.stderr, "");
 }
 

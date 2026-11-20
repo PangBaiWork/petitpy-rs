@@ -200,13 +200,6 @@ impl Vm {
         globals: GcRef,
         locals: GcRef,
     ) -> Result<Value, Value> {
-        // `petitpy-vm`: the compiler is not linked (the Zig's
-        // `npy_zig_eval_exec` stub).
-        if !state.compiler_linked {
-            return Err(crate::runtime::compile_bridge::compiler_not_linked_error(
-                ctx, state,
-            ));
-        }
         let source_str = match std::str::from_utf8(source) {
             Ok(s) => s,
             Err(_) => {
@@ -350,14 +343,6 @@ impl Vm {
         globals: GcRef,
         locals: GcRef,
     ) -> Result<Value, Value> {
-        // `petitpy-vm`: the compiler is not linked (the Zig's
-        // `npy_zig_eval_exec` stub).
-        if !self.state.compiler_linked {
-            let (mut ctx, state) = self.split();
-            return Err(
-                crate::runtime::compile_bridge::compiler_not_linked_error(&mut ctx, state),
-            );
-        }
         let source_str = match std::str::from_utf8(source) {
             Ok(s) => s,
             Err(_) => return Err(self.compile_error_value_named(CompileError::SyntaxError, name)),

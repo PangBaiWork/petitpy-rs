@@ -44,9 +44,7 @@ use crate::objects::containers::objdict::dict_store;
 use crate::objects::objtype::objexcept::new_exception_msg;
 use crate::objects::value::{GcRef, Obj, StrData, Value};
 use crate::pyerr::PyError;
-use crate::runtime::compile_bridge::{
-    compile_source_to_mpy, compiler_not_linked_error, raise_from_code,
-};
+use crate::runtime::compile_bridge::{compile_source_to_mpy, raise_from_code};
 use crate::runtime::persistentcode::{raw_code_load_mem, LoadedCode};
 use crate::runtime::runtime::{dunder, RtError};
 use crate::runtime::runtime_method::load_method_maybe;
@@ -384,13 +382,6 @@ pub fn exec_source_in_module(
     source_name: &[u8],
     module_obj: Value,
 ) -> Result<(), Value> {
-    // `petitpy-vm`: the compiler is not linked — a `.py`
-    // import cannot compile (the Zig's `npy_zig_compile_source`
-    // stub). `.mpy` imports (`exec_mpy_in_module`) are NOT
-    // gated: they need no compiler.
-    if !state.compiler_linked {
-        return Err(compiler_not_linked_error(ctx, state));
-    }
     let mpy = match compile_source_to_mpy(src, InputKind::FileInput, source_name) {
         Ok(m) => m,
         Err(ce) => {

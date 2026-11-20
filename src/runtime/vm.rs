@@ -300,14 +300,6 @@ pub struct VmState {
     /// drained by `pending_exc_check` (the dispatch loop's
     /// per-iteration poll, `vm.zig:110-114` Tier G).
     pub pending_sched: Option<Value>,
-    /// Whether the compiler is linked into this VM
-    /// (`main_vm.zig`: the `petitpy-vm` binary sets the
-    /// compiler-bridge stubs, so `eval` / `exec` / `compile`
-    /// and the import system's `.py` compile path raise
-    /// `NotImplementedError("compiler not linked in
-    /// petitpy-vm")`; the `petitpy` binary leaves it true).
-    /// Added by E1.
-    pub compiler_linked: bool,
     /// `sys.path` (`MP_STATE_VM(sys_mutable[0])`,
     /// `runtime.zig:276-279`): the import search path. Default
     /// `[""]` — `mp_init` creates an empty list and appends the
@@ -577,7 +569,6 @@ impl Vm {
                 host_call_builtin: Value::None,
                 not_implemented: Value::None,
                 pending_sched: None,
-                compiler_linked: true,
                 sys_path: vec![Vec::new()],
                 sys_path_list: None,
                 sys_modules_dict: None,

@@ -2,11 +2,10 @@
 //! `main_vm.zig`): load a `.mpy` buffer and execute its
 //! top-level function.
 //!
-//! No compile step — `.mpy` imports still work, but `eval` /
-//! `exec` / `compile` and `.py` imports raise
-//! `NotImplementedError("compiler not linked in petitpy-vm")`
-//! (the `VmState.compiler_linked` flag, set false by the
-//! `petitpy-vm` binary).
+//! No compile step for the entry `.mpy` itself; `eval` /
+//! `exec` / `compile` and `.py` imports inside it work — the
+//! compiler is linked (the old compiler separation was removed:
+//! it saved only ~14KB of ~2.1MB).
 
 use crate::entry::embed_exec::exit_status_for;
 use crate::runtime::vm::{Vm, VmError};

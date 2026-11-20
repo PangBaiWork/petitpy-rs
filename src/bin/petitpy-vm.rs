@@ -1,11 +1,10 @@
 //! `petitpy-vm` — the VM-only entry point (`src/main_vm.zig`, E1).
 //!
 //! Reads argv[1] as a `.mpy` file and executes it. The compiler
-//! track is deliberately NOT linked here: `eval` / `exec` /
-//! `compile` and `.py` imports raise
-//! `NotImplementedError("compiler not linked in petitpy-vm")`
-//! (`VmState.compiler_linked = false`); `.mpy` imports still
-//! work. The printed program name and version are the
+//! IS linked here: the old compiler separation (a compiler-less
+//! `petitpy-vm`) was removed — it saved only ~14KB of ~2.1MB, so
+//! `eval` / `exec` / `compile` and `.py` imports work, exactly as
+//! under `petitpy`. The printed program name and version are the
 //! ORIGINAL's (`petitpy-vm 0.9.0`).
 //!
 //! Dispatch (`main_vm.zig`, in order):
@@ -70,6 +69,5 @@ fn real_main() -> ExitCode {
     };
 
     let mut vm = Vm::new();
-    vm.state.compiler_linked = false;
     ExitCode::from(run_mpy(&mut vm, &buf) as u8)
 }

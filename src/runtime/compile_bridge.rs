@@ -24,26 +24,6 @@ use crate::objects::objtype::objexcept::{
 };
 use crate::objects::value::Value;
 use crate::runtime::vm::VmState;
-use crate::runtime::vm_ops::exc_from_pyerror;
-
-/// The `petitpy-vm` compiler stub error (`main_vm.zig`):
-/// with the compiler unlinked (`VmState.compiler_linked ==
-/// false`), any compile attempt raises
-/// `NotImplementedError("compiler not linked in petitpy-vm")`
-/// — the exact message of the Zig stub (`main_vm.zig:15-19`
-/// replaces `npy_zig_eval_exec` / `compile_to_code_glue`
-/// with it). Callers check `state.compiler_linked` first
-/// and return this error. Code objects do NOT go through
-/// here: the `objIsCode` fast path in `eval_exec_helper`
-/// runs before any compile, exactly as the Zig checks it
-/// before calling `npy_zig_eval_exec`.
-pub(crate) fn compiler_not_linked_error(ctx: &mut CallCtx, state: &VmState) -> Value {
-    let e = crate::runtime::raise::raise_not_implemented(
-        ctx,
-        Some("compiler not linked in petitpy-vm"),
-    );
-    exc_from_pyerror(ctx, state, e)
-}
 
 /// `MP_ENOMEM` (`zig_compile_bridge.zig:51-52`).
 pub const MP_ENOMEM: i32 = 12;
@@ -165,11 +145,6 @@ pub fn compile_to_code(
     kind: InputKind,
     source_name: &[u8],
 ) -> Result<Value, Value> {
-    // `petitpy-vm`: the compiler is not linked (the Zig's
-    // `compile_to_code_glue` stub).
-    if !state.compiler_linked {
-        return Err(compiler_not_linked_error(ctx, state));
-    }
     let mpy = match compile_source_to_mpy(src, kind, source_name) {
         Ok(m) => m,
         Err(ce) => {
@@ -201,7 +176,8 @@ pub fn compile_to_code(
 ///   `raiseIncompatibleMpy` — every structural load failure is
 ///   the same raise in the original).
 /// * `OutOfMemory` → `MemoryError("out of memory")` (the existing
-///   convention — `exc_from_pyerror`'s `OutOfMemory` arm).
+///   convention — `crate::runtime::vm_ops::exc_from_pyerror`'s
+///   `OutOfMemory` arm).
 /// * `Raised(v)` → the object itself.
 pub(crate) fn vm_error_to_value(
     ctx: &mut CallCtx,

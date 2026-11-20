@@ -193,8 +193,16 @@ pub struct SockaddrStorage {
 
 /// `struct addrinfo` — Unix layout (glibc / BSD):
 /// `ai_addrlen` is `socklen_t` (`u32`), `ai_addr` comes
-/// before `ai_canonname`.
-#[cfg(all(feature = "unsafe-ffi", unix))]
+/// before `ai_canonname`. Linux / Android only — macOS
+/// puts `ai_canonname` before `ai_addr` (see the
+/// variant below).
+/// Build #20: this variant used to cover all of Unix,
+/// so on macOS `getaddrinfo_owned` read the (usually
+/// NULL) canonname pointer as `ai_addr` and skipped
+/// every entry → `socket.getaddrinfo` returned an empty
+/// list. The layout now mirrors the correct 3-variant
+/// definition in `src/support/ffi.rs`.
+#[cfg(all(feature = "unsafe-ffi", unix, not(target_os = "macos")))]
 #[repr(C)]
 pub struct Addrinfo {
     pub ai_flags: i32,
@@ -204,6 +212,24 @@ pub struct Addrinfo {
     pub ai_addrlen: u32,
     pub ai_addr: *mut Sockaddr,
     pub ai_canonname: *mut std::os::raw::c_char,
+    pub ai_next: *mut Addrinfo,
+}
+
+/// `struct addrinfo` — macOS (Darwin) layout:
+/// `ai_addrlen` is `socklen_t` (`u32`), but
+/// `ai_canonname` comes before `ai_addr` (unlike Linux).
+/// Build #20: added — without it the Unix variant above
+/// misread every macOS `getaddrinfo` result.
+#[cfg(all(feature = "unsafe-ffi", target_os = "macos"))]
+#[repr(C)]
+pub struct Addrinfo {
+    pub ai_flags: i32,
+    pub ai_family: i32,
+    pub ai_socktype: i32,
+    pub ai_protocol: i32,
+    pub ai_addrlen: u32,
+    pub ai_canonname: *mut std::os::raw::c_char,
+    pub ai_addr: *mut Sockaddr,
     pub ai_next: *mut Addrinfo,
 }
 
@@ -238,7 +264,14 @@ pub struct Servent {
     pub s_proto: *mut std::os::raw::c_char,
 }
 
-/// Address families (identical on every platform).
+/// Address families, PYTHON-numbered (`AF_INET6` 10 —
+/// the value `modsocket.rs` exposes). These are NOT the
+/// kernel values on macOS (30) / Windows (23): anything
+/// handed to C, or compared against a kernel family from
+/// `ai_family`, must use `crate::support::ffi`'s
+/// platform-correct constants (see `sockaddr_from_raw`)
+/// or `translate_family` in `modsocket_ffi.rs`.
+/// (`AF_INET` 2 agrees everywhere.)
 #[cfg(feature = "unsafe-ffi")]
 pub const AF_INET: i32 = 2;
 #[cfg(feature = "unsafe-ffi")]
@@ -581,13 +614,25 @@ impl Drop for AddrInfoList {
 /// `sockaddr` of the given family (owned by the C list —
 /// alive until the guard drops). Returns `None` for a
 /// family we do not carry, or a too-short sockaddr.
+///
+/// `len` is `usize`: on Windows `ai_addrlen` is
+/// `size_t`, so the `u32` parameter broke the Windows
+/// build (Build #20, E0308 at the call site).
+/// `family` is the KERNEL family straight from
+/// `ai_family`, so it is matched against the
+/// platform-correct constants in `crate::support::ffi`
+/// (`AF_INET6` is 10 on Linux, 30 on macOS, 23 on
+/// Windows) — NOT this file's Python-numbered
+/// `AF_INET6` (10): Build #20, matching 10 skipped
+/// every macOS IPv6 entry, so a family=`AF_INET6`
+/// lookup came back empty.
 #[cfg(feature = "unsafe-ffi")]
-fn sockaddr_from_raw(sa: *mut Sockaddr, len: u32, family: i32) -> Option<ResolvedAddr> {
+fn sockaddr_from_raw(sa: *mut Sockaddr, len: usize, family: i32) -> Option<ResolvedAddr> {
     if sa.is_null() {
         return None;
     }
     match family {
-        AF_INET if (len as usize) >= std::mem::size_of::<SockaddrIn>() => {
+        crate::support::ffi::AF_INET if len >= std::mem::size_of::<SockaddrIn>() => {
             // FFI invariant: `sa` points at a valid
             // `sockaddr_in` (the list guarantees
             // `ai_addrlen` bytes); reading it cannot fault.
@@ -596,7 +641,7 @@ fn sockaddr_from_raw(sa: *mut Sockaddr, len: u32, family: i32) -> Option<Resolve
             let port = u16::from_be(sin.sin_port);
             Some(ResolvedAddr::Inet(SocketAddr::new(ip.into(), port)))
         }
-        AF_INET6 if (len as usize) >= std::mem::size_of::<SockaddrIn6>() => {
+        crate::support::ffi::AF_INET6 if len >= std::mem::size_of::<SockaddrIn6>() => {
             // FFI invariant: `sa` points at a valid
             // `sockaddr_in6`; reading it cannot fault.
             // `flowinfo` / `scope_id` are dropped — the
@@ -610,11 +655,15 @@ fn sockaddr_from_raw(sa: *mut Sockaddr, len: u32, family: i32) -> Option<Resolve
             let port = u16::from_be(sin6.sin6_port);
             Some(ResolvedAddr::Inet(SocketAddr::new(ip.into(), port)))
         }
-        1 if (len as usize) >= std::mem::size_of::<Sockaddr>() => {
+        1 if len >= std::mem::size_of::<Sockaddr>() => {
             // AF_UNIX: the path is the bytes after
             // `sun_family`, up to the first NUL (or the
             // end of the sockaddr). Defensive only.
-            let raw = unsafe { std::slice::from_raw_parts(sa as *const u8, len as usize) };
+            // (No all-NUL special case is needed here,
+            // unlike `SockAddr::from_raw`: the first-NUL
+            // rule already yields an empty path when the
+            // whole path is NULs.)
+            let raw = unsafe { std::slice::from_raw_parts(sa as *const u8, len) };
             let path = &raw[2..];
             let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
             Some(ResolvedAddr::Unix(path[..end].to_vec()))
@@ -678,7 +727,9 @@ pub fn getaddrinfo_owned(
         } else {
             unsafe { CStr::from_ptr(ai.ai_canonname) }.to_string_lossy().into_owned()
         };
-        if let Some(sockaddr) = sockaddr_from_raw(ai.ai_addr, ai.ai_addrlen, ai.ai_family) {
+        if let Some(sockaddr) =
+            sockaddr_from_raw(ai.ai_addr, ai.ai_addrlen as usize, ai.ai_family)
+        {
             out.push(AddrInfoEntry {
                 family: ai.ai_family,
                 socktype: ai.ai_socktype,

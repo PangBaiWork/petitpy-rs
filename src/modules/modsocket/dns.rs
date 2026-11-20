@@ -74,9 +74,24 @@ use crate::runtime::raise::raise_os_error;
 #[cfg(feature = "unsafe-ffi")]
 use crate::support::ffi_dns::{
     getaddrinfo_owned, gethostname_owned, getnameinfo_owned, getservbyname_owned,
-    getservbyport_owned, inet_aton_owned, inet_ntoa_owned, inet_ntop_owned, inet_pton_owned,
-    AddrInfoEntry, NameInfoAddr, ResolvedAddr,
+    getservbyport_owned, inet_ntoa_owned, inet_ntop_owned, inet_pton_owned, AddrInfoEntry,
+    NameInfoAddr, ResolvedAddr,
 };
+/// Build #20: `inet_aton_owned` is defined only under
+/// `#[cfg(all(feature = "unsafe-ffi", unix))]` in
+/// `ffi_dns.rs` (Windows has no `inet_aton`), so the
+/// unconditional import broke the Windows build
+/// (E0432). The call site already dispatches to the
+/// pure-Rust `parse_inet_aton` on Windows.
+#[cfg(all(feature = "unsafe-ffi", unix))]
+use crate::support::ffi_dns::inet_aton_owned;
+/// Family translation across the FFI boundary (kernel
+/// `AF_INET6` is 30 on macOS, 23 on Windows; the
+/// Python-facing value stays 10). Used by
+/// `ffi_getaddrinfo` / `socket_getaddrinfo_ffi` — see
+/// Build #20.
+#[cfg(feature = "unsafe-ffi")]
+use crate::modules::modsocket_ffi::{translate_family, translate_family_back};
 
 // ── Constants (Python-visible; cfg-correct values) ──────────────────
 
@@ -451,7 +466,15 @@ fn ffi_getaddrinfo(
     proto: i32,
     flags: i32,
 ) -> Result<Vec<AddrInfoEntry>, i32> {
-    match getaddrinfo_owned(node, service, family, socktype, proto, flags) {
+    // Build #20: `family` here is Python-facing
+    // (`AF_INET6` 10); the C hints need the kernel
+    // family (30 on macOS, 23 on Windows) — passing 10
+    // to Darwin's `getaddrinfo` resolves nothing.
+    // (`AF_INET` 2 / `AF_UNSPEC` 0 are the identity, so
+    // the other `getaddrinfo_owned` call sites that pass
+    // only those need no translation.)
+    let kernel_family = translate_family(family);
+    match getaddrinfo_owned(node, service, kernel_family, socktype, proto, flags) {
         Ok(v) => Ok(v),
         Err(e) if service_is_name && (e == EAI_NONAME || e == EAI_SERVICE) => {
             // The C resolver does not know this service
@@ -459,9 +482,14 @@ fn ffi_getaddrinfo(
             // through the built-in 9-entry table (the
             // same table the `std` path uses).
             match resolve_service(service) {
-                Some(port) => {
-                    getaddrinfo_owned(node, &port.to_string(), family, socktype, proto, flags)
-                }
+                Some(port) => getaddrinfo_owned(
+                    node,
+                    &port.to_string(),
+                    kernel_family,
+                    socktype,
+                    proto,
+                    flags,
+                ),
                 None => Err(EAI_NONAME),
             }
         }
@@ -537,7 +565,13 @@ pub(crate) fn socket_getaddrinfo_ffi(ctx: &mut CallCtx, args: &[Value]) -> PyRes
     let types = ctx.types;
     let mut out: Vec<Value> = Vec::new();
     for e in entries {
-        let fam = e.family;
+        // Build #20: `e.family` is the KERNEL family
+        // from `ai_family` (30 on macOS for IPv6);
+        // translate it back to the Python-facing family
+        // (10) BEFORE the filter and the tuple, or an
+        // `AF_INET6` request filters everything out and
+        // the tuple would carry 30.
+        let fam = translate_family_back(e.family);
         match (family, fam) {
             (AF_INET, AF_INET) | (AF_INET6, AF_INET6) | (AF_UNSPEC, _) => {}
             _ => continue,

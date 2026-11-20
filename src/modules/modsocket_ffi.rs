@@ -138,6 +138,7 @@ impl SockAddr {
                 storage._inner[..n].copy_from_slice(bytes);
                 n as u32
             }
+            #[cfg(unix)]
             SockAddr::Unix { path } => {
                 let sa = ffi::SockaddrUn::new(path);
                 let n = std::mem::size_of::<ffi::SockaddrUn>();
@@ -153,6 +154,14 @@ impl SockAddr {
                 storage._inner[..n].copy_from_slice(bytes);
                 ffi::SockaddrUn::len_for(path)
             }
+            // Build #20: `ffi::SockaddrUn` does not exist
+            // on Windows (Unix-only in `ffi.rs`), and
+            // there is no Winsock `sockaddr_un` mapping
+            // in this port — return length 0, so the
+            // `bind` / `connect` / `sendto` call fails
+            // with the OS error instead of not compiling.
+            #[cfg(windows)]
+            SockAddr::Unix { .. } => 0,
         }
     }
 
@@ -193,30 +202,59 @@ impl SockAddr {
                 scope_id: sa.sin6_scope_id,
             })
         } else if fam == ffi::AF_UNIX as u16 {
-            // SAFETY (invariant): the family matched, so
-            // `storage` holds a kernel-written
-            // `sockaddr_un`; the path starts at offset 2
-            // on every platform (see `ffi.rs`). Abstract
-            // addresses start with NUL and are NOT
-            // NUL-terminated — the name is the full
-            // `len - 2` bytes; filesystem paths end at
-            // the first NUL.
-            let sa = unsafe { &*(storage._inner.as_ptr() as *const ffi::SockaddrUn) };
-            let total = (len as usize).saturating_sub(2);
-            let path_len = total.min(sa.sun_path.len());
-            let raw = &sa.sun_path[..path_len];
-            let end = if raw.first() == Some(&0) {
-                raw.len()
-            } else {
-                raw.iter().position(|b| *b == 0).unwrap_or(raw.len())
-            };
-            Some(SockAddr::Unix {
-                path: raw[..end].to_vec(),
-            })
+            unix_sockaddr_un(storage, len)
         } else {
             None
         }
     }
+}
+
+/// Read a kernel `sockaddr_un` back (Unix only). Split
+/// out of `SockAddr::from_raw` so the `#[cfg]` stays on
+/// a whole function: `#[cfg]` on an `else if` arm is
+/// fragile, and on Windows `ffi::SockaddrUn` does not
+/// exist at all (Build #20).
+/// An all-NUL path is an unnamed address (empty path):
+/// Build #20, macOS `accept()` returns `addrlen > 2`
+/// with a zeroed path for the unbound peer (Linux
+/// returns len 2), and the old code treated a leading
+/// NUL as an abstract address of full length — a path
+/// of NUL bytes instead of empty. Safe: no filesystem
+/// path is all NULs, and an abstract name with real
+/// content (leading NUL + non-NUL bytes) is preserved.
+#[cfg(unix)]
+fn unix_sockaddr_un(storage: &ffi::SockaddrStorage, len: u32) -> Option<SockAddr> {
+    // SAFETY (invariant): the family matched, so
+    // `storage` holds a kernel-written `sockaddr_un`;
+    // the path starts at offset 2 on every platform
+    // (see `ffi.rs`). Abstract addresses start with NUL
+    // and are NOT NUL-terminated — the name is the full
+    // `len - 2` bytes; filesystem paths end at the
+    // first NUL.
+    let sa = unsafe { &*(storage._inner.as_ptr() as *const ffi::SockaddrUn) };
+    let total = (len as usize).saturating_sub(2);
+    let path_len = total.min(sa.sun_path.len());
+    let raw = &sa.sun_path[..path_len];
+    let end = if raw.first() == Some(&0) {
+        if raw.iter().all(|b| *b == 0) {
+            0
+        } else {
+            raw.len()
+        }
+    } else {
+        raw.iter().position(|b| *b == 0).unwrap_or(raw.len())
+    };
+    Some(SockAddr::Unix {
+        path: raw[..end].to_vec(),
+    })
+}
+
+/// Windows has no `sockaddr_un` in this port (see
+/// `to_raw`): an `AF_UNIX` family from the kernel has
+/// no address to read back.
+#[cfg(windows)]
+fn unix_sockaddr_un(_storage: &ffi::SockaddrStorage, _len: u32) -> Option<SockAddr> {
+    None
 }
 
 /// Translate a Python-facing family (`modsocket.rs`
@@ -228,6 +266,22 @@ pub fn translate_family(py_family: i32) -> i32 {
         ffi::AF_INET6
     } else {
         py_family
+    }
+}
+
+/// The reverse: a KERNEL family (e.g. `ai_family` from
+/// `getaddrinfo`, 30 on macOS) back to the Python-facing
+/// family (`AF_INET6` 10). Identity on Linux/Android;
+/// `30 → 10` on macOS, `23 → 10` on Windows.
+/// Build #20: `socket_getaddrinfo_ffi` put the raw C
+/// family (30 on macOS) into the 5-tuple and compared it
+/// against the requested Python family, so an
+/// `AF_INET6` request filtered everything out.
+pub fn translate_family_back(kernel_family: i32) -> i32 {
+    if kernel_family == ffi::AF_INET6 {
+        AF_INET6
+    } else {
+        kernel_family
     }
 }
 

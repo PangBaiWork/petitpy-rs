@@ -64,14 +64,20 @@ use std::os::unix::io::FromRawFd;
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 #[cfg(windows)]
-use std::os::windows::io::FromRawSocket;
+use std::os::windows::io::FromRawHandle;
 
 use crate::memory::gc::CallCtx;
 use crate::modules::modsocket::{
-    alloc_socket, int_arg, io_os_error, self_socket, set_fd, settings, sock_key_of, sockets,
-    str_arg, swap_in, SocketState, TableKey, AF_INET, AF_INET6, AF_UNIX, EAFNOSUPPORT, EBADF,
-    EINVAL, ENOTCONN, MAX_RECV, SOCK_DGRAM, SOCK_STREAM,
+    alloc_socket, int_arg, self_socket, set_fd, settings, sock_key_of, sockets, str_arg,
+    SocketState, TableKey, AF_INET, AF_INET6, AF_UNIX, EAFNOSUPPORT, EBADF, EINVAL, ENOTCONN,
+    MAX_RECV, SOCK_DGRAM, SOCK_STREAM,
 };
+/// Build #20: `io_os_error` / `swap_in` are only used in
+/// Unix-gated code in this file (`msg_fd`'s
+/// `SwapUnixDgram` arm), so on Windows the imports were
+/// unused (warning).
+#[cfg(unix)]
+use crate::modules::modsocket::{io_os_error, swap_in};
 use crate::modules::modsocket_ffi::{
     ffi_os_error, parse_target, sockaddr_value, translate_family, FfiSocket, SockAddr,
 };
@@ -368,7 +374,14 @@ pub(crate) unsafe fn makefile_file(fd: RawFd) -> File {
     }
     #[cfg(windows)]
     {
-        File::from_raw_socket(fd)
+        // Build #20: `std::fs::File` does not implement
+        // `FromRawSocket` (`from_raw_socket` is for
+        // `TcpStream` etc.), so the old call did not
+        // compile (E0599). `FromRawHandle` is the
+        // compilable Windows equivalent for this
+        // test-only helper: a `SOCKET` is a handle, and
+        // the `usize` value converts losslessly.
+        File::from_raw_handle(fd as *mut std::ffi::c_void)
     }
 }
 
@@ -667,7 +680,11 @@ pub(crate) fn socket_fromfd_ffi(ctx: &mut CallCtx, args: &[Value]) -> PyResult<V
 /// receives — the `sock_send` / `sock_recv` shapes).
 fn msg_fd(
     ctx: &mut CallCtx,
-    r: GcRef,
+    // Build #20: `r` is only used in the `#[cfg(unix)]`
+    // `SwapUnixDgram` arm below, so on Windows it was an
+    // unused-variable warning. Underscore-prefixed (the
+    // use stays real on Unix).
+    _r: GcRef,
     fd: TableKey,
     fields: [i32; 3],
     listener_err: i32,
@@ -710,7 +727,7 @@ fn msg_fd(
             #[cfg(unix)]
             {
                 let d = UnixDatagram::unbound().map_err(|e| io_os_error(ctx, e))?;
-                let new_key = swap_in(ctx, r, fd, SocketState::DatagramUnix(d));
+                let new_key = swap_in(ctx, _r, fd, SocketState::DatagramUnix(d));
                 Ok(raw_fd_from_key(new_key))
             }
             #[cfg(not(unix))]

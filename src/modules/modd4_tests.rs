@@ -544,7 +544,10 @@ fn h_select_socket_object_never_ready() {
     // `poll(2)`, which reports an unconnected stream
     // socket as readable — the CPython answer (verified:
     // CPython `select` on an unbound `AF_UNIX` stream
-    // socket returns it) — so the feature build expects 1.
+    // socket returns it) — so the feature build expects 1
+    // on Linux. On macOS `poll(2)` reports 0 events for
+    // the same socket (Build #20), so the feature build
+    // expects 0 there — see `expected` below.
     let mut fx = Fx::new();
     fx.run_ok(
         "import socket, select\n\
@@ -556,8 +559,17 @@ fn h_select_socket_object_never_ready() {
          s.close()\n",
     );
     // Default: never ready (0). Feature (`unsafe-ffi`):
-    // `poll(2)` reports the unconnected socket (1).
-    let expected = if cfg!(feature = "unsafe-ffi") { 1 } else { 0 };
+    // Linux `poll(2)` reports the unconnected socket
+    // (1); macOS `poll(2)` reports 0 events for the same
+    // socket (Build #20: Darwin does not mark
+    // unconnected sockets readable — the FFI call itself
+    // is correct, `Pollfd` matches Darwin's layout and
+    // `sys_poll` passes `nfds_t` correctly).
+    let expected = if cfg!(feature = "unsafe-ffi") && !cfg!(target_os = "macos") {
+        1
+    } else {
+        0
+    };
     assert_eq!(fx.g_int("a"), expected);
     assert_eq!(fx.g_int("b"), expected);
 }

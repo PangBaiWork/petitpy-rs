@@ -19,6 +19,35 @@ use crate::objects::primitives::ops::static_qstr_id;
 use crate::objects::value::{GcRef, Obj, Value};
 use crate::runtime::vm::{Vm, VmError};
 
+/// Build #20 macOS errnos (CI run 44764410645): Darwin
+/// reports different errnos than Linux for the same
+/// failing call, so the tests below take the value from
+/// here. The Linux values are the pinned ones; the macOS
+/// values are the Darwin errnos observed in Build #20.
+/// - `recv` on an unconnected stream socket: Linux
+///   `EINVAL` (22), macOS `ENOTCONN` (57).
+/// - Second `connect` on a connected socket: Linux
+///   `EISCONN` (106), macOS `EISCONN` (56).
+/// - `send` / `sendall` on a listener: Linux `ENOTCONN`
+///   (107), macOS `ENOTCONN` (57).
+/// The other cases in `socket_bind_listen_errors` stay
+/// 22 / 36 on both: they are validated module-side
+/// (`sock_recv_ffi` rejects `n < 0`, `sock_getsockopt`
+/// rejects a bad `buflen`, `parse_unix_path` rejects a
+/// long path) — read from the code, not guessed.
+#[cfg(target_os = "macos")]
+const ERR_RECV_UNCONN: &str = "57";
+#[cfg(not(target_os = "macos"))]
+const ERR_RECV_UNCONN: &str = "22";
+#[cfg(target_os = "macos")]
+const ERR_EISCONN: &str = "56";
+#[cfg(not(target_os = "macos"))]
+const ERR_EISCONN: &str = "106";
+#[cfg(target_os = "macos")]
+const ERR_ENOTCONN: &str = "57";
+#[cfg(not(target_os = "macos"))]
+const ERR_ENOTCONN: &str = "107";
+
 /// A fresh VM with `socket` registered, plus the read-back
 /// helpers (the `objstringio_tests.rs` pattern).
 struct Fx {
@@ -292,7 +321,7 @@ fn socket_bind_listen_errors() {
         ),
         (
             "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.recv(10)",
-            ("OSError", "22"),
+            ("OSError", ERR_RECV_UNCONN),
         ),
         (
             "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.recv(-1)",
@@ -300,7 +329,7 @@ fn socket_bind_listen_errors() {
         ),
         (
             "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.recv(4097)",
-            ("OSError", "22"),
+            ("OSError", ERR_RECV_UNCONN),
         ),
         (
             "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.getsockopt(1, 17, 0)",
@@ -688,7 +717,7 @@ fn socket_listener_send_enotconn() {
             fx.raised_msg(&format!(
                 "import socket\ns = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\ns.bind('{path}')\ns.listen(1)\ns.{method}(b'x')"
             )),
-            ("OSError".to_string(), "107".to_string()),
+            ("OSError".to_string(), ERR_ENOTCONN.to_string()),
             "for {method}"
         );
         unlink(&path);
@@ -714,7 +743,7 @@ fn socket_connect_errors() {
         fx.raised_msg(&format!(
             "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.connect(('127.0.0.1', {port}))\ns.connect(('127.0.0.1', {port}))"
         )),
-        ("OSError".to_string(), "106".to_string())
+        ("OSError".to_string(), ERR_EISCONN.to_string())
     );
     server.join().expect("server thread");
 }
@@ -810,6 +839,10 @@ infos = socket.getaddrinfo(None, 0)
 assert len(infos) > 0
 "#,
     );
+    // `EAFNOSUPPORT` is the hardcoded Python-facing 97
+    // (`modsocket.rs`), not the kernel value — so this
+    // assert passes on macOS as-is (verified for
+    // Build #20; Darwin's kernel value is 47).
     assert_eq!(
         fx.raised_msg("import socket\nsocket.getaddrinfo('localhost', 80, 999)"),
         ("OSError".to_string(), "97".to_string())

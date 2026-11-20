@@ -41,6 +41,13 @@
 
 #[cfg(feature = "unsafe-ffi")]
 use std::os::raw::{c_char, c_void};
+/// `c_int` is used only by the `#[cfg(windows)]` arms of
+/// `sys_send` / `sys_recv` / `sys_sendto` / `sys_recvfrom`
+/// below (Build #20: `len as c_int` was out of scope —
+/// `c_int` lived only inside `mod ffi`). Imported here,
+/// Windows-only, so the Unix build stays untouched.
+#[cfg(all(feature = "unsafe-ffi", windows))]
+use std::os::raw::c_int;
 
 /// A socket handle: an fd number on Unix, a `SOCKET`
 /// (`UINT_PTR`) on Windows.
@@ -63,9 +70,22 @@ pub const INVALID_SOCKET: RawFd = usize::MAX;
 /// The raw declarations (private mod).
 #[cfg(feature = "unsafe-ffi")]
 mod ffi {
-    use std::os::raw::{c_int, c_uint, c_void};
+    use std::os::raw::{c_int, c_void};
 
-    use super::{Msghdr, Pollfd, Sockaddr};
+    // Build #20: `c_uint` is only used by the
+    // `#[cfg(unix)]` `umask` declaration below, so on
+    // Windows the import was unused (warning). Split it
+    // out, Unix-only.
+    #[cfg(unix)]
+    use std::os::raw::c_uint;
+
+    use super::{Pollfd, Sockaddr};
+
+    // Build #20: `Msghdr` is defined only under
+    // `#[cfg(unix)]` below, so importing it
+    // unconditionally broke the Windows build (E0432).
+    #[cfg(unix)]
+    use super::Msghdr;
 
     #[cfg(windows)]
     use super::{FdSet, Timeval, WsaMsg};

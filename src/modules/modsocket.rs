@@ -2190,7 +2190,12 @@ fn sock_makefile(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
                 #[cfg(windows)]
                 {
                     use std::os::windows::io::FromRawSocket;
-                    SocketIo::Tcp(unsafe { TcpStream::from_raw_socket(raw) })
+                    // Build #20: `from_raw_socket` takes
+                    // `u64`, but `raw` is `RawFd` (`usize`
+                    // on Windows). Lossless: `usize` is
+                    // 64-bit on x86_64 Windows, and still
+                    // fits `u64` on 32-bit.
+                    SocketIo::Tcp(unsafe { TcpStream::from_raw_socket(raw as u64) })
                 }
             }
             Some(_) => return Err(raise_os_error(ctx, EINVAL)),

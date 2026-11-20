@@ -18,6 +18,17 @@ use crate::objects::value::{FunBuiltinData, Obj, Value};
 use crate::pyerr::{PyError, PyResult};
 use crate::runtime::vm::{Vm, VmError};
 
+/// Temp dir as a forward-slash path for embedding in petitpy
+/// scripts: `std::env::temp_dir()` on Windows is
+/// `C:\Users\...\Temp` — backslashes would need escaping in a
+/// string literal, forward slashes work with `std::fs` on all
+/// platforms.
+fn tmpdir_str() -> String {
+    std::env::temp_dir()
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 #[test]
 fn os_constants() {
     let mut fx = Sx::new();
@@ -170,26 +181,28 @@ assert os.getenv("PETITPY_D2_TEST") is None
 #[test]
 fn os_access_bool() {
     let mut fx = Sx::new();
-    fx.run_ok(
+    let tmp = tmpdir_str();
+    fx.run_ok(&format!(
         r#"
 import os
-assert os.access("/tmp", os.F_OK) == True
-assert os.access("/tmp", os.R_OK) == True
-assert os.access("/tmp", os.W_OK) == True
+assert os.access("{tmp}", os.F_OK) == True
+assert os.access("{tmp}", os.R_OK) == True
+assert os.access("{tmp}", os.W_OK) == True
 assert os.access("/nonexistent_xyz", os.F_OK) == False
-assert os.access("/tmp", 8) == False
-assert os.access("/tmp", -1) == False
+assert os.access("{tmp}", 8) == False
+assert os.access("{tmp}", -1) == False
 "#,
-    );
+    ));
 }
 
 #[test]
 fn os_mkdir_rmdir_rename_remove() {
     let mut fx = Sx::new();
-    fx.run_ok(
+    let tmp = tmpdir_str();
+    fx.run_ok(&format!(
         r#"
 import os
-d = "/tmp/petitpy_d2_os_" + str(os.getpid())
+d = "{tmp}/petitpy_d2_os_" + str(os.getpid())
 os.mkdir(d)
 assert os.listdir(d) == []
 os.mkdir(d + "/sub")
@@ -206,8 +219,8 @@ assert os.remove is os.unlink
 os.rmdir(d + "/sub2")
 os.rmdir(d)
 "#,
-    );
-    let (name, value) = fx.run_err("import os\nos.mkdir(\"/tmp\")\n");
+    ));
+    let (name, value) = fx.run_err(&format!("import os\nos.mkdir(\"{tmp}\")\n"));
     assert_eq!(name, "OSError");
     assert_eq!(value, "17");
     let (name, value) = fx.run_err("import os\nos.rmdir(\"/nonexistent_xyz\")\n");
@@ -238,10 +251,11 @@ fn os_getattr_and_fixed_dict() {
 #[test]
 fn os_fd_roundtrip() {
     let mut fx = Sx::new();
-    fx.run_ok(
+    let tmp = tmpdir_str();
+    fx.run_ok(&format!(
         r#"
 import os
-d = "/tmp/petitpy_d2_fd_" + str(os.getpid())
+d = "{tmp}/petitpy_d2_fd_" + str(os.getpid())
 os.mkdir(d)
 fd = os.open(d + "/f", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
 assert os.write(fd, b"hello") == 5
@@ -258,7 +272,7 @@ os.close(fd)
 os.remove(d + "/f")
 os.rmdir(d)
 "#,
-    );
+    ));
     // A closed stdio fd raises EBADF on later use. On the
     // default build the fd is only recorded in
     // `os_closed_stdio` (the real fd is never closed, so the
@@ -295,29 +309,36 @@ os.rmdir(d)
 /// close succeeds.
 #[test]
 fn os_close_open_file_fd() {
+    // A real file to open: /dev/null does not exist on Windows.
+    let path = std::env::temp_dir().join(format!("petitpy_devnull_{}", std::process::id()));
+    std::fs::write(&path, b"x").unwrap();
+    let p = path.to_string_lossy().replace('\\', "/");
     #[cfg(not(feature = "unsafe-ffi"))]
     {
-        let (name, value) =
-            fx_run_err_new("f = open('/dev/null', 'r')\nimport os\nos.close(f.fileno())\n");
+        let (name, value) = fx_run_err_new(&format!(
+            "f = open({p:?}, 'r')\nimport os\nos.close(f.fileno())\n"
+        ));
         assert_eq!(name, "OSError");
         assert_eq!(value, "9");
     }
     #[cfg(feature = "unsafe-ffi")]
     {
         let mut fx = Sx::new();
-        fx.run_ok(
-            "f = open('/dev/null', 'r')\nimport os\nos.close(f.fileno())\nprint('os.close done')\n",
-        );
+        fx.run_ok(&format!(
+            "f = open({p:?}, 'r')\nimport os\nos.close(f.fileno())\nprint('os.close done')\n"
+        ));
     }
+    std::fs::remove_file(&path).unwrap();
 }
 
 #[test]
 fn os_fd_lseek_whence() {
     let mut fx = Sx::new();
-    fx.run_ok(
+    let tmp = tmpdir_str();
+    fx.run_ok(&format!(
         r#"
 import os
-d = "/tmp/petitpy_d2_lseek_" + str(os.getpid())
+d = "{tmp}/petitpy_d2_lseek_" + str(os.getpid())
 os.mkdir(d)
 fd = os.open(d + "/f", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
 assert os.write(fd, b"hello") == 5
@@ -328,12 +349,18 @@ os.close(fd)
 os.remove(d + "/f")
 os.rmdir(d)
 "#,
-    );
-    let (name, value) = fx.run_err(
-        "import os\nfd = os.open(\"/tmp\", os.O_RDONLY)\nos.lseek(fd, 0, 99)\n",
-    );
+    ));
+    // Bad whence (99) is rejected with EINVAL before the file is
+    // touched, so any existing readable file works — use a fresh
+    // temp file rather than a directory (opening a directory is
+    // not portable).
+    let w = std::env::temp_dir().join(format!("petitpy_d2_lseek_w_{}", std::process::id()));
+    let (name, value) = fx.run_err(&format!(
+        "import os\nf = \"{tmp}/petitpy_d2_lseek_w_\" + str(os.getpid())\nfd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)\nos.close(fd)\nfd = os.open(f, os.O_RDONLY)\nos.lseek(fd, 0, 99)\n"
+    ));
     assert_eq!(name, "OSError");
     assert_eq!(value, "22");
+    let _ = std::fs::remove_file(&w);
     // `os.lseek(1, 0, 0)` on stdio: on the default build this
     // is always ESPIPE(29) (no `Seek` on stdio). Under
     // `--features unsafe-ffi` (G6a) the real `lseek(2)` runs,

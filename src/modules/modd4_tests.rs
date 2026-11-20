@@ -9,7 +9,9 @@
 //! every assertion was probed on the reference binary
 //! 2026-11-18 (see `scripts/d4_result.txt` §2).
 
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::time::Duration;
 
 use crate::compiler::bridge::compile_to_mpy_named;
@@ -369,22 +371,33 @@ fn h_select_stdio_fd_ebadf() {
 
 // ── select, pure-`std` probes (H-select; both builds) ───────────────
 
+/// A readable temp file for select probes: /dev/null does not
+/// exist on Windows. A regular file is equally "ready" for
+/// select (files are always ready; EOF counts as ready).
+fn probe_path() -> String {
+    let path = std::env::temp_dir().join(format!("petitpy_probe_{}", std::process::id()));
+    std::fs::write(&path, b"").unwrap();
+    path.to_string_lossy().replace('\\', "/")
+}
+
 #[test]
 fn h_select_devnull_readable() {
     let mut fx = Fx::new();
-    fx.run_ok(
+    let path = probe_path();
+    fx.run_ok(&format!(
         "import os, select\n\
-         fd = os.open('/dev/null', os.O_RDONLY)\n\
+         fd = os.open({path:?}, os.O_RDONLY)\n\
          r, w, x = select.select([fd], [], [], 0)\n\
          a = len(r)\n\
          b = r[0]\n\
          os.close(fd)\n",
-    );
+    ));
     assert_eq!(fx.g_int("a"), 1);
     // The result keeps the original fd object.
     assert!(fx.g_int("b") >= 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn h_select_listener_never_ready() {
     // H-select: a listener is never ready — pure `std` has no
@@ -421,26 +434,28 @@ fn h_select_listener_never_ready() {
 #[test]
 fn h_select_write_ready() {
     let mut fx = Fx::new();
-    fx.run_ok(
+    let path = probe_path();
+    fx.run_ok(&format!(
         "import os, select\n\
-         fd = os.open('/dev/null', os.O_WRONLY)\n\
+         fd = os.open({path:?}, os.O_WRONLY)\n\
          _, w, _ = select.select([], [fd], [], 0)\n\
          a = len(w)\n\
          os.close(fd)\n",
-    );
+    ));
     assert_eq!(fx.g_int("a"), 1);
 }
 
 #[test]
 fn h_select_ebadf() {
     let mut fx = Fx::new();
+    let path = probe_path();
     assert_eq!(
-        fx.raised_msg(
+        fx.raised_msg(&format!(
             "import os, select\n\
-             fd = os.open('/dev/null', os.O_RDONLY)\n\
+             fd = os.open({path:?}, os.O_RDONLY)\n\
              os.close(fd)\n\
              select.select([fd], [], [], 0)\n",
-        ),
+        )),
         ("OSError".to_string(), "9".to_string())
     );
 }
@@ -460,13 +475,14 @@ fn h_select_high_fd_ebadf() {
 #[test]
 fn h_select_dup_fd() {
     let mut fx = Fx::new();
-    fx.run_ok(
+    let path = probe_path();
+    fx.run_ok(&format!(
         "import os, select\n\
-         fd = os.open('/dev/null', os.O_RDONLY)\n\
+         fd = os.open({path:?}, os.O_RDONLY)\n\
          r, _, _ = select.select([fd, fd], [], [], 0)\n\
          a = len(r)\n\
          os.close(fd)\n",
-    );
+    ));
     // filterReady appends per input item, like the Zig.
     assert_eq!(fx.g_int("a"), 2);
 }
@@ -474,34 +490,37 @@ fn h_select_dup_fd() {
 #[test]
 fn h_select_xlist_not_ready() {
     let mut fx = Fx::new();
-    fx.run_ok(
+    let path = probe_path();
+    fx.run_ok(&format!(
         "import os, select\n\
-         fd = os.open('/dev/null', os.O_RDONLY)\n\
+         fd = os.open({path:?}, os.O_RDONLY)\n\
          _, _, x = select.select([], [], [fd], 0)\n\
          a = len(x)\n\
          os.close(fd)\n",
-    );
+    ));
     assert_eq!(fx.g_int("a"), 0);
 }
 
 #[test]
 fn h_select_file_object_ready() {
     // H-select: a file object is accepted (its own `File`),
-    // `/dev/null` is ready at once (EOF counts as ready),
+    // a regular file is ready at once (EOF counts as ready),
     // and the result keeps the ORIGINAL object (identity).
     let mut fx = Fx::new();
-    fx.run_ok(
+    let path = probe_path();
+    fx.run_ok(&format!(
         "import select\n\
-         f = open('/dev/null', 'rb')\n\
+         f = open({path:?}, 'rb')\n\
          r, w, x = select.select([f], [], [], 0)\n\
          a = len(r)\n\
          b = r[0] is f\n\
          f.close()\n",
-    );
+    ));
     assert_eq!(fx.g_int("a"), 1);
     assert!(fx.g_bool("b"));
 }
 
+#[cfg(unix)]
 #[test]
 fn h_select_socket_object_never_ready() {
     // H-select: a socket object resolves through its
@@ -616,6 +635,7 @@ fn d4_signal_bad_type() {
 
 // ── pwd / grp ─────────────────────────────────────────────────────
 
+#[cfg(unix)]
 #[test]
 fn d4_pwd_root() {
     let mut fx = Fx::new();
@@ -635,6 +655,7 @@ fn d4_pwd_root() {
     assert_eq!(fx.g_str("s"), "/bin/bash");
 }
 
+#[cfg(unix)]
 #[test]
 fn d4_pwd_missing() {
     let mut fx = Fx::new();
@@ -652,6 +673,7 @@ fn d4_pwd_missing() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn d4_pwd_getpwuid_root() {
     let mut fx = Fx::new();
@@ -659,6 +681,7 @@ fn d4_pwd_getpwuid_root() {
     assert_eq!(fx.g_str("n"), "root");
 }
 
+#[cfg(unix)]
 #[test]
 fn d4_grp_root() {
     let mut fx = Fx::new();
@@ -674,6 +697,7 @@ fn d4_grp_root() {
     assert_eq!(fx.g_str("m"), "[0]");
 }
 
+#[cfg(unix)]
 #[test]
 fn d4_grp_missing() {
     let mut fx = Fx::new();

@@ -19,6 +19,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::Duration;
 
 fn bin_petitpy() -> PathBuf {
@@ -275,10 +276,18 @@ fn h_socket_makefile_dup() {
 #[test]
 fn h_socket_fromfd() {
     let dir = scratch("fromfd");
+    // Any readable file gives a valid fd for fromfd; /dev/null
+    // does not exist on Windows, so open the script itself.
+    let path = dir
+        .join("t.py")
+        .to_string_lossy()
+        .replace('\\', "/");
     let script = write_script(
         &dir,
         "t.py",
-        "import socket, os\nfd = os.open('/dev/null', os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    print('fromfd: no error')\nexcept NotImplementedError as e:\n    print('fromfd:', e.args[0])\n",
+        &format!(
+            "import socket, os\nfd = os.open({path:?}, os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    print('fromfd: no error')\nexcept NotImplementedError as e:\n    print('fromfd:', e.args[0])\n"
+        ),
     );
     let r = run_script(&script);
     assert_ok(&r, b"fromfd: socket.fromfd is not implemented\n");

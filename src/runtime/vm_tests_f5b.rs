@@ -195,14 +195,21 @@ fn f5b_itertools_zip_longest_repeat() {
 #[test]
 fn f5b_socket_fromfd_not_implemented() {
     let mut fx = Fx::new();
-    fx.run_ok(
-        "import socket, os\nfd = os.open('/dev/null', os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    ok = False\nexcept NotImplementedError:\n    ok = True\n",
-    );
+    // Any readable file gives a valid fd for fromfd; /dev/null
+    // does not exist on Windows.
+    let path = std::env::temp_dir().join(format!("petitpy_fromfd_{}", std::process::id()));
+    std::fs::write(&path, b"").unwrap();
+    let p = path.to_string_lossy().replace('\\', "/");
+    fx.run_ok(&format!(
+        "import socket, os\nfd = os.open({p:?}, os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    ok = False\nexcept NotImplementedError:\n    ok = True\n",
+    ));
     assert_eq!(fx.g("ok"), Some(Value::Bool(true)));
+    let _ = std::fs::remove_file(&path);
 }
 
 /// `subprocess.run` with `stderr=STDOUT` merges stderr into the
 /// captured stdout, and `text=True` decodes it.
+#[cfg(unix)]
 #[test]
 fn f5b_subprocess_stderr_stdout_text() {
     let mut fx = Fx::new();
@@ -227,6 +234,7 @@ fn f5b_os_kill_esrch_raises() {
 
 /// `os.chown` of a path to its own uid/gid is a no-op (the
 /// integration case creates its own file first).
+#[cfg(unix)]
 #[test]
 fn f5b_os_chown_self_noop() {
     let mut fx = Fx::new();

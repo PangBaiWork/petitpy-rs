@@ -59,10 +59,18 @@ fn run_script(script: &Path) -> Run {
 #[test]
 fn g6b_fromfd_not_implemented() {
     let dir = scratch("fromfd_notimpl");
+    // Any readable file gives a valid fd for fromfd; /dev/null
+    // does not exist on Windows, so open the script itself.
+    let path = dir
+        .join("t.py")
+        .to_string_lossy()
+        .replace('\\', "/");
     let script = write_script(
         &dir,
         "t.py",
-        "import socket, os\nfd = os.open('/dev/null', os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    print('fromfd: no error')\nexcept NotImplementedError as e:\n    print('fromfd:', e.args[0])\n",
+        &format!(
+            "import socket, os\nfd = os.open({path:?}, os.O_RDONLY)\ntry:\n    s = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)\n    print('fromfd: no error')\nexcept NotImplementedError as e:\n    print('fromfd:', e.args[0])\n"
+        ),
     );
     let r = run_script(&script);
     assert_eq!(r.code, 0, "stderr: {}", String::from_utf8_lossy(&r.stderr));

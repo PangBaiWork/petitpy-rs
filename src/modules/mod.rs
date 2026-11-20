@@ -33,11 +33,11 @@ pub(crate) mod sysdb;
 mod modjson_tests;
 #[cfg(test)]
 mod modmath_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod modsocket_tests;
 #[cfg(test)]
 mod modstruct_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod modsubprocess_tests;
 #[cfg(test)]
 mod modd4_tests;

@@ -136,6 +136,7 @@ fn fd_guard() -> std::sync::MutexGuard<'static, ()> {
     FD_GUARD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(unix)]
 #[test]
 fn f6_file_finaliser_closes_on_collect() {
     let _guard = fd_guard();
@@ -154,6 +155,7 @@ fn f6_file_finaliser_closes_on_collect() {
     assert!(fx.gi("leaked") < 10, "dropped files must be closed");
 }
 
+#[cfg(unix)]
 #[test]
 fn f6_socket_finaliser_closes_on_collect() {
     let _guard = fd_guard();
@@ -204,9 +206,10 @@ fn f6_live_file_survives_collect() {
     // A still-reachable file is NOT finalised by gc.collect().
     let _guard = fd_guard();
     let mut fx = Fx::new();
-    fx.run_ok(
+    let tmp = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+    fx.run_ok(&format!(
         "import gc, os\n\
-         path = '/tmp/f6_test_live_' + str(os.getpid())\n\
+         path = \"{tmp}/f6_test_live_\" + str(os.getpid())\n\
          f = open(path, 'w')\n\
          f.write('hello')\n\
          gc.collect()\n\
@@ -214,7 +217,7 @@ fn f6_live_file_survives_collect() {
          f.close()\n\
          content = open(path).read()\n\
          os.remove(path)\n",
-    );
+    ));
     // Read the content back through the `content` global.
     match fx.g("content") {
         Some(Value::Heap(r)) => match fx.vm.arena.get(r) {

@@ -308,13 +308,18 @@ mod ffi {
         pub fn closesocket(s: usize) -> c_int;
         pub fn ioctlsocket(s: usize, cmd: c_int, argp: *mut u32) -> c_int;
         pub fn WSAPoll(fds: *mut Pollfd, nfds: u32, timeout: c_int) -> c_int;
-        // FFI invariant: `WSASendMsg` / `WSARecvMsg` take a
-        // socket, a caller-owned `WSAMSG` (whose buffers
-        // point to caller-owned slices) and a pointer to a
+        // FFI invariant: `WSASendMsg` takes a socket, a
+        // caller-owned `WSAMSG` (whose buffers point to
+        // caller-owned slices) and a pointer to a
         // caller-owned `DWORD` for the byte count; the last
         // two parameters are always null here (no
         // overlapped I/O). `SOCKET_ERROR` (-1) on failure,
-        // 0 on success.
+        // 0 on success. `WSASendMsg` links directly from
+        // `ws2_32` — but `WSARecvMsg` does NOT (Build #21:
+        // LNK2019; it is an extension function, fetched
+        // via `WSAIoctl` in `sys_recvmsg` below — see
+        // there). The docs say both must be fetched, but
+        // the CI link proves only `WSARecvMsg` needs it.
         pub fn WSASendMsg(
             s: usize,
             msg: *const WsaMsg,
@@ -323,10 +328,21 @@ mod ffi {
             overlapped: *mut c_void,
             completion: *mut c_void,
         ) -> c_int;
-        pub fn WSARecvMsg(
+        // FFI invariant: `WSAIoctl` takes a socket, a
+        // control code, caller-owned in/out buffers with
+        // their lengths, a caller-owned `DWORD` for the
+        // byte count, and two nulls here (no overlapped
+        // I/O). 0 on success, `SOCKET_ERROR` (-1) on
+        // failure. Used only to fetch `WSARecvMsg`
+        // (`SIO_GET_EXTENSION_FUNCTION_POINTER`, below).
+        pub fn WSAIoctl(
             s: usize,
-            msg: *mut WsaMsg,
-            received: *mut u32,
+            code: u32,
+            in_buf: *const c_void,
+            in_len: u32,
+            out_buf: *mut c_void,
+            out_len: u32,
+            bytes: *mut u32,
             overlapped: *mut c_void,
             completion: *mut c_void,
         ) -> c_int;
@@ -344,8 +360,16 @@ mod ffi {
             exceptfds: *mut FdSet,
             timeout: *const Timeval,
         ) -> c_int;
-        pub fn WSADuplicateSocket(s: usize, pid: u32, info: *mut u8) -> c_int;
-        pub fn WSASocket(
+        // FFI invariant: `WSASocket` / `WSADuplicateSocket`
+        // are UNICODE macros in `winsock2.h` — `ws2_32`
+        // exports only the suffixed names, so the plain
+        // names are LNK2019 (Build #21). The `A` variants
+        // are used: the `WSAPROTOCOL_INFO` buffer in
+        // `sys_dup` is the ANSI struct (372 bytes; the
+        // wide struct is 628 and would not fit its
+        // 512-byte buffer).
+        pub fn WSADuplicateSocketA(s: usize, pid: u32, info: *mut u8) -> c_int;
+        pub fn WSASocketA(
             af: c_int,
             ty: c_int,
             protocol: c_int,
@@ -1733,6 +1757,89 @@ pub fn sys_sendmsg(fd: RawFd, msg: *const WsaMsg, flags: u32) -> Result<usize, i
     }
 }
 
+/// `GUID` (Windows only): the 16-byte identifier of a
+/// Winsock extension function (`WSAID_WSARECVMSG`
+/// below).
+#[cfg(all(feature = "unsafe-ffi", windows))]
+#[repr(C)]
+struct Guid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+/// `SIO_GET_EXTENSION_FUNCTION_POINTER` (Windows only):
+/// the `WSAIoctl` opcode that returns an
+/// extension-function pointer (`_WSAIOW(IOC_WS2, 6)`).
+#[cfg(all(feature = "unsafe-ffi", windows))]
+const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
+
+/// `WSAID_WSARECVMSG` (Windows only, `Mswsock.h`): the
+/// GUID that identifies the `WSARecvMsg` extension
+/// function.
+#[cfg(all(feature = "unsafe-ffi", windows))]
+const WSAID_WSARECVMSG: Guid = Guid {
+    data1: 0xf689_d7c8,
+    data2: 0x6f1f,
+    data3: 0x436b,
+    data4: [0xa1, 0x7d, 0xe5, 0x4d, 0x12, 0x9c, 0x36, 0xd7],
+};
+
+/// The `LPFN_WSARECVMSG` function-pointer type (Windows
+/// only): same parameters as the `WSARecvMsg` extern
+/// that used to be declared above (`WSAAPI` is
+/// `__stdcall`, i.e. `extern "system"`).
+#[cfg(all(feature = "unsafe-ffi", windows))]
+type WsarecvmsgFn = unsafe extern "system" fn(
+    s: usize,
+    msg: *mut WsaMsg,
+    received: *mut u32,
+    overlapped: *mut c_void,
+    completion: *mut c_void,
+) -> c_int;
+
+/// Fetch the `WSARecvMsg` extension function (Windows
+/// only): `ws2_32` does not export it, so the pointer
+/// comes from `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)`
+/// with `WSAID_WSARECVMSG` (Build #21: a direct extern
+/// is LNK2019). Cached in a `OnceLock` — the pointer is
+/// the same for every socket — so the query runs once.
+/// `fd` is any open socket (the query needs one); the
+/// caller (`sys_recvmsg`) already ran `wsa_ensure()`.
+#[cfg(all(feature = "unsafe-ffi", windows))]
+fn wsarecvmsg_fn(fd: RawFd) -> Result<WsarecvmsgFn, i32> {
+    use std::sync::OnceLock;
+    static FN: OnceLock<Result<WsarecvmsgFn, i32>> = OnceLock::new();
+    *FN.get_or_init(|| {
+        // FFI invariant: `WSAIoctl` writes the function
+        // pointer into the caller-owned `Option` (8 bytes);
+        // a null result on success cannot happen for this
+        // opcode, but it is reported as an error rather
+        // than called.
+        let mut f: Option<WsarecvmsgFn> = None;
+        let mut n: u32 = 0;
+        let r = unsafe {
+            ffi::WSAIoctl(
+                fd,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                &WSAID_WSARECVMSG as *const Guid as *const c_void,
+                std::mem::size_of::<Guid>() as u32,
+                &mut f as *mut Option<WsarecvmsgFn> as *mut c_void,
+                std::mem::size_of::<Option<WsarecvmsgFn>>() as u32,
+                &mut n,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if r == 0 {
+            f.ok_or_else(errno)
+        } else {
+            Err(errno())
+        }
+    })
+}
+
 /// `WSARecvMsg` (S3 uses it): the Windows counterpart of
 /// `sys_recvmsg`. Same return shape (bytes received) as
 /// the Unix wrapper; the `received` out-parameter is
@@ -1741,16 +1848,17 @@ pub fn sys_sendmsg(fd: RawFd, msg: *const WsaMsg, flags: u32) -> Result<usize, i
 #[cfg(all(feature = "unsafe-ffi", windows))]
 pub fn sys_recvmsg(fd: RawFd, msg: *mut WsaMsg) -> Result<usize, i32> {
     wsa_ensure()?;
-    // FFI invariant: `WSARecvMsg` takes a socket, a
-    // pointer to a caller-owned `WSAMSG` (whose buffers
-    // point to caller-owned slices) and a pointer to a
-    // caller-owned `DWORD` for the byte count; the last two
-    // parameters are always null (no overlapped I/O). A bad
-    // socket fails with `SOCKET_ERROR`, it cannot fault on
-    // valid pointers.
+    // FFI invariant: the fetched `WSARecvMsg` takes a
+    // socket, a pointer to a caller-owned `WSAMSG` (whose
+    // buffers point to caller-owned slices) and a pointer
+    // to a caller-owned `DWORD` for the byte count; the
+    // last two parameters are always null (no overlapped
+    // I/O). A bad socket fails with `SOCKET_ERROR`, it
+    // cannot fault on valid pointers.
+    let f = wsarecvmsg_fn(fd)?;
     let mut received: u32 = 0;
     let r = unsafe {
-        ffi::WSARecvMsg(
+        f(
             fd,
             msg,
             &mut received,
@@ -1959,7 +2067,7 @@ pub fn sys_closesocket(fd: RawFd) -> Result<(), i32> {
 /// `dup(2)`: duplicate a handle (new handle, same file
 /// description). The `family` / `kind` / `proto`
 /// arguments are ignored on Unix; on Windows they are
-/// needed for `WSASocket` (see below).
+/// needed for `WSASocketA` (see below).
 #[cfg(feature = "unsafe-ffi")]
 pub fn sys_dup(fd: RawFd, family: i32, kind: i32, proto: i32) -> Result<RawFd, i32> {
     #[cfg(unix)]
@@ -1977,22 +2085,21 @@ pub fn sys_dup(fd: RawFd, family: i32, kind: i32, proto: i32) -> Result<RawFd, i
     #[cfg(windows)]
     {
         wsa_ensure()?;
-        // FFI invariant: `WSADuplicateSocket` takes a
+        // FFI invariant: `WSADuplicateSocketA` takes a
         // `SOCKET`, the current process id, and a
-        // caller-owned `WSAPROTOCOL_INFO` buffer; it fills
-        // the buffer (373 bytes — the 512-byte buffer is
+        // caller-owned `WSAPROTOCOL_INFOA` buffer; it fills
+        // the buffer (372 bytes — the 512-byte buffer is
         // larger, so the write cannot overflow it).
-        // `WSASocket` then creates a new `SOCKET` from that
+        // `WSASocketA` then creates a new `SOCKET` from that
         // buffer. Both fail with `INVALID_SOCKET` / -1 and
         // the WSA error cell holds the failure.
         let mut info = [0u8; 512];
-        let r = unsafe {
-            ffi::WSADuplicateSocket(fd, ffi::GetCurrentProcessId(), info.as_mut_ptr())
-        };
+        let r =
+            unsafe { ffi::WSADuplicateSocketA(fd, ffi::GetCurrentProcessId(), info.as_mut_ptr()) };
         if r < 0 {
             return Err(errno());
         }
-        let s = unsafe { ffi::WSASocket(family, kind, proto, info.as_mut_ptr(), 0, 0) };
+        let s = unsafe { ffi::WSASocketA(family, kind, proto, info.as_mut_ptr(), 0, 0) };
         if s == INVALID_SOCKET {
             Err(errno())
         } else {

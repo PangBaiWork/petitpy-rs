@@ -35,17 +35,28 @@ use crate::runtime::vm::{Vm, VmError};
 /// (`sock_recv_ffi` rejects `n < 0`, `sock_getsockopt`
 /// rejects a bad `buflen`, `parse_unix_path` rejects a
 /// long path) — read from the code, not guessed.
-#[cfg(target_os = "macos")]
+///
+/// Build #21: the macOS values above hold ONLY for the
+/// `unsafe-ffi` build, where the kernel is the state
+/// machine (a real `recv` / `connect` / `send` returns
+/// the Darwin errno). The default build synthesizes the
+/// Linux numbers on every platform (`io_handle` /
+/// `sock_connect` raise the `modsocket.rs` constants),
+/// so macOS default gave 22 / 106 / 107 and failed
+/// against the macOS-only constants. Each constant is
+/// therefore (platform × feature) aware — the same
+/// pattern as `modd4_tests.rs` (`h_select_*`).
+#[cfg(all(target_os = "macos", feature = "unsafe-ffi"))]
 const ERR_RECV_UNCONN: &str = "57";
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "unsafe-ffi")))]
 const ERR_RECV_UNCONN: &str = "22";
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "unsafe-ffi"))]
 const ERR_EISCONN: &str = "56";
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "unsafe-ffi")))]
 const ERR_EISCONN: &str = "106";
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "unsafe-ffi"))]
 const ERR_ENOTCONN: &str = "57";
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "unsafe-ffi")))]
 const ERR_ENOTCONN: &str = "107";
 
 /// A fresh VM with `socket` registered, plus the read-back

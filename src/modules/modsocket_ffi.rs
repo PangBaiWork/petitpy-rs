@@ -571,7 +571,17 @@ impl FfiSocket {
                 self.bound = true;
                 return Ok(());
             }
-            Err(e) if e == ffi::EINPROGRESS => {}
+            // `EINPROGRESS` is the Unix signal; on
+            // Windows a nonblocking `connect()` returns
+            // `WSAEWOULDBLOCK` (10035) instead —
+            // `WSAEINPROGRESS` only means a blocking
+            // connect is already in progress. CPython
+            // treats both as "in progress" here (a
+            // nonblocking `AF_UNIX` connect can also
+            // return `EAGAIN` when the backlog is full;
+            // the `poll` + `SO_ERROR` check below then
+            // reports the true outcome).
+            Err(e) if e == ffi::EINPROGRESS || e == ffi::EWOULDBLOCK => {}
             Err(e) => return Err(e),
         }
         // `poll` for writability until the deadline,

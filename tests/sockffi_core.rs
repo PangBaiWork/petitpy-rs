@@ -121,6 +121,12 @@ fn sockffi_tcp_accept() {
     let dir = scratch("tcp_accept");
     let port_file = dir.join("port.txt");
     let port_file_str = port_file.to_str().unwrap().to_string();
+    // Windows paths carry backslashes, which are escape
+    // sequences inside the generated Python string
+    // literal (`\U` in `C:\Users\...` is a SyntaxError);
+    // forward slashes work on every platform (same fix
+    // as g6a_os / h_socket / sockffi_dns).
+    let port_file_py = port_file.to_string_lossy().replace('\\', "/");
     let client = std::thread::spawn(move || {
         let mut port = None;
         for _ in 0..500 {
@@ -144,7 +150,7 @@ fn sockffi_tcp_accept() {
         "t.py",
         &format!(
             "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.bind(('127.0.0.1', 0))\ns.listen(1)\nport = s.getsockname()[1]\nf = open('{port_file}', 'w')\nf.write(str(port))\nf.close()\nconn, addr = s.accept()\nassert addr[0] == '127.0.0.1'\ndata = conn.recv(10)\nassert data == b'ping'\nconn.send(b'pong')\nconn.close()\ns.close()\nprint('OK')\n",
-            port_file = port_file.to_str().unwrap()
+            port_file = port_file_py
         ),
     );
     let r = run_script(&script);

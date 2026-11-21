@@ -8,9 +8,12 @@ the interpreter and the code optimizer. Every piece was checked
 against the original — no freelancing — and verified against the same
 test suite as the original.
 
-Pure Rust, standard library only, no `unsafe` in the VM core (the
-only `unsafe` is the FFI boundary of the embedding API, each block
-with an invariant comment). Single files stay under 2500 lines.
+Pure Rust, standard library only. `unsafe` exists only at FFI
+boundaries — the embedding API, the opt-in `--features unsafe-ffi`
+build (real `socket(2)`/DNS syscalls and the `os` fd syscalls),
+and one std-only block in subprocess (`BorrowedFd::borrow_raw`) —
+each block with an invariant comment. Single files stay under
+2500 lines.
 The project is managed in git; the work is organized as lanes in
 `docs/任务书.md` (Chinese task book).
 
@@ -20,20 +23,22 @@ Continuous integration (`.github/workflows/build.yml`, runs on every
 push): builds `petitpy-rs`, `petitpy-vm` and `zigpy-compile` for
 Linux x86_64 + aarch64, macOS x86_64 + aarch64, Windows x86_64
 (MSVC) and Android aarch64 + x86_64, and uploads them as artifacts
-(`petitpy-rs-<platform>`). The Linux rows also build the
-`--features unsafe-ffi` variant (`petitpy-rs-linux-<arch>-unsafe-ffi`).
+(`petitpy-rs-<platform>`). The Linux, Windows and macOS rows also
+run the test suite under `--features unsafe-ffi` (artifacts
+`petitpy-rs-<platform>-unsafe-ffi`; Android rows are compile-only).
+Build #34 (2026-11-21) is 7/7 green.
 
-Final acceptance (F2, master `bdf3c5b` + this lane):
+Current status (master `7f4a3bc`; CI Build #34 7/7 green, 2026-11-21):
 
 | Gate | Result |
 | --- | --- |
 | Corpus, full config (`scripts/run_full_gate.py`) | 545/552 — GREEN, exactly the 7 documented known-fails |
-| Integration smoke (`scripts/run_integration.py`) | 202/202 with `--features unsafe-ffi`; 200/202 default (see below) |
+| Integration smoke (`scripts/run_integration.py`) | 202/202 with `--features unsafe-ffi`; 201/202 default (see below) |
 | Golden programs (`scripts/run_golden.py`) | 585/585 (rust==cpython on 576/585) |
 | Capability matrix (`scripts/run_capability.py`) | 67/67 GREEN |
 | Test-stdlib (`scripts/run_stdlib.py`) | 8/8 |
 | Nano config (`scripts/run_nano.py`) | 454/541, report-only (no Rust nano build exists) |
-| `cargo test --release --lib --tests` | 1755 passed, 0 failed, 1 ignored with `--features unsafe-ffi`; 1739 / 0 / 1 default (master `73184bc`, P7b merged) |
+| `cargo test --release --lib --tests` | 1896 passed, 0 failed, 5 ignored with `--features unsafe-ffi`; 1854 / 0 / 3 default (master `7f4a3bc`) |
 | `cargo test --release --bins` / `--test entry_cli` | 9 / 45 passed |
 | Benchmark vs reference binary | 0.172x wall-clock (limit ≤ 1.5x; `~/workspace/bench_e3.py`, steady-state run 2) |
 
@@ -42,26 +47,28 @@ benchmark bar is lenient — but the 5.8x margin leaves large headroom,
 and no further optimization was needed.
 
 Integration is 202/202 with `--features unsafe-ffi` (cargo feature
-`unsafe-ffi`, default OFF): that feature adds a real POSIX
-`select(2)` call (hand-written `extern "C"`, zero dependencies —
-see `src/modules/modselect.rs`), which flips the two `select` cases
-(`select_readable_fd_is_ready`, `select_timeout_zero_returns_promptly`).
-The default build is still 200/202: pure Rust std has no
-`select(2)`/`poll(2)`, a helper process cannot inherit the fds, and
-reading a byte to stash it would corrupt later `os.read` semantics —
-so without the feature the two cases remain a documented divergence,
-not faked.
+`unsafe-ffi`, default OFF) and 201/202 without it. The one
+default-build gap is `socket.fromfd`: `NotImplementedError` without
+the feature (pure std has no `FromRawFd`), a real fd wrap under the
+feature. The two `select` cases (`select_readable_fd_is_ready`,
+`select_timeout_zero_returns_promptly`) pass in pure Rust too, via a
+per-fd monitor thread + shared read buffer
+(`src/support/readiness.rs`). Under the feature, socket and DNS go
+through real syscalls instead (hand-written `extern "C"`, zero
+dependencies — `src/support/ffi.rs`, `src/support/ffi_dns.rs`).
 
 Cross-compile for arm64 (Linux glibc, `aarch64-unknown-linux-gnu`)
 works via the committed Zig-based linker wrapper
 (`scripts/zig-cc-aarch64.sh`, `.cargo/config.toml`):
 `cargo build --target aarch64-unknown-linux-gnu --release
 --features unsafe-ffi` produces a real ARM aarch64 ELF (including
-`libpetitpy_rs.so` / `.a`). Runtime on arm64 is unverified — this VM
-has no arm64 machine; qemu-user was installed and a qemu run was
-attempted, but the host has no aarch64 glibc sysroot (no
-`ld-linux-aarch64.so.1`), so the dynamic loader cannot be found
-and the binary cannot start under qemu here.
+`libpetitpy_rs.so` / `.a`). Runtime on arm64 is verified by CI: the
+linux-aarch64 job runs the full test suite natively on GitHub's
+ARM64 runners (Build #34 green). Locally this VM still has no arm64
+machine; qemu-user was installed and a qemu run was attempted, but
+the host has no aarch64 glibc sysroot (no `ld-linux-aarch64.so.1`),
+so the dynamic loader cannot be found and the binary cannot start
+under qemu here.
 
 ## Build
 
@@ -70,7 +77,7 @@ cargo build --release
 ```
 
 Produces `target/release/petitpy-rs` (the `petitpy` CLI),
-`target/release/petitpy-vm` (the VM-only `.mpy` loader), plus
+`target/release/petitpy-vm` (the `.mpy` runner), plus
 `libpetitpy_rs.so` / `libpetitpy_rs.a` (the embedding library, see
 below). Rust 1.99+; `cargo` must be on `PATH`
 (`export PATH="$HOME/.cargo/bin:$PATH"`).
@@ -96,9 +103,10 @@ petitpy-rs                    # interactive REPL (banner + >>> prompts on stderr
 
 Exit codes: 0 clean / `SystemExit(n)`; 1 uncaught non-`SystemExit`
 (traceback to stderr); 2 CLI errors (unreadable script, bad `-c`).
-`petitpy-vm file.mpy` loads and runs a `.mpy` file without the
-compiler (`eval`/`exec`/`compile` raise `NotImplementedError` there,
-as in the original).
+`petitpy-vm file.mpy` loads and runs a `.mpy` file. (The original
+Zig `petitpy-vm` has no compiler linked, so `eval`/`exec`/`compile`
+raise `NotImplementedError` there; the Rust port links the compiler
+into the library, so they work inside `petitpy-vm` too.)
 
 The REPL reads one 4095-byte `fgets` chunk per line (the original's
 4096-byte buffer); a continuation never happens — the original's
@@ -163,24 +171,24 @@ These are deliberate, probed, and recorded in the per-lane result
 files (`scripts/<lane>_result.txt` §4); nothing here is faked to
 pass a gate.
 
-- **Integration 200/202 on the default build** — the two `select`
-  cases (see above); with `--features unsafe-ffi` it is 202/202.
-  Nano 454/541 is report-only: the original's nano gate is
-  541/541, but Rust has no nano build.
-- **arm64 runtime unverified** — cross-compile to
-  `aarch64-unknown-linux-gnu` passes (Zig linker wrapper, committed),
-  but no arm64 machine or qemu run was available in this lane.
-- **`socket.fromfd` doesn't own the OS fd on the default build**
-  (F5b): `fileno() == fd` holds, but `close()` does not close
-  the underlying fd — pure std has no `from_raw_fd`. Under
-  `--features unsafe-ffi` (G6b U4) the socket OWNS the fd
-  (the reference wraps without dup and closes it; CPython
-  dups it): `close()` closes the OS fd (`os.close(fd)` after
-  `s.close()` is `EBADF`, probed), and `recv` / `sendall` /
-  `setblocking` / `accept` work on fromfd sockets. The
-  integration case only asserts `fileno`.
+- **Integration 201/202 on the default build** — the one
+  `socket.fromfd` case (see above); with `--features unsafe-ffi`
+  it is 202/202. Nano 454/541 is report-only: the original's nano
+  gate is 541/541, but Rust has no nano build.
+- **`socket.fromfd` is `NotImplementedError` on the default build**
+  — pure std has no `FromRawFd` (the integration case only asserts
+  `fileno`, so the default build is 201/202). Under
+  `--features unsafe-ffi` the socket wraps the fd without dup:
+  `fileno() == fd` holds and `close()` closes the OS fd
+  (`os.close(fd)` after `s.close()` is `EBADF`, probed), and `recv` /
+  `sendall` / `setblocking` / `accept` work on fromfd sockets. The
+  wrapped fd stays in the `os_fds` table, so closing the socket
+  then dropping the VM aborts a debug build (known hazard;
+  release is harmless). On Windows, `fromfd(AF_UNIX)` is
+  `NotImplementedError` by design (a plain file fd is never a
+  `SOCKET`).
 - **Real socket construction / bind / listen under
-  `--features unsafe-ffi`** (G6b U6): the constructor calls
+  `--features unsafe-ffi`** (Socket FFI): the constructor calls
   the real `socket(2)` (a bad family/type fails `EAFNOSUPPORT`
   there, as the reference), `bind()` runs the real `bind(2)`
   on the same fd (the fd number never changes; a client
@@ -190,17 +198,20 @@ pass a gate.
   `bind("")` binds an abstract socket (a client connecting
   to the 108-byte all-NUL name is accepted — the kernel
   matches abstract names by full length). On the default
-  build the old shape stays: a `/dev/null` placeholder fd,
-  `bind()` swaps in an already-listening `UnixListener`
-  (fd number changes, `bind("")` binds an unnamed socket
-  that listens but is unreachable by name).
-- **Real `getsockopt` under `--features unsafe-ffi`** (G6b
-  U7): `SO_PEERCRED` returns the real 12-byte `ucred`
-  (unconnected: pid 0 / uid -1 / gid -1; connected: the
-  peer's pid/uid/gid), `SO_REUSEADDR` returns 4 bytes, an
-  unknown optname is `ENOPROTOOPT` (all probed on the
-  reference). On the default build it is `ENOPROTOOPT`
-  for every `(level, opt)` (no stable-std `getsockopt`).
+  build the old shape stays: a real `UdpSocket` placeholder
+  bound to `127.0.0.1:0`, `bind()` swaps in an
+  already-listening `UnixListener` (fd number changes,
+  `bind("")` binds an unnamed socket that listens but is
+  unreachable by name).
+- **`getsockopt`/`setsockopt` answer from shadow state** (both
+  builds): `SO_PEERCRED` and any unknown `(level, opt)` are
+  `ENOPROTOOPT`; unset `SO_RCVBUF`/`SO_SNDBUF` are `ENOPROTOOPT`
+  (their kernel defaults are unknown — the kernel doubles a set
+  value, so the shadow must answer); the other known options
+  return their shadow value or known default (`TCP_NODELAY` /
+  `SO_BROADCAST` / `SO_REUSEADDR` 0, `IP_TTL` 64, timeouts 16
+  zero bytes). `setsockopt` stores in the shadow and lands in
+  the kernel where possible.
 - **`os.close(fd)` closes any fd under `--features unsafe-ffi`**
   (G6a U3): the real `close(2)` runs for every fd — an
   `open()` file's fd, stdio 0–2 (the number is freed for reuse),

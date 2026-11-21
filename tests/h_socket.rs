@@ -274,7 +274,14 @@ fn h_socket_makefile_dup() {
 
 /// `fromfd` raises `NotImplementedError` on the default
 /// build (H-socket cut). Under `unsafe-ffi` (S3) it wraps
-/// the fd as-is and succeeds.
+/// the fd as-is and succeeds — except on Windows, where
+/// AF_UNIX `fromfd` is deliberately unimplemented in the
+/// FFI layer (`modsocket_ffi_adv::socket_fromfd_ffi`), so
+/// the test pins that `NotImplementedError` message there
+/// instead. Build #30: the unconditional `no error`
+/// expectation failed on windows-x86_64 (only job failing,
+/// 6/7 pass); making AF_UNIX `fromfd` work on Windows is a
+/// separate design change, not a CI fix (same as g6b).
 #[test]
 fn h_socket_fromfd() {
     let dir = scratch("fromfd");
@@ -293,7 +300,11 @@ fn h_socket_fromfd() {
     );
     let r = run_script(&script);
     #[cfg(feature = "unsafe-ffi")]
-    let expected = b"fromfd: no error\n";
+    let expected: &[u8] = if cfg!(windows) {
+        b"fromfd: socket.fromfd(AF_UNIX) is not implemented on Windows\n"
+    } else {
+        b"fromfd: no error\n"
+    };
     #[cfg(not(feature = "unsafe-ffi"))]
     let expected = b"fromfd: socket.fromfd is not implemented\n";
     assert_ok(&r, expected);

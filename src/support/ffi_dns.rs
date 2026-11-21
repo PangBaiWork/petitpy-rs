@@ -163,15 +163,29 @@ mod ffi {
 /// (Winsock's `servent`). Defined here — `ffi.rs` has no
 /// canonical `Servent` (Build #23: the other structs
 /// above moved to `crate::support::ffi`).
+///
+/// Build #34: on 64-bit Windows the field order is
+/// SWAPPED — `winsock.h` puts `s_proto` before `s_port`
+/// under `_WIN64` (`{ s_name, s_aliases, s_proto,
+/// s_port }`; the winapi crate mirrors it with two
+/// `#[cfg(target_pointer_width)]` variants). The old
+/// order read `s_port` at offset 16, which on Win64 is
+/// the `s_proto` pointer — `getservbyname("http")`
+/// returned the pointer's low bytes as the port (Build
+/// #33: 59935 instead of 80). 32-bit Windows and Unix
+/// keep `s_port` before `s_proto`.
 #[cfg(feature = "unsafe-ffi")]
 #[repr(C)]
 pub struct Servent {
     pub s_name: *mut std::os::raw::c_char,
     pub s_aliases: *mut *mut std::os::raw::c_char,
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    pub s_proto: *mut std::os::raw::c_char,
     #[cfg(unix)]
     pub s_port: i32,
     #[cfg(windows)]
     pub s_port: i16,
+    #[cfg(not(all(windows, target_pointer_width = "64")))]
     pub s_proto: *mut std::os::raw::c_char,
 }
 

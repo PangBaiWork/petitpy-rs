@@ -157,6 +157,18 @@ print("DNS_HOSTNAME_OK")
 
 /// Service names: `getservbyname` / `getservbyport`
 /// (FFI first, then the built-in table).
+/// Build #32: every assert carries a label + the value
+/// actually returned, so a Windows failure names the
+/// failing call in the CI log. The bare asserts only
+/// said "AssertionError": the stock Windows services
+/// file (`http 80/tcp`, no `http 80/udp`; `ssh 22/tcp`;
+/// `domain 53/tcp+udp`) plus the built-in fallback make
+/// all 9 pass in theory, so which call the runner
+/// disagrees on is still undiagnosed — and CPython
+/// itself only checks round-trip consistency for these
+/// names (`testGetServBy`), not the pinned values.
+/// The pinned values stay: they match CPython on a
+/// stock Windows services file.
 #[test]
 fn sockffi_dns_service() {
     let dir = scratch("service");
@@ -165,15 +177,17 @@ fn sockffi_dns_service() {
         "svc.py",
         r#"
 import socket
-assert socket.getservbyname("http") == 80
-assert socket.getservbyname("http", "tcp") == 80
-assert socket.getservbyname("http", "udp") == 80
-assert socket.getservbyname("ssh") == 22
-assert socket.getservbyname("domain", "udp") == 53
-assert socket.getservbyport(80) == "http"
-assert socket.getservbyport(80, "tcp") == "http"
-assert socket.getservbyport(80, "udp") == "http"
-assert socket.getservbyport(22) == "ssh"
+def eq(label, got, want):
+    assert got == want, (label, got, want)
+eq("getservbyname('http')", socket.getservbyname("http"), 80)
+eq("getservbyname('http','tcp')", socket.getservbyname("http", "tcp"), 80)
+eq("getservbyname('http','udp')", socket.getservbyname("http", "udp"), 80)
+eq("getservbyname('ssh')", socket.getservbyname("ssh"), 22)
+eq("getservbyname('domain','udp')", socket.getservbyname("domain", "udp"), 53)
+eq("getservbyport(80)", socket.getservbyport(80), "http")
+eq("getservbyport(80,'tcp')", socket.getservbyport(80, "tcp"), "http")
+eq("getservbyport(80,'udp')", socket.getservbyport(80, "udp"), "http")
+eq("getservbyport(22)", socket.getservbyport(22), "ssh")
 print("DNS_SERVICE_OK")
 "#,
     );

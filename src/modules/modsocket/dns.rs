@@ -92,6 +92,12 @@ use crate::support::ffi_dns::inet_aton_owned;
 /// Build #20.
 #[cfg(feature = "unsafe-ffi")]
 use crate::modules::modsocket_ffi::{translate_family, translate_family_back};
+/// `socketpair_windows` (Windows loopback pair) only:
+/// `FfiSocket` / `ffi_os_error` / `winsock_socketpair`.
+#[cfg(all(windows, feature = "unsafe-ffi"))]
+use crate::modules::modsocket_ffi::{ffi_os_error, FfiSocket};
+#[cfg(all(windows, feature = "unsafe-ffi"))]
+use crate::modules::modsocket_ffi_adv::winsock_socketpair;
 
 // ── Constants (Python-visible; cfg-correct values) ──────────────────
 
@@ -1772,14 +1778,60 @@ fn socketpair_unix(ctx: &mut CallCtx, family: i32, type_: i32, proto: i32) -> Py
     Ok(Value::Heap(tuple))
 }
 
+/// Windows `AF_UNIX` pair: there is no `socketpair(2)` on
+/// Windows, so build a loopback TCP pair (CPython does the
+/// same — its `socket.socketpair()` on Windows is the
+/// `Lib/socket.py` loopback fallback, default family
+/// `AF_INET`, only `AF_INET` / `AF_INET6`; "Windows
+/// support added" in 3.5, reworked in gh-122133 /
+/// gh-122493, whose note calls Windows a platform
+/// "where `AF_UNIX` is not available"). The pair is
+/// therefore reported as `AF_INET`, exactly like
+/// CPython's no-argument `socketpair()` result on
+/// Windows. (An explicit `AF_UNIX` pair is `ValueError`
+/// there; here it is the same loopback pair — the S3
+/// lane's `winsock_socketpair` was written for this use
+/// and sat unwired as dead code.) Under `unsafe-ffi`
+/// the pair uses the FFI sockets; the default build
+/// uses the `std` loopback pair (`socketpair_tcp`).
+/// The listener fd is closed inside
+/// `winsock_socketpair`, so nothing leaks.
+#[cfg(windows)]
+fn socketpair_windows(ctx: &mut CallCtx, type_: i32, proto: i32) -> PyResult<Value> {
+    #[cfg(feature = "unsafe-ffi")]
+    {
+        let (fd1, fd2) = winsock_socketpair().map_err(|e| ffi_os_error(ctx, e))?;
+        let wrap = |ctx: &mut CallCtx, fd: crate::support::ffi::RawFd| -> PyResult<Value> {
+            let f = FfiSocket::from_raw(fd, AF_INET, type_, proto);
+            let key = f.fileno();
+            sockets().insert(key, SocketState::Ffi(f));
+            alloc_socket(ctx, key, AF_INET, type_, proto)
+        };
+        let s1 = wrap(ctx, fd1)?;
+        let s2 = wrap(ctx, fd2)?;
+        root_temporary(ctx, s1);
+        root_temporary(ctx, s2);
+        let tuple = new_tuple(ctx, ctx.types.tuple, &[s1, s2]);
+        unroot_temporary(ctx, s1);
+        unroot_temporary(ctx, s2);
+        Ok(Value::Heap(tuple))
+    }
+    #[cfg(not(feature = "unsafe-ffi"))]
+    {
+        socketpair_tcp(ctx, AF_INET, type_, proto)
+    }
+}
+
 /// `socket.socketpair([family[, type[, proto]]]) ->
 /// (sock, sock)`: a pair of connected stream sockets.
 /// Only `SOCK_STREAM` is supported (a datagram pair is
 /// `EOPNOTSUPP` — CPython's loopback path is stream-only
 /// too). INET / INET6 use a loopback TCP pair;
 /// `AF_UNIX` on Unix uses a temporary path (see
-/// `socketpair_unix`); `AF_UNIX` on Windows is
-/// `NotImplementedError` (as for `socket()`).
+/// `socketpair_unix`); `AF_UNIX` on Windows is a
+/// loopback TCP pair reported as `AF_INET` (see
+/// `socketpair_windows` — CPython's Windows
+/// `socketpair()` is the same loopback fallback).
 pub(crate) fn socket_socketpair(ctx: &mut CallCtx, args: &[Value]) -> PyResult<Value> {
     let family = match args.first() {
         Some(v) => int_arg(ctx, *v)? as i32,
@@ -1806,7 +1858,7 @@ pub(crate) fn socket_socketpair(ctx: &mut CallCtx, args: &[Value]) -> PyResult<V
     if family == AF_UNIX {
         #[cfg(windows)]
         {
-            return Err(not_implemented(ctx, "AF_UNIX is not supported on Windows"));
+            return socketpair_windows(ctx, type_, proto);
         }
         #[cfg(unix)]
         {
